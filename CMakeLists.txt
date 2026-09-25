@@ -39,6 +39,14 @@ if (EXISTS /opt/rocm)
   list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
 endif()
 
+# ROCm's hip/amd_detail/host_defines.h #defines __noinline__ as a macro, which
+# corrupts the [[__gnu__::__noinline__]] attribute in libstdc++ <format> when
+# a HIP header is parsed first. Parse <format> before any HIP header so the
+# attribute survives the macro expansion.
+if (ENGINE_ENABLE_HIP)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX,HIP>:-include;format>")
+endif()
+
 if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
   find_package(hip REQUIRED)
