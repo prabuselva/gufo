@@ -130,6 +130,18 @@ __global__ void RopeKernel(float* x, const std::uint32_t* pos,
   v[i + half] = a * s + b * c;
 }
 
+// One thread per output channel: deinterleave the per-head [q | gate] pair.
+__global__ void SplitQGateKernel(const float* qg, float* q, float* gate,
+                                 std::uint32_t head_dim) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::uint32_t head = static_cast<std::uint32_t>(idx / head_dim);
+  const std::uint32_t i = static_cast<std::uint32_t>(idx % head_dim);
+  const std::size_t base = static_cast<std::size_t>(head) * 2 * head_dim;
+  q[idx] = qg[base + i];
+  gate[idx] = qg[base + head_dim + i];
+}
+
 __global__ void SwigluKernel(float* gate, const float* up, std::size_t count) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
@@ -145,6 +157,15 @@ __global__ void SigmoidMulKernel(float* x, const float* g, std::size_t count) {
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += stride) {
     x[i] *= DSigmoid(g[i]);
+  }
+}
+
+__global__ void AddKernel(float* a, const float* b, std::size_t count) {
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += stride) {
+    a[i] += b[i];
   }
 }
 
@@ -240,7 +261,7 @@ __global__ void GdnConvKernel(const float* qkv, const float* conv_w,
       acc += w[t] * history[static_cast<std::size_t>(t) * channels + ch];
     }
     convolved[ch] = DSilu(acc);
-    for (std::uint32_t t = 0; t + 1 < kernel; ++t) {
+    for (std::uint32_t t = 0; t + 2 < kernel; ++t) {
       history[static_cast<std::size_t>(t) * channels + ch] =
           history[static_cast<std::size_t>(t + 1) * channels + ch];
     }
@@ -411,6 +432,15 @@ void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
                                          theta);
 }
 
+void SplitQGate(const float* qg, float* q, float* gate, std::uint32_t heads,
+                std::uint32_t head_dim, hipStream_t stream) {
+  const std::size_t count = static_cast<std::size_t>(heads) * head_dim;
+  const std::size_t block = 256;
+  const std::size_t grid =
+      std::min<std::size_t>((count + block - 1) / block, 65535);
+  SplitQGateKernel<<<grid, block, 0, stream>>>(qg, q, gate, head_dim);
+}
+
 void Swiglu(float* gate, const float* up, std::size_t count,
             hipStream_t stream) {
   if (count == 0) {
@@ -431,6 +461,16 @@ void SigmoidMul(float* x, const float* g, std::size_t count,
   const std::size_t grid =
       std::min<std::size_t>((count + block - 1) / block, 65535);
   SigmoidMulKernel<<<grid, block, 0, stream>>>(x, g, count);
+}
+
+void Add(float* a, const float* b, std::size_t count, hipStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  const std::size_t block = 256;
+  const std::size_t grid =
+      std::min<std::size_t>((count + block - 1) / block, 65535);
+  AddKernel<<<grid, block, 0, stream>>>(a, b, count);
 }
 
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,

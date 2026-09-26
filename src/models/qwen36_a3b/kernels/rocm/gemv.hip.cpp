@@ -87,7 +87,66 @@ __global__ void GemvBf16(const hip_bfloat16* __restrict__ w,
   }
 }
 
+// Dequantize a single row of a quantized matrix (the token-embedding lookup).
+// One warp per Q8_0 block; one thread per element for F32/BF16.
+__global__ void EmbedRowQ8_0(const Q8_0Block* __restrict__ w,
+                             float* __restrict__ out) {
+  const std::uint32_t b = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  const float d = __half2float(w[b].d);
+  out[b * 32 + lane] = d * static_cast<float>(w[b].qs[lane]);
+}
+
+__global__ void EmbedRowF32(const float* __restrict__ w,
+                            float* __restrict__ out, std::uint32_t cols) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < cols) {
+    out[idx] = w[idx];
+  }
+}
+
+__global__ void EmbedRowBf16(const hip_bfloat16* __restrict__ w,
+                             float* __restrict__ out, std::uint32_t cols) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < cols) {
+    out[idx] = static_cast<float>(w[idx]);
+  }
+}
+
 }  // namespace
+
+void EmbedRow(const void* base, GemvType type, std::uint32_t row,
+              std::uint32_t cols, float* out, hipStream_t stream) {
+  switch (type) {
+    case GemvType::kQ8_0: {
+      const std::uint32_t nblocks = cols / 32;
+      const Q8_0Block* w = static_cast<const Q8_0Block*>(base) +
+                           static_cast<std::size_t>(row) * nblocks;
+      EmbedRowQ8_0<<<nblocks, 32, 0, stream>>>(w, out);
+      break;
+    }
+    case GemvType::kF32: {
+      const float* w = static_cast<const float*>(base) +
+                       static_cast<std::size_t>(row) * cols;
+      const std::size_t block = 256;
+      const std::size_t grid =
+          std::min<std::size_t>((cols + block - 1) / block, 65535);
+      EmbedRowF32<<<grid, block, 0, stream>>>(w, out, cols);
+      break;
+    }
+    case GemvType::kBF16: {
+      const hip_bfloat16* w = static_cast<const hip_bfloat16*>(base) +
+                              static_cast<std::size_t>(row) * cols;
+      const std::size_t block = 256;
+      const std::size_t grid =
+          std::min<std::size_t>((cols + block - 1) / block, 65535);
+      EmbedRowBf16<<<grid, block, 0, stream>>>(w, out, cols);
+      break;
+    }
+  }
+}
 
 void Gemv(const void* base, GemvType type, std::uint32_t rows,
           std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,

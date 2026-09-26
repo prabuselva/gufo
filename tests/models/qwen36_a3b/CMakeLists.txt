@@ -39,4 +39,15 @@ if (ENGINE_ENABLE_HIP)
       LABELS "qwen36_a3b;hip;gpu;gfx1151")
     add_dependencies(qwen36_a3b_tests qwen36_a3b_${name}_test)
   endforeach()
+
+  # End-to-end forward pass: the GPU executor's trunk and MTP logits must agree
+  # with the scalar oracle over the real artifact. Skips (77) without the GGUF.
+  add_executable(qwen36_a3b_rocm_forward_test EXCLUDE_FROM_ALL
+    rocm_forward_test.cpp)
+  target_link_libraries(qwen36_a3b_rocm_forward_test PRIVATE
+    gufo_qwen36_a3b_executor gufo_qwen36_a3b_reference)
+  add_test(NAME qwen36_a3b.rocm_forward COMMAND qwen36_a3b_rocm_forward_test)
+  set_tests_properties(qwen36_a3b.rocm_forward PROPERTIES
+    LABELS "qwen36_a3b;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
 endif()
