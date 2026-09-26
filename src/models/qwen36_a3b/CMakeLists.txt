@@ -20,3 +20,21 @@ target_link_libraries(gufo_qwen36_a3b_reference PUBLIC
 # even as an oracle, so it keeps -O2 in every configuration.
 set_source_files_properties(cpu_ops.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
+
+if (ENGINE_ENABLE_HIP)
+  # Fused operators outside the quantized GEMM tier. Built only by explicit
+  # GPU validation targets until the executor consumes them. -ffast-math is
+  # deliberately omitted so expf/log1pf stay faithful to the scalar oracle.
+  add_library(gufo_qwen36_a3b_kernels STATIC EXCLUDE_FROM_ALL
+    kernels/rocm/kernels.hip.cpp)
+  set_source_files_properties(kernels/rocm/kernels.hip.cpp
+    PROPERTIES LANGUAGE HIP)
+  set_target_properties(gufo_qwen36_a3b_kernels PROPERTIES
+    HIP_STANDARD 17
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_qwen36_a3b_kernels PUBLIC ${PROJECT_SOURCE_DIR})
+  target_compile_options(gufo_qwen36_a3b_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+  target_link_libraries(gufo_qwen36_a3b_kernels PUBLIC hip::host)
+endif()
