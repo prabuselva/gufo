@@ -26,9 +26,10 @@ if (ENGINE_ENABLE_HIP)
   # GPU validation targets until the executor consumes them. -ffast-math is
   # deliberately omitted so expf/log1pf stay faithful to the scalar oracle.
   add_library(gufo_qwen36_a3b_kernels STATIC EXCLUDE_FROM_ALL
-    kernels/rocm/kernels.hip.cpp)
+    kernels/rocm/kernels.hip.cpp
+    kernels/rocm/gemv.hip.cpp)
   set_source_files_properties(kernels/rocm/kernels.hip.cpp
-    PROPERTIES LANGUAGE HIP)
+    kernels/rocm/gemv.hip.cpp PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_qwen36_a3b_kernels PROPERTIES
     HIP_STANDARD 17
     HIP_STANDARD_REQUIRED ON
