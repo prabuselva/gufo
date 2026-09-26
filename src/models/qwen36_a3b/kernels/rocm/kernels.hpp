@@ -1,0 +1,105 @@
+#ifndef GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_KERNELS_HPP_
+#define GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_KERNELS_HPP_
+
+#include <hip/hip_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+/// Model-private HIP launchers for the Qwen3.6-35B-A3B (qwen35moe) graph: the
+/// fused operators outside the quantized GEMM tier. Activations are row-major
+/// float32 [tokens][dim] unless noted; every launch is asynchronous on
+/// `stream` (null uses the default stream). These encode the semantics the
+/// scalar oracle in reference.cpp pins: plain `w * x` RMSNorm, partial NEOX
+/// rotary, the Gated DeltaNet recurrence with its SiLU output gate and tiled
+/// key heads, gated grouped-query attention, and the softmax top-k Mixture-of-
+/// Experts combine. Nothing here is shared with another model.
+namespace gufo::models::qwen36_a3b::rocm {
+
+/// out[r][d] = (x[r][d] * rsqrt(mean_d x^2 + eps)) * gamma[d]. `rows`
+/// independent norms of `dim` elements; `gamma` may be null (scale 1).
+void RmsNormRows(const float* x, const float* gamma, float* out,
+                 std::uint32_t rows, std::uint32_t dim, float eps,
+                 hipStream_t stream);
+
+/// NEOX partial rotary on x [rows][heads][head_dim] at positions pos[row].
+/// Only the leading `rotary_dim` channels of each head rotate; pair (i,
+/// i + rotary_dim/2) turns by pos * theta^(-2i/rotary_dim).
+void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
+          std::uint32_t heads, std::uint32_t head_dim, std::uint32_t rotary_dim,
+          float theta, hipStream_t stream);
+
+/// gate[i] = silu(gate[i]) * up[i], in place in `gate`, over `count` floats.
+void Swiglu(float* gate, const float* up, std::size_t count,
+            hipStream_t stream);
+
+/// x[i] *= sigmoid(g[i]) over `count` floats.
+void SigmoidMul(float* x, const float* g, std::size_t count,
+                hipStream_t stream);
+
+/// Softmax over `n_experts` logits per token (rows `stride` apart), keep the
+/// top `k`, renormalize by their sum floored at 2^-14. `ids` [tokens][k] and
+/// `weights` [tokens][k] receive the chosen expert indices (ascending index
+/// order on ties) and their renormalized weights.
+void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
+                float* weights, std::uint32_t tokens, std::uint32_t n_experts,
+                std::uint32_t k, hipStream_t stream);
+
+/// out[t][i] = sum_s weights[t][s] * expert_out[(t*k + s)][i]
+///           + sigmoid(gate[t * gate_stride]) * shared[t][i].
+void MoeEpilogue(const float* expert_out, const float* weights,
+                 const float* shared, const float* gate,
+                 std::uint32_t gate_stride, float* out, std::uint32_t tokens,
+                 std::uint32_t k, std::uint32_t dim, hipStream_t stream);
+
+/// Causal depthwise convolution with SiLU over one token, advancing the rolling
+/// history. `qkv` is [channels], `conv_w` is [channels][kernel] (kernel index
+/// contiguous), `history` is [kernel-1][channels] (oldest first) and is updated
+/// in place to drop the oldest tap and append `qkv`. `convolved` [channels]
+/// receives silu(conv). One launch per token.
+void GdnConv(const float* qkv, const float* conv_w, float* history,
+             float* convolved, std::uint32_t channels, std::uint32_t kernel,
+             hipStream_t stream);
+
+/// L2-normalizes the query and key halves of `convolved` per key head into
+/// `qn` and `kn` (each [k_heads * head_dim]). The value half is left in place.
+/// x / sqrt(sum x^2 + eps) over each head_dim slice.
+void GdnNormQk(const float* convolved, float* qn, float* kn,
+               std::uint32_t k_heads, std::uint32_t head_dim, float eps,
+               hipStream_t stream);
+
+/// One Gated DeltaNet recurrence step for every value head. `qn`/`kn` are the
+/// normalized key-head vectors [k_heads * head_dim]; value head h reads key
+/// head h % k_heads. `v` is [v_heads * head_dim]. `alpha`/`beta`/`a`/`dt` are
+/// [v_heads]. `state` is [v_heads][head_dim][head_dim] (row j over the value
+/// dim, column i over the key dim) and is updated in place. `attn`
+/// [v_heads * head_dim] receives the raw recurrence output (before the norm
+/// and gate). decay = exp(a[h] * softplus(alpha[h] + dt[h])),
+/// b = sigmoid(beta[h]).
+void GdnDelta(const float* qn, const float* kn, const float* v,
+              const float* alpha, const float* beta, const float* a,
+              const float* dt, float* state, float* attn, std::uint32_t k_heads,
+              std::uint32_t v_heads, std::uint32_t head_dim,
+              hipStream_t stream);
+
+/// Per-head RMSNorm of `attn` (gamma `norm_w` [head_dim]) followed by the SiLU
+/// output gate `attn[h*d + j] *= silu(z[h*d + j])`, in place. `z` is
+/// [v_heads * head_dim].
+void GdnOutNorm(float* attn, const float* z, const float* norm_w,
+                std::uint32_t v_heads, std::uint32_t head_dim, float eps,
+                hipStream_t stream);
+
+/// Single-query grouped-query causal attention with the sigmoid output gate.
+/// `q` [heads][head_dim]; `k_cache`/`v_cache` [n_kv][kv_heads][head_dim]
+/// (already rotated); `gate` [heads * head_dim]. `out` [heads * head_dim]
+/// receives the gated context (before the output projection). `scale` is
+/// 1/sqrt(head_dim). `scratch` holds heads * n_kv softmax weights.
+void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
+                     const float* gate, float* out, float* scratch,
+                     std::uint32_t n_kv, std::uint32_t heads,
+                     std::uint32_t kv_heads, std::uint32_t head_dim,
+                     float scale, hipStream_t stream);
+
+}  // namespace gufo::models::qwen36_a3b::rocm
+
+#endif  // GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_KERNELS_HPP_

@@ -1,0 +1,112 @@
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#include "src/models/qwen36_a3b/kernels/rocm/kernels.hpp"
+#include "tests/models/qwen36_a3b/hip_test.hpp"
+
+namespace q = gufo::models::qwen36_a3b::rocm;
+namespace t = gufo::tests::qwen36_a3b;
+
+namespace {
+
+// The model's full-attention geometry: 16 query heads over 2 key/value heads,
+// 256-wide heads, with a sigmoid output gate.
+constexpr std::uint32_t kHeads = 16;
+constexpr std::uint32_t kKvHeads = 2;
+constexpr std::uint32_t kHeadDim = 256;
+constexpr std::uint32_t kGroup = kHeads / kKvHeads;
+
+bool Check(const std::string& name, double worst, double tolerance) {
+  std::cout << name << " worst relative error " << worst << '\n';
+  if (!(worst <= tolerance)) {
+    std::cerr << name << " exceeded tolerance " << tolerance << '\n';
+    return false;
+  }
+  return true;
+}
+
+bool RunCase(std::uint32_t n_kv) {
+  const std::size_t q_count = static_cast<std::size_t>(kHeads) * kHeadDim;
+  const std::size_t cache_count =
+      static_cast<std::size_t>(n_kv) * kKvHeads * kHeadDim;
+  const auto query = t::MakeValues(q_count, 0x1234ABCDU, 1.0F);
+  const auto k_cache = t::MakeValues(cache_count, 0xDEADBEEFU, 1.0F);
+  const auto v_cache = t::MakeValues(cache_count, 0x0BADF00DU, 1.0F);
+  const auto gate = t::MakeValues(q_count, 0xC0FFEE11U, 3.0F);
+
+  t::HipBuffer<float> d_q(query.size());
+  t::HipBuffer<float> d_k(k_cache.size());
+  t::HipBuffer<float> d_v(v_cache.size());
+  t::HipBuffer<float> d_gate(gate.size());
+  t::HipBuffer<float> d_out(q_count);
+  t::HipBuffer<float> d_scratch(static_cast<std::size_t>(kHeads) * n_kv);
+  t::Upload(&d_q, query);
+  t::Upload(&d_k, k_cache);
+  t::Upload(&d_v, v_cache);
+  t::Upload(&d_gate, gate);
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+  q::AttentionDecode(d_q.get(), d_k.get(), d_v.get(), d_gate.get(), d_out.get(),
+                     d_scratch.get(), n_kv, kHeads, kKvHeads, kHeadDim, scale,
+                     nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "Attention synchronization");
+  const auto got = t::Download(&d_out, q_count);
+
+  std::vector<float> ref(q_count, 0.0F);
+  for (std::uint32_t h = 0; h < kHeads; ++h) {
+    const std::uint32_t kvh = h / kGroup;
+    const float* qh = query.data() + static_cast<std::size_t>(h) * kHeadDim;
+    std::vector<double> scores(n_kv);
+    double max_score = -INFINITY;
+    for (std::uint32_t j = 0; j < n_kv; ++j) {
+      const float* kj =
+          k_cache.data() +
+          (static_cast<std::size_t>(j) * kKvHeads + kvh) * kHeadDim;
+      double dot = 0.0;
+      for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+        dot += static_cast<double>(qh[i]) * kj[i];
+      }
+      scores[j] = dot * scale;
+      max_score = std::max(max_score, scores[j]);
+    }
+    double denom = 0.0;
+    for (double& sc : scores) {
+      sc = std::exp(sc - max_score);
+      denom += sc;
+    }
+    float* oh = ref.data() + static_cast<std::size_t>(h) * kHeadDim;
+    for (std::uint32_t j = 0; j < n_kv; ++j) {
+      const float p = static_cast<float>(scores[j] / denom);
+      const float* vj =
+          v_cache.data() +
+          (static_cast<std::size_t>(j) * kKvHeads + kvh) * kHeadDim;
+      for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+        oh[i] += p * vj[i];
+      }
+    }
+    for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+      oh[i] *= static_cast<float>(
+          t::SigmoidD(gate[static_cast<std::size_t>(h) * kHeadDim + i]));
+    }
+  }
+  return Check("AttentionDecode n_kv=" + std::to_string(n_kv),
+               t::WorstRelative(ref, got), 1e-4);
+}
+
+}  // namespace
+
+int main() {
+  try {
+    bool ok = true;
+    for (std::uint32_t n_kv : {1U, 5U, 33U, 128U}) {
+      ok = RunCase(n_kv) && ok;
+    }
+    return ok ? 0 : 1;
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
+}
