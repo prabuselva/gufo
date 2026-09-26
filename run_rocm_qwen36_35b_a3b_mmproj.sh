@@ -78,9 +78,8 @@ export CPATH=/opt/rocm/include:${CPATH:-}
 export PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}
 
 
-MODEL_Q4="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf"
-MODEL_Q8="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q8_K_XL/Qwen3.8-27B-UD-Q8_K_XL.gguf"
-MMPROJ="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q4_K_XL/mmproj-BF16.gguf"
-DFLASH="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+MODEL_Q4=""
+MODEL_Q8="/home/praburaja/projects/llm/models/gguf/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
+MMPROJ="/home/praburaja/projects/llm/models/gguf/Qwen3.6-35B-A3B-MTP/mmproj-BF16.gguf"
 
-build_rocm10/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL_Q8" --mmproj "$MMPROJ" --speculative dflash2 --dflash-model "$DFLASH" --sessions 2 --think on --reasoning-effort xhigh
+build_rocm10/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL_Q8" --sessions 2
