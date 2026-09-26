@@ -26,6 +26,13 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
           std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,
           hipStream_t stream);
 
+/// out[i] = W[row][i] for i in [0, cols): dequantizes a single row of a
+/// row-major [rows x cols] matrix stored in `type` (the token-embedding
+/// lookup). `base` points at the matrix start; the row offset is derived from
+/// `cols` and `type`. Asynchronous on `stream` (null uses the default stream).
+void EmbedRow(const void* base, GemvType type, std::uint32_t row,
+              std::uint32_t cols, float* out, hipStream_t stream);
+
 }  // namespace gufo::models::qwen36_a3b::rocm
 
 #endif  // GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_GEMV_HPP_

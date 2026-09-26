@@ -38,4 +38,16 @@ if (ENGINE_ENABLE_HIP)
   target_compile_options(gufo_qwen36_a3b_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
   target_link_libraries(gufo_qwen36_a3b_kernels PUBLIC hip::host)
+
+  # Host-side driver: streams the artifact to the GPU and runs the trunk and
+  # MTP draft one token at a time. Built only by explicit GPU validation
+  # targets until the engine and CLI consume it.
+  add_library(gufo_qwen36_a3b_executor STATIC EXCLUDE_FROM_ALL
+    kernels/rocm/device_model.cpp
+    kernels/rocm/executor.cpp)
+  set_target_properties(gufo_qwen36_a3b_executor PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_qwen36_a3b_executor PUBLIC ${PROJECT_SOURCE_DIR})
+  target_link_libraries(gufo_qwen36_a3b_executor PUBLIC
+    gufo_qwen36_a3b_kernels gufo_qwen36_a3b hip::host)
 endif()

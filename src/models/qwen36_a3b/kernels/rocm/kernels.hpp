@@ -29,6 +29,13 @@ void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
           std::uint32_t heads, std::uint32_t head_dim, std::uint32_t rotary_dim,
           float theta, hipStream_t stream);
 
+/// Splits the fused query/gate projection of a full-attention layer. `qg` is
+/// [heads][2 * head_dim] with query and gate channels interleaved per head;
+/// `q` and `gate` (each [heads * head_dim]) receive the two halves so the
+/// query can be normalized and rotated on its own.
+void SplitQGate(const float* qg, float* q, float* gate, std::uint32_t heads,
+                std::uint32_t head_dim, hipStream_t stream);
+
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`, over `count` floats.
 void Swiglu(float* gate, const float* up, std::size_t count,
             hipStream_t stream);
@@ -36,6 +43,9 @@ void Swiglu(float* gate, const float* up, std::size_t count,
 /// x[i] *= sigmoid(g[i]) over `count` floats.
 void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream);
+
+/// a[i] += b[i] over `count` floats, the residual stream update.
+void Add(float* a, const float* b, std::size_t count, hipStream_t stream);
 
 /// Softmax over `n_experts` logits per token (rows `stride` apart), keep the
 /// top `k`, renormalize by their sum floored at 2^-14. `ids` [tokens][k] and
