@@ -30,7 +30,7 @@ set_tests_properties(qwen36_a3b.reference PROPERTIES
 if (ENGINE_ENABLE_HIP)
   # Fused-operator checks: synthetic activations through each kernel against a
   # CPU reference of the scalar oracle's formulas. No model artifact required.
-  foreach(name IN ITEMS rocm_ops rocm_gdn rocm_attention)
+  foreach(name IN ITEMS rocm_ops rocm_gdn rocm_attention rocm_gemv)
     add_executable(qwen36_a3b_${name}_test ${name}_test.cpp)
     target_link_libraries(qwen36_a3b_${name}_test PRIVATE
       gufo_qwen36_a3b_kernels)
