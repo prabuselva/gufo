@@ -16,3 +16,13 @@ add_test(NAME qwen36_a3b.weights COMMAND qwen36_a3b_weights_test)
 set_tests_properties(qwen36_a3b.weights PROPERTIES
   LABELS "qwen36_a3b;cpu;external-model" SKIP_RETURN_CODE 77)
 add_dependencies(qwen36_a3b_tests qwen36_a3b_weights_test)
+
+# Runs the scalar oracle over the real artifact (a few tokens). Built only when
+# the reference library is requested, and skips (77) without the GGUF.
+add_executable(qwen36_a3b_reference_test EXCLUDE_FROM_ALL reference_test.cpp)
+target_link_libraries(qwen36_a3b_reference_test PRIVATE
+  gufo_qwen36_a3b_reference)
+set_source_files_properties(reference_test.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+add_test(NAME qwen36_a3b.reference COMMAND qwen36_a3b_reference_test)
+set_tests_properties(qwen36_a3b.reference PROPERTIES
+  LABELS "qwen36_a3b;cpu;external-model;slow" SKIP_RETURN_CODE 77)
