@@ -50,4 +50,16 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen36_a3b.rocm_forward PROPERTIES
     LABELS "qwen36_a3b;hip;gpu;gfx1151;external-model;slow"
     SKIP_RETURN_CODE 77)
+
+  # CPU-vs-GPU greedy decode over a real text prompt: the token streams must
+  # agree exactly and the decoded text is the quality gate the forward test
+  # cannot provide. Skips (77) without the GGUF.
+  add_executable(qwen36_a3b_rocm_inference_test EXCLUDE_FROM_ALL
+    rocm_inference_test.cpp)
+  target_link_libraries(qwen36_a3b_rocm_inference_test PRIVATE
+    gufo_qwen36_a3b_executor gufo_qwen36_a3b_reference gufo_core)
+  add_test(NAME qwen36_a3b.rocm_inference COMMAND qwen36_a3b_rocm_inference_test)
+  set_tests_properties(qwen36_a3b.rocm_inference PROPERTIES
+    LABELS "qwen36_a3b;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
 endif()

@@ -50,4 +50,14 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_qwen36_a3b_executor PUBLIC ${PROJECT_SOURCE_DIR})
   target_link_libraries(gufo_qwen36_a3b_executor PUBLIC
     gufo_qwen36_a3b_kernels gufo_qwen36_a3b hip::host)
+
+  # Gufo-owned API over the ROCm runtime: one resident model and one session.
+  # Built only by explicit GPU validation targets until the CLI consumes it.
+  add_library(gufo_qwen36_a3b_engine STATIC EXCLUDE_FROM_ALL
+    engine.cpp)
+  set_target_properties(gufo_qwen36_a3b_engine PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_qwen36_a3b_engine PUBLIC ${PROJECT_SOURCE_DIR})
+  target_link_libraries(gufo_qwen36_a3b_engine PUBLIC
+    gufo_qwen36_a3b_executor gufo_qwen36_a3b gufo_core)
 endif()

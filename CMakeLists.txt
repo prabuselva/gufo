@@ -188,7 +188,7 @@ add_library(gufo_llm_cli STATIC
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next)
+    gufo_qwen38_flash_next gufo_qwen36_a3b_engine)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)

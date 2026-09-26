@@ -31,6 +31,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen36_a3b/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
@@ -727,6 +728,78 @@ int GenerateFlashNextResponse(const PromptOptions& opt,
   return 0;
 }
 
+std::shared_ptr<models::qwen36_a3b::Model> LoadQwen36A3BModel(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  if (opt.force_cpu || !opt.speculative_backend.empty()) {
+    std::cerr << "Qwen3.6-35B-A3B requires ROCm and does not support "
+                 "speculative decoding\n";
+    return nullptr;
+  }
+  if (opt.use_chat_template &&
+      !tokenization::QwenChatTemplate::ValidateGgufTemplate(reader, &error)) {
+    std::cerr << "Unsupported Qwen3.6-35B-A3B chat template: " << error << '\n';
+    return nullptr;
+  }
+  auto model = models::qwen36_a3b::Model::Load(
+      opt.model_path, {.max_context = kDefaultContext}, &error);
+  PrintModelLoadTime(load_start, model != nullptr);
+  if (!model)
+    std::cerr << "Qwen3.6-35B-A3B load failed: " << error << '\n';
+  return model;
+}
+
+int GenerateQwen36A3BResponse(const PromptOptions& opt,
+                              const models::qwen36_a3b::Model& model,
+                              models::qwen36_a3b::Session& session,
+                              std::span<const tokenization::TokenId> prompt,
+                              std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= session.ContextSize() ||
+      opt.max_tokens > session.ContextSize() - prompt.size()) {
+    std::cerr
+        << "Qwen3.6-35B-A3B prompt and output exceed the 4096-token CLI "
+           "context\n";
+    return 1;
+  }
+  const std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  std::string error;
+  if (!session.Sync(input, &error)) {
+    std::cerr << "Qwen3.6-35B-A3B prefill failed: " << error << '\n';
+    return 1;
+  }
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  while (generated.size() < opt.max_tokens) {
+    models::qwen36_a3b::Session::DecodeResult decoded;
+    if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
+                            &decoded, &error)) {
+      std::cerr << "Qwen3.6-35B-A3B decode failed: " << error << '\n';
+      return 1;
+    }
+    for (const auto token : decoded.tokens) {
+      const auto piece = model.TokenText(token);
+      std::cout << piece << std::flush;
+      if (reply)
+        reply->append(piece);
+      generated.push_back(static_cast<tokenization::TokenId>(token));
+    }
+    if (decoded.stop)
+      break;
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
 std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     const PromptOptions& opt, hip::QwenGpuExecutor& executor) {
   std::string err;
@@ -1041,6 +1114,24 @@ int RunPrompt(std::span<const char* const> args) {
   };
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    auto model = LoadQwen36A3BModel(opt, *reader, model_load_start);
+    if (!model)
+      return 1;
+    auto session = model->CreateSession(kDefaultContext, &err);
+    if (!session) {
+      std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
+      return 1;
+    }
+    try {
+      const auto ids = model->Tokenize(rendered_prompt);
+      const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
+      return GenerateQwen36A3BResponse(opt, *model, *session, prompt);
+    } catch (const std::exception& e) {
+      std::cerr << e.what() << '\n';
+      return 1;
+    }
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)
