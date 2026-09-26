@@ -81,4 +81,4 @@ export PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}
 MODEL="/home/praburaja/projects/llm/models/gguf/Qwen3.8-Flash-Next/Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 MMPROJ="/home/praburaja/projects/llm/models/gguf/Qwen3.8-Flash-Next/mmproj-BF16.gguf"
 MTP="/home/praburaja/projects/llm/models/gguf/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0_unsloth.gguf"
-build/release/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL" --mmproj "$MMPROJ" --speculative mtp --mtp-model "$MTP" --sessions 2 --think on --reasoning-effort xhigh
+build_rocm10/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL" --mmproj "$MMPROJ" --speculative mtp --mtp-model "$MTP" --sessions 2 --think on --reasoning-effort xhigh
