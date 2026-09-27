@@ -99,6 +99,35 @@ void GdnOutNorm(float* attn, const float* z, const float* norm_w,
                 std::uint32_t v_heads, std::uint32_t head_dim, float eps,
                 hipStream_t stream);
 
+/// Batched Gated DeltaNet prefill over a chunk of `tokens`. Buffers are
+/// row-major [tokens][...]: `qkv`/`convolved` [tokens][channels], `qn`/`kn`
+/// [tokens][k_heads * head_dim], `alpha`/`beta` [tokens][v_heads], `attn`/`z`
+/// [tokens][v_heads * head_dim]. `a`/`dt`/`norm_w` are per-head/per-dim static.
+/// `conv_state` ([kernel-1][channels]) is read by the convolution and advanced
+/// past the chunk via `history_out` (a disjoint buffer the caller copies back).
+/// `state` ([v_heads][head_dim][head_dim]) is updated in place. `channels` is
+/// 2 * k_heads * head_dim + v_heads * head_dim. head_dim must be 256.
+void GdnConvPrefill(const float* qkv, const float* conv_w, const float* history,
+                    float* convolved, std::uint32_t tokens,
+                    std::uint32_t channels, std::uint32_t kernel,
+                    hipStream_t stream);
+void GdnHistoryUpdate(const float* qkv, const float* history, float* out,
+                      std::uint32_t tokens, std::uint32_t channels,
+                      std::uint32_t kernel, hipStream_t stream);
+void GdnNormQkPrefill(const float* convolved, float* qn, float* kn,
+                      std::uint32_t tokens, std::uint32_t k_heads,
+                      std::uint32_t channels, std::uint32_t head_dim, float eps,
+                      hipStream_t stream);
+void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
+                  const float* alpha, const float* beta, const float* a,
+                  const float* dt, float* state, float* attn,
+                  std::uint32_t tokens, std::uint32_t k_heads,
+                  std::uint32_t v_heads, std::uint32_t head_dim,
+                  std::uint32_t channels, hipStream_t stream);
+void GdnOutNormPrefill(float* attn, const float* z, const float* norm_w,
+                       std::uint32_t tokens, std::uint32_t v_heads,
+                       std::uint32_t head_dim, float eps, hipStream_t stream);
+
 /// Single-query grouped-query causal attention with the sigmoid output gate.
 /// `q` [heads][head_dim]; `k_cache`/`v_cache` [n_kv][kv_heads][head_dim]
 /// (already rotated); `gate` [heads * head_dim]. `out` [heads * head_dim]
@@ -109,6 +138,18 @@ void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
                      std::uint32_t n_kv, std::uint32_t heads,
                      std::uint32_t kv_heads, std::uint32_t head_dim,
                      float scale, hipStream_t stream);
+
+/// Batched causal self-attention for a prefill chunk. `q` and `gate` are
+/// [tokens][heads * head_dim] (already normed and rotated); `k_cache`/`v_cache`
+/// hold absolute positions `[0][kv_heads * head_dim]` and must already contain
+/// the chunk's own keys/values. Token `t` attends positions `[0, start + t]`.
+/// `out` [tokens][heads * head_dim] receives the gated context. Uses a tiled
+/// online softmax so no per-token scratch is needed.
+void AttentionPrefill(const float* q, const float* k_cache,
+                      const float* v_cache, const float* gate, float* out,
+                      std::uint32_t start, std::uint32_t tokens,
+                      std::uint32_t heads, std::uint32_t kv_heads,
+                      std::uint32_t head_dim, float scale, hipStream_t stream);
 
 }  // namespace gufo::models::qwen36_a3b::rocm
 

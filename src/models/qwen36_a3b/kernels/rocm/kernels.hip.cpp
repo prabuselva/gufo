@@ -414,6 +414,271 @@ __global__ void AttentionDecodeKernel(const float* q, const float* k_cache,
   }
 }
 
+// One workgroup per (token, head). A tiled online softmax over the causal
+// range [0, start + token] keeps only one tile of scores in shared memory, so
+// the resident footprint does not grow with the context. Accumulation matches
+// AttentionDecodeKernel (double sums, same sigmoid gate).
+__global__ void AttentionPrefillKernel(const float* q, const float* k_cache,
+                                       const float* v_cache, const float* gate,
+                                       float* out, std::uint32_t start,
+                                       std::uint32_t heads,
+                                       std::uint32_t kv_heads,
+                                       std::uint32_t head_dim, float scale) {
+  constexpr std::uint32_t kTile = 128;
+  __shared__ float score[kTile];
+  __shared__ double reduce[32];
+  __shared__ float max_buf[32];
+  __shared__ int idx_buf[32];
+
+  const std::uint32_t h = blockIdx.x % heads;
+  const std::uint32_t token = blockIdx.x / heads;
+  const std::uint32_t kvh = h / (heads / kv_heads);
+  const float* qh =
+      q + (static_cast<std::size_t>(token) * heads + h) * head_dim;
+  const std::uint32_t causal = start + token + 1;
+
+  const std::uint32_t i = threadIdx.x;
+  double acc = 0.0;
+  double run_sum = 0.0;
+  float run_max = -INFINITY;
+
+  for (std::uint32_t base = 0; base < causal; base += kTile) {
+    const std::uint32_t span = causal - base;
+    const std::uint32_t len = span < kTile ? span : kTile;
+    __syncthreads();
+    for (std::uint32_t t = threadIdx.x; t < len; t += blockDim.x) {
+      const std::uint32_t j = base + t;
+      const float* kj =
+          k_cache + (static_cast<std::size_t>(j) * kv_heads + kvh) * head_dim;
+      double dot = 0.0;
+      for (std::uint32_t d = 0; d < head_dim; ++d) {
+        dot += static_cast<double>(qh[d]) * kj[d];
+      }
+      score[t] = static_cast<float>(dot) * scale;
+    }
+    __syncthreads();
+
+    float tile_max = -INFINITY;
+    for (std::uint32_t t = threadIdx.x; t < len; t += blockDim.x) {
+      tile_max = fmaxf(tile_max, score[t]);
+    }
+    {
+      int dummy = 0;
+      BlockReduceMaxIndex(tile_max, dummy, max_buf, idx_buf);
+      tile_max = max_buf[0];
+    }
+    const float new_max = fmaxf(run_max, tile_max);
+    const float corr = expf(run_max - new_max);
+    run_sum *= corr;
+    if (i < head_dim) {
+      acc *= corr;
+    }
+
+    double tile_sum = 0.0;
+    for (std::uint32_t t = threadIdx.x; t < len; t += blockDim.x) {
+      const float e = expf(score[t] - new_max);
+      score[t] = e;
+      tile_sum += e;
+    }
+    run_sum += BlockReduceSum(tile_sum, reduce);
+
+    if (i < head_dim) {
+      for (std::uint32_t t = 0; t < len; ++t) {
+        const float* vj = v_cache +
+                          (static_cast<std::size_t>(base + t) * kv_heads + kvh) *
+                              head_dim;
+        acc += static_cast<double>(score[t]) * vj[i];
+      }
+    }
+    run_max = new_max;
+  }
+
+  const float inv = 1.0F / static_cast<float>(run_sum);
+  if (i < head_dim) {
+    const std::size_t o =
+        (static_cast<std::size_t>(token) * heads + h) * head_dim + i;
+    out[o] = static_cast<float>(acc * inv) * DSigmoid(gate[o]);
+  }
+}
+
+// Causal depthwise convolution over a chunk, SiLU applied. Token t reads the
+// `kernel` inputs ending at t; those before the chunk come from `history`
+// ([kernel-1][channels], oldest first). Accumulation order matches the decode
+// kernel (newest tap first) so a chunk reproduces per-token decode.
+__global__ void GdnConvPrefillKernel(const float* qkv, const float* conv_w,
+                                     const float* history, float* convolved,
+                                     std::uint32_t tokens,
+                                     std::uint32_t channels,
+                                     std::uint32_t kernel) {
+  const std::size_t total = static_cast<std::size_t>(tokens) * channels;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t idx =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < total; idx += stride) {
+    const std::uint32_t t = static_cast<std::uint32_t>(idx / channels);
+    const std::uint32_t ch = static_cast<std::uint32_t>(idx % channels);
+    const float* w = conv_w + static_cast<std::size_t>(ch) * kernel;
+    float acc = w[kernel - 1] * qkv[idx];
+    for (std::uint32_t k = 0; k + 1 < kernel; ++k) {
+      const std::int64_t s = static_cast<std::int64_t>(t) -
+                             static_cast<std::int64_t>(kernel - 1) +
+                             static_cast<std::int64_t>(k);
+      const float xv = s >= 0
+                           ? qkv[static_cast<std::size_t>(s) * channels + ch]
+                           : history[static_cast<std::size_t>(
+                                 static_cast<std::int64_t>(kernel - 1) + s) *
+                                 channels +
+                             ch];
+      acc += w[k] * xv;
+    }
+    convolved[idx] = DSilu(acc);
+  }
+}
+
+// Advances the rolling convolution state past a chunk: new row j is the input
+// at absolute position (chunk_end - (kernel-1) + j). Reads the old `history`
+// and the chunk `qkv`, writes a disjoint `out` so there is no aliasing.
+__global__ void GdnHistoryUpdateKernel(const float* qkv, const float* history,
+                                       float* out, std::uint32_t tokens,
+                                       std::uint32_t channels,
+                                       std::uint32_t kernel) {
+  const std::size_t total =
+      static_cast<std::size_t>(kernel - 1) * channels;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t idx =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < total; idx += stride) {
+    const std::uint32_t j = static_cast<std::uint32_t>(idx / channels);
+    const std::uint32_t ch = static_cast<std::uint32_t>(idx % channels);
+    const std::int64_t src = static_cast<std::int64_t>(tokens) -
+                             static_cast<std::int64_t>(kernel - 1) +
+                             static_cast<std::int64_t>(j);
+    out[idx] = src >= 0 ? qkv[static_cast<std::size_t>(src) * channels + ch]
+                        : history[static_cast<std::size_t>(
+                              static_cast<std::int64_t>(kernel - 1) + src) *
+                              channels +
+                          ch];
+  }
+}
+
+// Per-token RMS norm of the q and k heads, batched over the chunk.
+__global__ void GdnNormQkPrefillKernel(const float* convolved, float* qn,
+                                       float* kn, std::uint32_t tokens,
+                                       std::uint32_t k_heads,
+                                       std::uint32_t channels,
+                                       std::uint32_t head_dim, float eps) {
+  __shared__ double reduce[32];
+  const std::uint32_t head = blockIdx.x % k_heads;
+  const std::uint32_t token = blockIdx.x / k_heads;
+  const bool is_key = blockIdx.y != 0;
+  const float* src =
+      convolved +
+      static_cast<std::size_t>(token) * channels +
+      static_cast<std::size_t>(is_key ? k_heads + head : head) * head_dim;
+  float* dst = (is_key ? kn : qn) +
+               (static_cast<std::size_t>(token) * k_heads + head) * head_dim;
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    const double x = src[i];
+    ss += x * x;
+  }
+  const float scale =
+      1.0f / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce)) + eps);
+  for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    dst[i] = src[i] * scale;
+  }
+}
+
+// Gated delta-rule recurrence over a chunk, sequential over tokens but fully
+// on-device. Each workgroup owns R state rows of one value head, keeps them in
+// registers across the whole chunk, and stages the token's q/k vectors in
+// shared memory. The recurrence is independent across rows, so this reproduces
+// the decode kernel exactly while touching global state once per element.
+template <std::uint32_t kRows>
+__global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
+                                   const float* convolved, const float* alpha,
+                                   const float* beta, const float* a,
+                                   const float* dt, float* state, float* attn,
+                                   std::uint32_t tokens, std::uint32_t k_heads,
+                                   std::uint32_t v_heads,
+                                   std::uint32_t head_dim,
+                                   std::uint32_t channels) {
+  __shared__ float sq[256];
+  __shared__ float sk[256];
+  __shared__ double reduce[32];
+  const std::uint32_t h = blockIdx.y;
+  const std::uint32_t kh = h % k_heads;
+  const std::uint32_t j0 = blockIdx.x * kRows;
+  const std::uint32_t i = threadIdx.x;
+  const std::size_t qk_stride = static_cast<std::size_t>(k_heads) * head_dim;
+  const std::size_t attn_stride =
+      static_cast<std::size_t>(v_heads) * head_dim;
+  const std::size_t v_base = 2 * static_cast<std::size_t>(k_heads) * head_dim +
+                             static_cast<std::size_t>(h) * head_dim;
+  const float q_scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+
+  float s[kRows];
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    s[r] = state[(static_cast<std::size_t>(h) * head_dim + j0 + r) * head_dim +
+                 i];
+  }
+  for (std::uint32_t t = 0; t < tokens; ++t) {
+    const float* qn_t = qn + static_cast<std::size_t>(t) * qk_stride +
+                        static_cast<std::size_t>(kh) * head_dim;
+    const float* kn_t = kn + static_cast<std::size_t>(t) * qk_stride +
+                        static_cast<std::size_t>(kh) * head_dim;
+    sq[i] = qn_t[i];
+    sk[i] = kn_t[i];
+    __syncthreads();
+    const float decay =
+        expf(a[h] * DSoftplus(alpha[static_cast<std::size_t>(t) * v_heads + h] +
+                              dt[h]));
+    const float b = DSigmoid(beta[static_cast<std::size_t>(t) * v_heads + h]);
+    for (std::uint32_t r = 0; r < kRows; ++r) {
+      s[r] *= decay;
+      const double u = BlockReduceSum(static_cast<double>(s[r]) * sk[i], reduce);
+      const float v_t =
+          convolved[static_cast<std::size_t>(t) * channels + v_base + j0 + r];
+      const float delta = (v_t - static_cast<float>(u)) * b;
+      s[r] += delta * sk[i];
+      const double o = BlockReduceSum(static_cast<double>(s[r]) * sq[i], reduce);
+      attn[static_cast<std::size_t>(t) * attn_stride +
+           (static_cast<std::size_t>(h) * head_dim + j0 + r)] =
+          static_cast<float>(o) * q_scale;
+    }
+    __syncthreads();
+  }
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    state[(static_cast<std::size_t>(h) * head_dim + j0 + r) * head_dim + i] =
+        s[r];
+  }
+}
+
+// Per-token gated RMS norm of the attention output, batched over the chunk.
+__global__ void GdnOutNormPrefillKernel(float* attn, const float* z,
+                                        const float* norm_w,
+                                        std::uint32_t v_heads,
+                                        std::uint32_t head_dim, float eps) {
+  __shared__ double reduce[32];
+  const std::uint32_t h = blockIdx.x % v_heads;
+  const std::uint32_t token = blockIdx.x / v_heads;
+  const std::size_t off =
+      (static_cast<std::size_t>(token) * v_heads + h) * head_dim;
+  float* row = attn + off;
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    const double x = row[i];
+    ss += x * x;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(head_dim)) +
+                   eps);
+  for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    row[i] = row[i] * scale * norm_w[i] * DSilu(z[off + i]);
+  }
+}
+
 }  // namespace
 
 void RmsNormRows(const float* x, const float* gamma, float* out,
@@ -531,6 +796,64 @@ void GdnOutNorm(float* attn, const float* z, const float* norm_w,
                                                   eps);
 }
 
+void GdnConvPrefill(const float* qkv, const float* conv_w, const float* history,
+                    float* convolved, std::uint32_t tokens,
+                    std::uint32_t channels, std::uint32_t kernel,
+                    hipStream_t stream) {
+  const std::size_t block = 256;
+  const std::size_t total = static_cast<std::size_t>(tokens) * channels;
+  const std::size_t grid =
+      std::min<std::size_t>((total + block - 1) / block, 65535);
+  GdnConvPrefillKernel<<<grid, block, 0, stream>>>(qkv, conv_w, history,
+                                                   convolved, tokens, channels,
+                                                   kernel);
+}
+
+void GdnHistoryUpdate(const float* qkv, const float* history, float* out,
+                      std::uint32_t tokens, std::uint32_t channels,
+                      std::uint32_t kernel, hipStream_t stream) {
+  const std::size_t block = 256;
+  const std::size_t total = static_cast<std::size_t>(kernel - 1) * channels;
+  const std::size_t grid =
+      std::min<std::size_t>((total + block - 1) / block, 65535);
+  GdnHistoryUpdateKernel<<<grid, block, 0, stream>>>(qkv, history, out, tokens,
+                                                     channels, kernel);
+}
+
+void GdnNormQkPrefill(const float* convolved, float* qn, float* kn,
+                      std::uint32_t tokens, std::uint32_t k_heads,
+                      std::uint32_t channels, std::uint32_t head_dim, float eps,
+                      hipStream_t stream) {
+  const dim3 grid(static_cast<std::uint32_t>(tokens) * k_heads, 2);
+  const dim3 block(head_dim);
+  GdnNormQkPrefillKernel<<<grid, block, 0, stream>>>(convolved, qn, kn, tokens,
+                                                     k_heads, channels,
+                                                     head_dim, eps);
+}
+
+void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
+                  const float* alpha, const float* beta, const float* a,
+                  const float* dt, float* state, float* attn,
+                  std::uint32_t tokens, std::uint32_t k_heads,
+                  std::uint32_t v_heads, std::uint32_t head_dim,
+                  std::uint32_t channels, hipStream_t stream) {
+  constexpr std::uint32_t kRows = 8;
+  const dim3 grid(head_dim / kRows, v_heads);
+  const dim3 block(head_dim);
+  GdnDeltaLoopKernel<kRows><<<grid, block, 0, stream>>>(
+      qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
+      v_heads, head_dim, channels);
+}
+
+void GdnOutNormPrefill(float* attn, const float* z, const float* norm_w,
+                       std::uint32_t tokens, std::uint32_t v_heads,
+                       std::uint32_t head_dim, float eps, hipStream_t stream) {
+  const dim3 grid(static_cast<std::uint32_t>(tokens) * v_heads);
+  const dim3 block(head_dim);
+  GdnOutNormPrefillKernel<<<grid, block, 0, stream>>>(attn, z, norm_w, v_heads,
+                                                      head_dim, eps);
+}
+
 void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
                      const float* gate, float* out, float* scratch,
                      std::uint32_t n_kv, std::uint32_t heads,
@@ -540,6 +863,17 @@ void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
   AttentionDecodeKernel<<<heads, block, 0, stream>>>(q, k_cache, v_cache, gate,
                                                      out, scratch, n_kv, heads,
                                                      kv_heads, head_dim, scale);
+}
+
+void AttentionPrefill(const float* q, const float* k_cache,
+                      const float* v_cache, const float* gate, float* out,
+                      std::uint32_t start, std::uint32_t tokens,
+                      std::uint32_t heads, std::uint32_t kv_heads,
+                      std::uint32_t head_dim, float scale, hipStream_t stream) {
+  const dim3 grid(static_cast<std::uint32_t>(tokens) * heads);
+  const dim3 block(std::max<std::uint32_t>(head_dim, 256U));
+  AttentionPrefillKernel<<<grid, block, 0, stream>>>(
+      q, k_cache, v_cache, gate, out, start, heads, kv_heads, head_dim, scale);
 }
 
 }  // namespace gufo::models::qwen36_a3b::rocm

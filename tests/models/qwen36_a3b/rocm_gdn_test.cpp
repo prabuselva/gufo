@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "src/models/qwen36_a3b/kernels/rocm/kernels.hpp"
@@ -24,7 +25,7 @@ constexpr std::uint32_t kValueDim = kVHeads * kDim;
 constexpr std::uint32_t kChannels = 2 * kKeyDim + kValueDim;
 constexpr float kEps = 1e-6F;
 
-bool Check(const char* name, double worst, double tolerance) {
+bool Check(const std::string& name, double worst, double tolerance) {
   std::cout << name << " worst relative error " << worst << '\n';
   if (!(worst <= tolerance)) {
     std::cerr << name << " exceeded tolerance " << tolerance << '\n';
@@ -203,12 +204,132 @@ bool RunCase(bool extreme_gates) {
   return ok;
 }
 
+// The batched prefill block must reproduce the decode kernels run token by
+// token: same per-token attention, same final recurrent state, same advanced
+// convolution history. The decode path is the already-verified ground truth.
+bool RunPrefillCase(std::uint32_t tokens) {
+  const std::size_t state_count =
+      static_cast<std::size_t>(kVHeads) * kDim * kDim;
+  const std::size_t conv_state =
+      static_cast<std::size_t>(kKernel - 1) * kChannels;
+  const std::size_t qkv_count = static_cast<std::size_t>(tokens) * kChannels;
+  const std::size_t attn_count =
+      static_cast<std::size_t>(tokens) * kValueDim;
+
+  const auto qkv = t::MakeValues(qkv_count, 0x1234ABCDU, 1.0F);
+  const auto conv_w = t::MakeValues(
+      static_cast<std::size_t>(kChannels) * kKernel, 0xDEADBEEFU, 0.5F);
+  const auto z = t::MakeValues(attn_count, 0x0BADF00DU, 2.0F);
+  const auto alpha = t::MakeValues(static_cast<std::size_t>(tokens) * kVHeads,
+                                   0xBADC0FFEU, 2.0F);
+  const auto beta = t::MakeValues(static_cast<std::size_t>(tokens) * kVHeads,
+                                  0x600DCAFEU, 3.0F);
+  const auto a = t::MakeValues(kVHeads, 0xC0FFEE11U, 1.0F, -1.5F);
+  const auto dt = t::MakeValues(kVHeads, 0xFEEDFACEU, 1.0F);
+  const auto norm_w = t::MakeValues(kDim, 0x13579BDFU, 0.5F, 1.0F);
+  const auto history = t::MakeValues(conv_state, 0x2468ACE0U, 1.0F);
+  const auto state = t::MakeValues(state_count, 0x0F1E2D3CU, 0.1F);
+
+  // Prefill buffers.
+  t::HipBuffer<float> d_qkv(qkv_count);
+  t::HipBuffer<float> d_conv_w(conv_w.size());
+  t::HipBuffer<float> d_z(attn_count);
+  t::HipBuffer<float> d_alpha(alpha.size());
+  t::HipBuffer<float> d_beta(beta.size());
+  t::HipBuffer<float> d_a(a.size());
+  t::HipBuffer<float> d_dt(dt.size());
+  t::HipBuffer<float> d_norm_w(norm_w.size());
+  t::HipBuffer<float> d_convolved(qkv_count);
+  t::HipBuffer<float> d_qn(static_cast<std::size_t>(tokens) * kKeyDim);
+  t::HipBuffer<float> d_kn(static_cast<std::size_t>(tokens) * kKeyDim);
+  t::HipBuffer<float> d_attn(attn_count);
+  t::HipBuffer<float> d_state(state_count);
+  t::HipBuffer<float> d_history(conv_state);
+  t::HipBuffer<float> d_hist_new(conv_state);
+  t::Upload(&d_qkv, qkv);
+  t::Upload(&d_conv_w, conv_w);
+  t::Upload(&d_z, z);
+  t::Upload(&d_alpha, alpha);
+  t::Upload(&d_beta, beta);
+  t::Upload(&d_a, a);
+  t::Upload(&d_dt, dt);
+  t::Upload(&d_norm_w, norm_w);
+  t::Upload(&d_history, history);
+  t::Upload(&d_state, state);
+
+  q::GdnConvPrefill(d_qkv.get(), d_conv_w.get(), d_history.get(),
+                    d_convolved.get(), tokens, kChannels, kKernel, nullptr);
+  q::GdnHistoryUpdate(d_qkv.get(), d_history.get(), d_hist_new.get(), tokens,
+                      kChannels, kKernel, nullptr);
+  q::GdnNormQkPrefill(d_convolved.get(), d_qn.get(), d_kn.get(), tokens,
+                      kKHeads, kChannels, kDim, kEps, nullptr);
+  q::GdnDeltaLoop(d_qn.get(), d_kn.get(), d_convolved.get(), d_alpha.get(),
+                  d_beta.get(), d_a.get(), d_dt.get(), d_state.get(),
+                  d_attn.get(), tokens, kKHeads, kVHeads, kDim, kChannels,
+                  nullptr);
+  q::GdnOutNormPrefill(d_attn.get(), d_z.get(), d_norm_w.get(), tokens, kVHeads,
+                       kDim, kEps, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "GDN prefill synchronization");
+  const auto pf_attn = t::Download(&d_attn, attn_count);
+  const auto pf_state = t::Download(&d_state, state_count);
+  const auto pf_hist = t::Download(&d_hist_new, conv_state);
+
+  // Decode reference: the existing kernels, one token at a time, rolling the
+  // same history and state.
+  t::HipBuffer<float> r_conv(kChannels);
+  t::HipBuffer<float> r_qn(kKeyDim);
+  t::HipBuffer<float> r_kn(kKeyDim);
+  t::HipBuffer<float> r_attn(kValueDim);
+  t::HipBuffer<float> r_state(state_count);
+  t::HipBuffer<float> r_history(conv_state);
+  t::HipBuffer<float> r_attn_all(attn_count);
+  t::Upload(&r_state, state);
+  t::Upload(&r_history, history);
+  for (std::uint32_t tk = 0; tk < tokens; ++tk) {
+    const float* qkv_t = d_qkv.get() + static_cast<std::size_t>(tk) * kChannels;
+    q::GdnConv(qkv_t, d_conv_w.get(), r_history.get(), r_conv.get(), kChannels,
+               kKernel, nullptr);
+    q::GdnNormQk(r_conv.get(), r_qn.get(), r_kn.get(), kKHeads, kDim, kEps,
+                 nullptr);
+    q::GdnDelta(r_qn.get(), r_kn.get(), r_conv.get() + 2 * kKeyDim,
+                d_alpha.get() + static_cast<std::size_t>(tk) * kVHeads,
+                d_beta.get() + static_cast<std::size_t>(tk) * kVHeads,
+                d_a.get(), d_dt.get(), r_state.get(), r_attn.get(), kKHeads,
+                kVHeads, kDim, nullptr);
+    q::GdnOutNorm(r_attn.get(), d_z.get() + static_cast<std::size_t>(tk) * kValueDim,
+                  d_norm_w.get(), kVHeads, kDim, kEps, nullptr);
+    (void)hipMemcpyAsync(r_attn_all.get() +
+                             static_cast<std::size_t>(tk) * kValueDim,
+                         r_attn.get(), kValueDim * sizeof(float),
+                         hipMemcpyDeviceToDevice, nullptr);
+  }
+  t::CheckHip(hipDeviceSynchronize(), "GDN decode reference synchronization");
+  const auto dc_attn = t::Download(&r_attn_all, attn_count);
+  const auto dc_state = t::Download(&r_state, state_count);
+  const auto dc_hist = t::Download(&r_history, conv_state);
+
+  bool ok = true;
+  ok = Check("GdnPrefill attn tokens=" + std::to_string(tokens),
+             t::WorstRelativeToScale(dc_attn, pf_attn), 1e-4) &&
+       ok;
+  ok = Check("GdnPrefill state tokens=" + std::to_string(tokens),
+             t::WorstRelativeToScale(dc_state, pf_state), 1e-4) &&
+       ok;
+  ok = Check("GdnPrefill history tokens=" + std::to_string(tokens),
+             t::WorstRelativeToScale(dc_hist, pf_hist), 1e-4) &&
+       ok;
+  return ok;
+}
+
 }  // namespace
 
 int main() {
   try {
     bool ok = RunCase(false);
     ok = RunCase(true) && ok;
+    for (std::uint32_t tokens : {1U, 2U, 5U, 17U, 64U}) {
+      ok = RunPrefillCase(tokens) && ok;
+    }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -27,9 +27,11 @@ if (ENGINE_ENABLE_HIP)
   # deliberately omitted so expf/log1pf stay faithful to the scalar oracle.
   add_library(gufo_qwen36_a3b_kernels STATIC EXCLUDE_FROM_ALL
     kernels/rocm/kernels.hip.cpp
-    kernels/rocm/gemv.hip.cpp)
+    kernels/rocm/gemv.hip.cpp
+    kernels/rocm/gemm.hip.cpp)
   set_source_files_properties(kernels/rocm/kernels.hip.cpp
-    kernels/rocm/gemv.hip.cpp PROPERTIES LANGUAGE HIP)
+    kernels/rocm/gemv.hip.cpp kernels/rocm/gemm.hip.cpp
+    PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_qwen36_a3b_kernels PROPERTIES
     HIP_STANDARD 17
     HIP_STANDARD_REQUIRED ON
@@ -37,7 +39,11 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_qwen36_a3b_kernels PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_qwen36_a3b_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
-  target_link_libraries(gufo_qwen36_a3b_kernels PUBLIC hip::host)
+  # The batched GEMM tier reuses the Qwen3.8-Flash-Next mmq routed/dense path
+  # (Q8_0) and hipBLAS (F32/BF16); the mmq target exports its header directory
+  # and roc::hipblas transitively, so weights stay in their native encoding.
+  target_link_libraries(gufo_qwen36_a3b_kernels PUBLIC
+    gufo_qwen38_flash_next_mmq hip::host)
 
   # Host-side driver: streams the artifact to the GPU and runs the trunk and
   # MTP draft one token at a time. Built only by explicit GPU validation
