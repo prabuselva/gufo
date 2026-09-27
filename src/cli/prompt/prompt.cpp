@@ -1333,6 +1333,24 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
   std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
+  std::shared_ptr<models::qwen36_a3b::Model> qwen36_model;
+  std::unique_ptr<models::qwen36_a3b::Session> qwen36_session;
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Qwen3.6-35B-A3B does not support image input\n";
+      return 2;
+    }
+    qwen36_model = LoadQwen36A3BModel(opt, *reader, model_load_start);
+    if (!qwen36_model)
+      return 1;
+    qwen36_session = qwen36_model->CreateSession(kDefaultContext, &err);
+    if (!qwen36_session) {
+      std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
+      return 1;
+    }
+    tokenizer = &qwen36_model->tokenizer();
+    architecture = "qwen35moe";
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!flash_model)
@@ -1452,7 +1470,11 @@ int RunChat(std::span<const char* const> args) {
         if (gpu_executor)
           gpu_executor->ConfigureVision(vision, vision_encoder);
       }
-      if (flash_model) {
+      if (qwen36_model) {
+        if (GenerateQwen36A3BResponse(opt, *qwen36_model, *qwen36_session,
+                                      prompt_tokens, &assistant_reply) != 0)
+          return 1;
+      } else if (flash_model) {
         if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
                                       prompt_tokens, &assistant_reply) != 0)
           return 1;

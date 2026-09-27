@@ -40,6 +40,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen36_a3b/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
@@ -2950,6 +2951,237 @@ private:
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
+
+using Qwen36A3BModel = models::qwen36_a3b::Model;
+using Qwen36A3BSession = models::qwen36_a3b::Session;
+
+constexpr std::string_view kQwen36A3BStateAbi =
+    "qwen36-a3b-rocm-session-v1";
+
+std::vector<std::int32_t> Qwen36A3BEngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument(
+          "Qwen3.6-35B-A3B token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class Qwen36A3BTextRunnerState final : public TextRunnerState {
+public:
+  Qwen36A3BTextRunnerState(const std::shared_ptr<Qwen36A3BModel>& model,
+                           std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Qwen3.6-35B-A3B session: " +
+                               error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->Reset();
+    position_ = 0;
+  }
+
+  [[nodiscard]] Qwen36A3BSession& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<Qwen36A3BSession> session_;
+  std::size_t position_{0};
+};
+
+Qwen36A3BTextRunnerState& RequireQwen36A3BState(TextRunnerState& state) {
+  auto* q36 = dynamic_cast<Qwen36A3BTextRunnerState*>(&state);
+  if (q36 == nullptr) {
+    throw std::logic_error("text runner state is not Qwen3.6-35B-A3B");
+  }
+  return *q36;
+}
+
+const Qwen36A3BTextRunnerState& RequireQwen36A3BState(
+    const TextRunnerState& state) {
+  const auto* q36 = dynamic_cast<const Qwen36A3BTextRunnerState*>(&state);
+  if (q36 == nullptr) {
+    throw std::logic_error("text runner state is not Qwen3.6-35B-A3B");
+  }
+  return *q36;
+}
+
+/// Serial single-session runner for Qwen3.6-35B-A3B. The model owns one shared
+/// executor (a single KV/recurrent/logits stream), so it backs exactly one
+/// request state; the pool is created with a single state.
+class Qwen36A3BTextRunner final : public TextModelRunner {
+public:
+  Qwen36A3BTextRunner(std::shared_ptr<Qwen36A3BModel> model,
+                      std::uint32_t max_context)
+      : model_(std::move(model)), max_context_(max_context) {}
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kQwen36A3BStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = false,
+                .batched_multi_token_decode = false,
+                .batched_multi_token_decode_max_width = 0u,
+                .prefix_reuse = true,
+            },
+        .persistence = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    // The single shared executor is allocated at model load; requests add no
+    // per-request device state.
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = std::nullopt,
+        .per_request_state_bytes = 0,
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = 0,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return model_->tokenizer().Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    return tokenization::QwenChatTemplate::RenderAndTokenize(
+        model_->tokenizer(), request.messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools},
+        QwenChatOptions(request));
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return QwenChatOptions(request).enable_thinking
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return model_->tokenizer().Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<Qwen36A3BTextRunnerState>(model_, max_context_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const auto& q36 = RequireQwen36A3BState(state);
+    if (q36.position() != prefix.size()) {
+      throw std::logic_error(
+          "Qwen3.6-35B-A3B reused prefix does not match checkpoint");
+    }
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& q36 = RequireQwen36A3BState(state);
+    if (offset != q36.position()) {
+      throw std::logic_error(
+          "Qwen3.6-35B-A3B prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error(
+          "Qwen3.6-35B-A3B prefill has no remaining input");
+    }
+    const std::size_t consumed =
+        std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
+    const std::size_t next_position = offset + consumed;
+    const auto prefix = Qwen36A3BEngineTokens(prompt.first(next_position));
+    std::string error;
+    if (!q36.session().Sync(prefix, &error)) {
+      q36.set_position(0);
+      throw std::runtime_error("Qwen3.6-35B-A3B prefill failed: " + error);
+    }
+    q36.set_position(next_position);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = next_position == prompt.size(),
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& q36 = RequireQwen36A3BState(state);
+    if (q36.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    const auto logits = q36.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "Qwen3.6-35B-A3B token selection has no logits");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (model_->IsStopToken(token)) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->TokenText(token),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument(
+          "Qwen3.6-35B-A3B token ID exceeds engine range");
+    }
+    auto& q36 = RequireQwen36A3BState(state);
+    std::string error;
+    if (!q36.session().Evaluate(static_cast<std::int32_t>(token), &error)) {
+      throw std::runtime_error("Qwen3.6-35B-A3B decode failed: " + error);
+    }
+    q36.set_position(q36.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireQwen36A3BState(state).position();
+  }
+
+private:
+  std::shared_ptr<Qwen36A3BModel> model_;
+  std::uint32_t max_context_;
+};
 #endif
 
 }  // namespace
@@ -3216,6 +3448,35 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
+  }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "Qwen3.6-35B-A3B does not support --mmproj");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error,
+               "Qwen3.6-35B-A3B HTTP models do not support speculative "
+               "decoding");
+      return false;
+    }
+    if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
+                                                              &load_error)) {
+      SetError(error,
+               "Unsupported Qwen3.6-35B-A3B chat template: " + load_error);
+      return false;
+    }
+    auto model = models::qwen36_a3b::Model::Load(
+        model_path,
+        models::qwen36_a3b::ModelOptions{.max_context = max_context},
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Qwen3.6-35B-A3B model: " + load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3567,6 +3828,61 @@ bool InferenceBackend::load(
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::qwen36_a3b::Model> model, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSpeculativeConfig speculative_config,
+    TextDiskCacheConfig disk_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Qwen3.6-35B-A3B model must not be null");
+    return false;
+  }
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (session_count > 1) {
+    SetError(error,
+             "Qwen3.6-35B-A3B serves a single shared executor and supports "
+             "exactly one concurrent HTTP session (--sessions 1)");
+    return false;
+  }
+  if (max_context == 0 || max_context > model->MaxContext()) {
+    SetError(error,
+             "HTTP context exceeds the loaded Qwen3.6-35B-A3B model context");
+    return false;
+  }
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    SetError(error,
+             "Qwen3.6-35B-A3B HTTP models do not support speculative decoding");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config)) {
+    SetError(error,
+             "Qwen3.6-35B-A3B HTTP models do not support the disk cache");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    auto runner =
+        std::make_shared<Qwen36A3BTextRunner>(std::move(model), max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
