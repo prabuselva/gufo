@@ -165,10 +165,17 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
     common = 0;
   }
   valid_ = false;
+  // Feed the new tail through the batched prefill path: one GEMM-driven pass
+  // over the whole span instead of a per-token GEMV step, so prompt processing
+  // runs at prefill throughput. The executor's position already equals the
+  // common prefix length (reset to 0 above, or a pure extension), so Prefill
+  // continues from there and leaves the final token's logits.
+  if (!executor_->Prefill(prompt.data() + common,
+                          static_cast<std::uint32_t>(prompt.size() - common),
+                          error_msg)) {
+    return false;
+  }
   for (std::size_t i = common; i < prompt.size(); ++i) {
-    if (!executor_->Step(prompt[i], error_msg)) {
-      return false;
-    }
     tokens_.push_back(prompt[i]);
   }
   (void)hipMemcpy(logits_.data(), executor_->logits(),

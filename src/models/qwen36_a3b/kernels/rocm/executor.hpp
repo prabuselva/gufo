@@ -33,6 +33,15 @@ public:
 
   /// Advances the trunk by one token; the result is in logits() and h_out().
   bool Step(std::int32_t token, std::string* error_msg = nullptr);
+  /// Advances the trunk by `count` prompt tokens in prefill-sized chunks,
+  /// driving the batched GEMM tier and the fused prefill operators so the whole
+  /// prompt is consumed without a per-token host round-trip. Recurrent state
+  /// (Gated DeltaNet state/history and the KV caches) and `position_` advance
+  /// exactly as they would have under `count` Step() calls, so decoding resumes
+  /// from the next position. `logits()` and `h_out()` hold the final token's
+  /// result.
+  bool Prefill(const std::int32_t* tokens, std::uint32_t count,
+               std::string* error_msg = nullptr);
   /// Runs the MTP draft block for `token` using the trunk hidden state from
   /// the most recent Step; the result is in mtp_logits().
   bool MtpStep(std::int32_t token, std::string* error_msg = nullptr);
@@ -56,6 +65,24 @@ private:
                  float* out, float* k_cache, float* v_cache,
                  const std::uint32_t* pos_dev);
   void Moe(const DeviceLayer& l, const float* x, float* out);
+  /// Batched (prefill) Mixture-of-Experts over `tokens` rows of `x`
+  /// ([tokens][hidden]) into `out` ([tokens][hidden]). Mirrors Moe() but drives
+  /// the GEMM tier and the batched router/epilogue kernels, so the routed
+  /// expert ids never round-trip through the host.
+  void MoeBatch(const DeviceLayer& l, const float* x, float* out,
+                std::uint32_t tokens);
+
+  /// Batched (prefill) Gated DeltaNet over `tokens` rows of `x`
+  /// ([tokens][hidden]) into `out` ([tokens][hidden]), advancing the layer's
+  /// recurrent state and conv history past the chunk. Mirrors LinearAttention().
+  void LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
+                            const float* x, float* out, std::uint32_t tokens);
+  /// Batched (prefill) gated grouped-query attention over `tokens` rows of `x`
+  /// starting at absolute position `start`, writing the chunk's keys/values into
+  /// the caches and reading them back causally. Mirrors Attention().
+  void AttentionBatch(const DeviceLayer& l, const float* x, std::uint32_t start,
+                      float* out, float* k_cache, float* v_cache,
+                      const std::uint32_t* pos_dev, std::uint32_t tokens);
 
   float* AllocFloats(std::size_t n, std::string* error);
   std::int32_t* AllocInts(std::size_t n, std::string* error);
@@ -109,6 +136,51 @@ private:
   float* moe_shared_down_{nullptr};
   float* moe_shared_gate_{nullptr};
   std::vector<std::int32_t> moe_ids_host_;
+
+  // Batched prefill scratch, sized to prefill_chunk_ tokens. The decode path
+  // reuses the single-token buffers above; prefill drives these and never
+  // syncs to the host. The MoE buffers hold one row per (token, slot) pair, so
+  // they scale with prefill_chunk_ * num_experts_used.
+  std::uint32_t prefill_chunk_{0};
+  float* pf_router_logits_{nullptr};
+  std::int32_t* pf_ids_{nullptr};
+  float* pf_weights_{nullptr};
+  float* pf_gate_{nullptr};
+  float* pf_up_{nullptr};
+  float* pf_expert_out_{nullptr};
+  float* pf_shared_gate_{nullptr};
+  float* pf_shared_up_{nullptr};
+  float* pf_shared_down_{nullptr};
+  float* pf_shared_gate_inp_{nullptr};
+
+  // Prefill residual stream and per-layer intermediates, [chunk][hidden].
+  float* pf_x_{nullptr};
+  float* pf_normed_{nullptr};
+  float* pf_attn_{nullptr};
+  float* pf_ffn_{nullptr};
+
+  // Prefill Gated DeltaNet scratch (reused across linear layers), row-major
+  // [chunk][...]. `pf_hist_new_` is the disjoint conv-history output the chunk
+  // writes back over the layer's rolling history.
+  float* pf_qkv_{nullptr};
+  float* pf_z_{nullptr};
+  float* pf_alpha_{nullptr};
+  float* pf_beta_{nullptr};
+  float* pf_convolved_{nullptr};
+  float* pf_qn_{nullptr};
+  float* pf_kn_{nullptr};
+  float* pf_gdn_attn_{nullptr};
+  float* pf_hist_new_{nullptr};
+
+  // Prefill gated grouped-query attention scratch (reused across full layers),
+  // row-major [chunk][...]. `pf_pos_` holds the absolute position of each row.
+  float* pf_qg_{nullptr};
+  float* pf_k_{nullptr};
+  float* pf_v_{nullptr};
+  float* pf_q_{nullptr};
+  float* pf_qgate_{nullptr};
+  float* pf_ctx_{nullptr};
+  std::uint32_t* pf_pos_{nullptr};
 
   // MTP scratch.
   float* mtp_e_{nullptr};

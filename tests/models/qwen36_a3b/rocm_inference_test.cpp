@@ -168,6 +168,59 @@ int main(int argc, char** argv) {
         return true;
       });
 
+  // --- Batched prefill path: one Prefill() over the whole prompt must land on
+  // the same post-prompt logits as the per-token Step() loop and the oracle,
+  // and decoding must resume correctly from the advanced position. ---
+  const auto pf_executor =
+      rocm::Executor::Create(*device_model, max_context, &error);
+  if (pf_executor == nullptr) {
+    std::cerr << "prefill executor create failed: " << error << "\n";
+    return 1;
+  }
+  if (!pf_executor->Prefill(prompt.data(),
+                            static_cast<std::uint32_t>(prompt.size()), &error)) {
+    std::cerr << "GPU batched prefill failed: " << error << "\n";
+    return 1;
+  }
+  std::vector<float> pf_logits(c.vocab_size);
+  test::CheckHip(hipMemcpy(pf_logits.data(), pf_executor->logits(),
+                           c.vocab_size * sizeof(float), hipMemcpyDeviceToHost),
+                 "download batched prefill logits");
+  {
+    const std::uint32_t cpu_arg = ArgMax(ref_logits);
+    const std::uint32_t pf_arg = ArgMax(pf_logits);
+    const double worst = test::WorstRelative(ref_logits, pf_logits, 1e-3);
+    std::cout << "\nbatched prefill: cpu_arg=" << cpu_arg << " pf_arg="
+              << pf_arg
+              << (cpu_arg == pf_arg ? "  OK" : "  *** DIVERGED ***")
+              << "  worst_rel=" << worst << "\n";
+    Expect(cpu_arg == pf_arg, "batched prefill argmax matches oracle");
+    Expect(pf_executor->position() == static_cast<std::uint32_t>(prompt.size()),
+           "batched prefill advanced position");
+  }
+  const auto pf_tokens = Greedy(
+      pf_logits, steps, [&](std::int32_t token, std::vector<float>& logits) {
+        if (!pf_executor->Step(token, &error)) {
+          return false;
+        }
+        test::CheckHip(hipMemcpy(logits.data(), pf_executor->logits(),
+                                 c.vocab_size * sizeof(float),
+                                 hipMemcpyDeviceToHost),
+                       "download batched-prefill gen logits");
+        return true;
+      });
+  std::cout << "prefill text: " << tokenizer->Decode(
+      std::vector<tok::TokenId>(pf_tokens.begin(), pf_tokens.end())) << "\n";
+  Expect(pf_tokens.size() == cpu_tokens.size(),
+         "batched-prefill token count matches oracle");
+  for (std::size_t i = 0; i < std::min(pf_tokens.size(), cpu_tokens.size());
+       ++i) {
+    Expect(pf_tokens[i] == cpu_tokens[i],
+           "batched-prefill token " + std::to_string(i) +
+               " matches oracle (pf=" + std::to_string(pf_tokens[i]) +
+               " cpu=" + std::to_string(cpu_tokens[i]) + ")");
+  }
+
   // --- Compare ---
   std::cout << "\nCPU tokens: ";
   for (const std::int32_t t : cpu_tokens)

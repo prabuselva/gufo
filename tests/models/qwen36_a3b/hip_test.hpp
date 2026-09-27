@@ -118,6 +118,25 @@ inline double WorstAbsolute(const std::vector<float>& reference,
   return worst;
 }
 
+// Worst absolute difference normalized by the largest reference magnitude.
+// This is the right metric for a quantized GEMM: the kernel quantizes the
+// activations to 8 bits, so every output carries an absolute error proportional
+// to the output scale, and a per-element relative error would be dominated by
+// whichever reference entry happened to land near zero. A genuine layout or
+// indexing fault moves this ratio toward 1.0, far above the ~1e-2 quantization
+// floor. Mirrors the reference projection check's scale-normalized contract.
+inline double WorstRelativeToScale(const std::vector<float>& reference,
+                                   const std::vector<float>& candidate) {
+  double scale = 0.0;
+  for (const float value : reference) {
+    scale = std::max(scale, std::abs(static_cast<double>(value)));
+  }
+  if (scale == 0.0) {
+    return WorstAbsolute(reference, candidate);
+  }
+  return WorstAbsolute(reference, candidate) / scale;
+}
+
 // The scalar oracle's transcendental helpers, evaluated in double so the
 // reference is at least as accurate as the kernel's float approximations.
 inline double SigmoidD(double x) noexcept {

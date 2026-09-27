@@ -96,6 +96,85 @@ bool RunCase(std::uint32_t n_kv) {
                t::WorstRelative(ref, got), 1e-4);
 }
 
+// Prefill over a chunk starting at absolute position `start` must reproduce,
+// for every token, the causal softmax the decode kernel produces when it is
+// fed the same keys/values up to that token's position.
+bool RunPrefillCase(std::uint32_t start, std::uint32_t tokens) {
+  const std::uint32_t causal_max = start + tokens;
+  const std::size_t q_count =
+      static_cast<std::size_t>(tokens) * kHeads * kHeadDim;
+  const std::size_t cache_count =
+      static_cast<std::size_t>(causal_max) * kKvHeads * kHeadDim;
+  const auto query = t::MakeValues(q_count, 0x5150A5A5U, 1.0F);
+  const auto gate = t::MakeValues(q_count, 0x2468ACE1U, 3.0F);
+  const auto k_cache = t::MakeValues(cache_count, 0xDEADBEEFU, 1.0F);
+  const auto v_cache = t::MakeValues(cache_count, 0x0BADF00DU, 1.0F);
+
+  t::HipBuffer<float> d_q(q_count);
+  t::HipBuffer<float> d_gate(q_count);
+  t::HipBuffer<float> d_k(cache_count);
+  t::HipBuffer<float> d_v(cache_count);
+  t::HipBuffer<float> d_out(q_count);
+  t::Upload(&d_q, query);
+  t::Upload(&d_gate, gate);
+  t::Upload(&d_k, k_cache);
+  t::Upload(&d_v, v_cache);
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+  q::AttentionPrefill(d_q.get(), d_k.get(), d_v.get(), d_gate.get(),
+                      d_out.get(), start, tokens, kHeads, kKvHeads, kHeadDim,
+                      scale, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
+  const auto got = t::Download(&d_out, q_count);
+
+  std::vector<float> ref(q_count, 0.0F);
+  for (std::uint32_t token = 0; token < tokens; ++token) {
+    const std::uint32_t n_kv = start + token + 1;
+    for (std::uint32_t h = 0; h < kHeads; ++h) {
+      const std::uint32_t kvh = h / kGroup;
+      const float* qh = query.data() +
+                        (static_cast<std::size_t>(token) * kHeads + h) *
+                            kHeadDim;
+      std::vector<double> scores(n_kv);
+      double max_score = -INFINITY;
+      for (std::uint32_t j = 0; j < n_kv; ++j) {
+        const float* kj =
+            k_cache.data() +
+            (static_cast<std::size_t>(j) * kKvHeads + kvh) * kHeadDim;
+        double dot = 0.0;
+        for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+          dot += static_cast<double>(qh[i]) * kj[i];
+        }
+        scores[j] = dot * scale;
+        max_score = std::max(max_score, scores[j]);
+      }
+      double denom = 0.0;
+      for (double& sc : scores) {
+        sc = std::exp(sc - max_score);
+        denom += sc;
+      }
+      float* oh = ref.data() +
+                  (static_cast<std::size_t>(token) * kHeads + h) * kHeadDim;
+      for (std::uint32_t j = 0; j < n_kv; ++j) {
+        const float p = static_cast<float>(scores[j] / denom);
+        const float* vj =
+            v_cache.data() +
+            (static_cast<std::size_t>(j) * kKvHeads + kvh) * kHeadDim;
+        for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+          oh[i] += p * vj[i];
+        }
+      }
+      for (std::uint32_t i = 0; i < kHeadDim; ++i) {
+        const std::size_t g =
+            (static_cast<std::size_t>(token) * kHeads + h) * kHeadDim + i;
+        oh[i] *= static_cast<float>(t::SigmoidD(gate[g]));
+      }
+    }
+  }
+  return Check("AttentionPrefill start=" + std::to_string(start) +
+                   " tokens=" + std::to_string(tokens),
+               t::WorstRelative(ref, got), 1e-4);
+}
+
 }  // namespace
 
 int main() {
@@ -103,6 +182,11 @@ int main() {
     bool ok = true;
     for (std::uint32_t n_kv : {1U, 5U, 33U, 128U}) {
       ok = RunCase(n_kv) && ok;
+    }
+    // Chunk starts and lengths that straddle the kernel's 128-wide softmax tile.
+    for (const auto& cs : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+             {0U, 1U}, {0U, 8U}, {5U, 7U}, {100U, 40U}, {200U, 64U}}) {
+      ok = RunPrefillCase(cs.first, cs.second) && ok;
     }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
