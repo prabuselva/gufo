@@ -375,23 +375,39 @@ bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
   if (n == 0U || n > 4U) {
     return false;
   }
+  // Fuse the Q8_0 subset into one Multi4 launch. The small F32 side
+  // projections (ssm alpha/beta, shared gate_inp) run as plain Gemv calls,
+  // which is bit-identical to the unfused path; empty projections are
+  // skipped.
   Multi4Args a{};
   std::uint32_t total = 0;
+  std::uint32_t m = 0;
   for (std::uint32_t i = 0; i < n; ++i) {
     if (projs[i].type != GemvType::kQ8_0 || projs[i].rows == 0U) {
-      return false;
+      continue;
     }
-    a.w[i] = static_cast<const Q8_0Block*>(projs[i].base);
-    a.out[i] = projs[i].out;
-    a.nb[i] = projs[i].cols / 32U;
-    a.off[i] = total;
+    a.w[m] = static_cast<const Q8_0Block*>(projs[i].base);
+    a.out[m] = projs[i].out;
+    a.nb[m] = projs[i].cols / 32U;
+    a.off[m] = total;
     total += projs[i].rows;
+    ++m;
   }
-  for (std::uint32_t i = n; i < 4U; ++i) {
+  for (std::uint32_t i = m; i < 4U; ++i) {
     a.off[i] = total;
   }
   a.off[4] = total;
-  GemvQ8_0Multi4<<<(total + 3U) / 4U, dim3(128), 0, stream>>>(a, x);
+  if (m > 1U) {
+    GemvQ8_0Multi4<<<(total + 3U) / 4U, dim3(128), 0, stream>>>(a, x);
+  }
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const bool fused =
+        m > 1U && projs[i].type == GemvType::kQ8_0 && projs[i].rows != 0U;
+    if (!fused && projs[i].rows != 0U) {
+      Gemv(projs[i].base, projs[i].type, projs[i].rows, projs[i].cols, 0U, x,
+           projs[i].out, stream);
+    }
+  }
   return true;
 }
 

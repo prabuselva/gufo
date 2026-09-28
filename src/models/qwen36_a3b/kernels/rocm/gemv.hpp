@@ -56,9 +56,11 @@ struct GemvMultiProj {
 
 /// Fused launch of up to four projections sharing one activation row x (the
 /// ssm qkv/gate/alpha/beta quartet, attention q/k/v, shared-expert
-/// gate/up/gate_inp). The per-row dots are bit-identical to separate Gemv
-/// calls. Returns false when n is outside [1,4] or any projection has a type
-/// without a fused kernel (the caller falls back to separate Gemv calls).
+/// gate/up/gate_inp). The Q8_0 projections are folded into one Multi4 launch;
+/// any non-Q8_0 projection (the F32 alpha/beta/gate_inp side vectors) runs as
+/// a plain Gemv, and empty projections are skipped. Every per-row dot is
+/// bit-identical to separate Gemv calls. Returns false only when n is outside
+/// [1,4] (the caller falls back to separate Gemv calls).
 bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
                hipStream_t stream);
 

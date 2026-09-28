@@ -274,15 +274,34 @@ bool TestMulti() {
                            t::Download(&d_pair_a, kRowsA) &&
                        t::Download(&d_ref_b, kRowsB) ==
                            t::Download(&d_pair_b, kRowsB);
-  const q::GemvMultiProj dense[1] = {
-      {d_wa.get(), q::GemvType::kF32, kRowsA, kCols, nullptr},
+  std::cout << "GemvMulti n=2: " << (pair_ok ? "yes" : "no") << '\n';
+  // Mixed Q8_0 + F32 group (the ssm quartet shape): the F32 side vector
+  // runs as a plain Gemv and must still match bit-for-bit.
+  constexpr std::uint32_t kRowsF = 3;
+  const auto wf = t::MakeValues(kRowsF * kCols, 0x99AA0006U, 1.0F);
+  t::HipBuffer<float> d_wf(wf.size());
+  t::Upload(&d_wf, wf);
+  t::HipBuffer<float> d_ref_f(kRowsF);
+  q::Gemv(d_wf.get(), q::GemvType::kF32, kRowsF, kCols, 0U, d_x.get(),
+          d_ref_f.get(), nullptr);
+  t::HipBuffer<float> d_out_f(kRowsF);
+  const q::GemvMultiProj mixed[3] = {
+      {d_wa.get(), q::GemvType::kQ8_0, kRowsA, kCols, d_pair_a.get()},
+      {d_wf.get(), q::GemvType::kF32, kRowsF, kCols, d_out_f.get()},
+      {d_wb.get(), q::GemvType::kQ8_0, kRowsB, kCols, d_pair_b.get()},
   };
-  const bool rejects = !q::GemvMulti(dense, 1U, d_x.get(), nullptr) &&
-                       !q::GemvMulti(pair, 0U, d_x.get(), nullptr) &&
+  const bool mixed_ok = q::GemvMulti(mixed, 3U, d_x.get(), nullptr) &&
+                        t::Download(&d_ref_a, kRowsA) ==
+                            t::Download(&d_pair_a, kRowsA) &&
+                        t::Download(&d_ref_f, kRowsF) ==
+                            t::Download(&d_out_f, kRowsF) &&
+                        t::Download(&d_ref_b, kRowsB) ==
+                            t::Download(&d_pair_b, kRowsB);
+  const bool rejects = !q::GemvMulti(pair, 0U, d_x.get(), nullptr) &&
                        !q::GemvMulti(pair, 5U, d_x.get(), nullptr);
-  std::cout << "GemvMulti n=2 and rejection: "
-            << (pair_ok && rejects ? "yes" : "no") << '\n';
-  return ok && pair_ok && rejects;
+  std::cout << "GemvMulti mixed Q8_0+F32 and rejection: "
+            << (mixed_ok && rejects ? "yes" : "no") << '\n';
+  return ok && pair_ok && mixed_ok && rejects;
 }
 
 bool TestGroupedPair() {
