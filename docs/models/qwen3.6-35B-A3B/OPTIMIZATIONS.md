@@ -112,20 +112,25 @@ Open items, in priority order:
     (engine.cpp DecodeStep). `Mark("sample")` now closes the stage right after
     the lm_head GEMV; the next profile run should show `output` ≈ 2.3 ms
     (matching the standalone bench) and a new `sample` row for the readback.
-2. **moe_shared / router consolidation** — 2.00 + 1.59 ms/step of small
-    GEMVs foldable into the grouped launches. Both are launch-bound, not
-    bandwidth-bound: the router GEMV moves 21 MB/step (≈0.09 ms roofline) and
-    the shared expert 134 MB/step (≈0.56 ms); the rest is per-kernel latency
-    across 40 layers.
+2. **MoE gate/up fusion — done** — `GemvPair` / `GemvGroupedPair`
+   (Q8_0-only, bit-exact to the separate launches per oracle test) merge
+   the shared and routed gate+up GEMVs into one launch each, saving 80
+   launches/step. Router+TopK fusion was rejected: it would reorder the
+   router dot product and break token parity. The remaining
+   `moe_shared`/`moe_router` cost is still launch latency across 40
+   layers (router roofline ≈0.09 ms/step, shared ≈0.56 ms), so the next
+   lever is hipGraph capture of the decode step (blockers: scalar `pos`
+   baked into the Attention cache pointer and `n_kv` argument).
 3. **MTP speculative decoding** — `draft_proposed=0` today; enabling the MTP
    block is the multiplier that takes 33 → 60+ tps.
 
 ## Verification
 
 - Oracle tests (run directly, MB-scale):
-  `qwen36_a3b_rocm_gemv_test`, `qwen36_a3b_rocm_gdn_test`,
-  `qwen36_a3b_rocm_attention_test` — all pass; GdnDelta errors match the
-  pre-refactor reference bit-for-bit.
+  `qwen36_a3b_rocm_gemv_test` (includes bit-exact checks for
+  `GemvQ8_0Pair` / `GemvGroupedQ8_0Pair` vs the separate launches),
+  `qwen36_a3b_rocm_gdn_test`, `qwen36_a3b_rocm_attention_test` — all
+  pass; GdnDelta errors match the pre-refactor reference bit-for-bit.
 - Forward test (user-run, loads the 40 GB model): trunk step0 0.0107703,
   step1 0.00451447, step2 0.00276079, mtp 0.00246238.
 - Profiler runner: `test_build_profiler.sh`.
