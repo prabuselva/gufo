@@ -198,45 +198,91 @@ std::vector<std::uint8_t> EncodeQ8_0(std::uint32_t rows, std::uint32_t cols,
   return bytes;
 }
 
-// The fused gate+up launches must be bit-identical to the separate ones:
-// the executor relies on this to keep the forward-test token parity.
-bool TestPair() {
+// The fused launches must be bit-identical to the separate ones: the
+// executor relies on this to keep the forward-test token parity.
+bool TestMulti() {
+  // Unequal rows and a narrower last matrix exercise the per-projection
+  // offsets and block counts; the n=2 call covers the pair case.
+  constexpr std::uint32_t kRowsA = 5, kRowsB = 3, kRowsC = 1, kRowsD = 7;
+  constexpr std::uint32_t kColsD = 512;
   const auto x = t::MakeValues(kCols, 0xABCD0123U, 1.0F);
-  const auto wa = EncodeQ8_0(kRows, kCols, 0x11110001U);
-  const auto wb = EncodeQ8_0(kRows, kCols, 0x22220002U);
+  const auto wa = EncodeQ8_0(kRowsA, kCols, 0x11110001U);
+  const auto wb = EncodeQ8_0(kRowsB, kCols, 0x22220002U);
+  const auto wc = EncodeQ8_0(kRowsC, kCols, 0x33330003U);
+  const auto wd = EncodeQ8_0(kRowsD, kColsD, 0x44440004U);
   t::HipBuffer<std::uint8_t> d_wa(wa.size());
+  t::HipBuffer<std::uint8_t> d_wb(wb.size());
+  t::HipBuffer<std::uint8_t> d_wc(wc.size());
+  t::HipBuffer<std::uint8_t> d_wd(wd.size());
   t::CheckHip(
       hipMemcpy(d_wa.get(), wa.data(), wa.size(), hipMemcpyHostToDevice),
-      "upload pair matrix A");
-  t::HipBuffer<std::uint8_t> d_wb(wb.size());
+      "upload multi matrix A");
   t::CheckHip(
       hipMemcpy(d_wb.get(), wb.data(), wb.size(), hipMemcpyHostToDevice),
-      "upload pair matrix B");
+      "upload multi matrix B");
+  t::CheckHip(
+      hipMemcpy(d_wc.get(), wc.data(), wc.size(), hipMemcpyHostToDevice),
+      "upload multi matrix C");
+  t::CheckHip(
+      hipMemcpy(d_wd.get(), wd.data(), wd.size(), hipMemcpyHostToDevice),
+      "upload multi matrix D");
   t::HipBuffer<float> d_x(x.size());
   t::Upload(&d_x, x);
-  t::HipBuffer<float> d_ref_a(kRows);
-  t::HipBuffer<float> d_ref_b(kRows);
-  q::Gemv(d_wa.get(), q::GemvType::kQ8_0, kRows, kCols, 34, d_x.get(),
+  t::HipBuffer<float> d_ref_a(kRowsA);
+  t::HipBuffer<float> d_ref_b(kRowsB);
+  t::HipBuffer<float> d_ref_c(kRowsC);
+  t::HipBuffer<float> d_ref_d(kRowsD);
+  q::Gemv(d_wa.get(), q::GemvType::kQ8_0, kRowsA, kCols, 34, d_x.get(),
           d_ref_a.get(), nullptr);
-  q::Gemv(d_wb.get(), q::GemvType::kQ8_0, kRows, kCols, 34, d_x.get(),
+  q::Gemv(d_wb.get(), q::GemvType::kQ8_0, kRowsB, kCols, 34, d_x.get(),
           d_ref_b.get(), nullptr);
-  t::HipBuffer<float> d_out_a(kRows);
-  t::HipBuffer<float> d_out_b(kRows);
-  if (!q::GemvPair(d_wa.get(), d_wb.get(), q::GemvType::kQ8_0, kRows, kRows,
-                  kCols, d_x.get(), d_out_a.get(), d_out_b.get(), nullptr)) {
-    std::cerr << "GemvPair unexpectedly returned false for Q8_0\n";
+  q::Gemv(d_wc.get(), q::GemvType::kQ8_0, kRowsC, kCols, 34, d_x.get(),
+          d_ref_c.get(), nullptr);
+  q::Gemv(d_wd.get(), q::GemvType::kQ8_0, kRowsD, kColsD, 34, d_x.get(),
+          d_ref_d.get(), nullptr);
+  t::HipBuffer<float> d_out_a(kRowsA);
+  t::HipBuffer<float> d_out_b(kRowsB);
+  t::HipBuffer<float> d_out_c(kRowsC);
+  t::HipBuffer<float> d_out_d(kRowsD);
+  const q::GemvMultiProj projs[4] = {
+      {d_wa.get(), q::GemvType::kQ8_0, kRowsA, kCols, d_out_a.get()},
+      {d_wb.get(), q::GemvType::kQ8_0, kRowsB, kCols, d_out_b.get()},
+      {d_wc.get(), q::GemvType::kQ8_0, kRowsC, kCols, d_out_c.get()},
+      {d_wd.get(), q::GemvType::kQ8_0, kRowsD, kColsD, d_out_d.get()},
+  };
+  if (!q::GemvMulti(projs, 4U, d_x.get(), nullptr)) {
+    std::cerr << "GemvMulti unexpectedly returned false for Q8_0\n";
     return false;
   }
-  t::CheckHip(hipDeviceSynchronize(), "GemvQ8_0Pair synchronization");
-  const auto ref_a = t::Download(&d_ref_a, kRows);
-  const auto ref_b = t::Download(&d_ref_b, kRows);
-  const auto out_a = t::Download(&d_out_a, kRows);
-  const auto out_b = t::Download(&d_out_b, kRows);
-  const bool ok_a = ref_a == out_a;
-  const bool ok_b = ref_b == out_b;
-  std::cout << "GemvQ8_0Pair bit-exact: " << (ok_a && ok_b ? "yes" : "no")
-            << '\n';
-  return ok_a && ok_b;
+  t::CheckHip(hipDeviceSynchronize(), "GemvQ8_0Multi4 synchronization");
+  const bool ok = t::Download(&d_ref_a, kRowsA) ==
+                      t::Download(&d_out_a, kRowsA) &&
+                  t::Download(&d_ref_b, kRowsB) ==
+                      t::Download(&d_out_b, kRowsB) &&
+                  t::Download(&d_ref_c, kRowsC) ==
+                      t::Download(&d_out_c, kRowsC);
+  std::cout << "GemvQ8_0Multi4 bit-exact: " << (ok ? "yes" : "no") << '\n';
+  // n=2 (the gate/up pair shape) and a non-Q8_0 rejection.
+  t::HipBuffer<float> d_pair_a(kRowsA);
+  t::HipBuffer<float> d_pair_b(kRowsB);
+  const q::GemvMultiProj pair[2] = {
+      {d_wa.get(), q::GemvType::kQ8_0, kRowsA, kCols, d_pair_a.get()},
+      {d_wb.get(), q::GemvType::kQ8_0, kRowsB, kCols, d_pair_b.get()},
+  };
+  const bool pair_ok = q::GemvMulti(pair, 2U, d_x.get(), nullptr) &&
+                       t::Download(&d_ref_a, kRowsA) ==
+                           t::Download(&d_pair_a, kRowsA) &&
+                       t::Download(&d_ref_b, kRowsB) ==
+                           t::Download(&d_pair_b, kRowsB);
+  const q::GemvMultiProj dense[1] = {
+      {d_wa.get(), q::GemvType::kF32, kRowsA, kCols, nullptr},
+  };
+  const bool rejects = !q::GemvMulti(dense, 1U, d_x.get(), nullptr) &&
+                       !q::GemvMulti(pair, 0U, d_x.get(), nullptr) &&
+                       !q::GemvMulti(pair, 5U, d_x.get(), nullptr);
+  std::cout << "GemvMulti n=2 and rejection: "
+            << (pair_ok && rejects ? "yes" : "no") << '\n';
+  return ok && pair_ok && rejects;
 }
 
 bool TestGroupedPair() {
@@ -296,7 +342,7 @@ int main() {
     ok = TestQ8_0() && ok;
     ok = TestF32() && ok;
     ok = TestBf16() && ok;
-    ok = TestPair() && ok;
+    ok = TestMulti() && ok;
     ok = TestGroupedPair() && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {

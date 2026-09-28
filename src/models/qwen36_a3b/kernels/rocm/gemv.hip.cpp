@@ -87,43 +87,6 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
   }
 }
 
-// Fused gate+up GEMV for the shared expert: one launch computes both
-// projections against the same activation row. Wave handles global row
-// blockIdx.x*4+w; rows below rows_a read matrix A, the rest matrix B. The
-// per-row dot is bit-identical to GemvQ8_0.
-__global__ void GemvQ8_0Pair(const Q8_0Block* __restrict__ wa,
-                             const Q8_0Block* __restrict__ wb,
-                             const float* __restrict__ x,
-                             float* __restrict__ out_a,
-                             float* __restrict__ out_b,
-                             std::uint32_t rows_a, std::uint32_t rows_b,
-                             std::uint32_t cols) {
-  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
-  if (r >= rows_a + rows_b) {
-    return;
-  }
-  const bool first = r < rows_a;
-  const std::uint32_t nblocks = cols / 32;
-  const Q8_0Block* __restrict__ row =
-      (first ? wa : wb) +
-      static_cast<std::size_t>(first ? r : r - rows_a) * nblocks;
-  const std::uint32_t lane = threadIdx.x & 31U;
-  float acc = 0.0f;
-#pragma unroll 4
-  for (std::uint32_t b = 0; b < nblocks; ++b) {
-    const float d = __half2float(row[b].d);
-    acc += d * static_cast<float>(row[b].qs[lane]) * x[b * 32 + lane];
-  }
-  acc = WarpReduceSum(acc);
-  if (lane == 0) {
-    if (first) {
-      out_a[r] = acc;
-    } else {
-      out_b[r - rows_a] = acc;
-    }
-  }
-}
-
 // Grouped gate+up pair for the routed experts: both expert stacks share the
 // ids, the activation row and the shape, so one launch folds 2*used*rows
 // (matrix, slot, row) triples. The per-row dot is bit-identical to
@@ -167,6 +130,44 @@ __global__ void GemvGroupedQ8_0Pair(const Q8_0Block* __restrict__ wa,
     } else {
       out_b[pair] = acc;
     }
+  }
+}
+
+// Fused multi projection: up to four Q8_0 matrices sharing one activation
+// row. Wave handles global row blockIdx.x*4+w and picks the owning matrix
+// from the cumulative row offsets; the per-row dot is bit-identical to
+// GemvQ8_0. Folding the ssm qkv/gate/alpha/beta quartet (and the attention
+// qkv / shared gate-up-gate_inp triples) into one launch measurably beats
+// separate launches at cold L2 (bench tools/bench/moe_gemv_bench.hip).
+struct Multi4Args {
+  const Q8_0Block* w[4];
+  float* out[4];
+  std::uint32_t off[5];  // cumulative row offsets, off[0] = 0
+  std::uint32_t nb[4];   // quant blocks per row
+};
+
+__global__ void GemvQ8_0Multi4(Multi4Args a, const float* __restrict__ x) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= a.off[4]) {
+    return;
+  }
+  std::uint32_t t = 0;
+  while (r >= a.off[t + 1]) {
+    ++t;
+  }
+  const std::uint32_t row_index = r - a.off[t];
+  const Q8_0Block* __restrict__ row =
+      a.w[t] + static_cast<std::size_t>(row_index) * a.nb[t];
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t b = 0; b < a.nb[t]; ++b) {
+    const float d = __half2float(row[b].d);
+    acc += d * static_cast<float>(row[b].qs[lane]) * x[b * 32 + lane];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    a.out[t][row_index] = acc;
   }
 }
 
@@ -351,20 +352,6 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
   }
 }
 
-bool GemvPair(const void* wa, const void* wb, GemvType type,
-              std::uint32_t rows_a, std::uint32_t rows_b, std::uint32_t cols,
-              const float* x, float* out_a, float* out_b,
-              hipStream_t stream) {
-  if (type != GemvType::kQ8_0) {
-    return false;
-  }
-  const std::uint32_t rows = rows_a + rows_b;
-  GemvQ8_0Pair<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
-      static_cast<const Q8_0Block*>(wa), static_cast<const Q8_0Block*>(wb), x,
-      out_a, out_b, rows_a, rows_b, cols);
-  return true;
-}
-
 bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
                      std::size_t expert_stride, const std::int32_t* ids,
                      std::uint32_t used, std::uint32_t rows,
@@ -380,6 +367,31 @@ bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
       static_cast<const Q8_0Block*>(wa), static_cast<const Q8_0Block*>(wb),
       ids, expert_stride / sizeof(Q8_0Block), x, x_stride, out_a, out_b, used,
       rows, cols);
+  return true;
+}
+
+bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
+               hipStream_t stream) {
+  if (n == 0U || n > 4U) {
+    return false;
+  }
+  Multi4Args a{};
+  std::uint32_t total = 0;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    if (projs[i].type != GemvType::kQ8_0 || projs[i].rows == 0U) {
+      return false;
+    }
+    a.w[i] = static_cast<const Q8_0Block*>(projs[i].base);
+    a.out[i] = projs[i].out;
+    a.nb[i] = projs[i].cols / 32U;
+    a.off[i] = total;
+    total += projs[i].rows;
+  }
+  for (std::uint32_t i = n; i < 4U; ++i) {
+    a.off[i] = total;
+  }
+  a.off[4] = total;
+  GemvQ8_0Multi4<<<(total + 3U) / 4U, dim3(128), 0, stream>>>(a, x);
   return true;
 }
 
