@@ -174,6 +174,120 @@ bool TestBf16() {
   return Check("GemvBf16", t::WorstRelative(ref, got), 1e-3);
 }
 
+// Encode a random Q8_0 matrix (same scheme as TestQ8_0) into host bytes.
+std::vector<std::uint8_t> EncodeQ8_0(std::uint32_t rows, std::uint32_t cols,
+                                     std::uint32_t seed) {
+  const std::uint32_t nblocks = cols / 32;
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(static_cast<std::size_t>(rows) * nblocks * 34);
+  for (std::size_t idx = 0; idx < static_cast<std::size_t>(rows) * nblocks;
+       ++idx) {
+    const float scale =
+        0.5F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
+    const __half h = __float2half(scale);
+    const auto* scale_bytes = reinterpret_cast<const std::uint8_t*>(&h);
+    bytes.push_back(scale_bytes[0]);
+    bytes.push_back(scale_bytes[1]);
+    for (int i = 0; i < 32; ++i) {
+      bytes.push_back(static_cast<std::uint8_t>(t::NextRandom(&seed) & 0xFFU));
+    }
+  }
+  return bytes;
+}
+
+// The fused gate+up launches must be bit-identical to the separate ones:
+// the executor relies on this to keep the forward-test token parity.
+bool TestPair() {
+  const auto x = t::MakeValues(kCols, 0xABCD0123U, 1.0F);
+  const auto wa = EncodeQ8_0(kRows, kCols, 0x11110001U);
+  const auto wb = EncodeQ8_0(kRows, kCols, 0x22220002U);
+  t::HipBuffer<std::uint8_t> d_wa(wa.size());
+  t::CheckHip(
+      hipMemcpy(d_wa.get(), wa.data(), wa.size(), hipMemcpyHostToDevice),
+      "upload pair matrix A");
+  t::HipBuffer<std::uint8_t> d_wb(wb.size());
+  t::CheckHip(
+      hipMemcpy(d_wb.get(), wb.data(), wb.size(), hipMemcpyHostToDevice),
+      "upload pair matrix B");
+  t::HipBuffer<float> d_x(x.size());
+  t::Upload(&d_x, x);
+  t::HipBuffer<float> d_ref_a(kRows);
+  t::HipBuffer<float> d_ref_b(kRows);
+  q::Gemv(d_wa.get(), q::GemvType::kQ8_0, kRows, kCols, 34, d_x.get(),
+          d_ref_a.get(), nullptr);
+  q::Gemv(d_wb.get(), q::GemvType::kQ8_0, kRows, kCols, 34, d_x.get(),
+          d_ref_b.get(), nullptr);
+  t::HipBuffer<float> d_out_a(kRows);
+  t::HipBuffer<float> d_out_b(kRows);
+  if (!q::GemvPair(d_wa.get(), d_wb.get(), q::GemvType::kQ8_0, kRows, kRows,
+                  kCols, d_x.get(), d_out_a.get(), d_out_b.get(), nullptr)) {
+    std::cerr << "GemvPair unexpectedly returned false for Q8_0\n";
+    return false;
+  }
+  t::CheckHip(hipDeviceSynchronize(), "GemvQ8_0Pair synchronization");
+  const auto ref_a = t::Download(&d_ref_a, kRows);
+  const auto ref_b = t::Download(&d_ref_b, kRows);
+  const auto out_a = t::Download(&d_out_a, kRows);
+  const auto out_b = t::Download(&d_out_b, kRows);
+  const bool ok_a = ref_a == out_a;
+  const bool ok_b = ref_b == out_b;
+  std::cout << "GemvQ8_0Pair bit-exact: " << (ok_a && ok_b ? "yes" : "no")
+            << '\n';
+  return ok_a && ok_b;
+}
+
+bool TestGroupedPair() {
+  constexpr std::uint32_t kExperts = 4;
+  constexpr std::uint32_t kUsed = 2;
+  const std::int32_t ids[kUsed] = {2, 0};
+  const std::size_t expert_bytes =
+      static_cast<std::size_t>(kRows) * (kCols / 32) * 34;
+  const auto x = t::MakeValues(kCols, 0x55AA0204U, 1.0F);
+  const auto wa = EncodeQ8_0(kExperts * kRows, kCols, 0x33330003U);
+  const auto wb = EncodeQ8_0(kExperts * kRows, kCols, 0x44440004U);
+  t::HipBuffer<std::uint8_t> d_wa(wa.size());
+  t::CheckHip(
+      hipMemcpy(d_wa.get(), wa.data(), wa.size(), hipMemcpyHostToDevice),
+      "upload grouped matrix A");
+  t::HipBuffer<std::uint8_t> d_wb(wb.size());
+  t::CheckHip(
+      hipMemcpy(d_wb.get(), wb.data(), wb.size(), hipMemcpyHostToDevice),
+      "upload grouped matrix B");
+  t::HipBuffer<float> d_x(x.size());
+  t::Upload(&d_x, x);
+  t::HipBuffer<std::int32_t> d_ids(kUsed);
+  t::CheckHip(hipMemcpy(d_ids.get(), ids, sizeof(ids), hipMemcpyHostToDevice),
+              "upload expert ids");
+  t::HipBuffer<float> d_ref_a(kUsed * kRows);
+  t::HipBuffer<float> d_ref_b(kUsed * kRows);
+  q::GemvGrouped(d_wa.get(), q::GemvType::kQ8_0, expert_bytes, d_ids.get(),
+                 kUsed, kRows, kCols, d_x.get(), 0U, d_ref_a.get(), nullptr);
+  q::GemvGrouped(d_wb.get(), q::GemvType::kQ8_0, expert_bytes, d_ids.get(),
+                 kUsed, kRows, kCols, d_x.get(), 0U, d_ref_b.get(), nullptr);
+  t::HipBuffer<float> d_out_a(kUsed * kRows);
+  t::HipBuffer<float> d_out_b(kUsed * kRows);
+  if (!q::GemvGroupedPair(d_wa.get(), d_wb.get(), q::GemvType::kQ8_0,
+                         expert_bytes, d_ids.get(), kUsed, kRows, kCols,
+                         d_x.get(), 0U, d_out_a.get(), d_out_b.get(),
+                         nullptr)) {
+    std::cerr << "GemvGroupedPair unexpectedly returned false for Q8_0\n";
+    return false;
+  }
+  t::CheckHip(hipDeviceSynchronize(), "GemvGroupedQ8_0Pair synchronization");
+  const auto ref_a = t::Download(&d_ref_a, kUsed * kRows);
+  const auto ref_b = t::Download(&d_ref_b, kUsed * kRows);
+  const auto out_a = t::Download(&d_out_a, kUsed * kRows);
+  const auto out_b = t::Download(&d_out_b, kUsed * kRows);
+  const bool ok_a = ref_a == out_a;
+  const bool ok_b = ref_b == out_b;
+  std::cout << "GemvGroupedQ8_0Pair bit-exact: "
+            << (ok_a && ok_b ? "yes" : "no") << '\n';
+  return ok_a && ok_b;
+}
+
 }  // namespace
 
 int main() {
@@ -182,6 +296,8 @@ int main() {
     ok = TestQ8_0() && ok;
     ok = TestF32() && ok;
     ok = TestBf16() && ok;
+    ok = TestPair() && ok;
+    ok = TestGroupedPair() && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

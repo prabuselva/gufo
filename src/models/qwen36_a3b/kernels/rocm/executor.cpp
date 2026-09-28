@@ -449,17 +449,29 @@ void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
              c_.num_experts, c_.num_experts_used, nullptr);
 
   // One launch per stage over all selected experts; the ids never leave the
-  // device, so the decode pipeline never stalls on a host round-trip.
-  prof_.Mark("moe_gate");
-  GemvGrouped(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
-              l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_,
-              c_.num_experts_used, l.ffn_gate_exps.rows, l.ffn_gate_exps.cols,
-              x, 0U, moe_gate_, nullptr);
-  prof_.Mark("moe_up");
-  GemvGrouped(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
-              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_,
-              c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols, x,
-              0U, moe_up_, nullptr);
+  // device, so the decode pipeline never stalls on a host round-trip. The
+  // gate and up projections share one launch (identical per-row dots).
+  prof_.Mark("moe_gateup");
+  const bool pair_routed =
+      l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
+      l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&
+      l.ffn_up_exps.row_bytes == l.ffn_gate_exps.row_bytes;
+  if (!pair_routed ||
+      !GemvGroupedPair(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                       ToGemvType(l.ffn_gate_exps.type),
+                       l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows,
+                       moe_ids_, c_.num_experts_used, l.ffn_gate_exps.rows,
+                       l.ffn_gate_exps.cols, x, 0U, moe_gate_, moe_up_,
+                       nullptr)) {
+    GemvGrouped(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
+                l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_,
+                c_.num_experts_used, l.ffn_gate_exps.rows, l.ffn_gate_exps.cols,
+                x, 0U, moe_gate_, nullptr);
+    GemvGrouped(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
+                l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_,
+                c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols, x,
+                0U, moe_up_, nullptr);
+  }
   Swiglu(moe_gate_, moe_up_, c_.num_experts_used * c_.expert_ff, nullptr);
   prof_.Mark("moe_routed_down");
   GemvGrouped(l.ffn_down_exps.data, ToGemvType(l.ffn_down_exps.type),
@@ -468,10 +480,17 @@ void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
               moe_gate_, c_.expert_ff, moe_expert_out_, nullptr);
 
   prof_.Mark("moe_shared");
-  Gemv(l.shexp_gate.data, ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
-       l.shexp_gate.cols, l.shexp_gate.row_bytes, x, moe_gate_, nullptr);
-  Gemv(l.shexp_up.data, ToGemvType(l.shexp_up.type), l.shexp_up.rows,
-       l.shexp_up.cols, l.shexp_up.row_bytes, x, moe_up_, nullptr);
+  const bool pair_shared = l.shexp_up.cols == l.shexp_gate.cols;
+  if (!pair_shared ||
+      !GemvPair(l.shexp_gate.data, l.shexp_up.data,
+                ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
+                l.shexp_up.rows, l.shexp_gate.cols, x, moe_gate_, moe_up_,
+                nullptr)) {
+    Gemv(l.shexp_gate.data, ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
+         l.shexp_gate.cols, l.shexp_gate.row_bytes, x, moe_gate_, nullptr);
+    Gemv(l.shexp_up.data, ToGemvType(l.shexp_up.type), l.shexp_up.rows,
+         l.shexp_up.cols, l.shexp_up.row_bytes, x, moe_up_, nullptr);
+  }
   Swiglu(moe_gate_, moe_up_, c_.shared_expert_ff, nullptr);
   Gemv(l.shexp_down.data, ToGemvType(l.shexp_down.type), l.shexp_down.rows,
        l.shexp_down.cols, l.shexp_down.row_bytes, moe_gate_, moe_shared_down_,
