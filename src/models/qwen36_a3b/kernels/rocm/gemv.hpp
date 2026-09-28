@@ -36,14 +36,6 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
                  std::uint32_t rows, std::uint32_t cols, const float* x,
                  std::uint32_t x_stride, float* out, hipStream_t stream);
 
-/// Fused gate+up pair of the shared Gemv: one launch computes both
-/// projections against the same activation row x. The per-row dots are
-/// bit-identical to two Gemv calls. Returns false for types without a fused
-/// kernel (the caller falls back to two Gemv calls).
-bool GemvPair(const void* wa, const void* wb, GemvType type,
-              std::uint32_t rows_a, std::uint32_t rows_b, std::uint32_t cols,
-              const float* x, float* out_a, float* out_b, hipStream_t stream);
-
 /// Fused gate+up pair of the grouped expert Gemv: both stacks must share the
 /// shape and `expert_stride` (they do for the MoE gate/up pair). Returns
 /// false for types without a fused kernel.
@@ -52,6 +44,23 @@ bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
                      std::uint32_t used, std::uint32_t rows,
                      std::uint32_t cols, const float* x, std::uint32_t x_stride,
                      float* out_a, float* out_b, hipStream_t stream);
+
+/// One projection of a fused multi launch (see GemvMulti).
+struct GemvMultiProj {
+  const void* base;
+  GemvType type;
+  std::uint32_t rows;
+  std::uint32_t cols;
+  float* out;
+};
+
+/// Fused launch of up to four projections sharing one activation row x (the
+/// ssm qkv/gate/alpha/beta quartet, attention q/k/v, shared-expert
+/// gate/up/gate_inp). The per-row dots are bit-identical to separate Gemv
+/// calls. Returns false when n is outside [1,4] or any projection has a type
+/// without a fused kernel (the caller falls back to separate Gemv calls).
+bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
+               hipStream_t stream);
 
 /// out[i] = W[row][i] for i in [0, cols): dequantizes a single row of a
 /// row-major [rows x cols] matrix stored in `type` (the token-embedding

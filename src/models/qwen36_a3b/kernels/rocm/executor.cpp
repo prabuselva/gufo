@@ -374,14 +374,26 @@ void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
   const std::uint32_t kern = c_.ssm_conv_kernel;
 
   prof_.Mark("lin_gemm_in");
-  Gemv(l.ssm_qkv.data, ToGemvType(l.ssm_qkv.type), l.ssm_qkv.rows,
-       l.ssm_qkv.cols, l.ssm_qkv.row_bytes, x, gdn_qkv_, nullptr);
-  Gemv(l.ssm_gate.data, ToGemvType(l.ssm_gate.type), l.ssm_gate.rows,
-       l.ssm_gate.cols, l.ssm_gate.row_bytes, x, gdn_z_, nullptr);
-  Gemv(l.ssm_alpha.data, ToGemvType(l.ssm_alpha.type), l.ssm_alpha.rows,
-       l.ssm_alpha.cols, l.ssm_alpha.row_bytes, x, gdn_alpha_, nullptr);
-  Gemv(l.ssm_beta.data, ToGemvType(l.ssm_beta.type), l.ssm_beta.rows,
-       l.ssm_beta.cols, l.ssm_beta.row_bytes, x, gdn_beta_, nullptr);
+  const GemvMultiProj ssm_in[4] = {
+      {l.ssm_qkv.data, ToGemvType(l.ssm_qkv.type), l.ssm_qkv.rows,
+       l.ssm_qkv.cols, gdn_qkv_},
+      {l.ssm_gate.data, ToGemvType(l.ssm_gate.type), l.ssm_gate.rows,
+       l.ssm_gate.cols, gdn_z_},
+      {l.ssm_alpha.data, ToGemvType(l.ssm_alpha.type), l.ssm_alpha.rows,
+       l.ssm_alpha.cols, gdn_alpha_},
+      {l.ssm_beta.data, ToGemvType(l.ssm_beta.type), l.ssm_beta.rows,
+       l.ssm_beta.cols, gdn_beta_},
+  };
+  if (!GemvMulti(ssm_in, 4U, x, nullptr)) {
+    Gemv(l.ssm_qkv.data, ToGemvType(l.ssm_qkv.type), l.ssm_qkv.rows,
+         l.ssm_qkv.cols, l.ssm_qkv.row_bytes, x, gdn_qkv_, nullptr);
+    Gemv(l.ssm_gate.data, ToGemvType(l.ssm_gate.type), l.ssm_gate.rows,
+         l.ssm_gate.cols, l.ssm_gate.row_bytes, x, gdn_z_, nullptr);
+    Gemv(l.ssm_alpha.data, ToGemvType(l.ssm_alpha.type), l.ssm_alpha.rows,
+         l.ssm_alpha.cols, l.ssm_alpha.row_bytes, x, gdn_alpha_, nullptr);
+    Gemv(l.ssm_beta.data, ToGemvType(l.ssm_beta.type), l.ssm_beta.rows,
+         l.ssm_beta.cols, l.ssm_beta.row_bytes, x, gdn_beta_, nullptr);
+  }
 
   prof_.Mark("lin_conv");
   GdnConv(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], gdn_convolved_,
@@ -409,12 +421,22 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
   const std::uint32_t nkv = c_.num_kv_heads;
 
   prof_.Mark("attn_gemm_qkv");
-  Gemv(l.attn_q.data, ToGemvType(l.attn_q.type), l.attn_q.rows, l.attn_q.cols,
-       l.attn_q.row_bytes, x, gqa_qg_, nullptr);
-  Gemv(l.attn_k.data, ToGemvType(l.attn_k.type), l.attn_k.rows, l.attn_k.cols,
-       l.attn_k.row_bytes, x, gqa_k_, nullptr);
-  Gemv(l.attn_v.data, ToGemvType(l.attn_v.type), l.attn_v.rows, l.attn_v.cols,
-       l.attn_v.row_bytes, x, gqa_v_, nullptr);
+  const GemvMultiProj qkv[3] = {
+      {l.attn_q.data, ToGemvType(l.attn_q.type), l.attn_q.rows, l.attn_q.cols,
+       gqa_qg_},
+      {l.attn_k.data, ToGemvType(l.attn_k.type), l.attn_k.rows, l.attn_k.cols,
+       gqa_k_},
+      {l.attn_v.data, ToGemvType(l.attn_v.type), l.attn_v.rows, l.attn_v.cols,
+       gqa_v_},
+  };
+  if (!GemvMulti(qkv, 3U, x, nullptr)) {
+    Gemv(l.attn_q.data, ToGemvType(l.attn_q.type), l.attn_q.rows,
+         l.attn_q.cols, l.attn_q.row_bytes, x, gqa_qg_, nullptr);
+    Gemv(l.attn_k.data, ToGemvType(l.attn_k.type), l.attn_k.rows,
+         l.attn_k.cols, l.attn_k.row_bytes, x, gqa_k_, nullptr);
+    Gemv(l.attn_v.data, ToGemvType(l.attn_v.type), l.attn_v.rows,
+         l.attn_v.cols, l.attn_v.row_bytes, x, gqa_v_, nullptr);
+  }
 
   prof_.Mark("attn_rope_norm");
   SplitQGate(gqa_qg_, gqa_q_, gqa_gate_, nh, hd, 1, nullptr);
@@ -480,24 +502,27 @@ void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
               moe_gate_, c_.expert_ff, moe_expert_out_, nullptr);
 
   prof_.Mark("moe_shared");
-  const bool pair_shared = l.shexp_up.cols == l.shexp_gate.cols;
-  if (!pair_shared ||
-      !GemvPair(l.shexp_gate.data, l.shexp_up.data,
-                ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
-                l.shexp_up.rows, l.shexp_gate.cols, x, moe_gate_, moe_up_,
-                nullptr)) {
+  const GemvMultiProj shared_in[3] = {
+      {l.shexp_gate.data, ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
+       l.shexp_gate.cols, moe_gate_},
+      {l.shexp_up.data, ToGemvType(l.shexp_up.type), l.shexp_up.rows,
+       l.shexp_up.cols, moe_up_},
+      {l.shexp_gate_inp.data, ToGemvType(l.shexp_gate_inp.type),
+       l.shexp_gate_inp.rows, l.shexp_gate_inp.cols, moe_shared_gate_},
+  };
+  if (!GemvMulti(shared_in, 3U, x, nullptr)) {
     Gemv(l.shexp_gate.data, ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
          l.shexp_gate.cols, l.shexp_gate.row_bytes, x, moe_gate_, nullptr);
     Gemv(l.shexp_up.data, ToGemvType(l.shexp_up.type), l.shexp_up.rows,
          l.shexp_up.cols, l.shexp_up.row_bytes, x, moe_up_, nullptr);
+    Gemv(l.shexp_gate_inp.data, ToGemvType(l.shexp_gate_inp.type),
+         l.shexp_gate_inp.rows, l.shexp_gate_inp.cols,
+         l.shexp_gate_inp.row_bytes, x, moe_shared_gate_, nullptr);
   }
   Swiglu(moe_gate_, moe_up_, c_.shared_expert_ff, nullptr);
   Gemv(l.shexp_down.data, ToGemvType(l.shexp_down.type), l.shexp_down.rows,
        l.shexp_down.cols, l.shexp_down.row_bytes, moe_gate_, moe_shared_down_,
        nullptr);
-  Gemv(l.shexp_gate_inp.data, ToGemvType(l.shexp_gate_inp.type),
-       l.shexp_gate_inp.rows, l.shexp_gate_inp.cols, l.shexp_gate_inp.row_bytes,
-       x, moe_shared_gate_, nullptr);
   prof_.Mark("moe_epilogue");
   MoeEpilogue(moe_expert_out_, moe_weights_, moe_shared_down_, moe_shared_gate_,
               1, out, 1, c_.num_experts_used, c_.hidden_size, nullptr);
