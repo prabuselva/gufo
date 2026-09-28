@@ -73,16 +73,22 @@ rows of the virtual concatenated row space `total = Σ rows_i`; wave `w`
 walks `off` to pick its tensor, then runs the identical unroll-4 +
 butterfly dot as `GemvQ8_0` — results are **bit-exact** to separate
 launches (verified by `qwen36_a3b_rocm_gemv_test`, including unequal
-rows and a narrower last tensor). The launcher returns `false` unless
-`n ∈ [1,4]`, every type is `kQ8_0` and every `rows > 0`; callers fall
-back to separate `Gemv` calls. Grid `ceil(total/4) × 128`.
+rows and a narrower last tensor). The launcher fuses the **Q8_0 subset**
+into one launch, runs any non-Q8_0 projection (the GGUF stores
+`ssm_alpha`/`ssm_beta`/`ffn_gate_inp_shexp` as F32) as a plain `Gemv`,
+and skips empty ones; it returns `false` only for `n ∉ [1,4]`, in which
+case callers fall back to separate `Gemv` calls. Grid `ceil(total/4) ×
+128`. (The first revision rejected any non-Q8_0 group outright, which
+silently disabled the fusion for `lin_gemm_in` and `moe_shared` — the
+profile was unchanged until the subset split landed.)
 
-In-model call sites: `lin_gemm_in` (ssm_qkv + ssm_gate + ssm_alpha +
-ssm_beta, 4-in-1), `attn_gemm_qkv` (q + k + v, 3-in-1), `moe_shared`
-(gate + up + gate_inp, 3-in-1; down stays separate — different `x`).
-Cold-L2 bench (`tools/bench/moe_gemv_bench.hip`, rotating row windows):
+In-model call sites: `lin_gemm_in` (ssm_qkv + ssm_gate fused Q8_0,
+ssm_alpha + ssm_beta F32 plain), `attn_gemm_qkv` (q + k + v, all Q8_0,
+3-in-1), `moe_shared` (gate + up fused Q8_0, gate_inp F32 plain; down
+stays separate — different `x`). Cold-L2 bench
+(`tools/bench/moe_gemv_bench.hip`, rotating row windows, all-Q8_0):
 lin_gemm_in 0.1425 → 0.1271 ms (−10.8 %, 211 GB/s); shared expert
-0.0197 → 0.0096 ms warm. Saves 60 launches/step across 40 layers.
+0.0197 → 0.0096 ms warm.
 
 ### `GemvGroupedDense<T>` :177 — launcher `GemvGrouped` :327 (kF32/kBF16)
 
@@ -110,7 +116,7 @@ grid cap 65535. Called once per token (and per MTP draft token).
 | `Gemv` | :307 | Q8_0: `ceil(rows/4)` × 128; dense: `rows` × 32 |
 | `GemvGrouped` | :327 | `ceil(used·rows/4)` × 128, all types; `expert_stride` is in **bytes**, divided by the element/block size per type |
 | `GemvGroupedPair` | :355 | `ceil(2·used·rows/4)` × 128; `expert_stride` in bytes; returns `false` for non-Q8_0 |
-| `GemvMulti` | :373 | `ceil(Σ rows_i/4)` × 128; returns `false` unless `n ∈ [1,4]`, all `kQ8_0`, all `rows > 0` |
+| `GemvMulti` | :373 | `ceil(Σ Q8_0 rows/4)` × 128 for the Q8_0 subset + plain `Gemv` per other projection; returns `false` only for `n ∉ [1,4]` |
 
 ## Numerics
 

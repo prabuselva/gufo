@@ -117,18 +117,23 @@ Open items, in priority order:
 2. **`sample` stage** — 2.04 ms/step for a 1 MB logits D2H plus host
     argmax/sampling. A pinned async D2H (or GPU-side argmax) removes
     most of it; it is the largest non-kernel cost.
-3. **Same-`x` projection fusion — done** — `GemvMulti` (Q8_0-only,
-    bit-exact per oracle test) folds up to four projections sharing one
-    activation row into a single launch: `lin_gemm_in` 4-in-1,
-    `attn_gemm_qkv` and `moe_shared` gate/up/gate_inp 3-in-1. Cold-L2
-    bench (`tools/bench/moe_gemv_bench.hip`): lin_gemm_in −10.8 %
-    (211 GB/s), shared expert 0.0197 → 0.0096 ms warm. Together with
-    `GemvGroupedPair` (routed gate+up) this removes 140 launches/step.
-    Router+TopK fusion was rejected: it would reorder the router dot
-    product and break token parity. vec4 int8 loads measured only
-    +9.5 % cold and are not bit-exact — rejected. The next lever is
-    hipGraph capture of the decode step (blockers: scalar `pos` baked
-    into the Attention cache pointer and `n_kv` argument).
+3. **Same-`x` projection fusion — done** — `GemvMulti` (bit-exact per
+    oracle test) folds the Q8_0 projections sharing one activation row
+    into a single launch and runs the F32 side vectors (`ssm_alpha`,
+    `ssm_beta`, `ffn_gate_inp_shexp` — F32 in the GGUF) as plain `Gemv`:
+    `lin_gemm_in` fuses qkv+gate, `attn_gemm_qkv` is 3-in-1,
+    `moe_shared` fuses gate+up. The first revision rejected any group
+    containing a non-Q8_0 tensor, so `lin_gemm_in`/`moe_shared` silently
+    fell back and the profile was unchanged; the subset split restores
+    the fusion. Cold-L2 bench (`tools/bench/moe_gemv_bench.hip`):
+    lin_gemm_in −10.8 % (211 GB/s), shared expert 0.0197 → 0.0096 ms
+    warm. Together with `GemvGroupedPair` (routed gate+up) this removes
+    140 launches/step. Router+TopK fusion was rejected: it would
+    reorder the router dot product and break token parity. vec4 int8
+    loads measured only +9.5 % cold and are not bit-exact — rejected.
+    The next lever is hipGraph capture of the decode step (blockers:
+    scalar `pos` baked into the Attention cache pointer and `n_kv`
+    argument).
 4. **MTP speculative decoding** — `draft_proposed=0` today; enabling the
    MTP block is the multiplier that takes 33 → 60+ tps.
 
