@@ -42,7 +42,7 @@ Dispatch rules inside the launchers:
 | `Gemm` / `GemmMoe` | Q8_0 → `qfn_mmq_*` (shared mmq target from `qwen38_flash_next`); F32 → hipBLAS SGEMM; BF16 → narrow + hipBLAS GemmEx; MoE non-Q8_0 → `MoeVecFallback` |
 | `RoutedF16Gemm` | Q4_K/Q5_K only at `tile_rows <= 48`; `tile_rows ∈ {16, 48, 64}`; returns false on unsupported shape (executor falls back to `GemmMoe`) |
 
-## Decode stage profile (33.3 tps, 32 steps)
+## Decode stage profile (34.2 tps, 32 steps)
 
 From `profile.hpp` `StageProfiler` (sync-per-mark inflates the total by
 ~250 ms; see `docs/models/qwen3.6-35B-A3B/OPTIMIZATIONS.md`). Per-step
@@ -50,25 +50,28 @@ totals mark where each kernel document's optimization notes apply:
 
 | Stage | ms/step | Kernel(s) |
 | --- | --- | --- |
-| `output` (lm_head) | 4.41 → ~2.34 | `GemvQ8_0` — 4.41 included the logits D2H + sampling (profiler scope fixed, `sample` row now separate; re-profile pending) |
-| `lin_gemm_in` (ssm qkv/gate/alpha/beta) | 5.00 | `GemvQ8_0` |
-| `moe_shared` | 2.00 | `GemvPair` + `Swiglu` + `Gemv` ×2 (gate/up fused) |
-| `lin_gemm_out` (ssm out) | 1.69 | `GemvQ8_0` |
-| `moe gateup` (routed) | — | `GemvGroupedPair` (merged from gate+up, 80 launches/step saved) |
-| `moe down` (routed) | 0.058–0.062 | `GemvGrouped*` |
-| `moe_router` | 1.59 | `Gemv` + `RouterTopK` |
-| `attn_gemm_qkv` | 1.44 | `Gemv` ×3 |
-| `lin_delta` | 1.25 | `GdnDeltaDecodeKernel` |
-| `attn_core` | 0.090 | `AttentionDecodeSplitKernel` + combine |
-| `moe_epilogue` | 0.50 | `MoeEpilogueKernel` |
-| `lin_conv` / `lin_outnorm` / `lin_normqk` | 0.38 / 0.34 / 0.31 | `GdnConvKernel`, `GdnOutNormKernel`, `GdnNormQkKernel` |
+| `lin_gemm_in` (ssm qkv/gate/alpha/beta) | 5.02 | `GemvMulti` ×1 (4-in-1; re-profile pending) |
+| `moe gateup` (routed) | 4.18 | `GemvGroupedPair` (merged from gate+up, 80 launches/step saved) |
+| `moe down` (routed) | 2.50 | `GemvGrouped*` |
+| `output` (lm_head) | 2.37 | `GemvQ8_0` — at roofline (the old 4.41 included the logits D2H + sampling; `sample` row now separate) |
+| `sample` | 2.04 | logits D2H + host sampler (engine, not a kernel) |
+| `moe_shared` | 1.76 | `GemvMulti` (gate/up/gate_inp 3-in-1) + `Swiglu` + `Gemv` (down) |
+| `lin_gemm_out` (ssm out) | 1.68 | `GemvQ8_0` |
+| `moe_router` | 1.58 | `Gemv` + `RouterTopK` |
+| `attn_gemm_qkv` | 1.45 | `GemvMulti` (q+k+v 3-in-1) |
+| `lin_delta` | 1.24 | `GdnDeltaDecodeKernel` |
+| `attn_core` | 0.90 | `AttentionDecodeSplitKernel` + combine |
+| `moe_epilogue` | 0.51 | `MoeEpilogueKernel` |
+| `lin_conv` / `lin_outnorm` / `lin_normqk` | 0.38 / 0.33 / 0.32 | `GdnConvKernel`, `GdnOutNormKernel`, `GdnNormQkKernel` |
 | `attn_rope_norm` | 0.24 | `RmsNormKernel` + `RopeKernel` |
 
 Roofline: ~3.07 GB of weights read per token → ~78 tps at 240 GB/s.
 `output` is confirmed at roofline (profiler-scope artifact, not a
-kernel gap) and shared/routed gate+up are fused into pair launches;
-remaining open items ranked in `OPTIMIZATIONS.md`: hipGraph capture of
-the launch-latency-bound decode step, MTP speculative decoding.
+kernel gap); every same-`x` projection group and both gate+up pairs are
+fused into single launches (`GemvMulti` / `GemvGroupedPair`); remaining
+open items ranked in `OPTIMIZATIONS.md`: the `sample` stage (pinned
+async D2H), hipGraph capture of the launch-latency-bound decode step,
+MTP speculative decoding.
 
 ## Oracle tests
 
