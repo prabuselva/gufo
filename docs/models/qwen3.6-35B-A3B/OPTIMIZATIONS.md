@@ -80,23 +80,23 @@ total by ~250 ms over 32 steps, so real step time is below the profiled
 
 | stage | ms | per step |
 | --- | --- | --- |
-| lin_gemm_in | 160 | 0.167 |
+| lin_gemm_in | 160 | 5.00 |
 | output (lm_head) | 141 | 4.41 |
-| moe down / up / gate | 80 / 78 / 75 | 0.058–0.062 |
-| moe_shared | 64 | 0.050 |
-| lin_gemm_out | 54 | 0.042 |
-| moe_router | 51 | 0.040 |
-| attn_gemm_qkv | 46 | 0.036 |
-| lin_delta | 40 | 0.041 |
-| attn_core | 29 | 0.023 |
-| add | 25 | 0.020 |
-| attn_gemm_out | 22 | 0.017 |
-| attn / ffn | 21 / 21 | 0.016 |
-| moe_epilogue | 16 | 0.013 |
-| lin_conv | 12 | 0.009 |
-| lin_outnorm | 11 | 0.009 |
-| lin_normqk | 10 | 0.008 |
-| attn_rope_norm | 7.6 | 0.006 |
+| moe down / up / gate | 80 / 78 / 75 | 2.50 / 2.44 / 2.34 |
+| moe_shared | 64 | 2.00 |
+| lin_gemm_out | 54 | 1.69 |
+| moe_router | 51 | 1.59 |
+| attn_gemm_qkv | 46 | 1.44 |
+| lin_delta | 40 | 1.25 |
+| attn_core | 29 | 0.91 |
+| add | 25 | 0.78 |
+| attn_gemm_out | 22 | 0.69 |
+| attn / ffn | 21 / 21 | 0.66 |
+| moe_epilogue | 16 | 0.50 |
+| lin_conv | 12 | 0.38 |
+| lin_outnorm | 11 | 0.34 |
+| lin_normqk | 10 | 0.31 |
+| attn_rope_norm | 7.6 | 0.24 |
 
 ## Roofline and open work
 
@@ -109,8 +109,8 @@ Open items, in priority order:
 1. **lm_head gap** — production `output` costs 4.41 ms/step but the identical
    kernel shape runs 2.34 ms standalone at 96 % of peak. The kernel is not
    the problem; investigate mark scope, x-buffer residency and contention.
-2. **moe_shared / router consolidation** — 0.050 + 0.040 ms/step of small
-   GEMVs foldable into the grouped launches.
+2. **moe_shared / router consolidation** — 2.00 + 1.59 ms/step of small
+    GEMVs foldable into the grouped launches.
 3. **MTP speculative decoding** — `draft_proposed=0` today; enabling the MTP
    block is the multiplier that takes 33 → 60+ tps.
 
