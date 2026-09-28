@@ -36,6 +36,23 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
                  std::uint32_t rows, std::uint32_t cols, const float* x,
                  std::uint32_t x_stride, float* out, hipStream_t stream);
 
+/// Fused gate+up pair of the shared Gemv: one launch computes both
+/// projections against the same activation row x. The per-row dots are
+/// bit-identical to two Gemv calls. Returns false for types without a fused
+/// kernel (the caller falls back to two Gemv calls).
+bool GemvPair(const void* wa, const void* wb, GemvType type,
+              std::uint32_t rows_a, std::uint32_t rows_b, std::uint32_t cols,
+              const float* x, float* out_a, float* out_b, hipStream_t stream);
+
+/// Fused gate+up pair of the grouped expert Gemv: both stacks must share the
+/// shape and `expert_stride` (they do for the MoE gate/up pair). Returns
+/// false for types without a fused kernel.
+bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
+                     std::size_t expert_stride, const std::int32_t* ids,
+                     std::uint32_t used, std::uint32_t rows,
+                     std::uint32_t cols, const float* x, std::uint32_t x_stride,
+                     float* out_a, float* out_b, hipStream_t stream);
+
 /// out[i] = W[row][i] for i in [0, cols): dequantizes a single row of a
 /// row-major [rows x cols] matrix stored in `type` (the token-embedding
 /// lookup). `base` points at the matrix start; the row offset is derived from
