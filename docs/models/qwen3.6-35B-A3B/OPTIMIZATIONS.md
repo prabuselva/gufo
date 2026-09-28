@@ -106,11 +106,17 @@ reach.
 
 Open items, in priority order:
 
-1. **lm_head gap** — production `output` costs 4.41 ms/step but the identical
-   kernel shape runs 2.34 ms standalone at 96 % of peak. The kernel is not
-   the problem; investigate mark scope, x-buffer residency and contention.
+1. **lm_head gap — explained, rerun pending** — the `output` stage ran from
+    `Mark("output")` to the *next step's* `Mark("embed")`, so it absorbed the
+    engine's synchronous 1 MB logits D2H + host sampling between steps
+    (engine.cpp DecodeStep). `Mark("sample")` now closes the stage right after
+    the lm_head GEMV; the next profile run should show `output` ≈ 2.3 ms
+    (matching the standalone bench) and a new `sample` row for the readback.
 2. **moe_shared / router consolidation** — 2.00 + 1.59 ms/step of small
-    GEMVs foldable into the grouped launches.
+    GEMVs foldable into the grouped launches. Both are launch-bound, not
+    bandwidth-bound: the router GEMV moves 21 MB/step (≈0.09 ms roofline) and
+    the shared expert 134 MB/step (≈0.56 ms); the rest is per-kernel latency
+    across 40 layers.
 3. **MTP speculative decoding** — `draft_proposed=0` today; enabling the MTP
    block is the multiplier that takes 33 → 60+ tps.
 
