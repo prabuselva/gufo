@@ -866,6 +866,9 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
   Gemv(model_.output().data, ToGemvType(model_.output().type),
        model_.output().rows, model_.output().cols, model_.output().row_bytes,
        x_, logits_, nullptr);
+  // Close the GPU-side output stage here; the logits readback and host
+  // sampling between steps get their own row instead of inflating lm_head.
+  prof_.Mark("sample");
   ++position_;
   if (prof_.enabled()) {
     ++decode_steps_;
