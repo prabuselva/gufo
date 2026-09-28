@@ -26,6 +26,16 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
           std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,
           hipStream_t stream);
 
+/// Grouped decode GEMV over a stacked expert matrix. For slot s in [0, used)
+/// with expert id ids[s]: out[s*rows + r] = sum_k W[e][r][k] *
+/// x[s*x_stride + k]. `expert_stride` is the byte distance between stacked
+/// experts (row_bytes * rows). One launch covers all selected experts, so the
+/// caller never reads ids back to the host.
+void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
+                 const std::int32_t* ids, std::uint32_t used,
+                 std::uint32_t rows, std::uint32_t cols, const float* x,
+                 std::uint32_t x_stride, float* out, hipStream_t stream);
+
 /// out[i] = W[row][i] for i in [0, cols): dequantizes a single row of a
 /// row-major [rows x cols] matrix stored in `type` (the token-embedding
 /// lookup). `base` points at the matrix start; the row offset is derived from

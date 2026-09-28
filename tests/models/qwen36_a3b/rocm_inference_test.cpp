@@ -197,6 +197,16 @@ int main(int argc, char** argv) {
     Expect(cpu_arg == pf_arg, "batched prefill argmax matches oracle");
     Expect(pf_executor->position() == static_cast<std::uint32_t>(prompt.size()),
            "batched prefill advanced position");
+    // Decisive cross-check: compare the batched prefill directly against the
+    // per-token GPU path (the original working path), not just the oracle. If
+    // these match, the batched path is correct and the oracle is wrong; if
+    // they diverge, the batched path is genuinely buggy.
+    const std::uint32_t gpu_arg = ArgMax(gpu_logits);
+    const double worst_gpu = test::WorstRelative(gpu_logits, pf_logits, 1e-3);
+    std::cout << "batched vs per-token GPU: gpu_arg=" << gpu_arg
+              << " pf_arg=" << pf_arg
+              << (gpu_arg == pf_arg ? "  OK" : "  *** DIVERGED ***")
+              << "  worst_rel=" << worst_gpu << "\n";
   }
   const auto pf_tokens = Greedy(
       pf_logits, steps, [&](std::int32_t token, std::vector<float>& logits) {

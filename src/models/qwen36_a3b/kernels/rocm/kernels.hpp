@@ -34,7 +34,8 @@ void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
 /// `q` and `gate` (each [heads * head_dim]) receive the two halves so the
 /// query can be normalized and rotated on its own.
 void SplitQGate(const float* qg, float* q, float* gate, std::uint32_t heads,
-                std::uint32_t head_dim, hipStream_t stream);
+                std::uint32_t head_dim, std::uint32_t tokens,
+                hipStream_t stream);
 
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`, over `count` floats.
 void Swiglu(float* gate, const float* up, std::size_t count,
@@ -54,6 +55,13 @@ void Add(float* a, const float* b, std::size_t count, hipStream_t stream);
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
+
+/// counts[e] = number of (token, slot) pairs in `ids` (length tokens*k) routed
+/// to expert e. Used to bound the routed MMQ column grid to the real largest
+/// expert bucket instead of the full pair count.
+void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
+                  std::uint32_t tokens, std::uint32_t n_experts,
+                  std::uint32_t k, hipStream_t stream);
 
 /// out[t][i] = sum_s weights[t][s] * expert_out[(t*k + s)][i]
 ///           + sigmoid(gate[t * gate_stride]) * shared[t][i].
@@ -132,10 +140,12 @@ void GdnOutNormPrefill(float* attn, const float* z, const float* norm_w,
 /// `q` [heads][head_dim]; `k_cache`/`v_cache` [n_kv][kv_heads][head_dim]
 /// (already rotated); `gate` [heads * head_dim]. `out` [heads * head_dim]
 /// receives the gated context (before the output projection). `scale` is
-/// 1/sqrt(head_dim). `scratch` holds heads * n_kv softmax weights.
+/// 1/sqrt(head_dim). `scratch` holds heads * n_kv softmax weights (legacy
+/// path). For head_dim == 256 a flash-decoding split runs instead: `part`
+/// (heads * 32 * (head_dim + 2) floats) receives the per-split partials.
 void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
                      const float* gate, float* out, float* scratch,
-                     std::uint32_t n_kv, std::uint32_t heads,
+                     float* part, std::uint32_t n_kv, std::uint32_t heads,
                      std::uint32_t kv_heads, std::uint32_t head_dim,
                      float scale, hipStream_t stream);
 
