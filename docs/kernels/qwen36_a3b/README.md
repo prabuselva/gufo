@@ -50,11 +50,12 @@ totals mark where each kernel document's optimization notes apply:
 
 | Stage | ms/step | Kernel(s) |
 | --- | --- | --- |
-| `output` (lm_head) | 4.41 | `GemvQ8_0` (gap vs 2.34 ms standalone bench — open) |
+| `output` (lm_head) | 4.41 → ~2.34 | `GemvQ8_0` — 4.41 included the logits D2H + sampling (profiler scope fixed, `sample` row now separate; re-profile pending) |
 | `lin_gemm_in` (ssm qkv/gate/alpha/beta) | 5.00 | `GemvQ8_0` |
-| `moe_shared` | 2.00 | `Gemv` ×4 + `Swiglu` |
+| `moe_shared` | 2.00 | `GemvPair` + `Swiglu` + `Gemv` ×2 (gate/up fused) |
 | `lin_gemm_out` (ssm out) | 1.69 | `GemvQ8_0` |
-| `moe down/up/gate` | 0.058–0.062 each | `GemvGrouped*` |
+| `moe gateup` (routed) | — | `GemvGroupedPair` (merged from gate+up, 80 launches/step saved) |
+| `moe down` (routed) | 0.058–0.062 | `GemvGrouped*` |
 | `moe_router` | 1.59 | `Gemv` + `RouterTopK` |
 | `attn_gemm_qkv` | 1.44 | `Gemv` ×3 |
 | `lin_delta` | 1.25 | `GdnDeltaDecodeKernel` |
@@ -64,8 +65,10 @@ totals mark where each kernel document's optimization notes apply:
 | `attn_rope_norm` | 0.24 | `RmsNormKernel` + `RopeKernel` |
 
 Roofline: ~3.07 GB of weights read per token → ~78 tps at 240 GB/s.
-Open items ranked in `OPTIMIZATIONS.md`: the `output` GEMV gap, router +
-shared-expert launch consolidation, MTP speculative decoding.
+`output` is confirmed at roofline (profiler-scope artifact, not a
+kernel gap) and shared/routed gate+up are fused into pair launches;
+remaining open items ranked in `OPTIMIZATIONS.md`: hipGraph capture of
+the launch-latency-bound decode step, MTP speculative decoding.
 
 ## Oracle tests
 

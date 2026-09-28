@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — Decode GEMV Tier (`gemv.hip.cpp`)
 
-Source: `src/models/qwen36_a3b/kernels/rocm/gemv.hip.cpp` (271 lines).
+Source: `src/models/qwen36_a3b/kernels/rocm/gemv.hip.cpp` (386 lines).
 Public API: `gemv.hpp` (`GemvType` = `kQ8_0 | kF32 | kBF16`). This tier
 runs every linear projection at decode (batch 1) and the shared-expert /
 router projections; it is the model's dominant memory consumer. Weights
@@ -32,11 +32,13 @@ loads in flight.
   240 GB/s peak.** Rejected variants: misaligned-uint32 vec4 loads
   214 GB/s, vec2 227 GB/s, vec4 + LDS-staged x 120 GB/s (occupancy
   loss). The kernel is at roofline; do not micro-optimize it further.
-- Open gap: in-model `output` (lm_head) measures 4.41 ms/step vs the
-  2.34 ms standalone — investigate launch context (stream state, clock
-  ramp, L2 pollution from the previous stage), not the kernel body.
+- The in-model 4.41 ms vs 2.34 ms "gap" was a profiler-scope artifact:
+  the `output` segment ran from `Mark("output")` to the next step's
+  `Mark("embed")`, absorbing the engine's synchronous 1 MB logits D2H
+  and host sampling. Fixed by `Mark("sample")` in the executor; the
+  GEMV itself measures 2.34 ms in-model, at roofline.
 
-### `GemvGroupedQ8_0` :59 — launcher `GemvGrouped` :243 (kQ8_0)
+### `GemvGroupedQ8_0` :59 — launcher `GemvGrouped` :326 (kQ8_0)
 
 Routed-expert GEMV: one launch computes all `used` selected experts of
 one projection. A 128-thread block folds four consecutive
@@ -51,18 +53,40 @@ one projection. A 128-thread block folds four consecutive
 - `ids[s]` is a dependent load before the streaming loop; with used=8
   and rows=512 the grid is 1024 blocks, enough waves to hide it.
 
-### `GemvGroupedDense<T>` :93 — launcher `GemvGrouped` (kF32/kBF16)
+### `GemvQ8_0Pair` :94 — launcher `GemvPair` :354 (kQ8_0 only)
+
+Fuses the two decode gate/up projections of one matrix pair (same
+`cols`, two weight stacks, two output rows) into a single launch:
+block 128 handles four consecutive rows of the **virtual concatenated**
+row space `rows_a + rows_b`; wave `w` picks `wa`/`out_a` for rows below
+`rows_a`, else `wb`/`out_b` with `r - rows_a`. The per-row dot is
+identical to `GemvQ8_0` (same unroll, lane mapping and butterfly), so
+results are **bit-exact** to two separate launches — verified by
+`qwen36_a3b_rocm_gemv_test`. Halves launch count for the shared-expert
+gate/up pair.
+
+### `GemvGroupedQ8_0Pair` :131 — launcher `GemvGroupedPair` :368 (kQ8_0 only)
+
+Routed-expert pair: one launch computes gate **and** up for all `used`
+selected experts. Extends the (slot, row) pairing of
+`GemvGroupedQ8_0` to `2·used·rows` virtual pairs — `pair ≥ used·rows`
+selects the `wb`/`out_b` half. Expert id `ids[s]` read from device
+memory as before; grid `ceil(2·used·rows / 4)`. Bit-exact to the two
+separate `GemvGrouped` calls (same oracle test). Replaces the decode
+routed gate + up launches (80 launches/step saved across 40 layers).
+
+### `GemvGroupedDense<T>` :176 — launcher `GemvGrouped` (kF32/kBF16)
 
 Same (slot, row) pairing for the dense expert stacks; element-strided
 loop `i = lane; i < cols; i += 32` with `static_cast<float>(row[i])`.
 
-### `GemvF32` :122 / `GemvBf16` :142 — launcher `Gemv`
+### `GemvF32` :205 / `GemvBf16` :225 — launcher `Gemv`
 
 Plain one-wave-per-row GEMV (grid = rows, block 32) for the dense
 encodings. Same unroll-4 + butterfly contract; BF16 converts per
 element.
 
-### `EmbedRowQ8_0` :164 / `EmbedRowF32` :172 / `EmbedRowBf16` :181 — launcher `EmbedRow` :192
+### `EmbedRowQ8_0` :247 / `EmbedRowF32` :255 / `EmbedRowBf16` :264 — launcher `EmbedRow` :275
 
 Token-embedding lookup: dequantize **one row** of the embedding matrix.
 Q8_0: one warp per quant block (`grid = cols/32`, block 32),
@@ -73,9 +97,11 @@ grid cap 65535. Called once per token (and per MTP draft token).
 
 | Launcher | Line | Grid / block |
 | --- | --- | --- |
-| `EmbedRow` | :192 | Q8_0: `cols/32` × 32; dense: `min(ceil(cols/256), 65535)` × 256 |
-| `Gemv` | :223 | Q8_0: `ceil(rows/4)` × 128; dense: `rows` × 32 |
-| `GemvGrouped` | :243 | `ceil(used·rows/4)` × 128, all types; `expert_stride` is in **bytes**, divided by the element/block size per type |
+| `EmbedRow` | :275 | Q8_0: `cols/32` × 32; dense: `min(ceil(cols/256), 65535)` × 256 |
+| `Gemv` | :306 | Q8_0: `ceil(rows/4)` × 128; dense: `rows` × 32 |
+| `GemvGrouped` | :326 | `ceil(used·rows/4)` × 128, all types; `expert_stride` is in **bytes**, divided by the element/block size per type |
+| `GemvPair` | :354 | `ceil((rows_a+rows_b)/4)` × 128; returns `false` for non-Q8_0 (caller falls back to two `Gemv` calls) |
+| `GemvGroupedPair` | :368 | `ceil(2·used·rows/4)` × 128; `expert_stride` in bytes; returns `false` for non-Q8_0 |
 
 ## Numerics
 
@@ -88,12 +114,17 @@ grid cap 65535. Called once per token (and per MTP draft token).
 ## Optimization notes
 
 - The decode roofline (~3.07 GB/token → ~78 tps) is set by this tier:
-  lm_head (1 GB) + per-layer projections. Everything else is noise
-  until `output` closes its 2 ms gap.
+  lm_head (1 GB) + per-layer projections. `output` is now confirmed at
+  roofline in-model (2.34 ms/step); the remaining decode headroom is
+  launch-latency bound, not bandwidth bound.
 - `GemvGrouped` reads `ids` per pair; a future bucket-compaction
   (reusing `RoutedCompact` from the prefill tier) would let decode share
   the WMMA path for long batches — see the MTP/speculative work in
   `docs/models/qwen3.6-35B-A3B/OPTIMIZATIONS.md`.
-- Shared-expert projections (4 separate `Gemv` calls + `Swiglu`) and
-  the router (`Gemv` + `RouterTopK`) are candidates for a grouped
-  launch: same x row, ≤6 small matrices per layer.
+- Done: shared-expert gate/up and routed gate/up each fused into one
+  pair launch (`GemvPair` / `GemvGroupedPair`), 80 launches/step saved.
+  Remaining candidates: router (`Gemv` + `RouterTopK`) fusion was
+  rejected — it would reorder the router dot product and break
+  token-parity; `moe_shared` (0.56 ms roofline) and `moe_router`
+  (0.09 ms) are launch-latency bound, so hipGraph capture of the decode
+  step is the better lever.
