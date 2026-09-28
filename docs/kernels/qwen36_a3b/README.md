@@ -50,12 +50,12 @@ totals mark where each kernel document's optimization notes apply:
 
 | Stage | ms/step | Kernel(s) |
 | --- | --- | --- |
-| `lin_gemm_in` (ssm qkv/gate/alpha/beta) | 5.02 | `GemvMulti` ×1 (4-in-1; re-profile pending) |
+| `lin_gemm_in` (ssm qkv/gate/alpha/beta) | 5.02 | `GemvMulti` (qkv+gate Q8_0) + `Gemv` ×2 (F32 alpha/beta; re-profile pending) |
 | `moe gateup` (routed) | 4.18 | `GemvGroupedPair` (merged from gate+up, 80 launches/step saved) |
 | `moe down` (routed) | 2.50 | `GemvGrouped*` |
 | `output` (lm_head) | 2.37 | `GemvQ8_0` — at roofline (the old 4.41 included the logits D2H + sampling; `sample` row now separate) |
 | `sample` | 2.04 | logits D2H + host sampler (engine, not a kernel) |
-| `moe_shared` | 1.76 | `GemvMulti` (gate/up/gate_inp 3-in-1) + `Swiglu` + `Gemv` (down) |
+| `moe_shared` | 1.76 | `GemvMulti` (gate/up Q8_0) + `Gemv` (F32 gate_inp) + `Swiglu` + `Gemv` (down) |
 | `lin_gemm_out` (ssm out) | 1.68 | `GemvQ8_0` |
 | `moe_router` | 1.58 | `Gemv` + `RouterTopK` |
 | `attn_gemm_qkv` | 1.45 | `GemvMulti` (q+k+v 3-in-1) |
