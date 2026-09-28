@@ -72,31 +72,34 @@ Landed in `49b6ee3`.
 5. **MoE debug-log removal** — per-(layer, chunk) routing prints removed from
    the hot decode path.
 
-## Decode profile at 33.3 tps
+## Decode profile at 34.2 tps
 
-`profile.hpp` `StageProfiler` (per-mark `hipDeviceSynchronize`; inflates the
-total by ~250 ms over 32 steps, so real step time is below the profiled
-963 ms / 32 ≈ 30 ms). Per-stage totals over 32 steps:
+`profile.hpp` `StageProfiler` (per-mark `hipDeviceSynchronize`; profiled
+total 938 ms / 32 ≈ 29 ms matches the real step time). Per-stage ms per
+step, measured after the gate/up pair fusion and before the `GemvMulti`
+fusion (re-profile pending):
 
-| stage | ms | per step |
-| --- | --- | --- |
-| lin_gemm_in | 160 | 5.00 |
-| output (lm_head) | 141 | 4.41 |
-| moe down / up / gate | 80 / 78 / 75 | 2.50 / 2.44 / 2.34 |
-| moe_shared | 64 | 2.00 |
-| lin_gemm_out | 54 | 1.69 |
-| moe_router | 51 | 1.59 |
-| attn_gemm_qkv | 46 | 1.44 |
-| lin_delta | 40 | 1.25 |
-| attn_core | 29 | 0.91 |
-| add | 25 | 0.78 |
-| attn_gemm_out | 22 | 0.69 |
-| attn / ffn | 21 / 21 | 0.66 |
-| moe_epilogue | 16 | 0.50 |
-| lin_conv | 12 | 0.38 |
-| lin_outnorm | 11 | 0.34 |
-| lin_normqk | 10 | 0.31 |
-| attn_rope_norm | 7.6 | 0.24 |
+| stage | per step |
+| --- | --- |
+| lin_gemm_in | 5.02 |
+| moe gateup (routed, fused) | 4.18 |
+| moe down (routed) | 2.50 |
+| output (lm_head) | 2.37 |
+| sample (logits D2H + host sampler) | 2.04 |
+| moe_shared | 1.76 |
+| lin_gemm_out | 1.68 |
+| moe_router | 1.58 |
+| attn_gemm_qkv | 1.45 |
+| lin_delta | 1.24 |
+| attn_core | 0.90 |
+| add | 0.79 |
+| attn_gemm_out | 0.69 |
+| attn / ffn | 0.65 |
+| moe_epilogue | 0.51 |
+| lin_conv | 0.38 |
+| lin_outnorm | 0.33 |
+| lin_normqk | 0.32 |
+| attn_rope_norm | 0.24 |
 
 ## Roofline and open work
 
@@ -106,29 +109,34 @@ reach.
 
 Open items, in priority order:
 
-1. **lm_head gap — explained, rerun pending** — the `output` stage ran from
-    `Mark("output")` to the *next step's* `Mark("embed")`, so it absorbed the
-    engine's synchronous 1 MB logits D2H + host sampling between steps
-    (engine.cpp DecodeStep). `Mark("sample")` now closes the stage right after
-    the lm_head GEMV; the next profile run should show `output` ≈ 2.3 ms
-    (matching the standalone bench) and a new `sample` row for the readback.
-2. **MoE gate/up fusion — done** — `GemvPair` / `GemvGroupedPair`
-   (Q8_0-only, bit-exact to the separate launches per oracle test) merge
-   the shared and routed gate+up GEMVs into one launch each, saving 80
-   launches/step. Router+TopK fusion was rejected: it would reorder the
-   router dot product and break token parity. The remaining
-   `moe_shared`/`moe_router` cost is still launch latency across 40
-   layers (router roofline ≈0.09 ms/step, shared ≈0.56 ms), so the next
-   lever is hipGraph capture of the decode step (blockers: scalar `pos`
-   baked into the Attention cache pointer and `n_kv` argument).
-3. **MTP speculative decoding** — `draft_proposed=0` today; enabling the MTP
-   block is the multiplier that takes 33 → 60+ tps.
+1. **lm_head gap — resolved** — the old `output` stage ran from
+    `Mark("output")` to the *next step's* `Mark("embed")`, absorbing the
+    engine's synchronous 1 MB logits D2H + host sampling. With
+    `Mark("sample")` the GEMV measures 2.37 ms/step — at roofline — and
+    the readback shows as its own `sample` row (2.04 ms/step).
+2. **`sample` stage** — 2.04 ms/step for a 1 MB logits D2H plus host
+    argmax/sampling. A pinned async D2H (or GPU-side argmax) removes
+    most of it; it is the largest non-kernel cost.
+3. **Same-`x` projection fusion — done** — `GemvMulti` (Q8_0-only,
+    bit-exact per oracle test) folds up to four projections sharing one
+    activation row into a single launch: `lin_gemm_in` 4-in-1,
+    `attn_gemm_qkv` and `moe_shared` gate/up/gate_inp 3-in-1. Cold-L2
+    bench (`tools/bench/moe_gemv_bench.hip`): lin_gemm_in −10.8 %
+    (211 GB/s), shared expert 0.0197 → 0.0096 ms warm. Together with
+    `GemvGroupedPair` (routed gate+up) this removes 140 launches/step.
+    Router+TopK fusion was rejected: it would reorder the router dot
+    product and break token parity. vec4 int8 loads measured only
+    +9.5 % cold and are not bit-exact — rejected. The next lever is
+    hipGraph capture of the decode step (blockers: scalar `pos` baked
+    into the Attention cache pointer and `n_kv` argument).
+4. **MTP speculative decoding** — `draft_proposed=0` today; enabling the
+   MTP block is the multiplier that takes 33 → 60+ tps.
 
 ## Verification
 
 - Oracle tests (run directly, MB-scale):
   `qwen36_a3b_rocm_gemv_test` (includes bit-exact checks for
-  `GemvQ8_0Pair` / `GemvGroupedQ8_0Pair` vs the separate launches),
+  `GemvQ8_0Multi4` / `GemvGroupedQ8_0Pair` vs the separate launches),
   `qwen36_a3b_rocm_gdn_test`, `qwen36_a3b_rocm_attention_test` — all
   pass; GdnDelta errors match the pre-refactor reference bit-for-bit.
 - Forward test (user-run, loads the 40 GB model): trunk step0 0.0107703,
