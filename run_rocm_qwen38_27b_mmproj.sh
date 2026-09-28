@@ -83,4 +83,5 @@ MODEL_Q8="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q8_K_XL/Qwen3.
 MMPROJ="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q4_K_XL/mmproj-BF16.gguf"
 DFLASH="/home/praburaja/projects/llm/models/gguf/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 
-build_rocm10/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL_Q8" --mmproj "$MMPROJ" --speculative dflash2 --dflash-model "$DFLASH" --sessions 2 --think on --reasoning-effort xhigh
+#build_rocm10/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL_Q8" --mmproj "$MMPROJ" --speculative dflash2 --dflash-model "$DFLASH" --sessions 2 --think on --reasoning-effort xhigh
+build_rocm10/gufo serve llm -v -i "0.0.0.0" -p 8083 -c 131072 -n 32768 --model "$MODEL_Q8" --mmproj "$MMPROJ" --speculative mtp --speculative mtp --min-draft-tokens 2 --draft-tokens 6 --sessions 2 --think on --reasoning-effort xhigh

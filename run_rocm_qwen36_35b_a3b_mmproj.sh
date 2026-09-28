@@ -82,6 +82,6 @@ MODEL_Q4=""
 MODEL_Q8="/home/praburaja/projects/llm/models/gguf/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
 MMPROJ="/home/praburaja/projects/llm/models/gguf/Qwen3.6-35B-A3B-MTP/mmproj-BF16.gguf"
 
-build/gpu-test/gufo serve llm -v -i "0.0.0.0" -p 8093 -c 131072 -n 32768 --model "$MODEL_Q8" --sessions 1
+build/gpu-test/gufo serve llm -v -i "0.0.0.0" -p 8093 -c 131072 -n 32768 --model "$MODEL_Q8" --sessions 1 --think off
 #build/gpu-test/gufo chat -v -n 32768 --model "$MODEL_Q8"
 #build/gpu-test/gufo prompt -v -n 2048 --model "$MODEL_Q8" -p "Capital of Russia is"

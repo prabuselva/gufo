@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/models/qwen36_a3b/kernels/rocm/device_model.hpp"
+#include "src/models/qwen36_a3b/kernels/rocm/profile.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {
 
@@ -87,6 +88,7 @@ private:
   float* AllocFloats(std::size_t n, std::string* error);
   std::int32_t* AllocInts(std::size_t n, std::string* error);
   std::uint32_t* AllocUints(std::size_t n, std::string* error);
+  void* AllocBytes(std::size_t bytes, std::string* error);
 
   const Config& c_;
   const DeviceModel& model_;
@@ -125,6 +127,7 @@ private:
   float* gqa_gate_{nullptr};
   float* gqa_ctx_{nullptr};
   float* gqa_scratch_{nullptr};
+  float* gqa_part_{nullptr};
 
   // Mixture-of-experts scratch (reused across layers).
   float* moe_logits_{nullptr};
@@ -135,7 +138,6 @@ private:
   float* moe_up_{nullptr};
   float* moe_shared_down_{nullptr};
   float* moe_shared_gate_{nullptr};
-  std::vector<std::int32_t> moe_ids_host_;
 
   // Batched prefill scratch, sized to prefill_chunk_ tokens. The decode path
   // reuses the single-token buffers above; prefill drives these and never
@@ -144,6 +146,8 @@ private:
   std::uint32_t prefill_chunk_{0};
   float* pf_router_logits_{nullptr};
   std::int32_t* pf_ids_{nullptr};
+  std::uint32_t* pf_expert_counts_{nullptr};
+  std::vector<std::uint32_t> pf_counts_host_;
   float* pf_weights_{nullptr};
   float* pf_gate_{nullptr};
   float* pf_up_{nullptr};
@@ -152,6 +156,18 @@ private:
   float* pf_shared_up_{nullptr};
   float* pf_shared_down_{nullptr};
   float* pf_shared_gate_inp_{nullptr};
+
+  // Routed F16 WMMA MoE scratch (prefill). The compacted bucket layout, the
+  // (expert, row-tile) map and the F16 activation/intermediate rows used by
+  // the matrix-core expert GEMMs. Only touched on the WMMA route.
+  std::int32_t* pf_pad_bounds_{nullptr};
+  std::int32_t* pf_cursors_{nullptr};
+  std::int32_t* pf_rows_token_{nullptr};
+  std::int32_t* pf_rows_slot_{nullptr};
+  std::int32_t* pf_tiles_dev_{nullptr};
+  std::vector<std::int32_t> pf_tiles_host_;
+  void* pf_x_half_{nullptr};
+  void* pf_up_half_{nullptr};
 
   // Prefill residual stream and per-layer intermediates, [chunk][hidden].
   float* pf_x_{nullptr};
@@ -197,6 +213,11 @@ private:
   float* mtp_v_cache_{nullptr};
 
   std::vector<void*> allocations_;
+
+  // Env-gated (GUFO_QWEN36_PROFILE=1) per-stage GPU timer for the forward
+  // path. No-op unless the variable is set.
+  StageProfiler prof_;
+  std::uint32_t decode_steps_{0};
 };
 
 }  // namespace gufo::models::qwen36_a3b::rocm

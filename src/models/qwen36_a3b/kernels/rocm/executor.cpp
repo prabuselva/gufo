@@ -1,12 +1,15 @@
 #include "src/models/qwen36_a3b/kernels/rocm/executor.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
 #include "src/models/qwen36_a3b/kernels/rocm/gemv.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/gemm.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/kernels.hpp"
+#include "src/models/qwen36_a3b/kernels/rocm/routed_f16.hpp"
 #include "qfn_mmq.h"
 
 namespace gufo::models::qwen36_a3b::rocm {
@@ -130,6 +133,20 @@ std::uint32_t* Executor::AllocUints(std::size_t n, std::string* error) {
   return p;
 }
 
+void* Executor::AllocBytes(std::size_t bytes, std::string* error) {
+  void* p = nullptr;
+  if (bytes > 0 && hipMalloc(&p, bytes) != hipSuccess) {
+    if (error != nullptr) {
+      *error = "hipMalloc failed for executor scratch";
+    }
+    return nullptr;
+  }
+  if (p != nullptr) {
+    allocations_.push_back(p);
+  }
+  return p;
+}
+
 std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                                            std::uint32_t max_context,
                                            std::string* error_msg) {
@@ -180,6 +197,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->gqa_ctx_ = e->AllocFloats(c.AttentionQDim(), error_msg);
   e->gqa_scratch_ = e->AllocFloats(
       static_cast<std::size_t>(c.num_heads) * max_context, error_msg);
+  e->gqa_part_ = e->AllocFloats(static_cast<std::size_t>(c.num_heads) * 32U *
+                                    (c.AttentionQDim() / c.num_heads + 2U),
+                                error_msg);
 
   // Mixture-of-experts scratch.
   e->moe_logits_ = e->AllocFloats(c.num_experts, error_msg);
@@ -187,11 +207,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->moe_weights_ = e->AllocFloats(c.num_experts_used, error_msg);
   e->moe_expert_out_ = e->AllocFloats(
       static_cast<std::size_t>(c.num_experts_used) * c.hidden_size, error_msg);
-  e->moe_gate_ = e->AllocFloats(c.expert_ff, error_msg);
-  e->moe_up_ = e->AllocFloats(c.expert_ff, error_msg);
+  e->moe_gate_ = e->AllocFloats(
+      static_cast<std::size_t>(c.num_experts_used) * c.expert_ff, error_msg);
+  e->moe_up_ = e->AllocFloats(
+      static_cast<std::size_t>(c.num_experts_used) * c.expert_ff, error_msg);
   e->moe_shared_down_ = e->AllocFloats(c.hidden_size, error_msg);
   e->moe_shared_gate_ = e->AllocFloats(1, error_msg);
-  e->moe_ids_host_.assign(c.num_experts_used, 0);
 
   // Batched prefill scratch. The chunk is capped at 2048 tokens (and at the
   // context length) to bound the (token, slot) MoE buffers near ~230 MB.
@@ -203,6 +224,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->pf_router_logits_ = e->AllocFloats(
       static_cast<std::size_t>(chunk) * c.num_experts, error_msg);
   e->pf_ids_ = e->AllocInts(pairs, error_msg);
+  e->pf_expert_counts_ = e->AllocUints(c.num_experts, error_msg);
+  e->pf_counts_host_.assign(c.num_experts, 0u);
   e->pf_weights_ = e->AllocFloats(pairs, error_msg);
   e->pf_gate_ = e->AllocFloats(pairs * c.expert_ff, error_msg);
   e->pf_up_ = e->AllocFloats(pairs * c.expert_ff, error_msg);
@@ -216,6 +239,24 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->pf_shared_down_ =
       e->AllocFloats(static_cast<std::size_t>(chunk) * c.hidden_size, error_msg);
   e->pf_shared_gate_inp_ = e->AllocFloats(chunk, error_msg);
+
+  // Routed F16 WMMA MoE scratch. The compacted bucket layout needs
+  // RoutedCompactRows rows; the (expert, row-tile) map is bounded by one tile
+  // per 16 padded rows plus one per expert. The F16 activation and up rows
+  // mirror the F32 gate/expert buffers at half the bytes.
+  const std::size_t compact_rows = RoutedCompactRows(pairs, c.num_experts);
+  e->pf_pad_bounds_ = e->AllocInts(c.num_experts + 1, error_msg);
+  e->pf_cursors_ = e->AllocInts(c.num_experts, error_msg);
+  e->pf_rows_token_ = e->AllocInts(compact_rows, error_msg);
+  e->pf_rows_slot_ = e->AllocInts(compact_rows, error_msg);
+  const std::size_t max_tiles = pairs / 16 + c.num_experts + 16;
+  e->pf_tiles_dev_ = e->AllocInts(max_tiles, error_msg);
+  e->pf_tiles_host_.assign(max_tiles, 0);
+  e->pf_x_half_ = e->AllocBytes(
+      static_cast<std::size_t>(chunk) * c.hidden_size * sizeof(__half),
+      error_msg);
+  e->pf_up_half_ =
+      e->AllocBytes(pairs * c.expert_ff * sizeof(__half), error_msg);
 
   // Prefill residual stream and per-layer intermediates.
   e->pf_x_ = e->AllocFloats(static_cast<std::size_t>(chunk) * c.hidden_size,
@@ -332,6 +373,7 @@ void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
   const std::uint32_t d = c_.ssm_head_dim;
   const std::uint32_t kern = c_.ssm_conv_kernel;
 
+  prof_.Mark("lin_gemm_in");
   Gemv(l.ssm_qkv.data, ToGemvType(l.ssm_qkv.type), l.ssm_qkv.rows,
        l.ssm_qkv.cols, l.ssm_qkv.row_bytes, x, gdn_qkv_, nullptr);
   Gemv(l.ssm_gate.data, ToGemvType(l.ssm_gate.type), l.ssm_gate.rows,
@@ -341,15 +383,20 @@ void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
   Gemv(l.ssm_beta.data, ToGemvType(l.ssm_beta.type), l.ssm_beta.rows,
        l.ssm_beta.cols, l.ssm_beta.row_bytes, x, gdn_beta_, nullptr);
 
+  prof_.Mark("lin_conv");
   GdnConv(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], gdn_convolved_,
           channels, kern, nullptr);
+  prof_.Mark("lin_normqk");
   GdnNormQk(gdn_convolved_, gdn_qn_, gdn_kn_, c_.ssm_num_k_heads, d, c_.rms_eps,
             nullptr);
+  prof_.Mark("lin_delta");
   GdnDelta(gdn_qn_, gdn_kn_, gdn_convolved_ + 2 * key_dim, gdn_alpha_,
            gdn_beta_, l.ssm_a.f32(), l.ssm_dt.f32(), gdn_state_[il], gdn_attn_,
            c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, nullptr);
+  prof_.Mark("lin_outnorm");
   GdnOutNorm(gdn_attn_, gdn_z_, l.ssm_norm.f32(), c_.ssm_num_v_heads, d,
              c_.rms_eps, nullptr);
+  prof_.Mark("lin_gemm_out");
   Gemv(l.ssm_out.data, ToGemvType(l.ssm_out.type), l.ssm_out.rows,
        l.ssm_out.cols, l.ssm_out.row_bytes, gdn_attn_, out, nullptr);
 }
@@ -361,6 +408,7 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
   const std::uint32_t nh = c_.num_heads;
   const std::uint32_t nkv = c_.num_kv_heads;
 
+  prof_.Mark("attn_gemm_qkv");
   Gemv(l.attn_q.data, ToGemvType(l.attn_q.type), l.attn_q.rows, l.attn_q.cols,
        l.attn_q.row_bytes, x, gqa_qg_, nullptr);
   Gemv(l.attn_k.data, ToGemvType(l.attn_k.type), l.attn_k.rows, l.attn_k.cols,
@@ -368,13 +416,15 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
   Gemv(l.attn_v.data, ToGemvType(l.attn_v.type), l.attn_v.rows, l.attn_v.cols,
        l.attn_v.row_bytes, x, gqa_v_, nullptr);
 
-  SplitQGate(gqa_qg_, gqa_q_, gqa_gate_, nh, hd, nullptr);
+  prof_.Mark("attn_rope_norm");
+  SplitQGate(gqa_qg_, gqa_q_, gqa_gate_, nh, hd, 1, nullptr);
   RmsNormRows(gqa_q_, l.attn_q_norm.f32(), gqa_q_, nh, hd, c_.rms_eps, nullptr);
   RmsNormRows(gqa_k_, l.attn_k_norm.f32(), gqa_k_, nkv, hd, c_.rms_eps,
               nullptr);
   Rope(gqa_q_, pos_dev, 1, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr);
   Rope(gqa_k_, pos_dev, 1, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr);
 
+  prof_.Mark("attn_core");
   const std::size_t kv_row = static_cast<std::size_t>(nkv) * hd;
   (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(pos) * kv_row, gqa_k_,
                        kv_row * sizeof(float), hipMemcpyDeviceToDevice,
@@ -385,36 +435,39 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
 
   const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
   AttentionDecode(gqa_q_, k_cache, v_cache, gqa_gate_, gqa_ctx_, gqa_scratch_,
-                  pos + 1, nh, nkv, hd, scale, nullptr);
+                  gqa_part_, pos + 1, nh, nkv, hd, scale, nullptr);
+  prof_.Mark("attn_gemm_out");
   Gemv(l.attn_out.data, ToGemvType(l.attn_out.type), l.attn_out.rows,
        l.attn_out.cols, l.attn_out.row_bytes, gqa_ctx_, out, nullptr);
 }
 
 void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
+  prof_.Mark("moe_router");
   Gemv(l.router.data, ToGemvType(l.router.type), l.router.rows, l.router.cols,
        l.router.row_bytes, x, moe_logits_, nullptr);
   RouterTopK(moe_logits_, c_.num_experts, moe_ids_, moe_weights_, 1,
              c_.num_experts, c_.num_experts_used, nullptr);
-  (void)hipMemcpy(moe_ids_host_.data(), moe_ids_,
-                  c_.num_experts_used * sizeof(std::int32_t),
-                  hipMemcpyDeviceToHost);
 
-  for (std::uint32_t s = 0; s < c_.num_experts_used; ++s) {
-    const std::uint32_t e = static_cast<std::uint32_t>(moe_ids_host_[s]);
-    Gemv(l.ffn_gate_exps.Expert(e), ToGemvType(l.ffn_gate_exps.type),
-         l.ffn_gate_exps.rows, l.ffn_gate_exps.cols, l.ffn_gate_exps.row_bytes,
-         x, moe_gate_, nullptr);
-    Gemv(l.ffn_up_exps.Expert(e), ToGemvType(l.ffn_up_exps.type),
-         l.ffn_up_exps.rows, l.ffn_up_exps.cols, l.ffn_up_exps.row_bytes, x,
-         moe_up_, nullptr);
-    Swiglu(moe_gate_, moe_up_, c_.expert_ff, nullptr);
-    Gemv(l.ffn_down_exps.Expert(e), ToGemvType(l.ffn_down_exps.type),
-         l.ffn_down_exps.rows, l.ffn_down_exps.cols, l.ffn_down_exps.row_bytes,
-         moe_gate_,
-         moe_expert_out_ + static_cast<std::size_t>(s) * c_.hidden_size,
-         nullptr);
-  }
+  // One launch per stage over all selected experts; the ids never leave the
+  // device, so the decode pipeline never stalls on a host round-trip.
+  prof_.Mark("moe_gate");
+  GemvGrouped(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
+              l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_,
+              c_.num_experts_used, l.ffn_gate_exps.rows, l.ffn_gate_exps.cols,
+              x, 0U, moe_gate_, nullptr);
+  prof_.Mark("moe_up");
+  GemvGrouped(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
+              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_,
+              c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols, x,
+              0U, moe_up_, nullptr);
+  Swiglu(moe_gate_, moe_up_, c_.num_experts_used * c_.expert_ff, nullptr);
+  prof_.Mark("moe_routed_down");
+  GemvGrouped(l.ffn_down_exps.data, ToGemvType(l.ffn_down_exps.type),
+              l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, moe_ids_,
+              c_.num_experts_used, l.ffn_down_exps.rows, l.ffn_down_exps.cols,
+              moe_gate_, c_.expert_ff, moe_expert_out_, nullptr);
 
+  prof_.Mark("moe_shared");
   Gemv(l.shexp_gate.data, ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
        l.shexp_gate.cols, l.shexp_gate.row_bytes, x, moe_gate_, nullptr);
   Gemv(l.shexp_up.data, ToGemvType(l.shexp_up.type), l.shexp_up.rows,
@@ -426,6 +479,7 @@ void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
   Gemv(l.shexp_gate_inp.data, ToGemvType(l.shexp_gate_inp.type),
        l.shexp_gate_inp.rows, l.shexp_gate_inp.cols, l.shexp_gate_inp.row_bytes,
        x, moe_shared_gate_, nullptr);
+  prof_.Mark("moe_epilogue");
   MoeEpilogue(moe_expert_out_, moe_weights_, moe_shared_down_, moe_shared_gate_,
               1, out, 1, c_.num_experts_used, c_.hidden_size, nullptr);
 }
@@ -440,29 +494,122 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   const std::uint32_t pairs = tokens * used;
 
   // Router: [tokens][experts], then the batched top-k. The ids stay on device.
+  prof_.Mark("moe_router");
   Gemm(l.router.data, ToGemvType(l.router.type), l.router.rows, l.router.cols,
        l.router.row_bytes, x, pf_router_logits_, tokens, nullptr);
   RouterTopK(pf_router_logits_, experts, pf_ids_, pf_weights_, tokens, experts,
              used, nullptr);
 
   // Routed experts: gate/up -> SwiGLU -> down, one row per (token, slot) pair.
-  // The down projection treats each pair as its own row routed by that pair's
-  // expert id, so it runs with n_expert_used = 1 over `pairs` rows.
-  GemmMoe(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
-          l.ffn_gate_exps.rows, l.ffn_gate_exps.cols,
-          l.ffn_gate_exps.row_bytes, x, pf_ids_, pf_gate_, tokens, experts, used,
-          nullptr);
-  GemmMoe(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
-          l.ffn_up_exps.rows, l.ffn_up_exps.cols, l.ffn_up_exps.row_bytes, x,
-          pf_ids_, pf_up_, tokens, experts, used, nullptr);
-  Swiglu(pf_gate_, pf_up_, static_cast<std::size_t>(pairs) * expert_ff,
-         nullptr);
-  GemmMoe(l.ffn_down_exps.data, ToGemvType(l.ffn_down_exps.type),
-          l.ffn_down_exps.rows, l.ffn_down_exps.cols,
-          l.ffn_down_exps.row_bytes, pf_gate_, pf_ids_, pf_expert_out_, pairs,
-          experts, 1, nullptr);
+  // The matrix-core F16 route (ported from Qwen3.8-Flash-Next) is ~55x faster
+  // per MAC than the dp4a MMQ grouped path on gfx1151: the assignments are
+  // compacted by expert into 16-row padded buckets, the token rows narrowed to
+  // F16 once, then one WMMA GEMM per (expert, row tile). Expert encodings the
+  // WMMA kernel does not decode (Q6_K, F16, BF16, F32) fall back to the dp4a
+  // MMQ grouped GEMM below.
+  ExpertCounts(pf_ids_, pf_expert_counts_, tokens, experts, used, nullptr);
+  (void)hipMemcpy(pf_counts_host_.data(), pf_expert_counts_,
+                  experts * sizeof(std::uint32_t), hipMemcpyDeviceToHost);
+  // Per-tensor route: the WMMA matrix-core path decodes Q8_0 and BF16 expert
+  // weights (this dynamic quant keeps a few BF16 expert tensors). Each of
+  // gate/up/down is dispatched with its own encoding; a layer with any other
+  // encoding (Q6_K, F16, F32) falls back to the dp4a MMQ grouped GEMM below.
+  const auto supported = [](core::GgmlType t) {
+    return t == core::GgmlType::kQ8_0 || t == core::GgmlType::kBF16;
+  };
+  const auto wtype = [](core::GgmlType t) {
+    return t == core::GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kQ8_0;
+  };
+  const bool wmma = supported(l.ffn_gate_exps.type) &&
+                    supported(l.ffn_up_exps.type) &&
+                    supported(l.ffn_down_exps.type) && hidden % 64 == 0 &&
+                    expert_ff % 64 == 0;
+
+  std::uint32_t n_tiles = 0;
+  if (wmma) {
+    // Build the (expert, row-tile) map: one entry per 64-row tile of each
+    // expert's 16-padded bucket, packed as expert | (tile << 16).
+    for (std::uint32_t e = 0; e < experts; ++e) {
+      const std::uint32_t padded = (pf_counts_host_[e] + 15u) / 16u * 16u;
+      for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j) {
+        pf_tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+      }
+    }
+    if (n_tiles > 0) {
+      (void)hipMemcpy(pf_tiles_dev_, pf_tiles_host_.data(),
+                      n_tiles * sizeof(std::int32_t), hipMemcpyHostToDevice);
+    }
+  } else {
+    // Bound the routed MMQ column grid to the real largest expert bucket.
+    // Without this the grid is sized by the full pair count (tokens*used), so
+    // every expert launches ~pair/mmq_x column tiles that reserve shared memory
+    // and exit, collapsing occupancy. The down projection routes the same pairs
+    // with n_expert_used=1, so one set of hints covers gate, up and down.
+    std::uint32_t max_rows = 0;
+    for (std::uint32_t e = 0; e < experts; ++e) {
+      max_rows = std::max(max_rows, pf_counts_host_[e]);
+    }
+    qfn_mmq_set_routed_max_expert_rows(
+        static_cast<int>(std::max(1u, max_rows)));
+    qfn_mmq_set_routed_tile_cols(
+        qfn_mmq_routed_tile_cols_for_counts(pf_counts_host_.data(),
+                                            static_cast<int>(experts)));
+  }
+
+  prof_.Mark("moe_compact");
+  if (wmma) {
+    RoutedCompact(pf_ids_, pf_expert_counts_, pf_pad_bounds_, pf_cursors_,
+                  pf_rows_token_, pf_rows_slot_, tokens, used, experts,
+                  nullptr);
+    NarrowActivations(x, pf_x_half_, false,
+                      static_cast<std::size_t>(tokens) * hidden, nullptr);
+    const auto* x_half = static_cast<const __half*>(pf_x_half_);
+    auto* up_half = static_cast<__half*>(pf_up_half_);
+    prof_.Mark("moe_gate");
+    if (n_tiles > 0) {
+      // gate -> F32 pf_gate_ (indexed by slot).
+      (void)RoutedF16Gemm(l.ffn_gate_exps.data, wtype(l.ffn_gate_exps.type),
+                          x_half, pf_tiles_dev_, n_tiles, 64, pf_pad_bounds_,
+                          pf_rows_token_, pf_rows_slot_, nullptr, pf_gate_,
+                          nullptr, expert_ff, hidden, nullptr);
+    }
+    prof_.Mark("moe_up");
+    if (n_tiles > 0) {
+      // up -> F16 up_half with the SwiGLU gate folded in from pf_gate_.
+      (void)RoutedF16Gemm(l.ffn_up_exps.data, wtype(l.ffn_up_exps.type), x_half,
+                          pf_tiles_dev_, n_tiles, 64, pf_pad_bounds_,
+                          pf_rows_token_, pf_rows_slot_, pf_gate_, nullptr,
+                          up_half, expert_ff, hidden, nullptr);
+    }
+    prof_.Mark("moe_routed_down");
+    if (n_tiles > 0) {
+      // down reads the F16 up rows (indexed by slot) and scatters F32 to
+      // pf_expert_out_ (indexed by slot), matching MoeEpilogue's layout.
+      (void)RoutedF16Gemm(l.ffn_down_exps.data, wtype(l.ffn_down_exps.type),
+                          up_half, pf_tiles_dev_, n_tiles, 64, pf_pad_bounds_,
+                          pf_rows_slot_, pf_rows_slot_, nullptr, pf_expert_out_,
+                          nullptr, hidden, expert_ff, nullptr);
+    }
+  } else {
+    prof_.Mark("dp4a_gateup");
+    GemmMoe(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
+            l.ffn_gate_exps.rows, l.ffn_gate_exps.cols,
+            l.ffn_gate_exps.row_bytes, x, pf_ids_, pf_gate_, tokens, experts,
+            used, nullptr);
+    GemmMoe(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
+            l.ffn_up_exps.rows, l.ffn_up_exps.cols, l.ffn_up_exps.row_bytes, x,
+            pf_ids_, pf_up_, tokens, experts, used, nullptr);
+    Swiglu(pf_gate_, pf_up_, static_cast<std::size_t>(pairs) * expert_ff,
+           nullptr);
+    prof_.Mark("dp4a_down");
+    GemmMoe(l.ffn_down_exps.data, ToGemvType(l.ffn_down_exps.type),
+            l.ffn_down_exps.rows, l.ffn_down_exps.cols,
+            l.ffn_down_exps.row_bytes, pf_gate_, pf_ids_, pf_expert_out_, pairs,
+            experts, 1, nullptr);
+  }
 
   // Shared expert: a single dense projection, batched over the tokens.
+  prof_.Mark("moe_shared");
   Gemm(l.shexp_gate.data, ToGemvType(l.shexp_gate.type), l.shexp_gate.rows,
        l.shexp_gate.cols, l.shexp_gate.row_bytes, x, pf_shared_gate_, tokens,
        nullptr);
@@ -477,6 +624,7 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
        l.shexp_gate_inp.rows, l.shexp_gate_inp.cols,
        l.shexp_gate_inp.row_bytes, x, pf_shared_gate_inp_, tokens, nullptr);
 
+  prof_.Mark("moe_epilogue");
   MoeEpilogue(pf_expert_out_, pf_weights_, pf_shared_down_, pf_shared_gate_inp_,
               1, out, tokens, used, hidden, nullptr);
 }
@@ -488,6 +636,7 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
   const std::uint32_t d = c_.ssm_head_dim;
   const std::uint32_t kern = c_.ssm_conv_kernel;
 
+  prof_.Mark("lin_gemm_in");
   Gemm(l.ssm_qkv.data, ToGemvType(l.ssm_qkv.type), l.ssm_qkv.rows,
        l.ssm_qkv.cols, l.ssm_qkv.row_bytes, x, pf_qkv_, tokens, nullptr);
   Gemm(l.ssm_gate.data, ToGemvType(l.ssm_gate.type), l.ssm_gate.rows,
@@ -497,21 +646,27 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
   Gemm(l.ssm_beta.data, ToGemvType(l.ssm_beta.type), l.ssm_beta.rows,
        l.ssm_beta.cols, l.ssm_beta.row_bytes, x, pf_beta_, tokens, nullptr);
 
+  prof_.Mark("lin_conv");
   GdnConvPrefill(pf_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], pf_convolved_,
                  tokens, channels, kern, nullptr);
+  prof_.Mark("lin_normqk");
   GdnNormQkPrefill(pf_convolved_, pf_qn_, pf_kn_, tokens, c_.ssm_num_k_heads,
                    channels, d, c_.rms_eps, nullptr);
+  prof_.Mark("lin_delta");
   GdnDeltaLoop(pf_qn_, pf_kn_, pf_convolved_, pf_alpha_, pf_beta_,
                l.ssm_a.f32(), l.ssm_dt.f32(), gdn_state_[il], pf_gdn_attn_,
                tokens, c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, channels,
                nullptr);
+  prof_.Mark("lin_outnorm");
   GdnOutNormPrefill(pf_gdn_attn_, pf_z_, l.ssm_norm.f32(), tokens,
                     c_.ssm_num_v_heads, d, c_.rms_eps, nullptr);
+  prof_.Mark("lin_gemm_out");
   Gemm(l.ssm_out.data, ToGemvType(l.ssm_out.type), l.ssm_out.rows,
        l.ssm_out.cols, l.ssm_out.row_bytes, pf_gdn_attn_, out, tokens, nullptr);
 
   // Advance the rolling conv history past the chunk (reading the pre-chunk
   // history, writing a disjoint buffer) and publish it for the next chunk.
+  prof_.Mark("lin_hist");
   GdnHistoryUpdate(pf_qkv_, gdn_history_[il], pf_hist_new_, tokens, channels,
                    kern, nullptr);
   (void)hipMemcpyAsync(gdn_history_[il], pf_hist_new_,
@@ -527,9 +682,9 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
   const std::uint32_t hd = c_.head_dim;
   const std::uint32_t nh = c_.num_heads;
   const std::uint32_t nkv = c_.num_kv_heads;
-  const std::size_t q_dim = c_.AttentionQDim();
   const std::size_t kv_row = static_cast<std::size_t>(nkv) * hd;
 
+  prof_.Mark("attn_gemm_qkv");
   Gemm(l.attn_q.data, ToGemvType(l.attn_q.type), l.attn_q.rows, l.attn_q.cols,
        l.attn_q.row_bytes, x, pf_qg_, tokens, nullptr);
   Gemm(l.attn_k.data, ToGemvType(l.attn_k.type), l.attn_k.rows, l.attn_k.cols,
@@ -537,11 +692,9 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
   Gemm(l.attn_v.data, ToGemvType(l.attn_v.type), l.attn_v.rows, l.attn_v.cols,
        l.attn_v.row_bytes, x, pf_v_, tokens, nullptr);
 
-  for (std::uint32_t t = 0; t < tokens; ++t) {
-    SplitQGate(pf_qg_ + static_cast<std::size_t>(t) * 2 * q_dim,
-               pf_q_ + static_cast<std::size_t>(t) * q_dim,
-               pf_qgate_ + static_cast<std::size_t>(t) * q_dim, nh, hd, nullptr);
-  }
+  prof_.Mark("attn_splitqgate");
+  SplitQGate(pf_qg_, pf_q_, pf_qgate_, nh, hd, tokens, nullptr);
+  prof_.Mark("attn_rope_norm");
   RmsNormRows(pf_q_, l.attn_q_norm.f32(), pf_q_, tokens * nh, hd, c_.rms_eps,
               nullptr);
   RmsNormRows(pf_k_, l.attn_k_norm.f32(), pf_k_, tokens * nkv, hd, c_.rms_eps,
@@ -551,6 +704,7 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
 
   // Publish the chunk's rotated keys/values at their absolute positions, then
   // read the whole prefix back causally.
+  prof_.Mark("attn_kv_write");
   (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(start) * kv_row,
                        pf_k_, tokens * kv_row * sizeof(float),
                        hipMemcpyDeviceToDevice, nullptr);
@@ -558,9 +712,11 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
                        pf_v_, tokens * kv_row * sizeof(float),
                        hipMemcpyDeviceToDevice, nullptr);
 
+  prof_.Mark("attn_core");
   const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
   AttentionPrefill(pf_q_, k_cache, v_cache, pf_qgate_, pf_ctx_, start, tokens,
                    nh, nkv, hd, scale, nullptr);
+  prof_.Mark("attn_gemm_out");
   Gemm(l.attn_out.data, ToGemvType(l.attn_out.type), l.attn_out.rows,
        l.attn_out.cols, l.attn_out.row_bytes, pf_ctx_, out, tokens, nullptr);
 }
@@ -590,6 +746,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
   }
 
   const std::uint32_t hidden = c_.hidden_size;
+  prof_.Reset();
   std::uint32_t done = 0;
   std::uint32_t last_rows = 0;
   while (done < count) {
@@ -601,6 +758,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
     for (std::uint32_t t = 0; t < rows; ++t) {
       host_pos[t] = start + t;
     }
+    prof_.Mark("embed");
     (void)hipMemcpyAsync(pf_pos_, host_pos.data(),
                          rows * sizeof(std::uint32_t), hipMemcpyHostToDevice,
                          nullptr);
@@ -613,6 +771,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
 
     for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
       const DeviceLayer& l = model_.layers()[il];
+      prof_.Mark("rmsnorm");
       RmsNormRows(pf_x_, l.attn_norm.f32(), pf_normed_, rows, hidden,
                   c_.rms_eps, nullptr);
       if (c_.IsLinearLayer(il)) {
@@ -621,10 +780,13 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
         AttentionBatch(l, pf_normed_, start, pf_attn_, k_cache_[il],
                        v_cache_[il], pf_pos_, rows);
       }
+      prof_.Mark("add");
       Add(pf_x_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
+      prof_.Mark("rmsnorm");
       RmsNormRows(pf_x_, l.post_attention_norm.f32(), pf_normed_, rows, hidden,
                   c_.rms_eps, nullptr);
       MoeBatch(l, pf_normed_, pf_ffn_, rows);
+      prof_.Mark("add");
       Add(pf_x_, pf_ffn_, static_cast<std::size_t>(rows) * hidden, nullptr);
     }
     done += rows;
@@ -632,6 +794,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
   }
 
   // The final token's hidden state drives the output norm, h_out and logits.
+  prof_.Mark("output");
   const float* last = pf_x_ + static_cast<std::size_t>(last_rows - 1) * hidden;
   RmsNormRows(last, model_.output_norm().f32(), x_, 1, hidden, c_.rms_eps,
               nullptr);
@@ -640,6 +803,12 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
        model_.output().rows, model_.output().cols, model_.output().row_bytes, x_,
        logits_, nullptr);
   position_ += count;
+  if (prof_.enabled()) {
+    char header[128];
+    std::snprintf(header, sizeof(header), "prefill %u tokens, chunk %u", count,
+                  prefill_chunk_);
+    prof_.Report(header);
+  }
   return true;
 }
 
@@ -658,14 +827,19 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
   }
 
   pos_host_ = position_;
+  if (prof_.enabled() && decode_steps_ % 32 == 0) {
+    prof_.Reset();
+  }
   (void)hipMemcpy(pos_dev_, &pos_host_, sizeof(std::uint32_t),
                   hipMemcpyHostToDevice);
 
+  prof_.Mark("embed");
   EmbedRow(model_.token_embd().data, ToGemvType(model_.token_embd().type),
            static_cast<std::uint32_t>(token), c_.hidden_size, x_, nullptr);
 
   for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
     const DeviceLayer& l = model_.layers()[il];
+    prof_.Mark("attn");
     RmsNormRows(x_, l.attn_norm.f32(), normed_, 1, c_.hidden_size, c_.rms_eps,
                 nullptr);
     if (c_.IsLinearLayer(il)) {
@@ -674,13 +848,17 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
       Attention(l, normed_, position_, attn_, k_cache_[il], v_cache_[il],
                 pos_dev_);
     }
+    prof_.Mark("add");
     Add(x_, attn_, c_.hidden_size, nullptr);
+    prof_.Mark("ffn");
     RmsNormRows(x_, l.post_attention_norm.f32(), normed_, 1, c_.hidden_size,
                 c_.rms_eps, nullptr);
     Moe(l, normed_, ffn_);
+    prof_.Mark("add");
     Add(x_, ffn_, c_.hidden_size, nullptr);
   }
 
+  prof_.Mark("output");
   RmsNormRows(x_, model_.output_norm().f32(), x_, 1, c_.hidden_size, c_.rms_eps,
               nullptr);
   (void)hipMemcpy(h_out_, x_, c_.hidden_size * sizeof(float),
@@ -689,6 +867,12 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
        model_.output().rows, model_.output().cols, model_.output().row_bytes,
        x_, logits_, nullptr);
   ++position_;
+  if (prof_.enabled()) {
+    ++decode_steps_;
+    if (decode_steps_ % 32 == 0) {
+      prof_.Report("decode (32 steps)");
+    }
+  }
   return true;
 }
 
