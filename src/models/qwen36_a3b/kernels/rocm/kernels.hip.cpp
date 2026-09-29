@@ -910,7 +910,8 @@ __global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
                                    std::uint32_t tokens, std::uint32_t k_heads,
                                    std::uint32_t v_heads,
                                    std::uint32_t head_dim,
-                                   std::uint32_t channels) {
+                                   std::uint32_t channels, float* snap,
+                                   std::uint32_t snap_rows) {
   const std::uint32_t h = blockIdx.y;
   const std::uint32_t kh = h % k_heads;
   const std::uint32_t j0 = blockIdx.x * kRows;
@@ -984,6 +985,17 @@ __global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
         attn[static_cast<std::size_t>(t) * attn_stride +
              (static_cast<std::size_t>(h) * head_dim + j0 + r)] =
             (po[r] + delta * kq) * q_scale;
+      }
+    }
+    if (snap != nullptr && t < snap_rows) {
+      for (std::uint32_t r = 0; r < kRows; ++r) {
+        float* row = snap + ((static_cast<std::size_t>(t) * v_heads + h) *
+                                 head_dim +
+                             j0 + r) *
+                                head_dim;
+        for (std::uint32_t c = 0; c < kCols; ++c) {
+          row[lane + c * blockDim.x] = s[r][c];
+        }
       }
     }
     for (std::uint32_t c = 0; c < kCols; ++c) {
@@ -1210,7 +1222,8 @@ void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
                   const float* dt, float* state, float* attn,
                   std::uint32_t tokens, std::uint32_t k_heads,
                   std::uint32_t v_heads, std::uint32_t head_dim,
-                  std::uint32_t channels, hipStream_t stream) {
+                  std::uint32_t channels, float* snap, std::uint32_t snap_rows,
+                  hipStream_t stream) {
   static const std::uint32_t warp = [] {
     int ws = 64;
     hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, 0);
@@ -1223,42 +1236,42 @@ void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
     case 8:
       GdnDeltaLoopKernel<kRows, 8><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 7:
       GdnDeltaLoopKernel<kRows, 7><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 6:
       GdnDeltaLoopKernel<kRows, 6><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 5:
       GdnDeltaLoopKernel<kRows, 5><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 4:
       GdnDeltaLoopKernel<kRows, 4><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 3:
       GdnDeltaLoopKernel<kRows, 3><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 2:
       GdnDeltaLoopKernel<kRows, 2><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
     default:
       GdnDeltaLoopKernel<kRows, 1><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-          v_heads, head_dim, channels);
+          v_heads, head_dim, channels, snap, snap_rows);
       break;
   }
 }
@@ -1270,6 +1283,25 @@ void GdnOutNormPrefill(float* attn, const float* z, const float* norm_w,
   const dim3 block(head_dim);
   GdnOutNormPrefillKernel<<<grid, block, 0, stream>>>(attn, z, norm_w, v_heads,
                                                       head_dim, eps);
+}
+
+__global__ void MtpConcatKernel(const float* e, const float* h,
+                                const float* h_prev, float* out,
+                                std::uint32_t hidden) {
+  const std::size_t t = blockIdx.x;
+  const float* h_src = t == 0 ? h_prev : h + (t - 1) * hidden;
+  float* row = out + t * 2 * static_cast<std::size_t>(hidden);
+  const float* e_row = e + t * hidden;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+    row[i] = e_row[i];
+    row[hidden + i] = h_src[i];
+  }
+}
+
+void MtpConcat(const float* e, const float* h, const float* h_prev, float* out,
+               std::uint32_t tokens, std::uint32_t hidden,
+               hipStream_t stream) {
+  MtpConcatKernel<<<tokens, 256, 0, stream>>>(e, h, h_prev, out, hidden);
 }
 
 void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,

@@ -266,7 +266,7 @@ bool RunPrefillCase(std::uint32_t tokens) {
   q::GdnDeltaLoop(d_qn.get(), d_kn.get(), d_convolved.get(), d_alpha.get(),
                   d_beta.get(), d_a.get(), d_dt.get(), d_state.get(),
                   d_attn.get(), tokens, kKHeads, kVHeads, kDim, kChannels,
-                  nullptr);
+                  nullptr, 0, nullptr);
   q::GdnOutNormPrefill(d_attn.get(), d_z.get(), d_norm_w.get(), tokens, kVHeads,
                        kDim, kEps, nullptr);
   t::CheckHip(hipDeviceSynchronize(), "GDN prefill synchronization");
@@ -285,6 +285,7 @@ bool RunPrefillCase(std::uint32_t tokens) {
   t::HipBuffer<float> r_attn_all(attn_count);
   t::Upload(&r_state, state);
   t::Upload(&r_history, history);
+  std::vector<std::vector<float>> dc_states;
   for (std::uint32_t tk = 0; tk < tokens; ++tk) {
     const float* qkv_t = d_qkv.get() + static_cast<std::size_t>(tk) * kChannels;
     q::GdnConv(qkv_t, d_conv_w.get(), r_history.get(), r_conv.get(), kChannels,
@@ -302,6 +303,7 @@ bool RunPrefillCase(std::uint32_t tokens) {
                              static_cast<std::size_t>(tk) * kValueDim,
                          r_attn.get(), kValueDim * sizeof(float),
                          hipMemcpyDeviceToDevice, nullptr);
+    dc_states.push_back(t::Download(&r_state, state_count));
   }
   t::CheckHip(hipDeviceSynchronize(), "GDN decode reference synchronization");
   const auto dc_attn = t::Download(&r_attn_all, attn_count);
@@ -318,6 +320,32 @@ bool RunPrefillCase(std::uint32_t tokens) {
   ok = Check("GdnPrefill history tokens=" + std::to_string(tokens),
              t::WorstRelativeToScale(dc_hist, pf_hist), 1e-4) &&
        ok;
+
+  // Speculative verify rolls the recurrent state back to the last accepted
+  // row, so slot t of the snapshot must equal the decode state after
+  // consuming tokens [0, t].
+  if (tokens > 1) {
+    t::HipBuffer<float> d_snap(static_cast<std::size_t>(tokens - 1) *
+                               state_count);
+    t::Upload(&d_state, state);
+    q::GdnDeltaLoop(d_qn.get(), d_kn.get(), d_convolved.get(), d_alpha.get(),
+                    d_beta.get(), d_a.get(), d_dt.get(), d_state.get(),
+                    d_attn.get(), tokens, kKHeads, kVHeads, kDim, kChannels,
+                    d_snap.get(), tokens - 1, nullptr);
+    t::CheckHip(hipDeviceSynchronize(), "GDN snapshot synchronization");
+    const auto snap =
+        t::Download(&d_snap, static_cast<std::size_t>(tokens - 1) * state_count);
+    double worst = 0.0;
+    for (std::uint32_t tk = 0; tk + 1 < tokens; ++tk) {
+      const std::vector<float> slot(
+          snap.begin() + static_cast<std::size_t>(tk) * state_count,
+          snap.begin() + static_cast<std::size_t>(tk + 1) * state_count);
+      worst = std::max(worst, t::WorstRelativeToScale(dc_states[tk], slot));
+    }
+    ok = Check("GdnPrefill state snapshots tokens=" + std::to_string(tokens),
+               worst, 1e-4) &&
+         ok;
+  }
   return ok;
 }
 

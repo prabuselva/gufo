@@ -328,9 +328,29 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->v_cache_[il] = e->AllocFloats(kv_elems, error_msg);
     }
   }
+  e->gdn_state_snap_.assign(c.num_layers, nullptr);
+  e->gdn_hist_snap_.assign(c.num_layers, nullptr);
   if (model.has_mtp()) {
     e->mtp_k_cache_ = e->AllocFloats(kv_elems, error_msg);
     e->mtp_v_cache_ = e->AllocFloats(kv_elems, error_msg);
+    // Speculative verify: two rows of logits and hidden states, the batched
+    // MTP fill scratch, and one recurrent-state snapshot per linear layer.
+    e->verify_logits_ =
+        e->AllocFloats(2 * static_cast<std::size_t>(c.vocab_size), error_msg);
+    e->verify_h_ = e->AllocFloats(2 * static_cast<std::size_t>(c.hidden_size),
+                                  error_msg);
+    e->pf_mtp_concat_ = e->AllocFloats(
+        static_cast<std::size_t>(chunk) * 2 * c.hidden_size, error_msg);
+    e->pf_mtp_cur_ =
+        e->AllocFloats(static_cast<std::size_t>(chunk) * c.hidden_size,
+                       error_msg);
+    e->mtp_prev_hidden_ = e->AllocFloats(c.hidden_size, error_msg);
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (c.IsLinearLayer(il)) {
+        e->gdn_state_snap_[il] = e->AllocFloats(state_elems, error_msg);
+        e->gdn_hist_snap_[il] = e->AllocFloats(history_elems, error_msg);
+      }
+    }
   }
 
   if (error_msg != nullptr && !error_msg->empty()) {
@@ -363,6 +383,8 @@ void Executor::Reset() {
   if (model_.has_mtp()) {
     (void)hipMemsetAsync(mtp_k_cache_, 0, kv_elems * sizeof(float), nullptr);
     (void)hipMemsetAsync(mtp_v_cache_, 0, kv_elems * sizeof(float), nullptr);
+    (void)hipMemsetAsync(mtp_prev_hidden_, 0,
+                         c_.hidden_size * sizeof(float), nullptr);
   }
 }
 
@@ -675,7 +697,8 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 
 void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
                                     const float* x, float* out,
-                                    std::uint32_t tokens) {
+                                    std::uint32_t tokens, float* state_snap,
+                                    float* hist_snap) {
   const std::uint32_t channels = c_.SsmConvChannels();
   const std::uint32_t d = c_.ssm_head_dim;
   const std::uint32_t kern = c_.ssm_conv_kernel;
@@ -700,7 +723,7 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
   GdnDeltaLoop(pf_qn_, pf_kn_, pf_convolved_, pf_alpha_, pf_beta_,
                l.ssm_a.f32(), l.ssm_dt.f32(), gdn_state_[il], pf_gdn_attn_,
                tokens, c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, channels,
-               nullptr);
+               state_snap, state_snap != nullptr ? tokens - 1 : 0, nullptr);
   prof_.Mark("lin_outnorm");
   GdnOutNormPrefill(pf_gdn_attn_, pf_z_, l.ssm_norm.f32(), tokens,
                     c_.ssm_num_v_heads, d, c_.rms_eps, nullptr);
@@ -710,7 +733,13 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
 
   // Advance the rolling conv history past the chunk (reading the pre-chunk
   // history, writing a disjoint buffer) and publish it for the next chunk.
+  // Snapshot the history after the first row when a verify rollback may need
+  // to rewind past the second row.
   prof_.Mark("lin_hist");
+  if (hist_snap != nullptr) {
+    GdnHistoryUpdate(pf_qkv_, gdn_history_[il], hist_snap, 1, channels, kern,
+                     nullptr);
+  }
   GdnHistoryUpdate(pf_qkv_, gdn_history_[il], pf_hist_new_, tokens, channels,
                    kern, nullptr);
   (void)hipMemcpyAsync(gdn_history_[il], pf_hist_new_,
@@ -833,15 +862,30 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
       prof_.Mark("add");
       Add(pf_x_, pf_ffn_, static_cast<std::size_t>(rows) * hidden, nullptr);
     }
+
+    // Fill the MTP block's caches over this chunk so the first draft after
+    // prefill reads a prefix aligned with the trunk. Norming the residual
+    // yields the block's hidden inputs; the last row also drives the logits
+    // stage below (MtpPrefillChunk reuses pf_x_ for its own residual).
+    if (model_.has_mtp()) {
+      RmsNormRows(pf_x_, model_.output_norm().f32(), pf_normed_, rows, hidden,
+                  c_.rms_eps, nullptr);
+      (void)hipMemcpyAsync(x_, pf_normed_ + (rows - 1) * hidden,
+                           hidden * sizeof(float), hipMemcpyDeviceToDevice,
+                           nullptr);
+      MtpPrefillChunk(tokens + done, rows, start, pf_normed_);
+    }
     done += rows;
     last_rows = rows;
   }
 
   // The final token's hidden state drives the output norm, h_out and logits.
   prof_.Mark("output");
-  const float* last = pf_x_ + static_cast<std::size_t>(last_rows - 1) * hidden;
-  RmsNormRows(last, model_.output_norm().f32(), x_, 1, hidden, c_.rms_eps,
-              nullptr);
+  if (!model_.has_mtp()) {
+    const float* last = pf_x_ + static_cast<std::size_t>(last_rows - 1) * hidden;
+    RmsNormRows(last, model_.output_norm().f32(), x_, 1, hidden, c_.rms_eps,
+                nullptr);
+  }
   (void)hipMemcpy(h_out_, x_, hidden * sizeof(float), hipMemcpyDeviceToDevice);
   Gemv(model_.output().data, ToGemvType(model_.output().type),
        model_.output().rows, model_.output().cols, model_.output().row_bytes, x_,
@@ -923,7 +967,45 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
   return true;
 }
 
-bool Executor::MtpStep(std::int32_t token, std::string* error_msg) {
+void Executor::MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
+                               std::uint32_t start, const float* hidden_rows) {
+  const std::uint32_t hidden = c_.hidden_size;
+  const DeviceLayer& l = model_.mtp();
+
+  // Row t of the block's input is [norm(e(token_t))][hidden of row t - 1],
+  // with the previous chunk's last row (or zeros before the first chunk)
+  // standing in for row -1.
+  for (std::uint32_t t = 0; t < rows; ++t) {
+    EmbedRow(model_.token_embd().data, ToGemvType(model_.token_embd().type),
+             static_cast<std::uint32_t>(tokens[t]), hidden,
+             pf_x_ + static_cast<std::size_t>(t) * hidden, nullptr);
+  }
+  RmsNormRows(pf_x_, l.nextn_enorm.f32(), pf_x_, rows, hidden, c_.rms_eps,
+              nullptr);
+  MtpConcat(pf_x_, hidden_rows, mtp_prev_hidden_, pf_mtp_concat_, rows, hidden,
+            nullptr);
+  Gemm(l.nextn_eh_proj.data, ToGemvType(l.nextn_eh_proj.type),
+       l.nextn_eh_proj.rows, l.nextn_eh_proj.cols, l.nextn_eh_proj.row_bytes,
+       pf_mtp_concat_, pf_mtp_cur_, rows, nullptr);
+
+  RmsNormRows(pf_mtp_cur_, l.attn_norm.f32(), pf_normed_, rows, hidden,
+              c_.rms_eps, nullptr);
+  AttentionBatch(l, pf_normed_, start, pf_attn_, mtp_k_cache_, mtp_v_cache_,
+                 pf_pos_, rows);
+  Add(pf_mtp_cur_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
+  RmsNormRows(pf_mtp_cur_, l.post_attention_norm.f32(), pf_normed_, rows,
+              hidden, c_.rms_eps, nullptr);
+  MoeBatch(l, pf_normed_, pf_ffn_, rows);
+  Add(pf_mtp_cur_, pf_ffn_, static_cast<std::size_t>(rows) * hidden, nullptr);
+
+  (void)hipMemcpyAsync(mtp_prev_hidden_, hidden_rows + (rows - 1) * hidden,
+                       hidden * sizeof(float), hipMemcpyDeviceToDevice,
+                       nullptr);
+  mtp_position_ += rows;
+}
+
+bool Executor::MtpForward(std::int32_t token, const float* hidden,
+                          bool with_logits, std::string* error_msg) {
   if (!model_.has_mtp()) {
     if (error_msg != nullptr) {
       *error_msg = "model has no MTP block";
@@ -952,7 +1034,7 @@ bool Executor::MtpStep(std::int32_t token, std::string* error_msg) {
            static_cast<std::uint32_t>(token), c_.hidden_size, mtp_e_, nullptr);
   RmsNormRows(mtp_e_, l.nextn_enorm.f32(), mtp_e_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
-  RmsNormRows(h_out_, l.nextn_hnorm.f32(), mtp_h_, 1, c_.hidden_size,
+  RmsNormRows(hidden, l.nextn_hnorm.f32(), mtp_h_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
   (void)hipMemcpy(mtp_concat_, mtp_e_, c_.hidden_size * sizeof(float),
                   hipMemcpyDeviceToDevice);
@@ -971,13 +1053,109 @@ bool Executor::MtpStep(std::int32_t token, std::string* error_msg) {
               c_.rms_eps, nullptr);
   Moe(l, normed_, ffn_);
   Add(mtp_cur_, ffn_, c_.hidden_size, nullptr);
-  RmsNormRows(mtp_cur_, l.nextn_shared_head_norm.f32(), mtp_cur_, 1,
-              c_.hidden_size, c_.rms_eps, nullptr);
-  Gemv(model_.output().data, ToGemvType(model_.output().type),
-       model_.output().rows, model_.output().cols, model_.output().row_bytes,
-       mtp_cur_, mtp_logits_, nullptr);
+  if (with_logits) {
+    RmsNormRows(mtp_cur_, l.nextn_shared_head_norm.f32(), mtp_cur_, 1,
+                c_.hidden_size, c_.rms_eps, nullptr);
+    Gemv(model_.output().data, ToGemvType(model_.output().type),
+         model_.output().rows, model_.output().cols,
+         model_.output().row_bytes, mtp_cur_, mtp_logits_, nullptr);
+  }
   ++mtp_position_;
   return true;
+}
+
+bool Executor::MtpStep(std::int32_t token, std::string* error_msg) {
+  return MtpForward(token, h_out_, true, error_msg);
+}
+
+bool Executor::MtpAdvance(std::int32_t token, const float* hidden,
+                          std::string* error_msg) {
+  return MtpForward(token, hidden, false, error_msg);
+}
+
+bool Executor::Verify(std::int32_t t0, std::int32_t t1, std::string* error_msg) {
+  if (!model_.has_mtp()) {
+    if (error_msg != nullptr) {
+      *error_msg = "model has no MTP block";
+    }
+    return false;
+  }
+  if (t0 < 0 || static_cast<std::uint32_t>(t0) >= c_.vocab_size || t1 < 0 ||
+      static_cast<std::uint32_t>(t1) >= c_.vocab_size) {
+    if (error_msg != nullptr) {
+      *error_msg = "token id out of range";
+    }
+    return false;
+  }
+  if (position_ + 2 > max_context_) {
+    if (error_msg != nullptr) {
+      *error_msg = "context length exceeded";
+    }
+    return false;
+  }
+
+  const std::uint32_t hidden = c_.hidden_size;
+  const std::uint32_t host_pos[2] = {position_, position_ + 1};
+  (void)hipMemcpyAsync(pf_pos_, host_pos, sizeof(host_pos),
+                       hipMemcpyHostToDevice, nullptr);
+  EmbedRow(model_.token_embd().data, ToGemvType(model_.token_embd().type),
+           static_cast<std::uint32_t>(t0), hidden, pf_x_, nullptr);
+  EmbedRow(model_.token_embd().data, ToGemvType(model_.token_embd().type),
+           static_cast<std::uint32_t>(t1), hidden, pf_x_ + hidden, nullptr);
+
+  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+    const DeviceLayer& l = model_.layers()[il];
+    RmsNormRows(pf_x_, l.attn_norm.f32(), pf_normed_, 2, hidden, c_.rms_eps,
+                nullptr);
+    if (c_.IsLinearLayer(il)) {
+      // Snapshot the recurrent state and conv history after the first row so
+      // a rejected draft can rewind to the state after t0.
+      LinearAttentionBatch(l, il, pf_normed_, pf_attn_, 2, gdn_state_snap_[il],
+                           gdn_hist_snap_[il]);
+    } else {
+      AttentionBatch(l, pf_normed_, position_, pf_attn_, k_cache_[il],
+                     v_cache_[il], pf_pos_, 2);
+    }
+    Add(pf_x_, pf_attn_, 2 * static_cast<std::size_t>(hidden), nullptr);
+    RmsNormRows(pf_x_, l.post_attention_norm.f32(), pf_normed_, 2, hidden,
+                c_.rms_eps, nullptr);
+    MoeBatch(l, pf_normed_, pf_ffn_, 2);
+    Add(pf_x_, pf_ffn_, 2 * static_cast<std::size_t>(hidden), nullptr);
+  }
+
+  RmsNormRows(pf_x_, model_.output_norm().f32(), verify_h_, 2, hidden,
+              c_.rms_eps, nullptr);
+  (void)hipMemcpyAsync(h_out_, verify_h_ + hidden, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, nullptr);
+  Gemm(model_.output().data, ToGemvType(model_.output().type),
+       model_.output().rows, model_.output().cols,
+       model_.output().row_bytes, verify_h_, verify_logits_, 2, nullptr);
+  position_ += 2;
+  return true;
+}
+
+void Executor::RollbackVerify() {
+  const std::size_t hidden = c_.hidden_size;
+  const std::size_t state_elems = static_cast<std::size_t>(c_.ssm_num_v_heads) *
+                                  c_.ssm_head_dim * c_.ssm_head_dim;
+  const std::size_t history_elems =
+      static_cast<std::size_t>(c_.ssm_conv_kernel - 1) * c_.SsmConvChannels();
+  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+    if (!c_.IsLinearLayer(il)) {
+      continue;
+    }
+    (void)hipMemcpyAsync(gdn_state_[il], gdn_state_snap_[il],
+                         state_elems * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+    (void)hipMemcpyAsync(gdn_history_[il], gdn_hist_snap_[il],
+                         history_elems * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+  }
+  // Rewind to the state after the accepted first row; its KV entry and hidden
+  // state were already published by Verify.
+  position_ -= 1;
+  (void)hipMemcpyAsync(h_out_, verify_h_, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice, nullptr);
 }
 
 }  // namespace gufo::models::qwen36_a3b::rocm
