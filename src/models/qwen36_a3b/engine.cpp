@@ -103,6 +103,10 @@ std::uint32_t Model::VocabSize() const noexcept {
   return weights_->config.vocab_size;
 }
 
+bool Model::HasMtp() const noexcept {
+  return device_->has_mtp();
+}
+
 std::string Model::ModelName() const {
   return std::string(reader_->GetMetadataString("general.name")
                          .value_or("Qwen3.6-35B-A3B"));
@@ -119,6 +123,8 @@ std::size_t Model::ResidentBytes() const noexcept {
 Session::Session(std::shared_ptr<Model> model, rocm::Executor* executor)
     : model_(std::move(model)), executor_(executor) {
   logits_.resize(model_->VocabSize());
+  draft_logits_.resize(model_->VocabSize());
+  verify_rows_.resize(2 * model_->VocabSize());
 }
 
 Session::~Session() = default;
@@ -222,20 +228,79 @@ bool Session::DecodeStep(std::size_t max_tokens,
   const auto is_stop = [&](std::int32_t token) {
     return stop_at_eos && model_->IsStopToken(token);
   };
+
+  // Speculative decoding: with an MTP block and a greedy sampler, draft one
+  // token with the MTP block, verify both tokens in one batched trunk pass,
+  // and accept the draft only when the trunk agrees. The verify pass reads
+  // the trunk weights once for two tokens, so a hit costs ~1.2 tokens' time.
+  const bool spec = model_->HasMtp() && max_tokens >= 2 &&
+                    sampler.config().can_use_unmodified_argmax() &&
+                    tokens_.size() + 2 <= ContextSize();
+  if (!spec) {
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits_));
+    if (is_stop(token)) {
+      result->stop = true;
+      return true;
+    }
+    valid_ = false;
+    if (!executor_->Step(token, error_msg)) {
+      return false;
+    }
+    tokens_.push_back(token);
+    (void)hipMemcpy(logits_.data(), executor_->logits(),
+                    logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
+    sampler.Accept(static_cast<sampling::TokenId>(token));
+    result->tokens.push_back(token);
+    valid_ = true;
+    return true;
+  }
+
   const auto token = static_cast<std::int32_t>(sampler.Sample(logits_));
   if (is_stop(token)) {
     result->stop = true;
     return true;
   }
   valid_ = false;
-  if (!executor_->Step(token, error_msg)) {
+  if (!executor_->MtpStep(token, error_msg)) {
     return false;
   }
-  tokens_.push_back(token);
-  (void)hipMemcpy(logits_.data(), executor_->logits(),
-                  logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
-  sampler.Accept(static_cast<sampling::TokenId>(token));
-  result->tokens.push_back(token);
+  (void)hipMemcpy(draft_logits_.data(), executor_->mtp_logits(),
+                  draft_logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
+  const auto draft = static_cast<std::int32_t>(
+      sampler.SampleGreedy(std::span<const float>(draft_logits_)));
+  if (!executor_->Verify(token, draft, error_msg)) {
+    return false;
+  }
+  (void)hipMemcpy(verify_rows_.data(), executor_->verify_logits(),
+                  verify_rows_.size() * sizeof(float), hipMemcpyDeviceToHost);
+  const std::span<const float> row0(verify_rows_.data(), draft_logits_.size());
+  const std::span<const float> row1(verify_rows_.data() + draft_logits_.size(),
+                                    draft_logits_.size());
+  if (static_cast<std::int32_t>(sampler.SampleGreedy(row0)) == draft) {
+    // The trunk reproduces the draft: keep both tokens and advance the MTP
+    // caches over the accepted pair so the next draft stays aligned.
+    if (!executor_->MtpAdvance(draft, executor_->verify_hidden(), error_msg)) {
+      return false;
+    }
+    logits_.assign(row1.begin(), row1.end());
+    tokens_.push_back(token);
+    tokens_.push_back(draft);
+    const sampling::TokenId accepted[2] = {
+        static_cast<sampling::TokenId>(token),
+        static_cast<sampling::TokenId>(draft)};
+    sampler.Accept(std::span<const sampling::TokenId>(accepted));
+    result->tokens.push_back(token);
+    result->tokens.push_back(draft);
+    result->stop = is_stop(draft);
+  } else {
+    // The trunk disagrees at the draft position: rewind to the state after
+    // the accepted token and continue from the trunk's own logits.
+    executor_->RollbackVerify();
+    logits_.assign(row0.begin(), row0.end());
+    tokens_.push_back(token);
+    sampler.Accept(static_cast<sampling::TokenId>(token));
+    result->tokens.push_back(token);
+  }
   valid_ = true;
   return true;
 }

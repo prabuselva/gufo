@@ -46,11 +46,34 @@ public:
   /// Runs the MTP draft block for `token` using the trunk hidden state from
   /// the most recent Step; the result is in mtp_logits().
   bool MtpStep(std::int32_t token, std::string* error_msg = nullptr);
+  /// Advances the MTP cache by `token` against the given device-side trunk
+  /// hidden state, skipping the shared head and LM head. Used to keep the
+  /// draft cache aligned with the trunk after an accepted draft.
+  bool MtpAdvance(std::int32_t token, const float* hidden,
+                  std::string* error_msg = nullptr);
+  /// Speculative verification: advances the trunk by two tokens in one
+  /// batched pass (the GEMM tier, like Prefill). Row `r` of verify_logits()
+  /// ([2][vocab]) holds the logits after consuming token `r`, and row `r` of
+  /// verify_hidden() ([2][hidden]) the post-output-norm hidden state. The
+  /// Gated DeltaNet state and conv history after the first row are
+  /// snapshotted so RollbackVerify() can undo the second token.
+  bool Verify(std::int32_t t0, std::int32_t t1,
+              std::string* error_msg = nullptr);
+  /// Undoes the second token of the most recent Verify: restores the
+  /// recurrent state from the snapshot, rewinds `position_` by one and leaves
+  /// the first row's hidden state in h_out().
+  void RollbackVerify();
   /// Clears the recurrent state and both positions.
   void Reset();
 
   [[nodiscard]] const float* logits() const noexcept { return logits_; }
   [[nodiscard]] const float* mtp_logits() const noexcept { return mtp_logits_; }
+  [[nodiscard]] const float* verify_logits() const noexcept {
+    return verify_logits_;
+  }
+  [[nodiscard]] const float* verify_hidden() const noexcept {
+    return verify_h_;
+  }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
@@ -76,8 +99,24 @@ private:
   /// Batched (prefill) Gated DeltaNet over `tokens` rows of `x`
   /// ([tokens][hidden]) into `out` ([tokens][hidden]), advancing the layer's
   /// recurrent state and conv history past the chunk. Mirrors LinearAttention().
+  /// When `state_snap` is non-null it receives the recurrent state after each
+  /// of the first `tokens - 1` rows (see GdnDeltaLoop); `hist_snap` receives
+  /// the conv history after the first row.
   void LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
-                            const float* x, float* out, std::uint32_t tokens);
+                            const float* x, float* out, std::uint32_t tokens,
+                            float* state_snap = nullptr,
+                            float* hist_snap = nullptr);
+  /// Batched MTP cache fill over one prefill chunk. `hidden_rows`
+  /// ([rows][hidden]) is the trunk's post-output-norm hidden state for the
+  /// chunk; the block's own hidden input for row 0 comes from
+  /// `mtp_prev_hidden_`. Advances the MTP KV caches and `mtp_position_`.
+  void MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
+                       std::uint32_t start, const float* hidden_rows);
+  /// The MTP block forward. `hidden` is the device-side trunk (or previous
+  /// draft) hidden state; with `with_logits` the shared head and LM head run
+  /// into mtp_logits_.
+  bool MtpForward(std::int32_t token, const float* hidden, bool with_logits,
+                  std::string* error_msg);
   /// Batched (prefill) gated grouped-query attention over `tokens` rows of `x`
   /// starting at absolute position `start`, writing the chunk's keys/values into
   /// the caches and reading them back causally. Mirrors Attention().
@@ -204,11 +243,27 @@ private:
   float* mtp_concat_{nullptr};
   float* mtp_cur_{nullptr};
 
+  // Speculative verify scratch: per-row logits ([2][vocab]) and post-output-
+  // norm hidden ([2][hidden]) for the two-token verify pass.
+  float* verify_logits_{nullptr};
+  float* verify_h_{nullptr};
+
+  // Batched MTP cache fill scratch ([chunk][2 * hidden] and [chunk][hidden])
+  // and the last prefill chunk's hidden row, the draft block's hidden input
+  // for the next chunk's first row.
+  float* pf_mtp_concat_{nullptr};
+  float* pf_mtp_cur_{nullptr};
+  float* mtp_prev_hidden_{nullptr};
+
   // Recurrent state, indexed by layer (null where the layer does not use it).
   std::vector<float*> gdn_state_;
   std::vector<float*> gdn_history_;
   std::vector<float*> k_cache_;
   std::vector<float*> v_cache_;
+  // Per-linear-layer verify snapshots: the recurrent state and conv history
+  // after the first row of the most recent Verify (null without an MTP block).
+  std::vector<float*> gdn_state_snap_;
+  std::vector<float*> gdn_hist_snap_;
   float* mtp_k_cache_{nullptr};
   float* mtp_v_cache_{nullptr};
 

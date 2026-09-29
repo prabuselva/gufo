@@ -53,6 +53,7 @@ public:
   [[nodiscard]] std::int32_t EosToken() const noexcept;
   [[nodiscard]] bool IsStopToken(std::int32_t token) const noexcept;
   [[nodiscard]] std::uint32_t VocabSize() const noexcept;
+  [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }
@@ -122,6 +123,10 @@ private:
   rocm::Executor* executor_;
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
+  // Readback scratch for speculative decoding: the draft block's logits and
+  // the two verify rows.
+  std::vector<float> draft_logits_;
+  std::vector<float> verify_rows_;
   bool valid_{true};
 };
 

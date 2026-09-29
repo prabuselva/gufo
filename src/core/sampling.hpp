@@ -141,6 +141,9 @@ public:
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);
   [[nodiscard]] TokenId Sample(std::span<const float> logits);
+  /// Pure argmax over logits (first maximum wins), ignoring RNG and pending
+  /// draws; penalties still apply. Used for speculative draft/accept checks.
+  [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
   [[nodiscard]] TokenId SampleResidual(
       std::span<const float> target_logits,
       std::span<const TokenId> candidate_ids,
@@ -153,8 +156,7 @@ private:
   void TrimHistory();
   void RebuildPenaltyCounts();
   [[nodiscard]] double AdjustedLogit(TokenId token, float logit) const noexcept;
-  [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
-  [[nodiscard]] TokenId SampleConstrainedGreedy(
+[[nodiscard]] TokenId SampleConstrainedGreedy(
       std::span<const float> logits) const;
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;

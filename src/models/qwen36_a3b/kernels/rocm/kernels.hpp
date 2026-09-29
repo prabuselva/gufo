@@ -126,15 +126,27 @@ void GdnNormQkPrefill(const float* convolved, float* qn, float* kn,
                       std::uint32_t tokens, std::uint32_t k_heads,
                       std::uint32_t channels, std::uint32_t head_dim, float eps,
                       hipStream_t stream);
+/// When `snap` is non-null the state after each of the first `snap_rows`
+/// tokens is also written to `snap` ([snap_rows][v_heads][head_dim][head_dim]),
+/// slot t holding the state once tokens [0, t] are consumed. The live `state`
+/// still ends the chunk fully advanced. Used by speculative verify to roll the
+/// recurrent state back to the last accepted token.
 void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
                   const float* alpha, const float* beta, const float* a,
                   const float* dt, float* state, float* attn,
                   std::uint32_t tokens, std::uint32_t k_heads,
                   std::uint32_t v_heads, std::uint32_t head_dim,
-                  std::uint32_t channels, hipStream_t stream);
+                  std::uint32_t channels, float* snap, std::uint32_t snap_rows,
+                  hipStream_t stream);
 void GdnOutNormPrefill(float* attn, const float* z, const float* norm_w,
                        std::uint32_t tokens, std::uint32_t v_heads,
                        std::uint32_t head_dim, float eps, hipStream_t stream);
+
+/// Builds the batched MTP input rows: `out[t]` = [`e[t]`][`h[t-1]`], with
+/// `h[-1]` taken from `h_prev`. All buffers hold `tokens` rows of `hidden`
+/// floats (`out` of 2 * `hidden`).
+void MtpConcat(const float* e, const float* h, const float* h_prev, float* out,
+               std::uint32_t tokens, std::uint32_t hidden, hipStream_t stream);
 
 /// Single-query grouped-query causal attention with the sigmoid output gate.
 /// `q` [heads][head_dim]; `k_cache`/`v_cache` [n_kv][kv_heads][head_dim]
