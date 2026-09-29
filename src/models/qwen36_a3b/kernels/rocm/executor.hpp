@@ -195,6 +195,12 @@ private:
   float* pf_shared_up_{nullptr};
   float* pf_shared_down_{nullptr};
   float* pf_shared_gate_inp_{nullptr};
+  // [2*used][hidden] copy of the verify normed rows (row t repeated `used`
+  // times) so the grouped expert GEMVs can index x by slot.
+  float* pf_x_dup_{nullptr};
+  // [2][heads][32][head_dim + 2] flash-decoding partials for the two verify
+  // rows (AttentionDecode2).
+  float* pf_part2_{nullptr};
 
   // Routed F16 WMMA MoE scratch (prefill). The compacted bucket layout, the
   // (expert, row-tile) map and the F16 activation/intermediate rows used by
@@ -273,6 +279,7 @@ private:
   // path. No-op unless the variable is set.
   StageProfiler prof_;
   std::uint32_t decode_steps_{0};
+  std::uint32_t spec_rounds_{0};
 };
 
 }  // namespace gufo::models::qwen36_a3b::rocm
