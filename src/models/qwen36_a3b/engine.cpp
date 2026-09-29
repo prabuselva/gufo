@@ -264,6 +264,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   if (!executor_->MtpStep(token, error_msg)) {
     return false;
   }
+  ++result->drafted;
   (void)hipMemcpy(draft_logits_.data(), executor_->mtp_logits(),
                   draft_logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
   const auto draft = static_cast<std::int32_t>(
@@ -291,6 +292,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
     sampler.Accept(std::span<const sampling::TokenId>(accepted));
     result->tokens.push_back(token);
     result->tokens.push_back(draft);
+    ++result->accepted;
     result->stop = is_stop(draft);
   } else {
     // The trunk disagrees at the draft position: rewind to the state after
