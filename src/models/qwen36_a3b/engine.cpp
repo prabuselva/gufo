@@ -50,8 +50,11 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->tokenizer_) {
     return nullptr;
   }
-  m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_, nullptr,
-                                         error_msg);
+  // The MTP draft block is optional: artifacts without it load and decode
+// single-token, artifacts with it enable draft-verify speculation.
+const auto mtp = MtpWeights::Bind(*m->reader_, c);
+  m->device_ = rocm::DeviceModel::Upload(
+      *m->weights_, *m->reader_, mtp.has_value() ? &*mtp : nullptr, error_msg);
   if (!m->device_) {
     return nullptr;
   }
