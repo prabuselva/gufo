@@ -53,6 +53,40 @@ __global__ void GemvQ8_0(const Q8_0Block* __restrict__ w,
   }
 }
 
+// Two-row dense GEMV for the speculative verify pass: one wave owns an output
+// row and dots the weight row against two activation rows in the same walk,
+// so the weight matrix is read once for both tokens. Each per-row dot is
+// bit-identical to GemvQ8_0.
+__global__ void Gemv2Q8_0(const Q8_0Block* __restrict__ w,
+                          const float* __restrict__ x, std::uint32_t x_stride,
+                          float* __restrict__ out, std::uint32_t out_stride,
+                          std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t nblocks = cols / 32;
+  const Q8_0Block* __restrict__ row = w + static_cast<std::size_t>(r) * nblocks;
+  const float* __restrict__ x0 = x;
+  const float* __restrict__ x1 = x + x_stride;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const float d = __half2float(row[b].d);
+    const float q = static_cast<float>(row[b].qs[lane]);
+    acc0 += d * q * x0[b * 32 + lane];
+    acc1 += d * q * x1[b * 32 + lane];
+  }
+  acc0 = WarpReduceSum(acc0);
+  acc1 = WarpReduceSum(acc1);
+  if (lane == 0) {
+    out[r] = acc0;
+    out[out_stride + r] = acc1;
+  }
+}
+
 // Grouped expert GEMV: a block of four waves folds four consecutive
 // (slot, row) pairs of the selected-expert product. The expert id is read
 // from device memory, so the whole routed MoE stays asynchronous.
@@ -243,6 +277,39 @@ __global__ void GemvBf16(const hip_bfloat16* __restrict__ w,
   }
 }
 
+// Two-row dense GEMV for the F32/BF16 stacks: one warp owns an output row and
+// dots it against two activation rows in the same walk. Each per-row dot is
+// bit-identical to GemvF32/GemvBf16.
+template <typename T>
+__global__ void Gemv2Dense(const T* __restrict__ w,
+                           const float* __restrict__ x,
+                           std::uint32_t x_stride, float* __restrict__ out,
+                           std::uint32_t out_stride, std::uint32_t rows,
+                           std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const T* __restrict__ row = w + static_cast<std::size_t>(r) * cols;
+  const float* __restrict__ x0 = x;
+  const float* __restrict__ x1 = x + x_stride;
+  const std::uint32_t lane = threadIdx.x;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t i = lane; i < cols; i += 32) {
+    const float wv = static_cast<float>(row[i]);
+    acc0 += wv * x0[i];
+    acc1 += wv * x1[i];
+  }
+  acc0 = WarpReduceSum(acc0);
+  acc1 = WarpReduceSum(acc1);
+  if (lane == 0) {
+    out[r] = acc0;
+    out[out_stride + r] = acc1;
+  }
+}
+
 // Dequantize a single row of a quantized matrix (the token-embedding lookup).
 // One warp per Q8_0 block; one thread per element for F32/BF16.
 __global__ void EmbedRowQ8_0(const Q8_0Block* __restrict__ w,
@@ -320,6 +387,30 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
     case GemvType::kBF16:
       GemvBf16<<<grid, dim3(32), 0, stream>>>(
           static_cast<const hip_bfloat16*>(base), x, out, rows, cols);
+      break;
+  }
+}
+
+void Gemv2(const void* base, GemvType type, std::uint32_t rows,
+           std::uint32_t cols, std::size_t row_bytes, const float* x,
+           std::uint32_t x_stride, float* out, std::uint32_t out_stride,
+           hipStream_t stream) {
+  (void)row_bytes;
+  switch (type) {
+    case GemvType::kQ8_0:
+      Gemv2Q8_0<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+          static_cast<const Q8_0Block*>(base), x, x_stride, out, out_stride,
+          rows, cols);
+      break;
+    case GemvType::kF32:
+      Gemv2Dense<float><<<rows, dim3(32), 0, stream>>>(
+          static_cast<const float*>(base), x, x_stride, out, out_stride, rows,
+          cols);
+      break;
+    case GemvType::kBF16:
+      Gemv2Dense<hip_bfloat16><<<rows, dim3(32), 0, stream>>>(
+          static_cast<const hip_bfloat16*>(base), x, x_stride, out, out_stride,
+          rows, cols);
       break;
   }
 }
