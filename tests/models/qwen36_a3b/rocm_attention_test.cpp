@@ -192,10 +192,9 @@ bool RunPrefillCase(std::uint32_t start, std::uint32_t tokens) {
                1e-4);
 }
 
-// The two-row verify kernel must reproduce the same causal rows as the
-// reference: row 0 attends [0, start + 1], row 1 attends [0, start + 2].
-bool RunDecode2Case(std::uint32_t start) {
-  const std::uint32_t tokens = 2U;
+// The multi-row verify kernel must reproduce the same causal rows as the
+// reference: row o attends [0, start + 1 + o].
+bool RunDecodeRowsCase(std::uint32_t start, std::uint32_t tokens) {
   const std::uint32_t causal_max = start + tokens;
   const std::size_t q_count =
       static_cast<std::size_t>(tokens) * kHeads * kHeadDim;
@@ -211,19 +210,21 @@ bool RunDecode2Case(std::uint32_t start) {
   t::HipBuffer<float> d_k(cache_count);
   t::HipBuffer<float> d_v(cache_count);
   t::HipBuffer<float> d_out(q_count);
-  t::HipBuffer<float> d_part(2ULL * kHeads * 32U * (kHeadDim + 2U));
+  t::HipBuffer<float> d_part(static_cast<std::size_t>(tokens) * kHeads * 32U *
+                             (kHeadDim + 2U));
   t::Upload(&d_q, query);
   t::Upload(&d_gate, gate);
   t::Upload(&d_k, k_cache);
   t::Upload(&d_v, v_cache);
   const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-  q::AttentionDecode2(d_q.get(), d_k.get(), d_v.get(), d_gate.get(),
-                      d_out.get(), d_part.get(), start + 1U, start + 2U, kHeads,
-                      kKvHeads, kHeadDim, scale, nullptr);
-  t::CheckHip(hipDeviceSynchronize(), "AttentionDecode2 synchronization");
+  q::AttentionDecodeRows(d_q.get(), d_k.get(), d_v.get(), d_gate.get(),
+                         d_out.get(), d_part.get(), start + 1U, tokens, kHeads,
+                         kKvHeads, kHeadDim, scale, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "AttentionDecodeRows synchronization");
   const auto got = t::Download(&d_out, q_count);
 
-  return Check("AttentionDecode2 start=" + std::to_string(start),
+  return Check("AttentionDecodeRows start=" + std::to_string(start) +
+                   " tokens=" + std::to_string(tokens),
                t::WorstRelative(Reference(query, gate, k_cache, v_cache, start,
                                           tokens),
                                 got),
@@ -243,9 +244,11 @@ int main() {
              {0U, 1U}, {0U, 8U}, {5U, 7U}, {100U, 40U}, {200U, 64U}}) {
       ok = RunPrefillCase(cs.first, cs.second) && ok;
     }
-    // Two-row verify kernel: split boundaries at 64 and the 32-split cap.
+    // Multi-row verify kernel: split boundaries at 64 and the 32-split cap.
     for (std::uint32_t start : {0U, 5U, 63U, 100U, 2047U, 2300U}) {
-      ok = RunDecode2Case(start) && ok;
+      for (std::uint32_t tokens = 2U; tokens <= 5U; ++tokens) {
+        ok = RunDecodeRowsCase(start, tokens) && ok;
+      }
     }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {

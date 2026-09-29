@@ -353,50 +353,56 @@ bool TestGroupedPair() {
   return ok_a && ok_b;
 }
 
-// The two-row verify GEMV must be bit-identical to two single-row Gemv
-// calls for every stored type: same per-row walk, weight row read once for
-// both activation rows.
-bool TestTwoRow() {
+// The multi-row verify GEMV must be bit-identical to single-row Gemv calls
+// for every row count in [2, 5] and every stored type: same per-row walk,
+// weight row read once for all activation rows.
+bool TestMultiRow() {
   bool ok = true;
 
   const auto run = [&](const char* name, q::GemvType type,
                        const std::vector<std::uint8_t>& w,
                        std::size_t row_bytes) {
-    const auto x0 = t::MakeValues(kCols, 0x11223344U, 1.0F);
-    const auto x1 = t::MakeValues(kCols, 0x55667788U, 1.0F);
-    std::vector<float> x(2ULL * kCols);
-    std::copy(x0.begin(), x0.end(), x.begin());
-    std::copy(x1.begin(), x1.end(), x.begin() + kCols);
-    t::HipBuffer<std::uint8_t> d_w(w.size());
-    t::CheckHip(
-        hipMemcpy(d_w.get(), w.data(), w.size(), hipMemcpyHostToDevice),
-        "upload two-row weights");
-    t::HipBuffer<float> d_x(x.size());
-    t::Upload(&d_x, x);
-    t::HipBuffer<float> d_ref(2ULL * kRows);
-    q::Gemv(d_w.get(), type, kRows, kCols, row_bytes, d_x.get(), d_ref.get(),
-            nullptr);
-    q::Gemv(d_w.get(), type, kRows, kCols, row_bytes, d_x.get() + kCols,
-            d_ref.get() + kRows, nullptr);
-    t::HipBuffer<float> d_out(2ULL * kRows);
-    q::Gemv2(d_w.get(), type, kRows, kCols, row_bytes, d_x.get(), kCols,
-             d_out.get(), kRows, nullptr);
-    t::CheckHip(hipDeviceSynchronize(), "Gemv2 synchronization");
-    const auto ref = t::Download(&d_ref, 2ULL * kRows);
-    const auto got = t::Download(&d_out, 2ULL * kRows);
-    const bool exact = ref == got;
-    std::cout << name << " bit-exact: " << (exact ? "yes" : "no") << '\n';
-    ok = ok && exact;
+    for (std::uint32_t rows = 2U; rows <= 5U; ++rows) {
+      std::vector<float> x(static_cast<std::size_t>(rows) * kCols);
+      for (std::uint32_t o = 0; o < rows; ++o) {
+        const auto xo = t::MakeValues(kCols, 0x11223344U + o * 0x01010101U,
+                                      1.0F);
+        std::copy(xo.begin(), xo.end(), x.begin() + o * kCols);
+      }
+      t::HipBuffer<std::uint8_t> d_w(w.size());
+      t::CheckHip(
+          hipMemcpy(d_w.get(), w.data(), w.size(), hipMemcpyHostToDevice),
+          "upload multi-row weights");
+      t::HipBuffer<float> d_x(x.size());
+      t::Upload(&d_x, x);
+      t::HipBuffer<float> d_ref(static_cast<std::size_t>(rows) * kRows);
+      for (std::uint32_t o = 0; o < rows; ++o) {
+        q::Gemv(d_w.get(), type, kRows, kCols, row_bytes, d_x.get() + o * kCols,
+                d_ref.get() + static_cast<std::size_t>(o) * kRows, nullptr);
+      }
+      t::HipBuffer<float> d_out(static_cast<std::size_t>(rows) * kRows);
+      q::GemvRows(d_w.get(), type, rows, kRows, kCols, row_bytes, d_x.get(),
+                  kCols, d_out.get(), kRows, nullptr);
+      t::CheckHip(hipDeviceSynchronize(), "GemvRows synchronization");
+      const auto ref =
+          t::Download(&d_ref, static_cast<std::size_t>(rows) * kRows);
+      const auto got =
+          t::Download(&d_out, static_cast<std::size_t>(rows) * kRows);
+      const bool exact = ref == got;
+      std::cout << name << " rows=" << rows
+                << " bit-exact: " << (exact ? "yes" : "no") << '\n';
+      ok = ok && exact;
+    }
   };
 
-  run("Gemv2Q8_0", q::GemvType::kQ8_0, EncodeQ8_0(kRows, kCols, 0x66778899U),
-      34);
+  run("GemvRowsQ8_0", q::GemvType::kQ8_0,
+      EncodeQ8_0(kRows, kCols, 0x66778899U), 34);
 
   const auto w_f32 =
       t::MakeValues(static_cast<std::size_t>(kRows) * kCols, 0x55556666U, 1.0F);
   std::vector<std::uint8_t> w_f32_bytes(w_f32.size() * sizeof(float));
   std::memcpy(w_f32_bytes.data(), w_f32.data(), w_f32_bytes.size());
-  run("Gemv2F32", q::GemvType::kF32, w_f32_bytes, 4);
+  run("GemvRowsF32", q::GemvType::kF32, w_f32_bytes, 4);
 
   std::vector<std::uint16_t> w_bf16(static_cast<std::size_t>(kRows) * kCols);
   std::uint32_t seed = 0x9A8B7C6DU;
@@ -410,7 +416,7 @@ bool TestTwoRow() {
   }
   std::vector<std::uint8_t> w_bf16_bytes(w_bf16.size() * sizeof(std::uint16_t));
   std::memcpy(w_bf16_bytes.data(), w_bf16.data(), w_bf16_bytes.size());
-  run("Gemv2Bf16", q::GemvType::kBF16, w_bf16_bytes, 2);
+  run("GemvRowsBf16", q::GemvType::kBF16, w_bf16_bytes, 2);
   return ok;
 }
 
@@ -424,7 +430,7 @@ int main() {
     ok = TestBf16() && ok;
     ok = TestMulti() && ok;
     ok = TestGroupedPair() && ok;
-    ok = TestTwoRow() && ok;
+    ok = TestMultiRow() && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

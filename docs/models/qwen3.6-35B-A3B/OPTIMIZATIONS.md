@@ -7,8 +7,8 @@ quantized on device). Geometry: hidden 2048, 40 layers (30 GDN + 10 GQA),
 16 q-heads / 2 kv-heads / head_dim 256, ssm 16 k-heads / 32 v-heads / head_dim
 128, 256 experts top-8 with expert_ff 512, vocab 248320.
 
-Headline: **prefill 6480 ms → 1630 ms**, **decode 14.1 tps → 33.3 tps**.
-Target: ≥60 tps (roofline below).
+Headline: **prefill 6480 ms → 1630 ms**, **decode 14.1 tps → 60.8 tps**
+(MTP k = 2). Target: ≥60 tps — met.
 
 ## Prefill (6480 → 1630 ms)
 
@@ -101,6 +101,64 @@ fusion (re-profile pending):
 | lin_normqk | 0.32 |
 | attn_rope_norm | 0.24 |
 
+## MTP speculative decode (33.3 → 55.2 tps)
+
+Landed in `966b3db8`..`14ebbdb0`.
+
+1. **MTP draft block** — the model's MTP layer is bound in `Model::Load`
+   (`6e51aa51`) and run by `Executor::MtpForward`: one fused
+   (previous-hidden, embedding) step that writes its own KV/GDN state at
+   `mtp_position_` and projects through the shared head. `MtpStep` feeds
+   the main-path hidden; `MtpAdvance` keeps the draft state aligned after a
+   committed token. `DecodeStep` drafts one token, verifies it with the
+   main model, and serves it over HTTP (`1447ab01`).
+2. **Decode-tier verify** (`14ebbdb0`) — the two-row verify pass reuses the
+   decode kernels instead of the prefill GEMM path: `Gemv2` (two activation
+   rows per GEMV launch), `RmsNormRows`, batched GDN with per-row state
+   snapshots for rollback, and `AttentionDecode2` — the flash-decoding
+   split kernel generalized so row `o` attends `[0, n_kv0 + o)` with a
+   per-row causal mask inside the shared online-softmax loop.
+   **attn_core stays 0.089 ms/call for a verify row pair; a full
+   draft+verify round costs 35.4 ms for 1.97 tokens = 55.2 tps** at
+   96.9 % draft acceptance.
+
+Profile per 16 rounds (565.9 ms total, k = 1): moe_gateup 117.8,
+lin_gemm_in 76.5, moe_routed_down 68.9, moe_epilogue 54.4, output 38.4,
+attn_core 17.0, mtp 3.7 ms. The round is still one weight-streaming pass
+per stage, so a rejected draft costs a full step (~18 ms for the
+correction token) and the win scales with acceptance, not kernel time.
+
+## k-draft speculation and sampling support
+
+Generalizes the fixed one-token loop to `k` drafts
+(`--draft-tokens` max, `--min-draft-tokens` floor, adaptive between
+them: full accept +1, full reject −1; equal values pin `k` for sweeps).
+
+- `GemvRows` / `AttentionDecodeRows` are the `Rows`-templated versions of
+  the two-row kernels (`switch (tokens)` dispatch, 2–5 rows). `k` is
+  capped at 4 (5 verify rows) because the split kernel's LDS is
+  `Rows × 8 × 256 × 4 B` — 40 KB fits, 8 rows would exceed the 64 KB
+  budget. CLI values above 4 are clamped.
+- Draft chain: `MtpStep(t0)` then `MtpDraft(d_i)` feeds the *unnormalized*
+  MTP output hidden (`mtp_chain_`, copied before the in-place shared
+  head norm) as the previous-hidden input of the next draft.
+- Verify: `Executor::Verify(t0, drafts, k)` runs `k+1` rows through the
+  batch path into `verify_logits_` / `verify_h_`; `RollbackVerify(keep)`
+  restores the GDN state/history snapshot row `keep − 1` and rewinds
+  `position_`/`mtp_position_` so the next step re-drafts from the
+  accepted prefix. Stale KV beyond `position_` is never read.
+- Temperature > 0 uses Leviathan speculative sampling: the draft
+  distribution `q` is captured per draft token, a draft is kept with
+  probability `min(1, p(d)/q(d))`, and on rejection the correction token
+  is drawn from `max(0, p − q)` (`SamplerState::SampleResidual`).
+  Speculation stays disabled while penalties are active.
+- Stop tokens inside an accepted block truncate the commit at the stop.
+
+Served sweep (greedy, pinned `k`): **k = 2 → 60.8 tps** (90.6 %
+acceptance, 128-token completion), k = 3 → 56–58 tps, k = 4 (CLI 6
+clamped) → 49 tps. Acceptance falls faster than the verify rows amortize
+beyond k = 2; the adaptive default should settle there.
+
 ## Roofline and open work
 
 Active weight bytes per token ≈ 3.07 GB (8/256 experts + shared + attention +
@@ -131,19 +189,24 @@ Open items, in priority order:
     140 launches/step. Router+TopK fusion was rejected: it would
     reorder the router dot product and break token parity. vec4 int8
     loads measured only +9.5 % cold and are not bit-exact — rejected.
-    The next lever is hipGraph capture of the decode step (blockers:
-    scalar `pos` baked into the Attention cache pointer and `n_kv`
-    argument).
-4. **MTP speculative decoding** — `draft_proposed=0` today; enabling the
-   MTP block is the multiplier that takes 33 → 60+ tps.
+    The next lever is hipGraph capture (see open item 5).
+4. **MTP speculative decoding — done** — see the two sections above;
+   k = 1 serves 55.2 tps, the k-draft generalization is in tree.
+5. **hipGraph capture of the decode step** — the remaining launch-gap
+   lever; blockers are the scalar `pos` baked into the Attention cache
+   pointer and `n_kv` argument.
 
 ## Verification
 
 - Oracle tests (run directly, MB-scale):
   `qwen36_a3b_rocm_gemv_test` (includes bit-exact checks for
-  `GemvQ8_0Multi4` / `GemvGroupedQ8_0Pair` vs the separate launches),
-  `qwen36_a3b_rocm_gdn_test`, `qwen36_a3b_rocm_attention_test` — all
-  pass; GdnDelta errors match the pre-refactor reference bit-for-bit.
+  `GemvQ8_0Multi4` / `GemvGroupedQ8_0Pair` vs the separate launches, and
+  `GemvRows` for 2–5 activation rows across Q8_0/F32/BF16),
+  `qwen36_a3b_rocm_gdn_test`, `qwen36_a3b_rocm_attention_test` (covers
+  `AttentionDecodeRows` for 2–5 rows over starts straddling the 64-token
+  split boundary and the 32-split cap, including fully masked
+  row/split blocks) — all pass; GdnDelta errors match the pre-refactor
+  reference bit-for-bit.
 - Forward test (user-run, loads the 40 GB model): trunk step0 0.0107703,
   step1 0.00451447, step2 0.00276079, mtp 0.00246238.
 - Profiler runner: `test_build_profiler.sh`.

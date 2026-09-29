@@ -116,6 +116,10 @@ public:
   }
   void Reset();
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
+  /// Bounds on the per-round MTP draft count. The session starts at `max`
+  /// drafts, grows while drafts keep being fully accepted and shrinks on
+  /// rejections down to `min`; `min` == `max` pins the count.
+  void SetDraftLimits(std::uint32_t min_drafts, std::uint32_t max_drafts);
 
 private:
   friend class Model;
@@ -126,9 +130,12 @@ private:
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
   // Readback scratch for speculative decoding: the draft block's logits and
-  // the two verify rows.
+  // the verify rows (kMaxVerifyRows * vocab).
   std::vector<float> draft_logits_;
   std::vector<float> verify_rows_;
+  std::uint32_t draft_min_{1};
+  std::uint32_t draft_max_{4};
+  std::uint32_t draft_k_{4};
   bool valid_{true};
 };
 

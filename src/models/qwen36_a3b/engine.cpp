@@ -127,7 +127,15 @@ Session::Session(std::shared_ptr<Model> model, rocm::Executor* executor)
     : model_(std::move(model)), executor_(executor) {
   logits_.resize(model_->VocabSize());
   draft_logits_.resize(model_->VocabSize());
-  verify_rows_.resize(2 * model_->VocabSize());
+  verify_rows_.resize(rocm::Executor::kMaxVerifyRows * model_->VocabSize());
+}
+
+void Session::SetDraftLimits(std::uint32_t min_drafts,
+                             std::uint32_t max_drafts) {
+  const std::uint32_t cap = rocm::Executor::kMaxVerifyRows - 1U;
+  draft_max_ = std::min(max_drafts == 0U ? 1U : max_drafts, cap);
+  draft_min_ = std::min(std::max(min_drafts, 1U), draft_max_);
+  draft_k_ = draft_max_;
 }
 
 Session::~Session() = default;
@@ -232,14 +240,21 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return stop_at_eos && model_->IsStopToken(token);
   };
 
-  // Speculative decoding: with an MTP block and a greedy sampler, draft one
-  // token with the MTP block, verify both tokens in one batched trunk pass,
-  // and accept the draft only when the trunk agrees. The verify pass reads
-  // the trunk weights once for two tokens, so a hit costs ~1.2 tokens' time.
-  const bool spec = model_->HasMtp() && max_tokens >= 2 &&
-                    sampler.config().can_use_unmodified_argmax() &&
-                    tokens_.size() + 2 <= ContextSize();
-  if (!spec) {
+  // Speculative decoding: with an MTP block and an unpenalized sampler,
+  // chain up to k drafts through the draft block, verify all k + 1 rows in
+  // one batched trunk pass, and keep the longest prefix the trunk agrees
+  // with. The verify pass reads the trunk weights once for the whole block,
+  // so a hit costs ~1.2 tokens' time. Greedy samplers take the exact-match
+  // path; temperature sampling uses the standard accept-and-residual rule.
+  std::size_t k = 0;
+  if (model_->HasMtp() && max_tokens >= 2 &&
+      !sampler.config().penalties_enabled() &&
+      tokens_.size() + 2 <= ContextSize()) {
+    k = std::min<std::size_t>(draft_k_, max_tokens - 1);
+    k = std::min<std::size_t>(k, ContextSize() - tokens_.size() - 1);
+    k = std::min<std::size_t>(k, rocm::Executor::kMaxVerifyRows - 1U);
+  }
+  if (k == 0) {
     const auto token = static_cast<std::int32_t>(sampler.Sample(logits_));
     if (is_stop(token)) {
       result->stop = true;
@@ -258,53 +273,145 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return true;
   }
 
+  const std::size_t vocab = draft_logits_.size();
+  const bool sampled = !sampler.config().can_use_unmodified_argmax();
   const auto token = static_cast<std::int32_t>(sampler.Sample(logits_));
   if (is_stop(token)) {
     result->stop = true;
     return true;
   }
+
+  // Draft chain: the first draft conditions on the trunk hidden state,
+  // every later one on the previous draft's own output hidden.
   valid_ = false;
   if (!executor_->MtpStep(token, error_msg)) {
     return false;
   }
-  ++result->drafted;
-  (void)hipMemcpy(draft_logits_.data(), executor_->mtp_logits(),
-                  draft_logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
-  const auto draft = static_cast<std::int32_t>(
-      sampler.SampleGreedy(std::span<const float>(draft_logits_)));
-  if (!executor_->Verify(token, draft, error_msg)) {
+  std::int32_t drafts[rocm::Executor::kMaxVerifyRows - 1U];
+  // Random sampling keeps each draft distribution so the accept step can
+  // weigh the target against it and draw the residual on a rejection.
+  std::vector<std::vector<sampling::TokenId>> draft_ids(k);
+  std::vector<std::vector<float>> draft_probs(k);
+  std::vector<double> draft_p(k, 0.0);
+  for (std::size_t i = 0; i < k; ++i) {
+    if (i > 0 && !executor_->MtpDraft(drafts[i - 1], error_msg)) {
+      return false;
+    }
+    (void)hipMemcpy(draft_logits_.data(), executor_->mtp_logits(),
+                    vocab * sizeof(float), hipMemcpyDeviceToHost);
+    if (!sampled) {
+      drafts[i] = static_cast<std::int32_t>(
+          sampler.SampleGreedy(std::span<const float>(draft_logits_)));
+      continue;
+    }
+    const auto q =
+        sampler.Distribution(std::span<const float>(draft_logits_));
+    draft_ids[i].reserve(q.entries().size());
+    draft_probs[i].reserve(q.entries().size());
+    for (const auto& entry : q.entries()) {
+      draft_ids[i].push_back(entry.token);
+      draft_probs[i].push_back(static_cast<float>(entry.value));
+    }
+    drafts[i] =
+        static_cast<std::int32_t>(q.Sample(sampler.mutable_rng_state()));
+    draft_p[i] = q.probability(static_cast<sampling::TokenId>(drafts[i]));
+  }
+  result->drafted += k;
+  if (!executor_->Verify(token, drafts, static_cast<std::uint32_t>(k),
+                         error_msg)) {
     return false;
   }
   (void)hipMemcpy(verify_rows_.data(), executor_->verify_logits(),
-                  verify_rows_.size() * sizeof(float), hipMemcpyDeviceToHost);
-  const std::span<const float> row0(verify_rows_.data(), draft_logits_.size());
-  const std::span<const float> row1(verify_rows_.data() + draft_logits_.size(),
-                                    draft_logits_.size());
-  if (static_cast<std::int32_t>(sampler.SampleGreedy(row0)) == draft) {
-    // The trunk reproduces the draft: keep both tokens and advance the MTP
-    // caches over the accepted pair so the next draft stays aligned.
-    if (!executor_->MtpAdvance(draft, executor_->verify_hidden(), error_msg)) {
+                  (k + 1) * vocab * sizeof(float), hipMemcpyDeviceToHost);
+  const auto row = [&](std::size_t r) {
+    return std::span<const float>(verify_rows_.data() + r * vocab, vocab);
+  };
+
+  // Keep the longest draft prefix the target reproduces. Greedy compares
+  // argmaxes; random sampling accepts draft d with probability min(1,
+  // p(d)/q(d)) and, on the first rejection, replaces d with a draw from
+  // the residual (p - q)+.
+  std::size_t accepted = 0;
+  std::int32_t correction = -1;
+  if (!sampled) {
+    while (accepted < k &&
+           static_cast<std::int32_t>(sampler.SampleGreedy(row(accepted))) ==
+               drafts[accepted]) {
+      ++accepted;
+    }
+    if (accepted < k) {
+      correction = static_cast<std::int32_t>(
+          sampler.SampleGreedy(row(accepted)));
+    }
+  } else {
+    for (; accepted < k; ++accepted) {
+      const auto p = sampler.Distribution(row(accepted));
+      if (sampler.Uniform() * draft_p[accepted] <
+          p.probability(static_cast<sampling::TokenId>(drafts[accepted]))) {
+        continue;
+      }
+      correction = static_cast<std::int32_t>(p.SampleResidual(
+          draft_ids[accepted], draft_probs[accepted],
+          sampler.mutable_rng_state()));
+      break;
+    }
+  }
+  bool stopped = false;
+  for (std::size_t i = 0; i < accepted; ++i) {
+    if (is_stop(drafts[i])) {
+      accepted = i + 1;
+      stopped = true;
+      break;
+    }
+  }
+
+  // Commit. A full accept advances the draft cache over the last draft
+  // against its own target hidden row; a partial one rewinds the trunk and
+  // the draft cache to the committed prefix.
+  std::vector<sampling::TokenId> committed;
+  committed.reserve(k + 2);
+  committed.push_back(static_cast<sampling::TokenId>(token));
+  for (std::size_t i = 0; i < accepted; ++i) {
+    committed.push_back(static_cast<sampling::TokenId>(drafts[i]));
+  }
+  if (accepted == k) {
+    if (!executor_->MtpAdvance(
+            drafts[k - 1],
+            executor_->verify_hidden() +
+                (k - 1) * model_->config().hidden_size,
+            error_msg)) {
       return false;
     }
-    logits_.assign(row1.begin(), row1.end());
-    tokens_.push_back(token);
-    tokens_.push_back(draft);
-    const sampling::TokenId accepted[2] = {
-        static_cast<sampling::TokenId>(token),
-        static_cast<sampling::TokenId>(draft)};
-    sampler.Accept(std::span<const sampling::TokenId>(accepted));
-    result->tokens.push_back(token);
-    result->tokens.push_back(draft);
-    ++result->accepted;
-    result->stop = is_stop(draft);
+    logits_.assign(row(k).begin(), row(k).end());
+    if (!stopped) {
+      draft_k_ = std::min(draft_max_, draft_k_ + 1U);
+    }
   } else {
-    // The trunk disagrees at the draft position: rewind to the state after
-    // the accepted token and continue from the trunk's own logits.
-    executor_->RollbackVerify();
-    logits_.assign(row0.begin(), row0.end());
-    tokens_.push_back(token);
-    sampler.Accept(static_cast<sampling::TokenId>(token));
-    result->tokens.push_back(token);
+    executor_->RollbackVerify(static_cast<std::uint32_t>(accepted + 1U));
+    if (accepted == 0) {
+      draft_k_ = std::max(draft_min_, draft_k_ - 1U);
+    }
+  }
+  result->accepted += accepted;
+  for (const auto id : committed) {
+    tokens_.push_back(static_cast<std::int32_t>(id));
+    result->tokens.push_back(static_cast<std::int32_t>(id));
+  }
+  sampler.Accept(std::span<const sampling::TokenId>(committed));
+  if (!stopped && correction >= 0) {
+    // The target's own token at the first rejected row continues the
+    // sequence; feeding it is the round's only extra cost.
+    if (!executor_->Step(correction, error_msg)) {
+      return false;
+    }
+    tokens_.push_back(correction);
+    result->tokens.push_back(correction);
+    sampler.Accept(static_cast<sampling::TokenId>(correction));
+    (void)hipMemcpy(logits_.data(), executor_->logits(),
+                    vocab * sizeof(float), hipMemcpyDeviceToHost);
+    result->stop = is_stop(correction);
+  } else if (stopped) {
+    result->stop = true;
   }
   valid_ = true;
   return true;
