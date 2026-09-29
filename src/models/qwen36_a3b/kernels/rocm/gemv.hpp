@@ -26,15 +26,16 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
           std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,
           hipStream_t stream);
 
-/// Two-row variant of Gemv for the speculative verify pass:
-/// out[o*out_stride + r] = sum_k W[r][k] * x[o*x_stride + k] for o in {0,1}.
-/// One wave owns an output row and dots the weight row against both
-/// activation rows in a single walk, so the matrix is read once for the two
-/// tokens. Each per-row dot is bit-identical to the matching Gemv call.
-void Gemv2(const void* base, GemvType type, std::uint32_t rows,
-           std::uint32_t cols, std::size_t row_bytes, const float* x,
-           std::uint32_t x_stride, float* out, std::uint32_t out_stride,
-           hipStream_t stream);
+/// Multi-row variant of Gemv for the speculative verify pass:
+/// out[o*out_stride + r] = sum_k W[r][k] * x[o*x_stride + k] for o in
+/// [0, tokens). `tokens` must be in [2, 5]. One wave owns an output row and
+/// dots the weight row against all activation rows in a single walk, so the
+/// matrix is read once for the whole token block. Each per-row dot is
+/// bit-identical to the matching Gemv call.
+void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
+              std::uint32_t rows, std::uint32_t cols, std::size_t row_bytes,
+              const float* x, std::uint32_t x_stride, float* out,
+              std::uint32_t out_stride, hipStream_t stream);
 
 /// Grouped decode GEMV over a stacked expert matrix. For slot s in [0, used)
 /// with expert id ids[s]: out[s*rows + r] = sum_k W[e][r][k] *

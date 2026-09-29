@@ -166,15 +166,16 @@ void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
                      std::uint32_t kv_heads, std::uint32_t head_dim,
                      float scale, hipStream_t stream);
 
-/// Two-row variant of the head_dim == 256 flash-decoding path for the
-/// speculative verify pass. `q`, `gate` and `out` are [2][heads * head_dim];
-/// row o attends positions [0, n_kv_o) (n_kv1 == n_kv0 + 1). `part` holds
-/// 2 * heads * 32 * (head_dim + 2) floats.
-void AttentionDecode2(const float* q, const float* k_cache,
-                      const float* v_cache, const float* gate, float* out,
-                      float* part, std::uint32_t n_kv0, std::uint32_t n_kv1,
-                      std::uint32_t heads, std::uint32_t kv_heads,
-                      std::uint32_t head_dim, float scale, hipStream_t stream);
+/// Multi-row variant of the head_dim == 256 flash-decoding path for the
+/// speculative verify pass. `q`, `gate` and `out` are [rows][heads * head_dim]
+/// with rows in [2, 5]; row o attends positions [0, n_kv0 + o). `part` holds
+/// rows * heads * 32 * (head_dim + 2) floats.
+void AttentionDecodeRows(const float* q, const float* k_cache,
+                         const float* v_cache, const float* gate, float* out,
+                         float* part, std::uint32_t n_kv0, std::uint32_t rows,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t head_dim, float scale,
+                         hipStream_t stream);
 
 /// Batched causal self-attention for a prefill chunk. `q` and `gate` are
 /// [tokens][heads * head_dim] (already normed and rotated); `k_cache`/`v_cache`

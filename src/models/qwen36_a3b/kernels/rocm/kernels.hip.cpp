@@ -590,137 +590,159 @@ __global__ void AttentionDecodeSplitKernel(
   }
 }
 
-// Two-row flash-decoding split for the speculative verify pass. One block
-// per (head, split) folds both query rows over the same KV chunk so the
-// cache is read once for the pair; row o attends [0, n_kv_o). Partials use
-// the AttentionDecodeSplitKernel layout per row: [row][head][split][hd + 2].
-__global__ void AttentionDecodeSplit2Kernel(
+// Multi-row flash-decoding split for the speculative verify pass. One block
+// per (head, split) folds all query rows over the same KV chunk so the
+// cache is read once for the block; row o attends [0, n_kv0 + o). Partials
+// use the AttentionDecodeSplitKernel layout per row:
+// [row][head][split][hd + 2].
+template <std::uint32_t Rows>
+__global__ void AttentionDecodeSplitRowsKernel(
     const float* q, const float* k_cache, const float* v_cache, float* part,
-    std::uint32_t n_kv0, std::uint32_t n_kv1, std::uint32_t heads,
-    std::uint32_t kv_heads, std::uint32_t head_dim, float scale,
-    std::uint32_t splits, std::uint32_t chunk) {
+    std::uint32_t n_kv0, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, float scale, std::uint32_t splits,
+    std::uint32_t chunk) {
   constexpr std::uint32_t kWaves = 8;
-  __shared__ float s_acc[2][kWaves][256];
-  __shared__ float s_max[2][kWaves];
-  __shared__ float s_sum[2][kWaves];
+  __shared__ float s_acc[Rows][kWaves][256];
+  __shared__ float s_max[Rows][kWaves];
+  __shared__ float s_sum[Rows][kWaves];
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t sp = blockIdx.y;
   const std::uint32_t kvh = h / (heads / kv_heads);
+  const std::size_t row_stride = static_cast<std::size_t>(heads) * head_dim;
   const float* q0 = q + static_cast<std::size_t>(h) * head_dim;
-  const float* q1 = q0 + static_cast<std::size_t>(heads) * head_dim;
   const std::size_t kv_stride = static_cast<std::size_t>(kv_heads) * head_dim;
   const std::uint32_t lane = threadIdx.x & 31U;
   const std::uint32_t wave = threadIdx.x >> 5;
-  float qv0[8];
-  float qv1[8];
+  float qv[Rows][8];
 #pragma unroll
-  for (std::uint32_t m = 0; m < 8U; ++m) {
-    qv0[m] = q0[lane + 32U * m];
-    qv1[m] = q1[lane + 32U * m];
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+#pragma unroll
+    for (std::uint32_t m = 0; m < 8U; ++m) {
+      qv[o][m] = q0[o * row_stride + lane + 32U * m];
+    }
   }
-  float wmax0 = -INFINITY;
-  float wsum0 = 0.0F;
-  float wmax1 = -INFINITY;
-  float wsum1 = 0.0F;
-  float acc0[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-  float acc1[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+  float wmax[Rows];
+  float wsum[Rows];
+  float acc[Rows][8];
+#pragma unroll
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    wmax[o] = -INFINITY;
+    wsum[o] = 0.0F;
+#pragma unroll
+    for (std::uint32_t m = 0; m < 8U; ++m) {
+      acc[o][m] = 0.0F;
+    }
+  }
+  const std::uint32_t n_kv_last = n_kv0 + Rows - 1U;
   const std::uint32_t j0 = sp * chunk;
-  const std::uint32_t j1 = (n_kv1 < j0 + chunk) ? n_kv1 : j0 + chunk;
+  const std::uint32_t j1 = (n_kv_last < j0 + chunk) ? n_kv_last : j0 + chunk;
   for (std::uint32_t j = j0 + wave; j < j1; j += kWaves) {
     const float* kj =
         k_cache + static_cast<std::size_t>(j) * kv_stride + kvh * head_dim;
-    float dot0 = 0.0F;
-    float dot1 = 0.0F;
+    float dot[Rows];
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      dot[o] = 0.0F;
+    }
 #pragma unroll
     for (std::uint32_t m = 0; m < 8U; ++m) {
       const float kv = kj[lane + 32U * m];
-      dot0 += qv0[m] * kv;
-      dot1 += qv1[m] * kv;
+#pragma unroll
+      for (std::uint32_t o = 0; o < Rows; ++o) {
+        dot[o] += qv[o][m] * kv;
+      }
     }
-    dot0 = WarpReduceSumF(dot0) * scale;
-    dot1 = WarpReduceSumF(dot1) * scale;
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      dot[o] = WarpReduceSumF(dot[o]) * scale;
+    }
     const float* vj =
         v_cache + static_cast<std::size_t>(j) * kv_stride + kvh * head_dim;
-    if (j < n_kv0) {
-      const float nm = fmaxf(wmax0, dot0);
-      const float r = expf(wmax0 - nm);
-      const float e = expf(dot0 - nm);
-      wsum0 = wsum0 * r + e;
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      if (j >= n_kv0 + o) {
+        continue;
+      }
+      const float nm = fmaxf(wmax[o], dot[o]);
+      const float r = expf(wmax[o] - nm);
+      const float e = expf(dot[o] - nm);
+      wsum[o] = wsum[o] * r + e;
 #pragma unroll
       for (std::uint32_t m = 0; m < 8U; ++m) {
-        acc0[m] = acc0[m] * r + e * vj[lane + 32U * m];
+        acc[o][m] = acc[o][m] * r + e * vj[lane + 32U * m];
       }
-      wmax0 = nm;
-    }
-    {
-      const float nm = fmaxf(wmax1, dot1);
-      const float r = expf(wmax1 - nm);
-      const float e = expf(dot1 - nm);
-      wsum1 = wsum1 * r + e;
-#pragma unroll
-      for (std::uint32_t m = 0; m < 8U; ++m) {
-        acc1[m] = acc1[m] * r + e * vj[lane + 32U * m];
-      }
-      wmax1 = nm;
+      wmax[o] = nm;
     }
   }
   if (lane == 0) {
-    s_max[0][wave] = wmax0;
-    s_sum[0][wave] = wsum0;
-    s_max[1][wave] = wmax1;
-    s_sum[1][wave] = wsum1;
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      s_max[o][wave] = wmax[o];
+      s_sum[o][wave] = wsum[o];
+    }
   }
   __syncthreads();
-  float bmax0 = -INFINITY;
-  float bmax1 = -INFINITY;
+  float bmax[Rows];
+#pragma unroll
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    bmax[o] = -INFINITY;
+  }
 #pragma unroll
   for (std::uint32_t w = 0; w < kWaves; ++w) {
-    bmax0 = fmaxf(bmax0, s_max[0][w]);
-    bmax1 = fmaxf(bmax1, s_max[1][w]);
-  }
-  const float r0 = expf(wmax0 - bmax0);
-  const float r1 = expf(wmax1 - bmax1);
 #pragma unroll
-  for (std::uint32_t m = 0; m < 8U; ++m) {
-    s_acc[0][wave][lane + 32U * m] = acc0[m] * r0;
-    s_acc[1][wave][lane + 32U * m] = acc1[m] * r1;
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      bmax[o] = fmaxf(bmax[o], s_max[o][w]);
+    }
+  }
+#pragma unroll
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    // A row whose whole chunk is causally masked keeps wmax = -INF; its
+    // contribution is zero, not the NaN that expf(-INF - -INF) would give.
+    const float r =
+        (wmax[o] == -INFINITY) ? 0.0F : expf(wmax[o] - bmax[o]);
+#pragma unroll
+    for (std::uint32_t m = 0; m < 8U; ++m) {
+      s_acc[o][wave][lane + 32U * m] = acc[o][m] * r;
+    }
   }
   __syncthreads();
-  float val0 = 0.0F;
-  float val1 = 0.0F;
+  // The block covers head_dim threads; each thread folds one element of
+  // every row into its partial slot.
 #pragma unroll
-  for (std::uint32_t w = 0; w < kWaves; ++w) {
-    val0 += s_acc[0][w][threadIdx.x];
-    val1 += s_acc[1][w][threadIdx.x];
-  }
-  const std::size_t base = static_cast<std::size_t>(h) * splits + sp;
-  float* pp0 = part + base * (head_dim + 2U);
-  float* pp1 = part + (base + static_cast<std::size_t>(heads) * splits) *
-                          (head_dim + 2U);
-  pp0[threadIdx.x] = val0;
-  pp1[threadIdx.x] = val1;
-  if (threadIdx.x == 0) {
-    float total0 = 0.0F;
-    float total1 = 0.0F;
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    float val = 0.0F;
 #pragma unroll
     for (std::uint32_t w = 0; w < kWaves; ++w) {
-      total0 += s_sum[0][w] * expf(s_max[0][w] - bmax0);
-      total1 += s_sum[1][w] * expf(s_max[1][w] - bmax1);
+      val += s_acc[o][w][threadIdx.x];
     }
-    pp0[head_dim] = bmax0;
-    pp0[head_dim + 1U] = total0;
-    pp1[head_dim] = bmax1;
-    pp1[head_dim + 1U] = total1;
+    const std::size_t base =
+        (static_cast<std::size_t>(o) * heads + h) * splits + sp;
+    part[base * (head_dim + 2U) + threadIdx.x] = val;
+  }
+  if (threadIdx.x < Rows) {
+    float total = 0.0F;
+#pragma unroll
+    for (std::uint32_t w = 0; w < kWaves; ++w) {
+      const float sm = s_max[threadIdx.x][w];
+      total += (sm == -INFINITY)
+                   ? 0.0F
+                   : s_sum[threadIdx.x][w] * expf(sm - bmax[threadIdx.x]);
+    }
+    const std::size_t base =
+        (static_cast<std::size_t>(threadIdx.x) * heads + h) * splits + sp;
+    float* pp = part + base * (head_dim + 2U);
+    pp[head_dim] = bmax[threadIdx.x];
+    pp[head_dim + 1U] = total;
   }
 }
 
-// Folds the AttentionDecodeSplit2Kernel partials per row and head and
-// applies the sigmoid output gate. Grid (heads, 2), block head_dim.
-__global__ void AttentionDecodeCombine2Kernel(const float* part,
-                                              const float* gate, float* out,
-                                              std::uint32_t heads,
-                                              std::uint32_t splits,
-                                              std::uint32_t head_dim) {
+// Folds the AttentionDecodeSplitRowsKernel partials per row and head and
+// applies the sigmoid output gate. Grid (heads, rows), block head_dim.
+__global__ void AttentionDecodeCombineRowsKernel(const float* part,
+                                                 const float* gate, float* out,
+                                                 std::uint32_t heads,
+                                                 std::uint32_t splits,
+                                                 std::uint32_t head_dim) {
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t o = blockIdx.y;
   const std::uint32_t i = threadIdx.x;
@@ -1506,22 +1528,36 @@ void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
                                                      kv_heads, head_dim, scale);
 }
 
-void AttentionDecode2(const float* q, const float* k_cache,
-                      const float* v_cache, const float* gate, float* out,
-                      float* part, std::uint32_t n_kv0, std::uint32_t n_kv1,
-                      std::uint32_t heads, std::uint32_t kv_heads,
-                      std::uint32_t head_dim, float scale,
-                      hipStream_t stream) {
-  std::uint32_t splits = (n_kv1 + 63U) / 64U;
+void AttentionDecodeRows(const float* q, const float* k_cache,
+                         const float* v_cache, const float* gate, float* out,
+                         float* part, std::uint32_t n_kv0,
+                         std::uint32_t rows, std::uint32_t heads,
+                         std::uint32_t kv_heads, std::uint32_t head_dim,
+                         float scale, hipStream_t stream) {
+  const std::uint32_t n_kv_last = n_kv0 + rows - 1U;
+  std::uint32_t splits = (n_kv_last + 63U) / 64U;
   if (splits > 32U) {
     splits = 32U;
   }
-  std::uint32_t chunk = (n_kv1 + splits - 1U) / splits;
-  splits = (n_kv1 + chunk - 1U) / chunk;
-  AttentionDecodeSplit2Kernel<<<dim3(heads, splits), 256, 0, stream>>>(
-      q, k_cache, v_cache, part, n_kv0, n_kv1, heads, kv_heads, head_dim,
-      scale, splits, chunk);
-  AttentionDecodeCombine2Kernel<<<dim3(heads, 2U), head_dim, 0, stream>>>(
+  std::uint32_t chunk = (n_kv_last + splits - 1U) / splits;
+  splits = (n_kv_last + chunk - 1U) / chunk;
+#define GUFO_ATTN_DECODE_ROWS(R)                                             \
+  case R:                                                                    \
+    AttentionDecodeSplitRowsKernel<R><<<dim3(heads, splits), 256, 0,         \
+                                         stream>>>(                          \
+        q, k_cache, v_cache, part, n_kv0, heads, kv_heads, head_dim, scale,  \
+        splits, chunk);                                                      \
+    break;
+  switch (rows) {
+    GUFO_ATTN_DECODE_ROWS(2U)
+    GUFO_ATTN_DECODE_ROWS(3U)
+    GUFO_ATTN_DECODE_ROWS(4U)
+    GUFO_ATTN_DECODE_ROWS(5U)
+    default:
+      return;
+  }
+#undef GUFO_ATTN_DECODE_ROWS
+  AttentionDecodeCombineRowsKernel<<<dim3(heads, rows), head_dim, 0, stream>>>(
       part, gate, out, heads, splits, head_dim);
 }
 

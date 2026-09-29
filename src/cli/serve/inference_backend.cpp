@@ -2790,13 +2790,16 @@ std::vector<std::int32_t> Qwen36A3BEngineTokens(
 class Qwen36A3BTextRunnerState final : public TextRunnerState {
 public:
   Qwen36A3BTextRunnerState(const std::shared_ptr<Qwen36A3BModel>& model,
-                           std::uint32_t max_context) {
+                           std::uint32_t max_context,
+                           std::uint32_t min_drafts,
+                           std::uint32_t max_drafts) {
     std::string error;
     session_ = model->CreateSession(max_context, &error);
     if (session_ == nullptr) {
       throw std::runtime_error("Failed to create Qwen3.6-35B-A3B session: " +
                                error);
     }
+    session_->SetDraftLimits(min_drafts, max_drafts);
   }
 
   void Invalidate() noexcept override {
@@ -2836,10 +2839,13 @@ const Qwen36A3BTextRunnerState& RequireQwen36A3BState(
 class Qwen36A3BTextRunner final : public TextModelRunner {
 public:
   Qwen36A3BTextRunner(std::shared_ptr<Qwen36A3BModel> model,
-                      std::uint32_t max_context, bool use_mtp)
+                      std::uint32_t max_context, bool use_mtp,
+                      std::uint32_t min_drafts, std::uint32_t max_drafts)
       : model_(std::move(model)),
         max_context_(max_context),
-        use_mtp_(use_mtp) {}
+        use_mtp_(use_mtp),
+        min_drafts_(min_drafts),
+        max_drafts_(max_drafts) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -2907,7 +2913,9 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<Qwen36A3BTextRunnerState>(model_, max_context_);
+    return std::make_unique<Qwen36A3BTextRunnerState>(model_, max_context_,
+                                                      min_drafts_,
+                                                      max_drafts_);
   }
 
   void PreparePrefixReuse(
@@ -3033,6 +3041,8 @@ private:
   std::shared_ptr<Qwen36A3BModel> model_;
   std::uint32_t max_context_;
   bool use_mtp_;
+  std::uint32_t min_drafts_;
+  std::uint32_t max_drafts_;
 };
 #endif
 
@@ -3668,8 +3678,10 @@ bool InferenceBackend::load(
   }
   try {
     auto new_state = std::make_shared<Impl::State>();
-    auto runner = std::make_shared<Qwen36A3BTextRunner>(std::move(model),
-                                                        max_context, use_mtp);
+    auto runner = std::make_shared<Qwen36A3BTextRunner>(
+        std::move(model), max_context, use_mtp,
+        speculative_config.min_draft_tokens,
+        speculative_config.max_draft_tokens);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);

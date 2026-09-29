@@ -51,18 +51,27 @@ public:
   /// draft cache aligned with the trunk after an accepted draft.
   bool MtpAdvance(std::int32_t token, const float* hidden,
                   std::string* error_msg = nullptr);
-  /// Speculative verification: advances the trunk by two tokens in one
-  /// batched pass (the GEMM tier, like Prefill). Row `r` of verify_logits()
-  /// ([2][vocab]) holds the logits after consuming token `r`, and row `r` of
-  /// verify_hidden() ([2][hidden]) the post-output-norm hidden state. The
-  /// Gated DeltaNet state and conv history after the first row are
-  /// snapshotted so RollbackVerify() can undo the second token.
-  bool Verify(std::int32_t t0, std::int32_t t1,
+  /// Chains one more MTP draft: feeds `token` back through the draft block
+  /// against the previous draft's own hidden state, producing new
+  /// mtp_logits(). The draft KV cache advances with each call.
+  bool MtpDraft(std::int32_t token, std::string* error_msg = nullptr);
+  /// Upper bound on the rows a Verify pass may run (kMaxDraftTokens + 1).
+  static constexpr std::uint32_t kMaxVerifyRows = 5U;
+  /// Speculative verification: advances the trunk by `k` + 1 tokens (the
+  /// accepted token `t0` followed by the `k` drafts) in one batched pass
+  /// (the GEMM tier, like Prefill). Row `r` of verify_logits()
+  /// ([k+1][vocab]) holds the logits after consuming row token `r`, and row
+  /// `r` of verify_hidden() ([k+1][hidden]) the post-output-norm hidden
+  /// state. The Gated DeltaNet state and conv history after each of the
+  /// first `k` rows are snapshotted so RollbackVerify() can commit any
+  /// prefix of the block.
+  bool Verify(std::int32_t t0, const std::int32_t* drafts, std::uint32_t k,
               std::string* error_msg = nullptr);
-  /// Undoes the second token of the most recent Verify: restores the
-  /// recurrent state from the snapshot, rewinds `position_` by one and leaves
-  /// the first row's hidden state in h_out().
-  void RollbackVerify();
+  /// Commits the first `keep` rows of the most recent Verify (1 <= keep <= k)
+  /// and discards the rest: restores the recurrent state from the snapshot
+  /// after row `keep` - 1, rewinds `position_` and the MTP cache to just past
+  /// the committed rows and leaves their hidden state in h_out().
+  void RollbackVerify(std::uint32_t keep);
   /// Clears the recurrent state and both positions.
   void Reset();
 
@@ -134,6 +143,8 @@ private:
   std::uint32_t max_context_{0};
   std::uint32_t position_{0};
   std::uint32_t mtp_position_{0};
+  /// Trunk position before the most recent Verify, the rewind base.
+  std::uint32_t verify_base_pos_{0};
 
   // Residual stream and outputs.
   float* x_{nullptr};
@@ -195,11 +206,11 @@ private:
   float* pf_shared_up_{nullptr};
   float* pf_shared_down_{nullptr};
   float* pf_shared_gate_inp_{nullptr};
-  // [2*used][hidden] copy of the verify normed rows (row t repeated `used`
-  // times) so the grouped expert GEMVs can index x by slot.
+  // [kMaxVerifyRows*used][hidden] copy of the verify normed rows (row t
+  // repeated `used` times) so the grouped expert GEMVs can index x by slot.
   float* pf_x_dup_{nullptr};
-  // [2][heads][32][head_dim + 2] flash-decoding partials for the two verify
-  // rows (AttentionDecode2).
+  // [kMaxVerifyRows][heads][32][head_dim + 2] flash-decoding partials for
+  // the verify rows (AttentionDecodeRows).
   float* pf_part2_{nullptr};
 
   // Routed F16 WMMA MoE scratch (prefill). The compacted bucket layout, the
@@ -243,14 +254,16 @@ private:
   float* pf_ctx_{nullptr};
   std::uint32_t* pf_pos_{nullptr};
 
-  // MTP scratch.
+  // MTP scratch. `mtp_chain_` keeps the draft block's unnormalized output
+  // hidden before the shared head norm, the hidden input of the next draft.
   float* mtp_e_{nullptr};
   float* mtp_h_{nullptr};
   float* mtp_concat_{nullptr};
   float* mtp_cur_{nullptr};
+  float* mtp_chain_{nullptr};
 
-  // Speculative verify scratch: per-row logits ([2][vocab]) and post-output-
-  // norm hidden ([2][hidden]) for the two-token verify pass.
+  // Speculative verify scratch: per-row logits ([kMaxVerifyRows][vocab]) and
+  // post-output-norm hidden ([kMaxVerifyRows][hidden]).
   float* verify_logits_{nullptr};
   float* verify_h_{nullptr};
 
