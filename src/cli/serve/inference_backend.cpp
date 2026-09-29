@@ -3022,8 +3022,10 @@ const Qwen36A3BTextRunnerState& RequireQwen36A3BState(
 class Qwen36A3BTextRunner final : public TextModelRunner {
 public:
   Qwen36A3BTextRunner(std::shared_ptr<Qwen36A3BModel> model,
-                      std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+                      std::uint32_t max_context, bool use_mtp)
+      : model_(std::move(model)),
+        max_context_(max_context),
+        use_mtp_(use_mtp) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -3037,7 +3039,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0u,
                 .prefix_reuse = true,
@@ -3173,6 +3175,41 @@ public:
     return SelectNext(state, sampler);
   }
 
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (!use_mtp_ || max_tokens == 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "Qwen3.6-35B-A3B MTP decode budget must be at least one token");
+    }
+    auto& q36 = RequireQwen36A3BState(state);
+    if (q36.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    Qwen36A3BSession::DecodeResult decoded;
+    std::string error;
+    if (!q36.session().DecodeStep(max_tokens, sampler, &decoded, &error)) {
+      throw std::runtime_error("Qwen3.6-35B-A3B MTP decode failed: " + error);
+    }
+    TextDecodeStep step;
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
+    q36.set_position(q36.session().Position());
+    step.draft_tokens = decoded.drafted;
+    step.draft_accepted_tokens = decoded.accepted;
+    return step;
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireQwen36A3BState(state).position();
@@ -3181,6 +3218,7 @@ public:
 private:
   std::shared_ptr<Qwen36A3BModel> model_;
   std::uint32_t max_context_;
+  bool use_mtp_;
 };
 #endif
 
@@ -3454,10 +3492,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, "Qwen3.6-35B-A3B does not support --mmproj");
       return false;
     }
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
-               "Qwen3.6-35B-A3B HTTP models do not support speculative "
-               "decoding");
+               "Qwen3.6-35B-A3B HTTP models support only MTP speculative "
+               "decoding (--speculative mtp)");
       return false;
     }
     if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
@@ -3866,9 +3905,19 @@ bool InferenceBackend::load(
              "HTTP context exceeds the loaded Qwen3.6-35B-A3B model context");
     return false;
   }
-  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != TextSpeculativeBackend::kMtp) {
     SetError(error,
-             "Qwen3.6-35B-A3B HTTP models do not support speculative decoding");
+             "Qwen3.6-35B-A3B HTTP models support only MTP speculative "
+             "decoding (--speculative mtp)");
+    return false;
+  }
+  const bool use_mtp =
+      speculative_config.backend == TextSpeculativeBackend::kMtp;
+  if (use_mtp && !model->HasMtp()) {
+    SetError(error,
+             "Qwen3.6-35B-A3B MTP speculative decoding requires a GGUF with "
+             "an MTP block");
     return false;
   }
   if (DiskCacheEnabled(disk_cache_config)) {
@@ -3878,8 +3927,8 @@ bool InferenceBackend::load(
   }
   try {
     auto new_state = std::make_shared<Impl::State>();
-    auto runner =
-        std::make_shared<Qwen36A3BTextRunner>(std::move(model), max_context);
+    auto runner = std::make_shared<Qwen36A3BTextRunner>(std::move(model),
+                                                        max_context, use_mtp);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);

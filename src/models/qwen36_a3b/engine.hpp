@@ -95,6 +95,8 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::size_t drafted{0};
+    std::size_t accepted{0};
   };
   /// Samples one token from the current logits, checks for stop, then feeds
   /// the token. The logits of the new last token are kept.
