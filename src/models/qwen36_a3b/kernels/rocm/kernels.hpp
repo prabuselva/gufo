@@ -180,11 +180,27 @@ void AttentionDecodeRows(const float* q, const float* k_cache,
 /// Batched causal self-attention for a prefill chunk. `q` and `gate` are
 /// [tokens][heads * head_dim] (already normed and rotated); `k_cache`/`v_cache`
 /// hold absolute positions `[0][kv_heads * head_dim]` and must already contain
+/// Mirror `count` contiguous FP32 key/value elements into the FP16 KV planes
+/// the WMMA prefill kernel reads, starting at element `start` in both the FP32
+/// cache and its FP16 mirror. The caller invokes this for every KV write
+/// (prefill chunk, verify rows, decode token) so the FP16 mirror always matches
+/// the FP32 cache. No-op when either FP16 pointer is null.
+void KvCacheWriteF16(const float* k, const float* v, void* k_cache_f16,
+                     void* v_cache_f16, std::size_t start, std::size_t count,
+                     hipStream_t stream);
+
 /// the chunk's own keys/values. Token `t` attends positions `[0, start + t]`.
 /// `out` [tokens][heads * head_dim] receives the gated context. Uses a tiled
 /// online softmax so no per-token scratch is needed.
+///
+/// When `k_cache_f16`/`v_cache_f16` are non-null and the shape is the model's
+/// 16Q/2KV head_dim-256 GQA, the chunk's FP32 KV rows (already published at
+/// `[start, start + tokens)` by the caller) are mirrored into the FP16 planes
+/// and the causal pass runs on the WMMA matrix cores; otherwise the scalar
+/// tiled/naive kernels read the FP32 cache directly.
 void AttentionPrefill(const float* q, const float* k_cache,
-                      const float* v_cache, const float* gate, float* out,
+                      const float* v_cache, void* k_cache_f16,
+                      void* v_cache_f16, const float* gate, float* out,
                       std::uint32_t start, std::uint32_t tokens,
                       std::uint32_t heads, std::uint32_t kv_heads,
                       std::uint32_t head_dim, float scale, hipStream_t stream);

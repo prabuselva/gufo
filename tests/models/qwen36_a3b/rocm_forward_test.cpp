@@ -4,6 +4,7 @@
 // quantized GEMV tier, wired together, must reproduce the reference forward
 // pass. Skips (77) unless GUFO_QWEN36_A3B_GGUF points at a Qwen3.6 GGUF.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -69,6 +70,79 @@ void CheckLogits(const std::vector<float>& reference,
   Expect(ArgMax(reference) == ArgMax(candidate), tag + " argmax matches");
 }
 
+// Prefill-throughput sweep over the real executor. Drives Executor::Prefill at
+// increasing prompt lengths (each runs as prefill_chunk_-sized chunks with the
+// WMMA attention reading the growing prefix) and reports average tokens/second,
+// which is the metric that exposed the O(n^2) prefill collapse. Gated by
+// GUFO_QWEN36_A3B_BENCH (comma-separated lengths; a default ladder is used when
+// the value is empty).
+int RunPrefillBench(const rocm::DeviceModel& device_model,
+                    const q36::Config& c) {
+  const char* spec = std::getenv("GUFO_QWEN36_A3B_BENCH");
+  std::vector<std::uint32_t> lengths;
+  if (spec != nullptr) {
+    std::string text(spec);
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+      const std::size_t comma = text.find(',', pos);
+      const std::string field = text.substr(
+          pos, comma == std::string::npos ? std::string::npos : comma - pos);
+      if (!field.empty()) {
+        lengths.push_back(static_cast<std::uint32_t>(std::stoul(field)));
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      pos = comma + 1;
+    }
+  }
+  if (lengths.empty()) {
+    lengths = {512U, 2048U, 8192U, 16384U, 32768U, 65536U, 100000U};
+  }
+  std::sort(lengths.begin(), lengths.end());
+  const std::uint32_t max_len = lengths.back();
+
+  std::string error;
+  const auto executor = rocm::Executor::Create(device_model, max_len, &error);
+  if (executor == nullptr) {
+    std::cerr << "bench executor create failed (max_context=" << max_len
+              << "): " << error << "\n";
+    return 1;
+  }
+  std::vector<std::int32_t> tokens(max_len);
+  for (std::uint32_t i = 0; i < max_len; ++i) {
+    tokens[i] = static_cast<std::int32_t>(i % 1000U);
+  }
+
+  std::cout << "prefill throughput sweep (chunk="
+            << (max_len < 2048U ? max_len : 2048U) << "):\n";
+  for (const std::uint32_t n : lengths) {
+    executor->Reset();
+    if (!executor->Prefill(tokens.data(), n, &error)) {
+      std::cerr << "prefill " << n << " failed: " << error << "\n";
+      return 1;
+    }
+    (void)hipDeviceSynchronize();
+    double best = 0.0;
+    for (int rep = 0; rep < 3; ++rep) {
+      executor->Reset();
+      const auto start = std::chrono::steady_clock::now();
+      if (!executor->Prefill(tokens.data(), n, &error)) {
+        std::cerr << "prefill " << n << " failed: " << error << "\n";
+        return 1;
+      }
+      (void)hipDeviceSynchronize();
+      const double seconds = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+      best = std::max(best, static_cast<double>(n) / seconds);
+    }
+    std::cout << "  n=" << n << ": " << best << " tok/s\n";
+  }
+  (void)c;
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -105,6 +179,10 @@ int main() {
     return 1;
   }
   std::cout << "resident bytes: " << device_model->resident_bytes() << "\n";
+
+  if (std::getenv("GUFO_QWEN36_A3B_BENCH") != nullptr) {
+    return RunPrefillBench(*device_model, c);
+  }
 
   const auto executor =
       rocm::Executor::Create(*device_model, max_context, &error);
