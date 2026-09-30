@@ -30,6 +30,43 @@ Landed in `47c27ce` (batched GEMM prefill path).
    `GdnOutNormPrefillKernel` keep the conv/norm/state-update chain in
    batched kernels.
 
+## Prefill attention WMMA + row-split GDN (Phase 1/2a)
+
+Landed in `fc428317`. Targets the depth-dependent prefill collapse (the 10
+full-attention layers are O(n²); the 30 GDN layers and MoE are O(n)).
+
+1. **WMMA flash prefill attention** (`WmmaCausalAttentionKernel`,
+   `kernels.hip.cpp:1046`) — tensor-core `wmma_f32_16x16x16_f16_w32`, online
+   softmax, double-buffered K/V into LDS, grid `(query_tiles, 8 head_pairs)`,
+   32 query rows × 2 heads/block. Replaces the scalar `AttentionPrefillTiled`
+   (kept as oracle; parity in `qwen36_a3b_rocm_attention_test`).
+2. **FP16 KV mirror** (`KvCacheWriteF16`) — written alongside every fp32 KV
+   write so the WMMA kernel reads half the bytes; MTP caches stay fp32.
+3. **Row-split GDN delta loop** (`GdnDeltaLoopRowSplitKernel`,
+   `kernels.hip.cpp:~1624`) — prefill-only (`snap==nullptr`): 4 lanes per
+   128-wide state row, 8 row-groups/wave, register-resident fp32 state, DPP
+   butterfly reductions (`RowXorAdd`). The snapshot/verify path keeps the
+   serial `GdnDeltaLoopKernel`; parity in `qwen36_a3b_rocm_gdn_test`.
+
+Raw `Executor::Prefill` sweep (chunk=2048, UD-Q8_K_XL, `GUFO_QWEN36_A3B_BENCH`):
+
+| n | t/s | slimsami | ratio |
+| ---: | ---: | ---: | ---: |
+| 512    | 1,420 | 1,475 | 96 % |
+| 2,048  | 1,882 | 2,311 | 81 % |
+| 8,192  | 1,693 | 2,300 | 74 % |
+| 16,384 | 1,414 | 2,168 | 65 % |
+| 65,536 |   771 |   —   | — |
+| 100,000|   567 |   —   | — |
+
+100K lifted ~2.3× (250 → 567). Still collapses vs slimsami's flat ~2.2K. The
+residual is the attention KV traffic: `kWmmaHeads=2` splits the 8-head GQA
+group across 4 blocks, each re-reading the same KV head's prefix — a 4×
+redundant read that makes long-context attention memory-bound. **Next:** load
+the K/V tile once per KV group (all `heads_per_kv` query heads per block) to
+cut KV traffic ~4×; profile at 100K first. See
+`optimization_missing_report.md` §8.
+
 ## Decode (14.1 → 33.3 tps)
 
 Landed in `49b6ee3`.
