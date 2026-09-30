@@ -178,9 +178,9 @@ bool RunPrefillCase(std::uint32_t start, std::uint32_t tokens) {
   t::Upload(&d_k, k_cache);
   t::Upload(&d_v, v_cache);
   const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-  q::AttentionPrefill(d_q.get(), d_k.get(), d_v.get(), d_gate.get(),
-                      d_out.get(), start, tokens, kHeads, kKvHeads, kHeadDim,
-                      scale, nullptr);
+  q::AttentionPrefill(d_q.get(), d_k.get(), d_v.get(), nullptr, nullptr,
+                      d_gate.get(), d_out.get(), start, tokens, kHeads, kKvHeads,
+                      kHeadDim, scale, nullptr);
   t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
   const auto got = t::Download(&d_out, q_count);
 
@@ -190,6 +190,49 @@ bool RunPrefillCase(std::uint32_t start, std::uint32_t tokens) {
                                           tokens),
                                 got),
                1e-4);
+}
+
+// The matrix-core prefill path (FP16 KV mirror) must reproduce the scalar
+// oracle within FP16 rounding. The caller publishes the FP32 cache into the
+// FP16 planes with KvCacheWriteF16, then AttentionPrefill dispatches to WMMA.
+bool RunWmmaCase(std::uint32_t start, std::uint32_t tokens) {
+  const std::uint32_t causal_max = start + tokens;
+  const std::size_t q_count =
+      static_cast<std::size_t>(tokens) * kHeads * kHeadDim;
+  const std::size_t cache_count =
+      static_cast<std::size_t>(causal_max) * kKvHeads * kHeadDim;
+  const auto query = t::MakeValues(q_count, 0x5150A5A5U, 1.0F);
+  const auto gate = t::MakeValues(q_count, 0x2468ACE1U, 3.0F);
+  const auto k_cache = t::MakeValues(cache_count, 0xDEADBEEFU, 1.0F);
+  const auto v_cache = t::MakeValues(cache_count, 0x0BADF00DU, 1.0F);
+
+  t::HipBuffer<float> d_q(q_count);
+  t::HipBuffer<float> d_gate(q_count);
+  t::HipBuffer<float> d_k(cache_count);
+  t::HipBuffer<float> d_v(cache_count);
+  t::HipBuffer<float> d_out(q_count);
+  t::HipBuffer<std::uint16_t> d_kf16(cache_count);
+  t::HipBuffer<std::uint16_t> d_vf16(cache_count);
+  t::Upload(&d_q, query);
+  t::Upload(&d_gate, gate);
+  t::Upload(&d_k, k_cache);
+  t::Upload(&d_v, v_cache);
+  q::KvCacheWriteF16(d_k.get(), d_v.get(), d_kf16.get(), d_vf16.get(), 0U,
+                     cache_count, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "KvCacheWriteF16 synchronization");
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+  q::AttentionPrefill(d_q.get(), d_k.get(), d_v.get(), d_kf16.get(),
+                      d_vf16.get(), d_gate.get(), d_out.get(), start, tokens,
+                      kHeads, kKvHeads, kHeadDim, scale, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill WMMA synchronization");
+  const auto got = t::Download(&d_out, q_count);
+
+  return Check("AttentionPrefillWmma start=" + std::to_string(start) +
+                   " tokens=" + std::to_string(tokens),
+               t::WorstRelativeToScale(Reference(query, gate, k_cache, v_cache,
+                                                start, tokens),
+                                       got),
+               2e-3);
 }
 
 // The multi-row verify kernel must reproduce the same causal rows as the
@@ -243,6 +286,13 @@ int main() {
     for (const auto& cs : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
              {0U, 1U}, {0U, 8U}, {5U, 7U}, {100U, 40U}, {200U, 64U}}) {
       ok = RunPrefillCase(cs.first, cs.second) && ok;
+    }
+    // Matrix-core (WMMA) prefill over the FP16 KV mirror, straddling the
+    // 32-row query tile and the 16-key inner tile at several depths.
+    for (const auto& cs : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+             {0U, 1U}, {0U, 32U}, {0U, 33U}, {5U, 7U}, {100U, 40U},
+             {200U, 64U}, {0U, 128U}, {1024U, 96U}}) {
+      ok = RunWmmaCase(cs.first, cs.second) && ok;
     }
     // Multi-row verify kernel: split boundaries at 64 and the 32-split cap.
     for (std::uint32_t start : {0U, 5U, 63U, 100U, 2047U, 2300U}) {

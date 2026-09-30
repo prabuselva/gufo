@@ -95,8 +95,8 @@ private:
   void LinearAttention(const DeviceLayer& l, std::uint32_t il, const float* x,
                        float* out);
   void Attention(const DeviceLayer& l, const float* x, std::uint32_t pos,
-                 float* out, float* k_cache, float* v_cache,
-                 const std::uint32_t* pos_dev);
+                 float* out, float* k_cache, float* v_cache, void* k_cache_f16,
+                 void* v_cache_f16, const std::uint32_t* pos_dev);
   void Moe(const DeviceLayer& l, const float* x, float* out);
   /// Batched (prefill) Mixture-of-Experts over `tokens` rows of `x`
   /// ([tokens][hidden]) into `out` ([tokens][hidden]). Mirrors Moe() but drives
@@ -131,6 +131,7 @@ private:
   /// the caches and reading them back causally. Mirrors Attention().
   void AttentionBatch(const DeviceLayer& l, const float* x, std::uint32_t start,
                       float* out, float* k_cache, float* v_cache,
+                      void* k_cache_f16, void* v_cache_f16,
                       const std::uint32_t* pos_dev, std::uint32_t tokens);
 
   float* AllocFloats(std::size_t n, std::string* error);
@@ -279,6 +280,12 @@ private:
   std::vector<float*> gdn_history_;
   std::vector<float*> k_cache_;
   std::vector<float*> v_cache_;
+  // FP16 mirror of the full-attention KV cache, [position][kv_head][head_dim],
+  // consumed by the WMMA prefill kernel. The FP32 planes above stay the source
+  // of truth for decode and the scalar oracle; these are written alongside them
+  // for every prefill chunk.
+  std::vector<void*> k_cache_f16_;
+  std::vector<void*> v_cache_f16_;
   // Per-linear-layer verify snapshots: the recurrent state and conv history
   // after the first row of the most recent Verify (null without an MTP block).
   std::vector<float*> gdn_state_snap_;

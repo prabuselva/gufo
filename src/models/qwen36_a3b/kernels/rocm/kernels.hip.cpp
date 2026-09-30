@@ -1,5 +1,7 @@
 #include "src/models/qwen36_a3b/kernels/rocm/kernels.hpp"
 
+#include <hip/hip_fp16.h>
+
 #include <algorithm>
 #include <cmath>
 
@@ -997,6 +999,423 @@ __global__ void AttentionPrefillTiled(const float* q, const float* k_cache,
   }
 }
 
+// ---------------------------------------------------------------------------
+// WMMA causal prefill attention on the matrix cores (FP16 KV cache).
+//
+// Ported from the Qwen route's validated kernel
+// (gufo_slimsami/src/models/qwen/hip/kernels/attention_wmma.hip), reduced to
+// the unpacked (position-major FP16 KV) path: no head-major repack, no LSE
+// output, and the key sweep always starts at position 0. Wave32 fragment
+// layout, verified against the CPU double-precision reference: A holds row
+// L%16 and 16 contiguous k, B holds column L%16 and 16 contiguous k (fed a
+// transposed tile), and C element i is row 2i + L/16, column L%16.
+//
+// The scalar AttentionPrefillTiled above stays the oracle; this kernel reads a
+// position-major FP16 mirror of the KV cache ([position][kv_head][head_dim],
+// the same layout as the FP32 cache) and writes the same gated context
+// ([token][head][head_dim]). attention_scale = 1/16 is 1/sqrt(head_dim) for
+// head_dim 256, folded into Q before the FP16 conversion so the score stays in
+// range; softmax is invariant to the constant.
+constexpr std::uint32_t kWmmaHeadDim = 256;
+constexpr std::uint32_t kWmmaHeads = 2;       // query heads per block
+constexpr std::uint32_t kWmmaQueryRows = 32;  // queries per block (x2 heads)
+constexpr std::uint32_t kWmmaKeys = 16;       // keys per tile
+constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
+constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
+
+using WmmaV16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using WmmaV8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+__device__ __forceinline__ WmmaV8f WmmaOp(WmmaV16h a, WmmaV16h b, WmmaV8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+// A fragment is 16 contiguous halves = 32 bytes; two 16-byte loads and a
+// bitcast replace 16 element loads. Every fragment base is 16-byte aligned.
+__device__ __forceinline__ WmmaV16h WmmaLoadFrag(const __half* p) {
+  union {
+    WmmaV16h f;
+    uint4 u[2];
+  } cvt;
+  cvt.u[0] = *reinterpret_cast<const uint4*>(p);
+  cvt.u[1] = *reinterpret_cast<const uint4*>(p + 8);
+  return cvt.f;
+}
+
+template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
+__launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const __half* __restrict__ k_cache_f16,
+    const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
+    std::uint32_t start_pos, std::size_t batch_size) {
+  constexpr std::uint32_t kHeadDim = kWmmaHeadDim;
+  constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
+  constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
+  constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
+  constexpr std::uint32_t kQueryRows = kWmmaQueryRows;
+  constexpr std::uint32_t kKeys = kWmmaKeys;
+  static_assert(kQueryHeads % kKvHeads == 0 && kGqa % kWmmaHeads == 0,
+                "each block takes kWmmaHeads heads of one KV group");
+  constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
+  constexpr std::uint32_t kKeyBlocks = kKeys / 16;
+  constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (8 / kSTiles);
+  constexpr std::uint32_t kRows = kRowBlocks * 16;
+  constexpr std::uint32_t kOTilesPerWave = (kRowBlocks * kWmmaKSteps) / 8;
+  constexpr std::uint32_t kSoftmaxLanes = 256 / kRows;
+  constexpr std::uint32_t kVtStride = kKeys + 8;
+  static_assert(kSTiles == 4, "eight waves cover four S tiles in two halves");
+  static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
+  static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
+  static_assert(kKStepsPerWave * 8 / kSTiles == kWmmaKSteps, "k split");
+  static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
+                "fragment rows must start on a 16-byte boundary");
+  static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31u;
+  const std::uint32_t wave = tid >> 5u;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t half_id = lane >> 4u;
+
+  const std::uint32_t query_start = blockIdx.x * kQueryRows;
+  const std::uint32_t head_pair = blockIdx.y;
+  const std::uint32_t kv_head = head_pair / (kGqa / kWmmaHeads);
+  const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
+  const std::uint32_t first_query_head =
+      (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
+  constexpr float attention_scale = 1.0F / 16.0F;
+
+  const auto row_block_head = [&](std::uint32_t rb) {
+    return first_query_head + (rb % kWmmaHeads);
+  };
+  const auto row_block_offset = [&](std::uint32_t rb) {
+    return (rb / kWmmaHeads) * 16;
+  };
+
+  // The K tile needs kKeys * kWmmaKStride halves; the transposed V staging
+  // needs kHeadDim * kVtStride. Size for the larger so the V transpose never
+  // runs off the end and corrupts the neighbouring softmax buffers.
+  constexpr std::uint32_t kKvLdsHalves =
+      (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? kKeys * kWmmaKStride
+                                                    : kHeadDim * kVtStride;
+  __shared__ __half kv_lds[kKvLdsHalves];
+  __shared__ float s_lds[2][kSTiles][16][17];
+  __shared__ __half p_lds[kRows][kKeys + 8];
+  __shared__ float row_max[kRows];
+  __shared__ float row_sum[kRows];
+  __shared__ float row_scale[kRows];
+
+  const std::uint32_t s_tile = wave % kSTiles;
+  const std::uint32_t s_kh = wave / kSTiles;
+  const std::uint32_t s_rb = s_tile % kRowBlocks;
+  const std::uint32_t s_kb = s_tile / kRowBlocks;
+
+  WmmaV16h q_frag[kKStepsPerWave];
+  {
+    const std::uint32_t local_query =
+        query_start + row_block_offset(s_rb) + sub;
+    const bool live = local_query < batch_size;
+    const float* q_row =
+        q + (static_cast<std::size_t>(local_query) * kAttnWidth) +
+        (static_cast<std::size_t>(row_block_head(s_rb)) * kHeadDim);
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+      const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+      const auto* qp = reinterpret_cast<const float4*>(q_row + d0);
+#pragma unroll
+      for (std::uint32_t v = 0; v < 4; ++v) {
+        const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x * attention_scale);
+        q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y * attention_scale);
+        q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z * attention_scale);
+        q_frag[ks][(v * 4) + 3] = static_cast<_Float16>(f.w * attention_scale);
+      }
+    }
+  }
+
+  WmmaV8f o_acc[kRowBlocks][2] = {};
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+
+  const std::uint32_t context_end =
+      start_pos + static_cast<std::uint32_t>(batch_size);
+  const std::uint32_t max_visible =
+      min(context_end, start_pos + query_start + kQueryRows);
+
+  constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
+  constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
+  static_assert(kKRegs * 256 == kKeys * (kHeadDim / 8), "K stages evenly");
+  const std::uint32_t v_key = lane % kKeys;
+  const std::uint32_t v_slice = (tid / kKeys) * (kVRegs * 8);
+  const std::size_t kv_stride = kKvWidth;
+  const std::size_t head_offset = static_cast<std::size_t>(kv_head) * kHeadDim;
+  const auto* v_base = v_cache_f16 + head_offset + v_slice;
+  const auto* k_base = k_cache_f16 + head_offset;
+
+  const auto load_v = [&](std::uint32_t key_start, uint4* dst) {
+    const std::uint32_t key_position = key_start + v_key;
+    const auto* src = v_base + (static_cast<std::size_t>(key_position) * kv_stride);
+    const bool live = key_position < context_end;
+#pragma unroll
+    for (std::uint32_t j = 0; j < kVRegs; ++j) {
+      dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
+                    : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+  const auto load_k = [&](std::uint32_t key_start, uint4* dst) {
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * 256);
+      const std::uint32_t key_position = key_start + (idx / (kHeadDim / 8));
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      dst[n] = (key_position < context_end)
+                   ? *reinterpret_cast<const uint4*>(
+                         k_base +
+                         (static_cast<std::size_t>(key_position) * kv_stride) +
+                         d8)
+                   : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+
+  uint4 k_cur[kKRegs];
+  uint4 v_cur[kVRegs];
+  uint4 k_pre[kKRegs] = {};
+  uint4 v_pre[kVRegs] = {};
+  load_k(0, k_cur);
+  load_v(0, v_cur);
+
+  for (std::uint32_t key_start = 0; key_start < max_visible;
+       key_start += kKeys) {
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * 256);
+      const std::uint32_t key_row = idx / (kHeadDim / 8);
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
+          k_cur[n];
+    }
+    __syncthreads();
+
+    const std::uint32_t next_start = key_start + kKeys;
+    if (next_start < max_visible) {
+      load_k(next_start, k_pre);
+      load_v(next_start, v_pre);
+    }
+
+    // --- S = Q K^T ---
+    {
+      WmmaV8f s_acc = {};
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+        const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+        const WmmaV16h k_frag =
+            WmmaLoadFrag(&kv_lds[(((s_kb * 16) + sub) * kWmmaKStride) + d0]);
+        s_acc = WmmaOp(q_frag[ks], k_frag, s_acc);
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
+      }
+    }
+    __syncthreads();
+
+    // --- online softmax: kSoftmaxLanes threads per query row ---
+    {
+      const std::uint32_t rg = tid / kSoftmaxLanes;
+      const std::uint32_t seg = tid % kSoftmaxLanes;
+      constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
+      const std::uint32_t rb = rg / 16;
+      const std::uint32_t row = rg % 16;
+      const std::uint32_t local_query =
+          query_start + row_block_offset(rb) + row;
+      const std::uint32_t absolute_query = start_pos + local_query;
+      float part_max = -INFINITY;
+      float vals[kPerLane];
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const std::uint32_t col = (seg * kPerLane) + m;
+        const std::uint32_t key_position = key_start + col;
+        const bool valid = local_query < batch_size &&
+                           key_position <= absolute_query &&
+                           key_position < context_end;
+        const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
+        vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
+                           s_lds[1][tile][row][col % 16])
+                        : -INFINITY;
+        part_max = fmaxf(part_max, vals[m]);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+        part_max = fmaxf(part_max, __shfl_xor(part_max, off));
+      }
+      const float prev_max = running_max;
+      const float next_max = fmaxf(prev_max, part_max);
+      const float prior_scale =
+          isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
+      float part_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
+        part_sum += w;
+        p_lds[rg][(seg * kPerLane) + m] = static_cast<__half>(w);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+        part_sum += __shfl_xor(part_sum, off);
+      }
+      running_max = next_max;
+      running_sum = (running_sum * prior_scale) + part_sum;
+      if (seg == 0) {
+        row_scale[rg] = prior_scale;
+      }
+    }
+    __syncthreads();
+
+    // Rescale the running O across both dimension tiles (unpacked path).
+#pragma unroll
+    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+      float scale[8];
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        scale[i] = row_scale[(rb * 16) + (2 * i) + half_id];
+      }
+#pragma unroll
+      for (std::uint32_t t = 0; t < 2; ++t) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          o_acc[rb][t][i] *= scale[i];
+        }
+      }
+    }
+
+    // --- stage V transposed into LDS (conflict-free: one key per lane) ---
+#pragma unroll
+    for (std::uint32_t j = 0; j < kVRegs; ++j) {
+      const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
+      }
+    }
+    __syncthreads();
+
+    // --- O += P V ---
+#pragma unroll
+    for (std::uint32_t t = 0; t < 2; ++t) {
+#pragma unroll
+      for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+        const std::uint32_t dim_tile = wave + t * 8;
+        WmmaV16h v_frag[kKeyBlocks];
+#pragma unroll
+        for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
+          v_frag[kb] =
+              WmmaLoadFrag(&kv_lds[(dim_tile * 16 + sub) * kVtStride + kb * 16]);
+        }
+#pragma unroll
+        for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
+          const WmmaV16h p_frag =
+              WmmaLoadFrag(&p_lds[(rb * 16) + sub][kb * 16]);
+          WmmaV8f next = WmmaOp(p_frag, v_frag[kb], o_acc[rb][t]);
+          const auto first_key = key_start + kb * 16;
+          if (first_key + 15 > start_pos + query_start) {
+            WmmaV8f tail = o_acc[rb][t];
+            const int relative_key = static_cast<int>(first_key) -
+                                     static_cast<int>(start_pos + query_start +
+                                                      row_block_offset(rb));
+#pragma unroll
+            for (std::uint32_t key = 0; key < 16; ++key) {
+              const float value = static_cast<float>(v_frag[kb][key]);
+#pragma unroll
+              for (std::uint32_t i = 0; i < 8; ++i) {
+                if (static_cast<int>(half_id) <
+                        relative_key + 15 - static_cast<int>(2 * i) &&
+                    static_cast<int>(half_id) >= relative_key +
+                                                     static_cast<int>(key) -
+                                                     static_cast<int>(2 * i)) {
+                  tail[i] = fmaf(
+                      __half2float(
+                          p_lds[rb * 16 + 2 * i + half_id][kb * 16 + key]),
+                      value, tail[i]);
+                }
+              }
+            }
+#pragma unroll
+            for (std::uint32_t i = 0; i < 8; ++i) {
+              if (static_cast<int>(half_id) <
+                  relative_key + 15 - static_cast<int>(2 * i)) {
+                next[i] = tail[i];
+              }
+            }
+          }
+          o_acc[rb][t] = next;
+        }
+      }
+    }
+
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      k_cur[n] = k_pre[n];
+    }
+#pragma unroll
+    for (std::uint32_t n = 0; n < kVRegs; ++n) {
+      v_cur[n] = v_pre[n];
+    }
+  }
+  if (tid % kSoftmaxLanes == 0) {
+    row_max[tid / kSoftmaxLanes] = running_max;
+    row_sum[tid / kSoftmaxLanes] = running_sum;
+  }
+  __syncthreads();
+
+  // --- epilogue ---
+#pragma unroll
+  for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+    const std::uint32_t query_head = row_block_head(rb);
+    const std::uint32_t row_offset = row_block_offset(rb);
+#pragma unroll
+    for (std::uint32_t t = 0; t < 2; ++t) {
+      const std::uint32_t dim_tile = wave + (t * 8);
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t row = (2 * i) + half_id;
+        const std::uint32_t local_query = query_start + row_offset + row;
+        if (local_query >= batch_size) {
+          continue;
+        }
+        const float denominator = row_sum[(rb * 16) + row];
+        const std::size_t offset =
+            (static_cast<std::size_t>(local_query) * kAttnWidth) +
+            (static_cast<std::size_t>(query_head) * kHeadDim) +
+            (dim_tile * 16) + sub;
+        float value =
+            (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
+        if (gate != nullptr) {
+          value *= 1.0F / (1.0F + __expf(-gate[offset]));
+        }
+        out_context[offset] = value;
+      }
+    }
+  }
+}
+
+// Convert one prefill chunk's FP32 keys/values to the FP16 KV mirror the WMMA
+// kernel reads. `k`/`v` are the just-published FP32 cache rows at [start,
+// start + tokens); the layout is [position][kv_head][head_dim] for both.
+__global__ void ConvertKvChunkF16Kernel(const float* __restrict__ k,
+                                        const float* __restrict__ v,
+                                        __half* __restrict__ k_f16,
+                                        __half* __restrict__ v_f16,
+                                        std::size_t count) {
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+       i < count; i += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+    k_f16[i] = __float2half_rn(k[i]);
+    v_f16[i] = __float2half_rn(v[i]);
+  }
+}
+
 // Causal depthwise convolution over a chunk, SiLU applied. Token t reads the
 // `kernel` inputs ending at t; those before the chunk come from `history`
 // ([kernel-1][channels], oldest first). Accumulation order matches the decode
@@ -1198,6 +1617,164 @@ __global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
         state + (static_cast<std::size_t>(h) * head_dim + j0 + r) * head_dim;
     for (std::uint32_t c = 0; c < kCols; ++c) {
       row[lane + c * blockDim.x] = s[r][c];
+    }
+  }
+}
+
+// Four-lane butterfly via the ALU-path DPP row-xmask modifier (gfx10+): the xor
+// masks stay inside an aligned 4-lane group, so the sum is valid in every lane
+// of the group that cooperates on one state row.
+__device__ __forceinline__ float RowXorAdd(float v) {
+  const int y2 = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v),
+                                             0x162, 0xF, 0xF, false);
+  v += __builtin_bit_cast(float, y2);
+  const int y1 = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v),
+                                             0x161, 0xF, 0xF, false);
+  v += __builtin_bit_cast(float, y1);
+  return v;
+}
+
+// Row-split gated delta-rule recurrence for a prefill chunk (no per-token
+// snapshots; the Verify path keeps GdnDeltaLoopKernel). head_dim == 128: four
+// lanes cooperate on one 128-wide state row (32 columns each as eight float4),
+// eight row groups fill a wave, and the two per-row reductions run as a
+// four-lane butterfly instead of the full 32-lane shuffle. State stays in
+// registers for the whole chunk and k/q are prefetched one token ahead. The
+// arithmetic matches GdnDeltaLoopKernel on the pre-normalized qn/kn.
+template <std::uint32_t kRowsPerLane>
+__global__ void __launch_bounds__(256) GdnDeltaLoopRowSplitKernel(
+    const float* qn, const float* kn, const float* convolved,
+    const float* alpha, const float* beta, const float* a, const float* dt,
+    float* state, float* attn, std::uint32_t tokens, std::uint32_t k_heads,
+    std::uint32_t v_heads, std::uint32_t head_dim, std::uint32_t channels) {
+  constexpr int kLanesPerRow = 4;
+  constexpr int kRowGroups = 32 / kLanesPerRow;            // 8
+  constexpr int kRowsPerWave = kRowGroups * kRowsPerLane;  // 8 or 16
+  constexpr int kVec = 8;                                  // 32 columns / 4
+  const std::uint32_t h = blockIdx.y;
+  const std::uint32_t kh = h % k_heads;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int seg = lane % kLanesPerRow;
+  const int grp = lane / kLanesPerRow;
+  const int row0 = static_cast<int>(blockIdx.x) * (kRowsPerWave * 8) +
+                   wave * kRowsPerWave + grp;
+  const std::size_t attn_stride = static_cast<std::size_t>(v_heads) * head_dim;
+  const float q_scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+
+  float* s_head = state + static_cast<std::size_t>(h) * head_dim * head_dim;
+  float4 s_reg[kRowsPerLane][kVec];
+#pragma unroll
+  for (int r = 0; r < kRowsPerLane; ++r) {
+    const float4* src = reinterpret_cast<const float4*>(
+        s_head + static_cast<std::size_t>(row0 + r * kRowGroups) * head_dim);
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      s_reg[r][vi] = src[seg * kVec + vi];
+    }
+  }
+
+  const float* q_base = qn + static_cast<std::size_t>(kh) * head_dim;
+  const float* k_base = kn + static_cast<std::size_t>(kh) * head_dim;
+  const float* v_base =
+      convolved + 2 * static_cast<std::size_t>(k_heads) * head_dim +
+      static_cast<std::size_t>(h) * head_dim;
+  const float* a_base = alpha + h;
+  const float* b_base = beta + h;
+  float* o_base = attn + static_cast<std::size_t>(h) * head_dim;
+  const float ah = a[h];
+  const float dth = dt[h];
+
+  float4 kv[kVec];
+  float4 qv[kVec];
+  {
+    const float4* kp = reinterpret_cast<const float4*>(k_base);
+    const float4* qp = reinterpret_cast<const float4*>(q_base);
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      kv[vi] = kp[seg * kVec + vi];
+      qv[vi] = qp[seg * kVec + vi];
+    }
+  }
+
+  for (std::uint32_t t = 0; t < tokens; ++t) {
+    float4 knx[kVec];
+    float4 qnx[kVec];
+    if (t + 1 < tokens) {
+      const float4* kp =
+          reinterpret_cast<const float4*>(k_base + k_heads * head_dim);
+      const float4* qp =
+          reinterpret_cast<const float4*>(q_base + k_heads * head_dim);
+#pragma unroll
+      for (int vi = 0; vi < kVec; ++vi) {
+        knx[vi] = kp[seg * kVec + vi];
+        qnx[vi] = qp[seg * kVec + vi];
+      }
+    }
+    const float decay = expf(ah * DSoftplus(*a_base + dth));
+    const float b = DSigmoid(*b_base);
+    float kq = 0.0F;
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      kq += kv[vi].x * qv[vi].x + kv[vi].y * qv[vi].y + kv[vi].z * qv[vi].z +
+            kv[vi].w * qv[vi].w;
+    }
+    kq = RowXorAdd(kq) * q_scale;
+#pragma unroll
+    for (int r = 0; r < kRowsPerLane; ++r) {
+      float u = 0.0F;
+      float p = 0.0F;
+#pragma unroll
+      for (int vi = 0; vi < kVec; ++vi) {
+        float4 s4 = s_reg[r][vi];
+        s4.x *= decay;
+        s4.y *= decay;
+        s4.z *= decay;
+        s4.w *= decay;
+        s_reg[r][vi] = s4;
+        u += s4.x * kv[vi].x + s4.y * kv[vi].y + s4.z * kv[vi].z +
+             s4.w * kv[vi].w;
+        p += s4.x * qv[vi].x + s4.y * qv[vi].y + s4.z * qv[vi].z +
+             s4.w * qv[vi].w;
+      }
+      u = RowXorAdd(u);
+      p = RowXorAdd(p);
+      const int row = row0 + r * kRowGroups;
+      const float delta = (v_base[row] - u) * b;
+      if (seg == 0) {
+        o_base[row] = p * q_scale + delta * kq;
+      }
+#pragma unroll
+      for (int vi = 0; vi < kVec; ++vi) {
+        float4 s4 = s_reg[r][vi];
+        s4.x += delta * kv[vi].x;
+        s4.y += delta * kv[vi].y;
+        s4.z += delta * kv[vi].z;
+        s4.w += delta * kv[vi].w;
+        s_reg[r][vi] = s4;
+      }
+    }
+    q_base += k_heads * head_dim;
+    k_base += k_heads * head_dim;
+    v_base += channels;
+    a_base += v_heads;
+    b_base += v_heads;
+    o_base += attn_stride;
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      kv[vi] = knx[vi];
+      qv[vi] = qnx[vi];
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < kRowsPerLane; ++r) {
+    float4* dst = reinterpret_cast<float4*>(
+        s_head + static_cast<std::size_t>(row0 + r * kRowGroups) * head_dim);
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      dst[seg * kVec + vi] = s_reg[r][vi];
     }
   }
 }
@@ -1428,6 +2005,18 @@ void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
     hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, 0);
     return static_cast<std::uint32_t>(ws);
   }();
+  // Prefill (no per-token snapshots) on the model's 128-wide state uses the
+  // row-split recurrence: four lanes per state row and a four-lane butterfly
+  // cut the reduction cost versus the 32-lane shuffle. The Verify path keeps
+  // GdnDeltaLoopKernel, which emits the per-row state snapshots rollback needs.
+  if (snap == nullptr && head_dim == 128U) {
+    constexpr std::uint32_t kRowsPerWave = 8U;  // kRowsPerLane == 1
+    const dim3 grid(head_dim / (kRowsPerWave * 8U), v_heads);
+    GdnDeltaLoopRowSplitKernel<1><<<grid, dim3(256), 0, stream>>>(
+        qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
+        v_heads, head_dim, channels);
+    return;
+  }
   constexpr std::uint32_t kRows = 8;
   const dim3 grid(head_dim / kRows, v_heads);
   const dim3 block(warp);
@@ -1561,11 +2150,44 @@ void AttentionDecodeRows(const float* q, const float* k_cache,
       part, gate, out, heads, splits, head_dim);
 }
 
+void KvCacheWriteF16(const float* k, const float* v, void* k_cache_f16,
+                     void* v_cache_f16, std::size_t start, std::size_t count,
+                     hipStream_t stream) {
+  if (k_cache_f16 == nullptr || v_cache_f16 == nullptr || count == 0) {
+    return;
+  }
+  const float* k_src = k + start;
+  const float* v_src = v + start;
+  auto* k_dst = static_cast<__half*>(k_cache_f16) + start;
+  auto* v_dst = static_cast<__half*>(v_cache_f16) + start;
+  constexpr std::uint32_t kBlock = 256;
+  const std::size_t want = (count + kBlock - 1) / kBlock;
+  const std::uint32_t blocks = static_cast<std::uint32_t>(
+      want < 4096 ? (want == 0 ? 1 : want) : 4096);
+  ConvertKvChunkF16Kernel<<<blocks, kBlock, 0, stream>>>(k_src, v_src, k_dst,
+                                                         v_dst, count);
+}
+
 void AttentionPrefill(const float* q, const float* k_cache,
-                      const float* v_cache, const float* gate, float* out,
+                      const float* v_cache, void* k_cache_f16,
+                      void* v_cache_f16, const float* gate, float* out,
                       std::uint32_t start, std::uint32_t tokens,
                       std::uint32_t heads, std::uint32_t kv_heads,
                       std::uint32_t head_dim, float scale, hipStream_t stream) {
+  // Matrix-core route: the validated 16Q/2KV, head_dim 256 shape. The caller
+  // has already published the chunk into both the FP32 cache and its FP16
+  // mirror (KvCacheWriteF16) at [start, start + tokens); the WMMA kernel reads
+  // the whole prefix causally from the FP16 planes.
+  if (k_cache_f16 != nullptr && v_cache_f16 != nullptr && head_dim == 256U &&
+      heads == 16U && kv_heads == 2U) {
+    const dim3 grid(static_cast<unsigned>((tokens + kWmmaQueryRows - 1) /
+                                          kWmmaQueryRows),
+                    kv_heads * ((heads / kv_heads) / kWmmaHeads));
+    WmmaCausalAttentionKernel<16, 2><<<grid, 256, 0, stream>>>(
+        q, gate, static_cast<const __half*>(k_cache_f16),
+        static_cast<const __half*>(v_cache_f16), out, start, tokens);
+    return;
+  }
   if (head_dim <= 256U) {
     constexpr std::uint32_t kQT = 32;
     const dim3 grid(heads, (tokens + kQT - 1) / kQT);

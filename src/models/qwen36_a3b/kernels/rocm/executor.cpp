@@ -328,6 +328,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->gdn_history_.assign(c.num_layers, nullptr);
   e->k_cache_.assign(c.num_layers, nullptr);
   e->v_cache_.assign(c.num_layers, nullptr);
+  e->k_cache_f16_.assign(c.num_layers, nullptr);
+  e->v_cache_f16_.assign(c.num_layers, nullptr);
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
       e->gdn_state_[il] = e->AllocFloats(state_elems, error_msg);
@@ -335,6 +337,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     } else {
       e->k_cache_[il] = e->AllocFloats(kv_elems, error_msg);
       e->v_cache_[il] = e->AllocFloats(kv_elems, error_msg);
+      e->k_cache_f16_[il] =
+          e->AllocBytes(kv_elems * sizeof(__half), error_msg);
+      e->v_cache_f16_[il] =
+          e->AllocBytes(kv_elems * sizeof(__half), error_msg);
     }
   }
   e->gdn_state_snap_.assign(c.num_layers, nullptr);
@@ -389,6 +395,10 @@ void Executor::Reset() {
     } else {
       (void)hipMemsetAsync(k_cache_[il], 0, kv_elems * sizeof(float), nullptr);
       (void)hipMemsetAsync(v_cache_[il], 0, kv_elems * sizeof(float), nullptr);
+      (void)hipMemsetAsync(k_cache_f16_[il], 0, kv_elems * sizeof(__half),
+                           nullptr);
+      (void)hipMemsetAsync(v_cache_f16_[il], 0, kv_elems * sizeof(__half),
+                           nullptr);
     }
   }
   if (model_.has_mtp()) {
@@ -448,7 +458,8 @@ void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
 
 void Executor::Attention(const DeviceLayer& l, const float* x,
                          std::uint32_t pos, float* out, float* k_cache,
-                         float* v_cache, const std::uint32_t* pos_dev) {
+                         float* v_cache, void* k_cache_f16, void* v_cache_f16,
+                         const std::uint32_t* pos_dev) {
   const std::uint32_t hd = c_.head_dim;
   const std::uint32_t nh = c_.num_heads;
   const std::uint32_t nkv = c_.num_kv_heads;
@@ -484,9 +495,11 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
   (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(pos) * kv_row, gqa_k_,
                        kv_row * sizeof(float), hipMemcpyDeviceToDevice,
                        nullptr);
-  (void)hipMemcpyAsync(v_cache + static_cast<std::size_t>(pos) * kv_row, gqa_v_,
-                       kv_row * sizeof(float), hipMemcpyDeviceToDevice,
-                       nullptr);
+(void)hipMemcpyAsync(v_cache + static_cast<std::size_t>(pos) * kv_row, gqa_v_,
+                      kv_row * sizeof(float), hipMemcpyDeviceToDevice,
+                      nullptr);
+  KvCacheWriteF16(k_cache, v_cache, k_cache_f16, v_cache_f16, pos * kv_row,
+                  kv_row, nullptr);
 
   const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
   AttentionDecode(gqa_q_, k_cache, v_cache, gqa_gate_, gqa_ctx_, gqa_scratch_,
@@ -835,7 +848,9 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
 
 void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
                               std::uint32_t start, float* out, float* k_cache,
-                              float* v_cache, const std::uint32_t* pos_dev,
+                              float* v_cache, void* k_cache_f16,
+                              void* v_cache_f16,
+                              const std::uint32_t* pos_dev,
                               std::uint32_t tokens) {
   const std::uint32_t hd = c_.head_dim;
   const std::uint32_t nh = c_.num_heads;
@@ -878,6 +893,8 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
   (void)hipMemcpyAsync(v_cache + static_cast<std::size_t>(start) * kv_row,
                        pf_v_, tokens * kv_row * sizeof(float),
                        hipMemcpyDeviceToDevice, nullptr);
+  KvCacheWriteF16(k_cache, v_cache, k_cache_f16, v_cache_f16,
+                  start * kv_row, tokens * kv_row, nullptr);
 
   prof_.Mark("attn_core");
   const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
@@ -885,8 +902,9 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
     AttentionDecodeRows(pf_q_, k_cache, v_cache, pf_qgate_, pf_ctx_, pf_part2_,
                         start + 1U, tokens, nh, nkv, hd, scale, nullptr);
   } else {
-    AttentionPrefill(pf_q_, k_cache, v_cache, pf_qgate_, pf_ctx_, start, tokens,
-                     nh, nkv, hd, scale, nullptr);
+    AttentionPrefill(pf_q_, k_cache, v_cache, k_cache_f16, v_cache_f16,
+                     pf_qgate_, pf_ctx_, start, tokens, nh, nkv, hd, scale,
+                     nullptr);
   }
   prof_.Mark("attn_gemm_out");
   proj(l.attn_out, pf_ctx_, out);
@@ -949,7 +967,8 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
         LinearAttentionBatch(l, il, pf_normed_, pf_attn_, rows);
       } else {
         AttentionBatch(l, pf_normed_, start, pf_attn_, k_cache_[il],
-                       v_cache_[il], pf_pos_, rows);
+                       v_cache_[il], k_cache_f16_[il], v_cache_f16_[il],
+                       pf_pos_, rows);
       }
       prof_.Mark("add");
       Add(pf_x_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
@@ -1032,7 +1051,7 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
       LinearAttention(l, il, normed_, attn_);
     } else {
       Attention(l, normed_, position_, attn_, k_cache_[il], v_cache_[il],
-                pos_dev_);
+                k_cache_f16_[il], v_cache_f16_[il], pos_dev_);
     }
     prof_.Mark("add");
     Add(x_, attn_, c_.hidden_size, nullptr);
@@ -1089,7 +1108,7 @@ void Executor::MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
   RmsNormRows(pf_mtp_cur_, l.attn_norm.f32(), pf_normed_, rows, hidden,
               c_.rms_eps, nullptr);
   AttentionBatch(l, pf_normed_, start, pf_attn_, mtp_k_cache_, mtp_v_cache_,
-                 pf_pos_, rows);
+                 nullptr, nullptr, pf_pos_, rows);
   Add(pf_mtp_cur_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
   RmsNormRows(pf_mtp_cur_, l.post_attention_norm.f32(), pf_normed_, rows,
               hidden, c_.rms_eps, nullptr);
@@ -1146,7 +1165,7 @@ bool Executor::MtpForward(std::int32_t token, const float* hidden,
   RmsNormRows(mtp_cur_, l.attn_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
   Attention(l, normed_, mtp_position_, attn_, mtp_k_cache_, mtp_v_cache_,
-            mtp_pos_dev_);
+            nullptr, nullptr, mtp_pos_dev_);
   Add(mtp_cur_, attn_, c_.hidden_size, nullptr);
   RmsNormRows(mtp_cur_, l.post_attention_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
@@ -1249,7 +1268,8 @@ bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
                            gdn_state_snap_[il], gdn_hist_snap_[il]);
     } else {
       AttentionBatch(l, pf_normed_, position_, pf_attn_, k_cache_[il],
-                     v_cache_[il], pf_pos_, rows);
+                     v_cache_[il], k_cache_f16_[il], v_cache_f16_[il], pf_pos_,
+                     rows);
     }
     Add(pf_x_, pf_attn_,
         static_cast<std::size_t>(rows) * hidden, nullptr);
