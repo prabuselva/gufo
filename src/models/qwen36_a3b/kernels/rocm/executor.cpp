@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -149,7 +150,9 @@ void* Executor::AllocBytes(std::size_t bytes, std::string* error) {
 
 std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                                            std::uint32_t max_context,
-                                           std::string* error_msg) {
+                                           std::string* error_msg,
+                                           std::uint32_t attn_window,
+                                           std::uint32_t attn_sink) {
   if (max_context == 0) {
     if (error_msg != nullptr) {
       *error_msg = "max_context must be positive";
@@ -219,6 +222,25 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   const std::uint32_t chunk =
       max_context < 2048u ? max_context : 2048u;
   e->prefill_chunk_ = chunk;
+  // Opt-in prefill attention sparsity (off unless a window is set). A positive
+  // `attn_window`/`attn_sink` from the caller (CLI) wins; otherwise fall back
+  // to GUFO_QWEN36_ATTN_WINDOW / GUFO_QWEN36_ATTN_SINK. The sink is the number
+  // of always-attended initial tokens.
+  if (attn_window > 0) {
+    e->attn_window_ = attn_window;
+  } else if (const char* w = std::getenv("GUFO_QWEN36_ATTN_WINDOW")) {
+    if (w[0] != '\0') {
+      e->attn_window_ =
+          static_cast<std::uint32_t>(std::strtoul(w, nullptr, 10));
+    }
+  }
+  if (attn_sink > 0) {
+    e->attn_sink_ = attn_sink;
+  } else if (const char* s = std::getenv("GUFO_QWEN36_ATTN_SINK")) {
+    if (s[0] != '\0') {
+      e->attn_sink_ = static_cast<std::uint32_t>(std::strtoul(s, nullptr, 10));
+    }
+  }
   const std::size_t pairs =
       static_cast<std::size_t>(chunk) * c.num_experts_used;
   e->pf_router_logits_ = e->AllocFloats(
@@ -904,7 +926,7 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
   } else {
     AttentionPrefill(pf_q_, k_cache, v_cache, k_cache_f16, v_cache_f16,
                      pf_qgate_, pf_ctx_, start, tokens, nh, nkv, hd, scale,
-                     nullptr);
+                     nullptr, attn_window_, attn_sink_);
   }
   prof_.Mark("attn_gemm_out");
   proj(l.attn_out, pf_ctx_, out);

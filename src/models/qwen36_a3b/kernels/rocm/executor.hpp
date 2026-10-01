@@ -30,7 +30,8 @@ public:
   /// GEMV tier cannot decode.
   [[nodiscard]] static std::unique_ptr<Executor> Create(
       const DeviceModel& model, std::uint32_t max_context,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr, std::uint32_t attn_window = 0,
+      std::uint32_t attn_sink = 0);
 
   /// Advances the trunk by one token; the result is in logits() and h_out().
   bool Step(std::int32_t token, std::string* error_msg = nullptr);
@@ -195,6 +196,11 @@ private:
   // syncs to the host. The MoE buffers hold one row per (token, slot) pair, so
   // they scale with prefill_chunk_ * num_experts_used.
   std::uint32_t prefill_chunk_{0};
+  // Opt-in sliding-window + attention-sink prefill sparsity. Both default to 0,
+  // which selects the exact dense WMMA kernel; a positive window restricts each
+  // prefill query to the last `attn_window_` keys plus the first `attn_sink_`.
+  std::uint32_t attn_window_{0};
+  std::uint32_t attn_sink_{0};
   float* pf_router_logits_{nullptr};
   std::int32_t* pf_ids_{nullptr};
   std::uint32_t* pf_expert_counts_{nullptr};

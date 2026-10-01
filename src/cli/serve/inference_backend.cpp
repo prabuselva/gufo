@@ -3132,8 +3132,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
-                            const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path) {
+const TextDiskCacheConfig& disk_cache_config,
+                             const std::string& vision_model_path,
+                             std::uint32_t attn_window,
+                             std::uint32_t attn_sink) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3288,7 +3290,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     auto model = models::qwen36_a3b::Model::Load(
         model_path,
-        models::qwen36_a3b::ModelOptions{.max_context = max_context},
+        models::qwen36_a3b::ModelOptions{.max_context = max_context,
+                                         .attn_window = attn_window,
+                                         .attn_sink = attn_sink},
         &load_error);
     if (model == nullptr) {
       SetError(error, "Failed to create Qwen3.6-35B-A3B model: " + load_error);

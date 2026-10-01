@@ -1053,12 +1053,13 @@ __device__ __forceinline__ constexpr std::uint32_t WmmaVtRow(
   return (d * kVtStride) + ((d / 8) * kVtSwizzle);
 }
 
-template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
+template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads, bool kSparse>
 __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache_f16,
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
-    std::uint32_t start_pos, std::size_t batch_size) {
+    std::uint32_t start_pos, std::size_t batch_size, std::uint32_t window,
+    std::uint32_t sink) {
   constexpr std::uint32_t kHeadDim = kWmmaHeadDim;
   constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
   constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
@@ -1159,6 +1160,28 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   const std::uint32_t max_visible =
       min(context_end, start_pos + query_start + kQueryRows);
 
+  // Opt-in sliding-window + attention-sink sparsity (kSparse). Each query keeps
+  // the first `sink` keys and the last `window` keys; the middle key tiles are
+  // never loaded, scored or multiplied. Tiles are 16 keys, so the two retained
+  // ranges are tile-aligned and the softmax mask still drops the keys inside a
+  // boundary tile that fall outside the window. sink_end never overlaps win_lo.
+  std::uint32_t sink_end = 0;
+  std::uint32_t win_lo = 0;
+  if constexpr (kSparse) {
+    win_lo = (start_pos + query_start + 1u > window)
+                 ? ((start_pos + query_start + 1u - window) / kKeys) * kKeys
+                 : 0u;
+    if (win_lo > max_visible) {
+      win_lo = max_visible;
+    }
+    sink_end = ((sink + kKeys - 1u) / kKeys) * kKeys;
+    if (sink_end > win_lo) {
+      sink_end = win_lo;
+    }
+  }
+  const std::uint32_t first_key_start =
+      (kSparse && sink_end == 0u) ? win_lo : 0u;
+
   constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
   constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
   static_assert(kKRegs * 256 == kKeys * (kHeadDim / 8), "K stages evenly");
@@ -1202,11 +1225,18 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   uint4 v_cur[kVRegs];
   uint4 k_pre[kKRegs] = {};
   uint4 v_pre[kVRegs] = {};
-  load_k(0, k_cur);
-  load_v(0, v_cur);
+  load_k(first_key_start, k_cur);
+  load_v(first_key_start, v_cur);
 
-  for (std::uint32_t key_start = 0; key_start < max_visible;
-       key_start += kKeys) {
+  for (std::uint32_t key_start = first_key_start; key_start < max_visible;) {
+    // Next visited tile: the following tile, or jump over the dropped middle
+    // range [sink_end, win_lo) when sparse so its KV is never fetched.
+    std::uint32_t next_start = key_start + kKeys;
+    if constexpr (kSparse) {
+      if (next_start >= sink_end && next_start < win_lo) {
+        next_start = win_lo;
+      }
+    }
     __syncthreads();
 #pragma unroll
     for (std::uint32_t n = 0; n < kKRegs; ++n) {
@@ -1218,7 +1248,6 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     }
     __syncthreads();
 
-    const std::uint32_t next_start = key_start + kKeys;
     if (next_start < max_visible) {
       load_k(next_start, k_pre);
       load_v(next_start, v_pre);
@@ -1257,9 +1286,13 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       for (std::uint32_t m = 0; m < kPerLane; ++m) {
         const std::uint32_t col = (seg * kPerLane) + m;
         const std::uint32_t key_position = key_start + col;
-        const bool valid = local_query < batch_size &&
-                           key_position <= absolute_query &&
-                           key_position < context_end;
+        bool valid = local_query < batch_size &&
+                     key_position <= absolute_query &&
+                     key_position < context_end;
+        if constexpr (kSparse) {
+          valid = valid && (key_position < sink ||
+                            absolute_query - key_position < window);
+        }
         const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
         vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
                            s_lds[1][tile][row][col % 16])
@@ -1388,6 +1421,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     for (std::uint32_t n = 0; n < kVRegs; ++n) {
       v_cur[n] = v_pre[n];
     }
+    key_start = next_start;
   }
   if (tid % kSoftmaxLanes == 0) {
     row_max[tid / kSoftmaxLanes] = running_max;
@@ -2199,19 +2233,29 @@ void AttentionPrefill(const float* q, const float* k_cache,
                       void* v_cache_f16, const float* gate, float* out,
                       std::uint32_t start, std::uint32_t tokens,
                       std::uint32_t heads, std::uint32_t kv_heads,
-                      std::uint32_t head_dim, float scale, hipStream_t stream) {
+                      std::uint32_t head_dim, float scale, hipStream_t stream,
+                      std::uint32_t window, std::uint32_t sink) {
   // Matrix-core route: the validated 16Q/2KV, head_dim 256 shape. The caller
   // has already published the chunk into both the FP32 cache and its FP16
   // mirror (KvCacheWriteF16) at [start, start + tokens); the WMMA kernel reads
-  // the whole prefix causally from the FP16 planes.
+  // the whole prefix causally from the FP16 planes. A positive `window` selects
+  // the sliding-window + sink sparse instantiation; window 0 keeps the dense
+  // kernel byte-for-byte.
   if (k_cache_f16 != nullptr && v_cache_f16 != nullptr && head_dim == 256U &&
       heads == 16U && kv_heads == 2U) {
     const dim3 grid(static_cast<unsigned>((tokens + kWmmaQueryRows - 1) /
                                           kWmmaQueryRows),
                     kv_heads * ((heads / kv_heads) / kWmmaHeads));
-    WmmaCausalAttentionKernel<16, 2><<<grid, 256, 0, stream>>>(
-        q, gate, static_cast<const __half*>(k_cache_f16),
-        static_cast<const __half*>(v_cache_f16), out, start, tokens);
+    if (window > 0U) {
+      WmmaCausalAttentionKernel<16, 2, true><<<grid, 256, 0, stream>>>(
+          q, gate, static_cast<const __half*>(k_cache_f16),
+          static_cast<const __half*>(v_cache_f16), out, start, tokens, window,
+          sink);
+    } else {
+      WmmaCausalAttentionKernel<16, 2, false><<<grid, 256, 0, stream>>>(
+          q, gate, static_cast<const __half*>(k_cache_f16),
+          static_cast<const __half*>(v_cache_f16), out, start, tokens, 0U, 0U);
+    }
     return;
   }
   if (head_dim <= 256U) {

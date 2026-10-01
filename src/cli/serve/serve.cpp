@@ -441,6 +441,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
     std::string served_model_name;
     std::uint32_t max_context = 4096;
+    std::uint32_t attn_window = 0;
+    std::uint32_t attn_sink = 0;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
@@ -488,6 +490,14 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("-c", "--context", "N",
                      "Maximum context tokens (default: 4096)", "Model",
                      &max_context);
+    parser.AddOption("", "--attn-window", "N",
+                     "Qwen3.6-35B-A3B prefill attention: sliding-window tokens "
+                     "(0 = dense, default)",
+                     "Model", &attn_window);
+    parser.AddOption("", "--attn-sink", "N",
+                     "Qwen3.6-35B-A3B prefill attention: always-attended "
+                     "initial tokens when --attn-window is set (default 0)",
+                     "Model", &attn_sink);
 
     // Sampling Defaults
     parser.AddOption("-n", "--max-tokens", "N",
@@ -892,6 +902,8 @@ int RunServe(std::span<const char* const> args) {
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
     std::string served_model_name;
     std::uint32_t max_context = 4096;
+    std::uint32_t attn_window = 0;
+    std::uint32_t attn_sink = 0;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
@@ -938,6 +950,14 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("-c", "--context", "N",
                          "Maximum context tokens (default: 4096)", "Model",
                          &max_context);
+    llm_parser.AddOption("", "--attn-window", "N",
+                         "Qwen3.6-35B-A3B prefill attention: sliding-window "
+                         "tokens (0 = dense, default)",
+                         "Model", &attn_window);
+    llm_parser.AddOption("", "--attn-sink", "N",
+                         "Qwen3.6-35B-A3B prefill attention: always-attended "
+                         "initial tokens when --attn-window is set (default 0)",
+                         "Model", &attn_sink);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default maximum new tokens per response (default: 128)",
@@ -1132,9 +1152,9 @@ int RunServe(std::span<const char* const> args) {
                            .directory = cache_disk_directory,
                            .capacity_bytes = cache_disk_bytes,
                            .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
-                       },
-                       vision_model_path)) {
+.model_artifact_fingerprint = {},
+                        },
+                        vision_model_path, attn_window, attn_sink)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

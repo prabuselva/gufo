@@ -90,6 +90,14 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
+  parser.AddOption("", "--attn-window", "N",
+                   "Qwen3.6-35B-A3B prefill attention: sliding-window tokens "
+                   "(0 = dense, default)",
+                   "Model", &opt.attn_window);
+  parser.AddOption("", "--attn-sink", "N",
+                   "Qwen3.6-35B-A3B prefill attention: always-attended initial "
+                   "tokens when --attn-window is set (default 0)",
+                   "Model", &opt.attn_sink);
   RegisterImageOptions(parser, opt);
 
   // Prompt & Formatting
@@ -736,7 +744,11 @@ std::shared_ptr<models::qwen36_a3b::Model> LoadQwen36A3BModel(
     return nullptr;
   }
   auto model = models::qwen36_a3b::Model::Load(
-      opt.model_path, {.max_context = kDefaultContext}, &error);
+      opt.model_path,
+      {.max_context = kDefaultContext,
+       .attn_window = opt.attn_window,
+       .attn_sink = opt.attn_sink},
+      &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
     std::cerr << "Qwen3.6-35B-A3B load failed: " << error << '\n';

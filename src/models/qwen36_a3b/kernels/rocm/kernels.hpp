@@ -197,13 +197,16 @@ void KvCacheWriteF16(const float* k, const float* v, void* k_cache_f16,
 /// 16Q/2KV head_dim-256 GQA, the chunk's FP32 KV rows (already published at
 /// `[start, start + tokens)` by the caller) are mirrored into the FP16 planes
 /// and the causal pass runs on the WMMA matrix cores; otherwise the scalar
-/// tiled/naive kernels read the FP32 cache directly.
+/// tiled/naive kernels read the FP32 cache directly. A positive `window`
+/// restricts each query to the last `window` keys plus the first `sink` keys
+/// (attention sink); `window == 0` keeps the exact dense pass.
 void AttentionPrefill(const float* q, const float* k_cache,
                       const float* v_cache, void* k_cache_f16,
                       void* v_cache_f16, const float* gate, float* out,
                       std::uint32_t start, std::uint32_t tokens,
                       std::uint32_t heads, std::uint32_t kv_heads,
-                      std::uint32_t head_dim, float scale, hipStream_t stream);
+                      std::uint32_t head_dim, float scale, hipStream_t stream,
+                      std::uint32_t window = 0U, std::uint32_t sink = 0U);
 
 }  // namespace gufo::models::qwen36_a3b::rocm
 
