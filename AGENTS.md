@@ -77,6 +77,15 @@ Use `tools/bench/build.sh` for standalone HIP experiments,
 `tools/prof/isa_mix.py` for instruction analysis. Production paths must retain
 quality; successful optimizations become the default, without extra switches.
 
+A resident `gufo serve` holds most VRAM and contends for the GPU, so any GPU
+benchmark needs exclusive access. Run it through
+`tools/bench/gpu_exclusive.sh [options] -- <command>`: it stops the server,
+waits for VRAM to release, runs one command, then always respawns the server
+via the launch script and polls `/v1/models` until ready before returning
+(override with `--launch-script`, `--port`, `--expect-model`, `--ready-timeout`,
+`--settle`). Never time a benchmark while the server is resident; contention
+and lazy allocation make such numbers meaningless.
+
 ## Development
 
 - Keep model code, tests, tools and numerical contracts with their model.
