@@ -1042,6 +1042,17 @@ __device__ __forceinline__ WmmaV16h WmmaLoadFrag(const __half* p) {
   return cvt.f;
 }
 
+// V^T is stored [dim][key]. A 16-half pad every 8 dims spreads the packed
+// transpose writes and the fragment reads over all 32 LDS banks: without it the
+// four lane groups differ only in dim, and 8 dims x kVtStride halves is 0 mod
+// 32, so they collide. Both strides are multiples of 8, so every fragment base
+// and every packed dword stays aligned.
+template<std::uint32_t kVtStride, std::uint32_t kVtSwizzle>
+__device__ __forceinline__ constexpr std::uint32_t WmmaVtRow(
+    std::uint32_t d) {
+  return (d * kVtStride) + ((d / 8) * kVtSwizzle);
+}
+
 template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
 __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
@@ -1064,11 +1075,15 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   constexpr std::uint32_t kOTilesPerWave = (kRowBlocks * kWmmaKSteps) / 8;
   constexpr std::uint32_t kSoftmaxLanes = 256 / kRows;
   constexpr std::uint32_t kVtStride = kKeys + 8;
+  constexpr std::uint32_t kVtSwizzle = 16;
   static_assert(kSTiles == 4, "eight waves cover four S tiles in two halves");
   static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
   static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
   static_assert(kKStepsPerWave * 8 / kSTiles == kWmmaKSteps, "k split");
-  static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
+  static_assert(kKeys == 16 && kHeadDim == 256,
+                "packed V mapping assumes 4 lanes x 32 dims per key");
+  static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0 &&
+                    kVtSwizzle % 8 == 0,
                 "fragment rows must start on a 16-byte boundary");
   static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
 
@@ -1096,9 +1111,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // The K tile needs kKeys * kWmmaKStride halves; the transposed V staging
   // needs kHeadDim * kVtStride. Size for the larger so the V transpose never
   // runs off the end and corrupts the neighbouring softmax buffers.
+  constexpr std::uint32_t kVtHalves =
+      WmmaVtRow<kVtStride, kVtSwizzle>(kHeadDim - 1) + kKeys;
   constexpr std::uint32_t kKvLdsHalves =
-      (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? kKeys * kWmmaKStride
-                                                    : kHeadDim * kVtStride;
+      (kKeys * kWmmaKStride > kVtHalves) ? kKeys * kWmmaKStride : kVtHalves;
   __shared__ __half kv_lds[kKvLdsHalves];
   __shared__ float s_lds[2][kSTiles][16][17];
   __shared__ __half p_lds[kRows][kKeys + 8];
@@ -1146,21 +1162,25 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
   constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
   static_assert(kKRegs * 256 == kKeys * (kHeadDim / 8), "K stages evenly");
-  const std::uint32_t v_key = lane % kKeys;
-  const std::uint32_t v_slice = (tid / kKeys) * (kVRegs * 8);
+  static_assert(kVRegs == 2, "packed V holds one uint4 per key of a pair");
+  // Lane L holds dims [wave*32 + (L%4)*8, +8) of keys 2*(L/4) and 2*(L/4)+1, so
+  // the two keys land in adjacent V^T columns and transpose to one dword.
+  const std::uint32_t v_pair = lane >> 2u;
+  const std::uint32_t v_dim = (wave * 32u) + ((lane & 3u) * 8u);
   const std::size_t kv_stride = kKvWidth;
   const std::size_t head_offset = static_cast<std::size_t>(kv_head) * kHeadDim;
-  const auto* v_base = v_cache_f16 + head_offset + v_slice;
+  const auto* v_base = v_cache_f16 + head_offset + v_dim;
   const auto* k_base = k_cache_f16 + head_offset;
 
   const auto load_v = [&](std::uint32_t key_start, uint4* dst) {
-    const std::uint32_t key_position = key_start + v_key;
-    const auto* src = v_base + (static_cast<std::size_t>(key_position) * kv_stride);
-    const bool live = key_position < context_end;
 #pragma unroll
-    for (std::uint32_t j = 0; j < kVRegs; ++j) {
-      dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
-                    : make_uint4(0u, 0u, 0u, 0u);
+    for (std::uint32_t j = 0; j < 2; ++j) {
+      const std::uint32_t key_position = key_start + (2 * v_pair) + j;
+      dst[j] = (key_position < context_end)
+                   ? *reinterpret_cast<const uint4*>(
+                         v_base +
+                         (static_cast<std::size_t>(key_position) * kv_stride))
+                   : make_uint4(0u, 0u, 0u, 0u);
     }
   };
   const auto load_k = [&](std::uint32_t key_start, uint4* dst) {
@@ -1290,13 +1310,18 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       }
     }
 
-    // --- stage V transposed into LDS (conflict-free: one key per lane) ---
-#pragma unroll
-    for (std::uint32_t j = 0; j < kVRegs; ++j) {
-      const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
+    // --- transpose V into LDS: 8 packed dwords, two adjacent V^T columns each
+    {
+      const auto* lo = reinterpret_cast<const __half*>(&v_cur[0]);
+      const auto* hi = reinterpret_cast<const __half*>(&v_cur[1]);
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
-        kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
+        const std::uint32_t packed =
+            static_cast<std::uint32_t>(__half_as_ushort(lo[i])) |
+            (static_cast<std::uint32_t>(__half_as_ushort(hi[i])) << 16);
+        *reinterpret_cast<std::uint32_t*>(
+            &kv_lds[WmmaVtRow<kVtStride, kVtSwizzle>(v_dim + i) +
+                    (2 * v_pair)]) = packed;
       }
     }
     __syncthreads();
@@ -1310,8 +1335,9 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         WmmaV16h v_frag[kKeyBlocks];
 #pragma unroll
         for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
-          v_frag[kb] =
-              WmmaLoadFrag(&kv_lds[(dim_tile * 16 + sub) * kVtStride + kb * 16]);
+          v_frag[kb] = WmmaLoadFrag(
+              &kv_lds[WmmaVtRow<kVtStride, kVtSwizzle>((dim_tile * 16) + sub) +
+                      (kb * 16)]);
         }
 #pragma unroll
         for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {

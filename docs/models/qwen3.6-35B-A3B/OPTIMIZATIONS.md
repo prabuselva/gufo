@@ -67,6 +67,31 @@ the K/V tile once per KV group (all `heads_per_kv` query heads per block) to
 cut KV traffic ~4×; profile at 100K first. See
 `optimization_missing_report.md` §8.
 
+## Prefill attention LDS transpose (packed V + bank swizzle)
+
+Landed on top of `fc428317`. Targets the WMMA kernel's V transpose into LDS.
+
+1. **Packed V transpose** (`WmmaCausalAttentionKernel`, `kernels.hip.cpp:1046`)
+   — the V load remaps so lane `L` holds dims `[wave*32 + (L%4)*8, +8)` of keys
+   `2*(L/4)` and `2*(L/4)+1`; the two keys land in adjacent V^T columns and
+   transpose to one packed dword write instead of 16 half writes.
+2. **Bank swizzle** (`WmmaVtRow<kVtStride,kVtSwizzle>`, `kVtSwizzle=16`) — a
+   16-half pad every 8 dims spreads the transpose writes and the PV fragment
+   reads over all 32 LDS banks (without it the four lane groups collide 4-way).
+
+A standalone microbenchmark (`tools/bench/attn_causal_bench.hip`, 16q/2kv,
+b=2048 s=98304) put the pipelined kernel at 1.69 ms vs 1.94 ms for the shipped
+prefetch-only mapping — a 1.15× kernel gain that implied ~10 % at 100K. It did
+**not** survive the full path: a matched same-session interleaved A/B
+(`tools/bench/gpu_exclusive.sh`, 2 reps, UD-Q8_K_XL) measured only **+0.6 %
+@4096, +0.9 % @16384, +0.8 % @100K** (candidate ahead in 6/6 paired runs). The
+kernel is LDS-transpose-bound in isolation but **global-KV-bandwidth-bound** in
+the real 100K path — the packed/swizzle change cuts LDS conflicts, not the 4×
+redundant global KV re-read, so the end-to-end effect is marginal. Kept as a
+strict, parity-safe improvement (attention parity holds across multi-tile,
+causal-tail and deep-prefix cases). The real 100K lever remains the 4× KV
+re-read above. See `EXPERIMENTS.md`.
+
 ## Decode (14.1 → 33.3 tps)
 
 Landed in `49b6ee3`.
