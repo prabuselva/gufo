@@ -58,8 +58,9 @@ const auto mtp = MtpWeights::Bind(*m->reader_, c);
   if (!m->device_) {
     return nullptr;
   }
-  m->executor_ =
-      rocm::Executor::Create(*m->device_, options.max_context, error_msg);
+  m->executor_ = rocm::Executor::Create(*m->device_, options.max_context,
+                                        error_msg, options.attn_window,
+                                        options.attn_sink);
   if (!m->executor_) {
     return nullptr;
   }

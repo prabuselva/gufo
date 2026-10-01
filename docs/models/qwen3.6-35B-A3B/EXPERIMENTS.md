@@ -28,3 +28,41 @@ global KV re-read**: the grid `(query_tiles, 8 head_pairs)` with `kWmmaHeads=2`
 streams each KV head's prefix from HBM once per head-pair block. The next lever
 is one block covering a full KV group (all `heads_per_kv` query heads) to cut
 that traffic ~4× — not further LDS-transpose tuning.
+
+## Prefill attention — opt-in sliding-window + sink sparsity
+
+Qwen3.6-35B-A3B ships dense Gated Attention (no trained QSA/indexer weights in
+the GGUF), so a lossless long-context speedup is impossible; the only lever is a
+**training-free, opt-in** restriction of each query to the first `sink` keys and
+the last `window` keys (StreamingLLM-style). The WMMA kernel is templated on
+`kSparse`; the dense instantiation (`window == 0`) is byte-for-byte the previous
+kernel, and the sparse instantiation never loads, scores or multiplies the
+dropped middle key tiles. The softmax mask drops boundary-tile keys outside the
+window, so the retained probabilities (and therefore PV) stay exact.
+
+Off by default. Enable with `--attn-window <tokens>` (and optional
+`--attn-sink <tokens>`, default 0) on `gufo serve llm` and `gufo prompt`; the
+`GUFO_QWEN36_ATTN_WINDOW` / `GUFO_QWEN36_ATTN_SINK` environment variables remain
+as a fallback and are ignored when the flag is set. Correctness is asserted
+against a masked CPU reference in `qwen36_a3b_rocm_attention_test` (worst rel
+err ~3.5e-4, same as dense FP16). Matched same-session A/B
+(`GUFO_QWEN36_A3B_BENCH`):
+
+| context | dense | window=2048 sink=4 | window=4096 sink=4 |
+| --- | --- | --- | --- |
+| 4 096 | 1915.8 tok/s | 1941.5 (+1.3 %) | 1916.6 (+0.0 %) |
+| 16 384 | 1482.5 tok/s | 1590.9 (+7.3 %) | 1563.9 (+5.5 %) |
+| 100 000 | 582.9 tok/s | 752.1 (+29.0 %) | 747.2 (+28.2 %) |
+
+**Decision: retained as opt-in, default off.** The gain scales with context
+length (the dropped middle range only exists once context > window) and is
+bounded because only the 1-in-4 full-attention layers benefit and each still
+keeps a 2048-token window. It is lossy: quality must be validated per workload
+before enabling, and a missing-model skip is not a quality pass.
+
+The kernel-level effect can be isolated with `tools/bench/attn_causal_bench.hip`
+(`-w <window> -n <sink>`), which adds a `pipe: sparse w/sink` variant beside a
+`pipe: dense full (key0)` baseline over the same key range; run it through
+`tools/bench/gpu_exclusive.sh` for exclusive access. The sparse variant is
+restricted to prefetch depth 1 (the double-buffer the shipped kernel uses)
+because the ring prefetch assumes contiguous key tiles.

@@ -27,6 +27,10 @@ class Executor;
 
 struct ModelOptions {
   std::uint32_t max_context = 4096;
+  // Opt-in prefill attention sparsity: restrict each prefill query to the last
+  // `attn_window` keys plus the first `attn_sink`. 0 disables sparsity (dense).
+  std::uint32_t attn_window = 0;
+  std::uint32_t attn_sink = 0;
 };
 
 class Session;

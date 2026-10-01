@@ -579,8 +579,10 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "llm") {
     std::string model;
     std::string served_model_name;
-    std::uint32_t max_context = 0;
+std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
+    std::uint32_t attn_window = 0;
+    std::uint32_t attn_sink = 0;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
@@ -624,10 +626,18 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API", "Model",
                      &served_model_name);
-    parser.AddOption(
+parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddOption("", "--attn-window", "N",
+                     "Qwen3.6-35B-A3B prefill attention: sliding-window tokens "
+                     "(0 = dense, default)",
+                     "Model", &attn_window);
+    parser.AddOption("", "--attn-sink", "N",
+                     "Qwen3.6-35B-A3B prefill attention: always-attended "
+                     "initial tokens when --attn-window is set (default 0)",
+                     "Model", &attn_sink);
 
     // Sampling Defaults
     parser.AddOption(
@@ -1116,8 +1126,10 @@ int RunServe(std::span<const char* const> args) {
     // Default to LLM server
     std::string model;
     std::string served_model_name;
-    std::uint32_t max_context = 0;
+std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
+    std::uint32_t attn_window = 0;
+    std::uint32_t attn_sink = 0;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
@@ -1161,10 +1173,18 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--served-model-name", "ID",
                          "Model identifier exposed by the OpenAI API", "Model",
                          &served_model_name);
-    llm_parser.AddOption(
+llm_parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddOption("", "--attn-window", "N",
+                         "Qwen3.6-35B-A3B prefill attention: sliding-window "
+                         "tokens (0 = dense, default)",
+                         "Model", &attn_window);
+    llm_parser.AddOption("", "--attn-sink", "N",
+                         "Qwen3.6-35B-A3B prefill attention: always-attended "
+                         "initial tokens when --attn-window is set (default 0)",
+                         "Model", &attn_sink);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1399,11 +1419,12 @@ int RunServe(std::span<const char* const> args) {
                            .directory = cache_disk_directory,
                            .capacity_bytes = cache_disk_bytes,
                            .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
+.model_artifact_fingerprint = {},
                        },
                        vision_model_path,
                        server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+                           .capacity_bytes = cache_ram_bytes},
+                       attn_window, attn_sink)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
