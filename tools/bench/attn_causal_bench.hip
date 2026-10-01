@@ -36,8 +36,17 @@
   } while (0)
 
 constexpr std::uint32_t kHeadDim = 256;
-constexpr std::uint32_t kQueryHeads = 24;
-constexpr std::uint32_t kKvHeads = 4;
+// Shape is overridable at compile time so the same harness can reproduce other
+// models' full-attention layers. Defaults are Qwen3.8-27B (24q/4kv, GQA 6);
+// Qwen3.6-35B-A3B uses -DKQUERY_HEADS=16 -DKKV_HEADS=2 (GQA 8).
+#ifndef KQUERY_HEADS
+#define KQUERY_HEADS 24
+#endif
+#ifndef KKV_HEADS
+#define KKV_HEADS 4
+#endif
+constexpr std::uint32_t kQueryHeads = KQUERY_HEADS;
+constexpr std::uint32_t kKvHeads = KKV_HEADS;
 constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
 constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
 constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
