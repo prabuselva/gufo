@@ -1,10 +1,16 @@
-// lm_head GEMV variants: rows=248320, cols=2048, Q8_0. Measures achieved GB/s
-// for the current byte-per-lane kernel vs vectorized unpacks.
+// Q8_0 GEMV variants across the real qwen36 decode shapes. Measures achieved
+// GB/s for the current byte-per-lane kernel vs bit-exact-preserving scheduling
+// variants (unroll depth, rows-per-block) and a non-exact vectorized-load
+// ceiling probe. Each bit-exact variant is checked against the current kernel
+// for identical output bits; the vec probe is reported as a bandwidth ceiling
+// only (it changes the accumulation order and is not promotable).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 #define CK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
   fprintf(stderr, "hip err %s @%d\n", hipGetErrorString(e), __LINE__); \
@@ -18,7 +24,8 @@ __device__ __forceinline__ float WSum(float v) {
   return v;
 }
 
-// Current production kernel: 4 rows/block, byte per lane per block.
+// Current production kernel: 4 rows/block (128 threads), byte per lane per
+// block, unroll 4. This is the bit-exact reference.
 __global__ void kCurrent(const Q8_0Block* __restrict__ w,
                          const float* __restrict__ x, float* __restrict__ out,
                          std::uint32_t rows, std::uint32_t cols) {
@@ -37,7 +44,65 @@ __global__ void kCurrent(const Q8_0Block* __restrict__ w,
   if (lane == 0) out[r] = acc;
 }
 
-// Variant A: uint32 quant load (misaligned on even blocks) + float4 x.
+// Bit-exact: same per-row FMA sequence, deeper unroll (more loads in flight).
+__global__ void kUnroll8(const Q8_0Block* __restrict__ w,
+                         const float* __restrict__ x, float* __restrict__ out,
+                         std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) return;
+  const std::uint32_t nb = cols / 32;
+  const Q8_0Block* __restrict__ row = w + (std::size_t)r * nb;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 8
+  for (std::uint32_t b = 0; b < nb; ++b) {
+    const float d = __half2float(row[b].d);
+    acc += d * (float)row[b].qs[lane] * x[b * 32 + lane];
+  }
+  acc = WSum(acc);
+  if (lane == 0) out[r] = acc;
+}
+
+// Bit-exact: 8 rows/block (256 threads), same per-row FMA sequence.
+__global__ void kRows8(const Q8_0Block* __restrict__ w,
+                       const float* __restrict__ x, float* __restrict__ out,
+                       std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 8U + (threadIdx.x >> 5);
+  if (r >= rows) return;
+  const std::uint32_t nb = cols / 32;
+  const Q8_0Block* __restrict__ row = w + (std::size_t)r * nb;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t b = 0; b < nb; ++b) {
+    const float d = __half2float(row[b].d);
+    acc += d * (float)row[b].qs[lane] * x[b * 32 + lane];
+  }
+  acc = WSum(acc);
+  if (lane == 0) out[r] = acc;
+}
+
+// Bit-exact: 2 rows/block (64 threads), same per-row FMA sequence.
+__global__ void kRows2(const Q8_0Block* __restrict__ w,
+                       const float* __restrict__ x, float* __restrict__ out,
+                       std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 2U + (threadIdx.x >> 5);
+  if (r >= rows) return;
+  const std::uint32_t nb = cols / 32;
+  const Q8_0Block* __restrict__ row = w + (std::size_t)r * nb;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t b = 0; b < nb; ++b) {
+    const float d = __half2float(row[b].d);
+    acc += d * (float)row[b].qs[lane] * x[b * 32 + lane];
+  }
+  acc = WSum(acc);
+  if (lane == 0) out[r] = acc;
+}
+
+// NOT bit-exact (ceiling probe): uint32 quant load + float4 x. Reads the row as
+// a flat byte stream, so the products are grouped differently.
 __global__ void kVec4(const Q8_0Block* __restrict__ w,
                       const float* __restrict__ x, float* __restrict__ out,
                       std::uint32_t rows, std::uint32_t cols) {
@@ -63,100 +128,97 @@ __global__ void kVec4(const Q8_0Block* __restrict__ w,
   if (lane == 0) out[r] = acc;
 }
 
-// Variant B: two blocks per iteration, uint16 quant load (always 2B aligned)
-// + float2 x (always 8B aligned).
-__global__ void kVec2(const Q8_0Block* __restrict__ w,
-                      const float* __restrict__ x, float* __restrict__ out,
-                      std::uint32_t rows, std::uint32_t cols) {
-  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
-  if (r >= rows) return;
-  const std::uint32_t nb = cols / 32;
-  const std::uint8_t* __restrict__ row =
-      reinterpret_cast<const std::uint8_t*>(w) + (std::size_t)r * nb * 34;
-  const std::uint32_t lane = threadIdx.x & 31U;
-  float acc = 0.0f;
-#pragma unroll 2
-  for (std::uint32_t b = 0; b < nb; b += 2) {
-    const float d0 = __half2float(*reinterpret_cast<const __half*>(row + b * 34));
-    const float d1 =
-        __half2float(*reinterpret_cast<const __half*>(row + b * 34 + 34));
-    const std::uint16_t q = *reinterpret_cast<const std::uint16_t*>(
-        row + b * 34 + 2 + lane * 2);
-    const float2 xv = *reinterpret_cast<const float2*>(x + b * 32 + lane * 2);
-    const float2 xv2 = *reinterpret_cast<const float2*>(x + b * 32 + 32 + lane * 2);
-    const std::uint16_t q2 = *reinterpret_cast<const std::uint16_t*>(
-        row + b * 34 + 34 + 2 + lane * 2);
-    acc += d0 * ((float)(std::int8_t)(q & 0xFF) * xv.x +
-                 (float)(std::int8_t)(q >> 8) * xv.y);
-    acc += d1 * ((float)(std::int8_t)(q2 & 0xFF) * xv2.x +
-                 (float)(std::int8_t)(q2 >> 8) * xv2.y);
-  }
-  acc = WSum(acc);
-  if (lane == 0) out[r] = acc;
-}
+typedef void (*Launch)(const Q8_0Block*, const float*, float*, std::uint32_t,
+                       std::uint32_t, hipStream_t);
 
-// Variant C: vec4 with x staged in LDS once per block.
-__global__ void kVec4Lds(const Q8_0Block* __restrict__ w,
-                         const float* __restrict__ x, float* __restrict__ out,
-                         std::uint32_t rows, std::uint32_t cols) {
-  extern __shared__ float sx[];
-  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) sx[i] = x[i];
-  __syncthreads();
-  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
-  if (r >= rows) return;
-  const std::uint32_t nb = cols / 32;
-  const std::uint8_t* __restrict__ row =
-      reinterpret_cast<const std::uint8_t*>(w) + (std::size_t)r * nb * 34;
-  const std::uint32_t lane = threadIdx.x & 31U;
-  float acc = 0.0f;
-#pragma unroll 4
-  for (std::uint32_t b = 0; b < nb; ++b) {
-    const float d = __half2float(*reinterpret_cast<const __half*>(row + b * 34));
-    const std::uint32_t q = *reinterpret_cast<const std::uint32_t*>(
-        row + b * 34 + 2 + lane * 4);
-    const float4 xv = *reinterpret_cast<const float4*>(sx + b * 32 + lane * 4);
-    acc += d * ((float)(std::int8_t)(q & 0xFF) * xv.x +
-                (float)(std::int8_t)((q >> 8) & 0xFF) * xv.y +
-                (float)(std::int8_t)((q >> 16) & 0xFF) * xv.z +
-                (float)(std::int8_t)(q >> 24) * xv.w);
-  }
-  acc = WSum(acc);
-  if (lane == 0) out[r] = acc;
+static void lCurrent(const Q8_0Block* w, const float* x, float* o,
+                     std::uint32_t r, std::uint32_t c, hipStream_t s) {
+  kCurrent<<<(r + 3) / 4, 128, 0, s>>>(w, x, o, r, c);
+}
+static void lUnroll8(const Q8_0Block* w, const float* x, float* o,
+                     std::uint32_t r, std::uint32_t c, hipStream_t s) {
+  kUnroll8<<<(r + 3) / 4, 128, 0, s>>>(w, x, o, r, c);
+}
+static void lRows8(const Q8_0Block* w, const float* x, float* o, std::uint32_t r,
+                   std::uint32_t c, hipStream_t s) {
+  kRows8<<<(r + 7) / 8, 256, 0, s>>>(w, x, o, r, c);
+}
+static void lRows2(const Q8_0Block* w, const float* x, float* o, std::uint32_t r,
+                   std::uint32_t c, hipStream_t s) {
+  kRows2<<<(r + 1) / 2, 64, 0, s>>>(w, x, o, r, c);
+}
+static void lVec4(const Q8_0Block* w, const float* x, float* o, std::uint32_t r,
+                  std::uint32_t c, hipStream_t s) {
+  kVec4<<<(r + 3) / 4, 128, 0, s>>>(w, x, o, r, c);
 }
 
 int main() {
-  const std::uint32_t rows = 248320, cols = 2048;
-  const std::size_t wbytes = (std::size_t)rows * (cols / 32) * 34;
-  float *x, *out; Q8_0Block* w;
-  CK(hipMalloc(&w, wbytes));
-  CK(hipMalloc(&x, cols * sizeof(float)));
-  CK(hipMalloc(&out, rows * sizeof(float)));
-  CK(hipMemset(w, 0x37, wbytes));
-  CK(hipMemset(x, 0x3c, cols * sizeof(float)));
-  const double gb = wbytes / 1e9;
-  printf("weights %.1f MB\n", gb * 1000);
+  struct Shape { const char* name; std::uint32_t rows; std::uint32_t cols; };
+  const Shape shapes[] = {
+      {"lm_head  248320x2048", 248320, 2048},
+      {"ssm_qkv    8192x2048", 8192, 2048},
+      {"ssm_gate   4096x2048", 4096, 2048},
+      {"attn_q     4096x2048", 4096, 2048},
+      {"moe_gate    512x2048", 512, 2048},
+  };
+  const struct { const char* name; Launch fn; bool exact; } kernels[] = {
+      {"current", lCurrent, true},
+      {"unroll8", lUnroll8, true},
+      {"rows8", lRows8, true},
+      {"rows2", lRows2, true},
+      {"vec4*", lVec4, false},
+  };
 
   hipEvent_t e0, e1;
-  hipEventCreate(&e0); hipEventCreate(&e1);
-  const int iters = 20;
-  auto bench = [&](const char* name, void (*launch)(const Q8_0Block*, const float*, float*, std::uint32_t, std::uint32_t, hipStream_t)) {
-    launch(w, x, out, rows, cols, 0);
-    CK(hipDeviceSynchronize());
-    hipEventRecord(e0);
-    for (int i = 0; i < iters; ++i) launch(w, x, out, rows, cols, 0);
-    hipEventRecord(e1);
-    CK(hipDeviceSynchronize());
-    float ms; hipEventElapsedTime(&ms, e0, e1);
-    ms /= iters;
-    printf("%-12s %7.3f ms  %6.1f GB/s\n", name, ms, gb / (ms / 1e3));
-  };
-  bench("current", [](const Q8_0Block* w, const float* x, float* o, std::uint32_t r, std::uint32_t c, hipStream_t s) {
-    kCurrent<<<(r + 3) / 4, 128, 0, s>>>(w, x, o, r, c); });
-  bench("vec4", [](const Q8_0Block* w, const float* x, float* o, std::uint32_t r, std::uint32_t c, hipStream_t s) {
-    kVec4<<<(r + 3) / 4, 128, 0, s>>>(w, x, o, r, c); });
-  bench("vec2", [](const Q8_0Block* w, const float* x, float* o, std::uint32_t r, std::uint32_t c, hipStream_t s) {
-    kVec2<<<(r + 3) / 4, 128, 0, s>>>(w, x, o, r, c); });
-  bench("vec4lds", [](const Q8_0Block* w, const float* x, float* o, std::uint32_t r, std::uint32_t c, hipStream_t s) {
-    kVec4Lds<<<(r + 3) / 4, 128, 2048 * 4, s>>>(w, x, o, r, c); });
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  const int iters = 30;
+
+  for (const Shape& sh : shapes) {
+    const std::size_t wbytes = (std::size_t)sh.rows * (sh.cols / 32) * 34;
+    const double gb = wbytes / 1e9;
+    float *x, *out, *ref;
+    Q8_0Block* w;
+    CK(hipMalloc(&w, wbytes));
+    CK(hipMalloc(&x, sh.cols * sizeof(float)));
+    CK(hipMalloc(&out, sh.rows * sizeof(float)));
+    CK(hipMalloc(&ref, sh.rows * sizeof(float)));
+    // Fill weights with a nonzero pattern (scales land on even offsets).
+    CK(hipMemset(w, 0x37, wbytes));
+    CK(hipMemset(x, 0x3c, sh.cols * sizeof(float)));
+    printf("\n== %s  (%.1f MB weights) ==\n", sh.name, gb * 1000);
+    for (const auto& k : kernels) {
+      // Warm.
+      k.fn(w, x, out, sh.rows, sh.cols, 0);
+      CK(hipDeviceSynchronize());
+      hipEventRecord(e0);
+      for (int i = 0; i < iters; ++i) k.fn(w, x, out, sh.rows, sh.cols, 0);
+      hipEventRecord(e1);
+      CK(hipDeviceSynchronize());
+      float ms;
+      hipEventElapsedTime(&ms, e0, e1);
+      ms /= iters;
+      const char* exact = "?";
+      if (k.exact) {
+        // Re-run current into ref, compare bits.
+        lCurrent(w, x, ref, sh.rows, sh.cols, 0);
+        CK(hipDeviceSynchronize());
+        std::vector<float> a(sh.rows), b(sh.rows);
+        CK(hipMemcpy(a.data(), out, sh.rows * 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(b.data(), ref, sh.rows * 4, hipMemcpyDeviceToHost));
+        bool same = true;
+        for (std::uint32_t i = 0; i < sh.rows; ++i) {
+          if (std::memcmp(&a[i], &b[i], 4) != 0) { same = false; break; }
+        }
+        exact = same ? "exact" : "DIFF!";
+      }
+      printf("  %-9s %8.3f ms  %6.1f GB/s  %s\n", k.name, ms,
+             gb / (ms / 1e3), exact);
+    }
+    CK(hipFree(w));
+    CK(hipFree(x));
+    CK(hipFree(out));
+    CK(hipFree(ref));
+  }
   return 0;
 }
