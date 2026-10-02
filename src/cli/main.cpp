@@ -3,6 +3,10 @@
 #include <span>
 #include <string_view>
 
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#endif
+
 #include "src/cli/bench/bench.hpp"
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
@@ -165,6 +169,15 @@ int run(std::span<const char* const> args) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#if defined(ENGINE_ENABLE_HIP)
+  // Make host-side GPU waits park on an OS event instead of spinning a core at
+  // 100%. This ROCm build ignores the per-event hipEventBlockingSync flag, so
+  // the device-level schedule flag -- set here, before any context exists -- is
+  // the only lever. It removes the busy-wait that otherwise pegs a core (and
+  // lags the whole machine) during every synchronous readback: prefill MoE
+  // expert counts and per-step decode logits.
+  (void)hipSetDeviceFlags(hipDeviceScheduleBlockingSync);
+#endif
   const std::span<const char* const> args(argv, static_cast<std::size_t>(argc));
   return run(args);
 }

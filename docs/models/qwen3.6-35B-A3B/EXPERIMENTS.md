@@ -66,3 +66,39 @@ The kernel-level effect can be isolated with `tools/bench/attn_causal_bench.hip`
 `tools/bench/gpu_exclusive.sh` for exclusive access. The sparse variant is
 restricted to prefetch depth 1 (the double-buffer the shipped kernel uses)
 because the ring prefetch assumes contiguous key tiles.
+
+## Host readback — busy-wait vs blocking-sync (process-global)
+
+Every synchronous device→host readback blocks the host on HIP's default signal
+wait, which on this ROCm build is a userspace **busy-wait** (`rocr::core::
+BusyWaitSignal`). It pegs one core at 100 % for the whole wait and lags the
+whole machine. The hot sites are the per-layer MoE expert-count readback in
+`kernels/rocm/executor.cpp` (`MoeBatch`) and the per-step logits readback in
+`engine.cpp` (`DecodeStep`); the same mechanism pegs every model, not just this
+one.
+
+The per-event `hipEventBlockingSync` flag is **ignored** by this `libamdhip64`,
+so a pinned-buffer + blocking-event readback still spins. Only the device-level
+`hipDeviceScheduleBlockingSync`, set before any context exists, parks the thread
+on an OS event. It is set once in `src/cli/main.cpp` before `run()`, so it
+applies to every model the `gufo` binary loads. Standalone wait probe (~0.6 s of
+GPU work, exclusive GPU):
+
+| wait mechanism | cores during wait |
+| --- | --- |
+| `hipDeviceSynchronize` (default) | 0.998 (spin) |
+| `hipEventBlockingSync` event (default) | 0.997 (spin — flag ignored) |
+| `hipDeviceScheduleBlockingSync` | 0.043 (sleeps) |
+
+Matched same-session A/B (`gufo prompt`, 1500 tokens, seed 42, greedy,
+window=2048 sink=4, exclusive GPU):
+
+| build | decode CPU | decode tok/s | output |
+| --- | --- | --- | --- |
+| baseline | 1.02 cores | 53.54 | — |
+| blocking-sync | 0.17 cores | 53.22 (−0.6 %) | byte-identical |
+
+**Decision: retained, always-on.** The residual 0.17 cores is the CPU sampler
+(softmax over the 151 K vocab), not a spin. Pinned readback buffers were also
+tested and gave no further gain (0.18 vs 0.17 cores), so they were dropped in
+favour of the single device flag.
