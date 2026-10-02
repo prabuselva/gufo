@@ -289,7 +289,10 @@ tokens, which is exactly the lever a bandwidth-bound batch-1 decode needs. At
 84 % acceptance the production config reaches **65.9 tok/s**, above the ~60
 tok/s slimsami reference.
 
-**Decision: no further decode-kernel work required.** The apparent gap to ~60
-tok/s was a benchmarking artifact (greedy vs MTP), not a kernel deficiency. The
-earlier "structural rewrite into mega-kernels" note is superseded: production
-already meets the target with MTP, and the GEMV is at the DRAM ceiling.
+**Decision: no further decode-kernel work required for the serving target.**
+The apparent gap to ~60 tok/s was a benchmarking artifact (greedy vs MTP): the
+production MTP serving path meets the target. This is *not* a claim that the
+decode kernel matches the reference — a strict like-for-like `gufo bench`
+comparison (same flags, same 16-token prefix, greedy) still shows real gaps to
+the reference on greedy decode, long-context prefill and MTP n=2, root-caused in
+[BENCHMARKS.md](BENCHMARKS.md) "Reading the numbers".
