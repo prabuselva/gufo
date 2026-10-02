@@ -26,7 +26,7 @@ namespace gufo::models::qwen36_a3b::rocm {
 /// new one. Report() closes the last segment, prints the accumulated breakdown
 /// sorted by cost, and clears the counters.
 class StageProfiler {
- public:
+public:
   StageProfiler() {
     const char* e = std::getenv("GUFO_QWEN36_PROFILE");
     enabled_ = (e != nullptr && e[0] != '\0' && e[0] != '0');
@@ -74,9 +74,9 @@ class StageProfiler {
                  header, "stage", "total_ms", "pct", "calls", "avg_ms");
     for (const auto& row : rows) {
       const std::uint64_t n = count_[row.first];
-      std::fprintf(stderr,
-                   "  %-22s %11.2f %6.1f%% %8llu %11.3f\n", row.first.c_str(),
-                   row.second, total > 0.0 ? 100.0 * row.second / total : 0.0,
+      std::fprintf(stderr, "  %-22s %11.2f %6.1f%% %8llu %11.3f\n",
+                   row.first.c_str(), row.second,
+                   total > 0.0 ? 100.0 * row.second / total : 0.0,
                    static_cast<unsigned long long>(n),
                    n != 0 ? row.second / static_cast<double>(n) : 0.0);
     }
@@ -86,7 +86,7 @@ class StageProfiler {
     count_.clear();
   }
 
- private:
+private:
   void Close() {
     if (label_ == nullptr) {
       return;

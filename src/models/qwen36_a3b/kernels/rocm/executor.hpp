@@ -108,10 +108,10 @@ private:
 
   /// Batched (prefill) Gated DeltaNet over `tokens` rows of `x`
   /// ([tokens][hidden]) into `out` ([tokens][hidden]), advancing the layer's
-  /// recurrent state and conv history past the chunk. Mirrors LinearAttention().
-  /// When `state_snap` is non-null it receives the recurrent state after each
-  /// of the first `tokens - 1` rows (see GdnDeltaLoop); `hist_snap` receives
-  /// the conv history after the first row.
+  /// recurrent state and conv history past the chunk. Mirrors
+  /// LinearAttention(). When `state_snap` is non-null it receives the recurrent
+  /// state after each of the first `tokens - 1` rows (see GdnDeltaLoop);
+  /// `hist_snap` receives the conv history after the first row.
   void LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
                             const float* x, float* out, std::uint32_t tokens,
                             float* state_snap = nullptr,
@@ -128,8 +128,8 @@ private:
   bool MtpForward(std::int32_t token, const float* hidden, bool with_logits,
                   std::string* error_msg);
   /// Batched (prefill) gated grouped-query attention over `tokens` rows of `x`
-  /// starting at absolute position `start`, writing the chunk's keys/values into
-  /// the caches and reading them back causally. Mirrors Attention().
+  /// starting at absolute position `start`, writing the chunk's keys/values
+  /// into the caches and reading them back causally. Mirrors Attention().
   void AttentionBatch(const DeviceLayer& l, const float* x, std::uint32_t start,
                       float* out, float* k_cache, float* v_cache,
                       void* k_cache_f16, void* v_cache_f16,

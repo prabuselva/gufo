@@ -57,7 +57,7 @@ __global__ void GemvQ8_0(const Q8_0Block* __restrict__ w,
 // output row and dots the weight row against `Rows` activation rows in the
 // same walk, so the weight matrix is read once for all tokens. Each per-row
 // dot is bit-identical to GemvQ8_0.
-template <std::uint32_t Rows>
+template<std::uint32_t Rows>
 __global__ void GemvRowsQ8_0(const Q8_0Block* __restrict__ w,
                              const float* __restrict__ x,
                              std::uint32_t x_stride, float* __restrict__ out,
@@ -77,8 +77,8 @@ __global__ void GemvRowsQ8_0(const Q8_0Block* __restrict__ w,
     const float q = static_cast<float>(row[b].qs[lane]);
 #pragma unroll
     for (std::uint32_t o = 0; o < Rows; ++o) {
-      acc[o] += d * q * x[static_cast<std::size_t>(o) * x_stride + b * 32 +
-                          lane];
+      acc[o] +=
+          d * q * x[static_cast<std::size_t>(o) * x_stride + b * 32 + lane];
     }
   }
 #pragma unroll
@@ -131,16 +131,12 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
 // ids, the activation row and the shape, so one launch folds 2*used*rows
 // (matrix, slot, row) triples. The per-row dot is bit-identical to
 // GemvGroupedQ8_0.
-__global__ void GemvGroupedQ8_0Pair(const Q8_0Block* __restrict__ wa,
-                                    const Q8_0Block* __restrict__ wb,
-                                    const std::int32_t* __restrict__ ids,
-                                    std::size_t expert_stride_blocks,
-                                    const float* __restrict__ x,
-                                    std::uint32_t x_stride,
-                                    float* __restrict__ out_a,
-                                    float* __restrict__ out_b,
-                                    std::uint32_t used, std::uint32_t rows,
-                                    std::uint32_t cols) {
+__global__ void GemvGroupedQ8_0Pair(
+    const Q8_0Block* __restrict__ wa, const Q8_0Block* __restrict__ wb,
+    const std::int32_t* __restrict__ ids, std::size_t expert_stride_blocks,
+    const float* __restrict__ x, std::uint32_t x_stride,
+    float* __restrict__ out_a, float* __restrict__ out_b, std::uint32_t used,
+    std::uint32_t rows, std::uint32_t cols) {
   const std::uint32_t total = used * rows;
   const std::uint32_t p = blockIdx.x * 4U + (threadIdx.x >> 5);
   if (p >= 2U * total) {
@@ -213,14 +209,14 @@ __global__ void GemvQ8_0Multi4(Multi4Args a, const float* __restrict__ x) {
 
 // Grouped expert GEMV for the dense (F32/BF16) expert stacks: same
 // (slot, row) pairing as GemvGroupedQ8_0, element-strided within the row.
-template <typename T>
+template<typename T>
 __global__ void GemvGroupedDense(const T* __restrict__ w,
                                  const std::int32_t* __restrict__ ids,
                                  std::size_t expert_stride_elems,
                                  const float* __restrict__ x,
-                                 std::uint32_t x_stride, float* __restrict__ out,
-                                 std::uint32_t used, std::uint32_t rows,
-                                 std::uint32_t cols) {
+                                 std::uint32_t x_stride,
+                                 float* __restrict__ out, std::uint32_t used,
+                                 std::uint32_t rows, std::uint32_t cols) {
   const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
   if (pair >= used * rows) {
     return;
@@ -286,7 +282,7 @@ __global__ void GemvBf16(const hip_bfloat16* __restrict__ w,
 // Multi-row dense GEMV for the F32/BF16 stacks: one warp owns an output row
 // and dots it against `Rows` activation rows in the same walk. Each per-row
 // dot is bit-identical to GemvF32/GemvBf16.
-template <typename T, std::uint32_t Rows>
+template<typename T, std::uint32_t Rows>
 __global__ void GemvRowsDense(const T* __restrict__ w,
                               const float* __restrict__ x,
                               std::uint32_t x_stride, float* __restrict__ out,
@@ -390,8 +386,8 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
           static_cast<const Q8_0Block*>(base), x, out, rows, cols);
       break;
     case GemvType::kF32:
-      GemvF32<<<grid, dim3(32), 0, stream>>>(static_cast<const float*>(base),
-                                             x, out, rows, cols);
+      GemvF32<<<grid, dim3(32), 0, stream>>>(static_cast<const float*>(base), x,
+                                             out, rows, cols);
       break;
     case GemvType::kBF16:
       GemvBf16<<<grid, dim3(32), 0, stream>>>(
@@ -406,25 +402,25 @@ void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
               std::uint32_t out_stride, hipStream_t stream) {
   (void)row_bytes;
   const std::uint32_t grid = (rows + 3U) / 4U;
-#define GUFO_GEMV_ROWS(R)                                                    \
-  case R:                                                                    \
-    switch (type) {                                                          \
-      case GemvType::kQ8_0:                                                  \
-        GemvRowsQ8_0<R><<<grid, dim3(128), 0, stream>>>(                     \
-            static_cast<const Q8_0Block*>(base), x, x_stride, out,           \
-            out_stride, rows, cols);                                         \
-        break;                                                               \
-      case GemvType::kF32:                                                   \
-        GemvRowsDense<float, R><<<rows, dim3(32), 0, stream>>>(              \
-            static_cast<const float*>(base), x, x_stride, out, out_stride,   \
-            rows, cols);                                                     \
-        break;                                                               \
-      case GemvType::kBF16:                                                  \
-        GemvRowsDense<hip_bfloat16, R><<<rows, dim3(32), 0, stream>>>(       \
-            static_cast<const hip_bfloat16*>(base), x, x_stride, out,        \
-            out_stride, rows, cols);                                         \
-        break;                                                               \
-    }                                                                        \
+#define GUFO_GEMV_ROWS(R)                                                      \
+  case R:                                                                      \
+    switch (type) {                                                            \
+      case GemvType::kQ8_0:                                                    \
+        GemvRowsQ8_0<R><<<grid, dim3(128), 0, stream>>>(                       \
+            static_cast<const Q8_0Block*>(base), x, x_stride, out, out_stride, \
+            rows, cols);                                                       \
+        break;                                                                 \
+      case GemvType::kF32:                                                     \
+        GemvRowsDense<float, R><<<rows, dim3(32), 0, stream>>>(                \
+            static_cast<const float*>(base), x, x_stride, out, out_stride,     \
+            rows, cols);                                                       \
+        break;                                                                 \
+      case GemvType::kBF16:                                                    \
+        GemvRowsDense<hip_bfloat16, R><<<rows, dim3(32), 0, stream>>>(         \
+            static_cast<const hip_bfloat16*>(base), x, x_stride, out,          \
+            out_stride, rows, cols);                                           \
+        break;                                                                 \
+    }                                                                          \
     break;
   switch (tokens) {
     GUFO_GEMV_ROWS(2U)
@@ -442,8 +438,7 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
                  std::uint32_t rows, std::uint32_t cols, const float* x,
                  std::uint32_t x_stride, float* out, hipStream_t stream) {
   const std::size_t pairs = static_cast<std::size_t>(used) * rows;
-  const std::uint32_t grid =
-      static_cast<std::uint32_t>((pairs + 3U) / 4U);
+  const std::uint32_t grid = static_cast<std::uint32_t>((pairs + 3U) / 4U);
   switch (type) {
     case GemvType::kQ8_0:
       GemvGroupedQ8_0<<<grid, dim3(128), 0, stream>>>(
@@ -453,8 +448,8 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
       break;
     case GemvType::kF32:
       GemvGroupedDense<float><<<grid, dim3(128), 0, stream>>>(
-          static_cast<const float*>(base), ids,
-          expert_stride / sizeof(float), x, x_stride, out, used, rows, cols);
+          static_cast<const float*>(base), ids, expert_stride / sizeof(float),
+          x, x_stride, out, used, rows, cols);
       break;
     case GemvType::kBF16:
       GemvGroupedDense<hip_bfloat16><<<grid, dim3(128), 0, stream>>>(
@@ -467,19 +462,18 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
 
 bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
                      std::size_t expert_stride, const std::int32_t* ids,
-                     std::uint32_t used, std::uint32_t rows,
-                     std::uint32_t cols, const float* x,
-                     std::uint32_t x_stride, float* out_a, float* out_b,
-                     hipStream_t stream) {
+                     std::uint32_t used, std::uint32_t rows, std::uint32_t cols,
+                     const float* x, std::uint32_t x_stride, float* out_a,
+                     float* out_b, hipStream_t stream) {
   if (type != GemvType::kQ8_0) {
     return false;
   }
   const std::size_t pairs = 2ULL * used * rows;
   GemvGroupedQ8_0Pair<<<static_cast<std::uint32_t>((pairs + 3U) / 4U),
                         dim3(128), 0, stream>>>(
-      static_cast<const Q8_0Block*>(wa), static_cast<const Q8_0Block*>(wb),
-      ids, expert_stride / sizeof(Q8_0Block), x, x_stride, out_a, out_b, used,
-      rows, cols);
+      static_cast<const Q8_0Block*>(wa), static_cast<const Q8_0Block*>(wb), ids,
+      expert_stride / sizeof(Q8_0Block), x, x_stride, out_a, out_b, used, rows,
+      cols);
   return true;
 }
 

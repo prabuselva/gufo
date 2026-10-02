@@ -23,9 +23,9 @@ namespace gufo::models::qwen36_a3b::rocm {
 /// TensorRef::RowBytes for that type and `cols`. `x` is [batch x cols] and
 /// `out` is [batch x rows], both row-major. The launch is asynchronous on
 /// `stream` (null uses the default stream).
-void Gemm(const void* base, GemvType type, std::uint32_t rows, std::uint32_t cols,
-          std::size_t row_bytes, const float* x, float* out, std::uint32_t batch,
-          hipStream_t stream);
+void Gemm(const void* base, GemvType type, std::uint32_t rows,
+          std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,
+          std::uint32_t batch, hipStream_t stream);
 
 /// Grouped MoE projection. For each token t and slot s in [0, n_expert_used),
 /// with e = ids[t*n_expert_used + s]:

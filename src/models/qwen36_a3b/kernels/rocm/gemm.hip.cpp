@@ -53,8 +53,9 @@ __global__ void NarrowBf16(const float* __restrict__ x,
 // vector; each thread strides the output rows and reduces over the input. The
 // expert row base is selected from `ids` on device, so no host round-trip is
 // needed. Weights stay in their native encoding.
-template <typename T>
-__global__ void MoeVecFallback(const T* __restrict__ w, const float* __restrict__ x,
+template<typename T>
+__global__ void MoeVecFallback(const T* __restrict__ w,
+                               const float* __restrict__ x,
                                const std::int32_t* __restrict__ ids,
                                float* __restrict__ out, std::uint32_t rows,
                                std::uint32_t cols, std::uint32_t used,
@@ -77,9 +78,9 @@ __global__ void MoeVecFallback(const T* __restrict__ w, const float* __restrict_
 
 }  // namespace
 
-void Gemm(const void* base, GemvType type, std::uint32_t rows, std::uint32_t cols,
-          std::size_t row_bytes, const float* x, float* out, std::uint32_t batch,
-          hipStream_t stream) {
+void Gemm(const void* base, GemvType type, std::uint32_t rows,
+          std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,
+          std::uint32_t batch, hipStream_t stream) {
   (void)row_bytes;
   switch (type) {
     case GemvType::kQ8_0:
@@ -91,12 +92,11 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows, std::uint32_t col
       const float alpha = 1.0F;
       const float beta = 0.0F;
       (void)hipblasSetStream(BlasHandle(), stream);
-      (void)hipblasSgemm(BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N,
-                         static_cast<int>(rows), static_cast<int>(batch),
-                         static_cast<int>(cols), &alpha,
-                         static_cast<const float*>(base), static_cast<int>(cols),
-                         x, static_cast<int>(cols), &beta, out,
-                         static_cast<int>(rows));
+      (void)hipblasSgemm(
+          BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(rows),
+          static_cast<int>(batch), static_cast<int>(cols), &alpha,
+          static_cast<const float*>(base), static_cast<int>(cols), x,
+          static_cast<int>(cols), &beta, out, static_cast<int>(rows));
       break;
     }
     case GemvType::kBF16: {
@@ -108,13 +108,12 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows, std::uint32_t col
       const float alpha = 1.0F;
       const float beta = 0.0F;
       (void)hipblasSetStream(BlasHandle(), stream);
-      (void)hipblasGemmEx(BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N,
-                          static_cast<int>(rows), static_cast<int>(batch),
-                          static_cast<int>(cols), &alpha, base, HIP_R_16BF,
-                          static_cast<int>(cols), xb, HIP_R_16BF,
-                          static_cast<int>(cols), &beta, out, HIP_R_32F,
-                          static_cast<int>(rows), HIPBLAS_COMPUTE_32F,
-                          HIPBLAS_GEMM_DEFAULT);
+      (void)hipblasGemmEx(
+          BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(rows),
+          static_cast<int>(batch), static_cast<int>(cols), &alpha, base,
+          HIP_R_16BF, static_cast<int>(cols), xb, HIP_R_16BF,
+          static_cast<int>(cols), &beta, out, HIP_R_32F, static_cast<int>(rows),
+          HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
       break;
     }
   }
@@ -127,10 +126,10 @@ void GemmMoe(const void* base, GemvType type, std::uint32_t rows,
              hipStream_t stream) {
   (void)row_bytes;
   if (type == GemvType::kQ8_0) {
-    (void)qfn_mmq_q8_0_moe_raw(base, x, ids, out, static_cast<int>(rows),
-                               static_cast<int>(cols), static_cast<int>(n_tokens),
-                               static_cast<int>(n_experts),
-                               static_cast<int>(n_expert_used), stream);
+    (void)qfn_mmq_q8_0_moe_raw(
+        base, x, ids, out, static_cast<int>(rows), static_cast<int>(cols),
+        static_cast<int>(n_tokens), static_cast<int>(n_experts),
+        static_cast<int>(n_expert_used), stream);
     return;
   }
   const std::uint32_t pairs = n_tokens * n_expert_used;
@@ -139,8 +138,8 @@ void GemmMoe(const void* base, GemvType type, std::uint32_t rows,
   const dim3 block(256);
   if (type == GemvType::kF32) {
     MoeVecFallback<float><<<grid, block, 0, stream>>>(
-        static_cast<const float*>(base), x, ids, out, rows, cols,
-        n_expert_used, expert_stride);
+        static_cast<const float*>(base), x, ids, out, rows, cols, n_expert_used,
+        expert_stride);
   } else {
     MoeVecFallback<hip_bfloat16><<<grid, block, 0, stream>>>(
         static_cast<const hip_bfloat16*>(base), x, ids, out, rows, cols,

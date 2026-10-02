@@ -303,8 +303,8 @@ __launch_bounds__(256) __global__
         __builtin_memcpy(&f_codes_hi[u], blk + 18, 16);
       } else if constexpr (kBF16) {
         // A BF16 K block is 32 lanes = 64 bytes = four 16-byte chunks.
-        const auto* u4 = reinterpret_cast<const uint4*>(f_ptr[u]) +
-                         ((kb0 + f_c) * 4);
+        const auto* u4 =
+            reinterpret_cast<const uint4*>(f_ptr[u]) + ((kb0 + f_c) * 4);
         f_bf16[u][0] = u4[0];
         f_bf16[u][1] = u4[1];
         f_bf16[u][2] = u4[2];
@@ -460,9 +460,8 @@ __launch_bounds__(256) __global__
           const uint4 c1 = s_codes[swizzle(row, (4 * kb) + 1)];
           const uint4 c2 = s_codes[swizzle(row, (4 * kb) + 2)];
           const uint4 c3 = s_codes[swizzle(row, (4 * kb) + 3)];
-          const std::uint32_t words[16] = {c0.x, c0.y, c0.z, c0.w,
-                                           c1.x, c1.y, c1.z, c1.w,
-                                           c2.x, c2.y, c2.z, c2.w,
+          const std::uint32_t words[16] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y,
+                                           c1.z, c1.w, c2.x, c2.y, c2.z, c2.w,
                                            c3.x, c3.y, c3.z, c3.w};
           __half2 h[8];
 #pragma unroll
@@ -476,61 +475,61 @@ __launch_bounds__(256) __global__
           }
           __builtin_memcpy(&a_hi[u], &h[0], 32);
         } else {
-        const __half2 sb =
-            __builtin_bit_cast(__half2, s_scale[(kb * BM) + row]);
-        const __half2 scale2 = __low2half2(sb);
-        const __half2 bias2 = __high2half2(sb);
-        std::uint32_t nib[8];
-        if constexpr (kQ8) {
-          // Q8_0: the block's 32 signed bytes are chunks 2 kb and 2 kb + 1;
-          // flipping the sign bit carries q + 128, which the 1152 magic
-          // takes back out.
-          const uint4 c0 = s_codes[swizzle(row, 2 * kb)];
-          const uint4 c1 = s_codes[swizzle(row, (2 * kb) + 1)];
-          const std::uint32_t words[8] = {c0.x, c0.y, c0.z, c0.w,
-                                          c1.x, c1.y, c1.z, c1.w};
+          const __half2 sb =
+              __builtin_bit_cast(__half2, s_scale[(kb * BM) + row]);
+          const __half2 scale2 = __low2half2(sb);
+          const __half2 bias2 = __high2half2(sb);
+          std::uint32_t nib[8];
+          if constexpr (kQ8) {
+            // Q8_0: the block's 32 signed bytes are chunks 2 kb and 2 kb + 1;
+            // flipping the sign bit carries q + 128, which the 1152 magic
+            // takes back out.
+            const uint4 c0 = s_codes[swizzle(row, 2 * kb)];
+            const uint4 c1 = s_codes[swizzle(row, (2 * kb) + 1)];
+            const std::uint32_t words[8] = {c0.x, c0.y, c0.z, c0.w,
+                                            c1.x, c1.y, c1.z, c1.w};
 #pragma unroll
-          for (int i = 0; i < 8; ++i) {
-            nib[i] = words[i] ^ 0x80808080U;
-          }
-        } else if constexpr (kQ5) {
-          // Q5_1: K block kb's 16 bytes are chunk kb; elements 0-15 take
-          // the low nibbles, 16-31 the high, plus bit j of the high-bit
-          // word.
-          const uint4 r = raw[u][kb];
-          const std::uint32_t high = s_high[(kb * BM) + row];
-          const std::uint32_t words[4] = {r.x, r.y, r.z, r.w};
+            for (int i = 0; i < 8; ++i) {
+              nib[i] = words[i] ^ 0x80808080U;
+            }
+          } else if constexpr (kQ5) {
+            // Q5_1: K block kb's 16 bytes are chunk kb; elements 0-15 take
+            // the low nibbles, 16-31 the high, plus bit j of the high-bit
+            // word.
+            const uint4 r = raw[u][kb];
+            const std::uint32_t high = s_high[(kb * BM) + row];
+            const std::uint32_t words[4] = {r.x, r.y, r.z, r.w};
 #pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            nib[i] = (words[i] & 0x0F0F0F0FU) |
-                     SpreadHighBits((high >> (4 * i)) & 0xFU);
-            nib[4 + i] = ((words[i] >> 4U) & 0x0F0F0F0FU) |
-                         SpreadHighBits((high >> (16 + 4 * i)) & 0xFU);
-          }
-        } else {
-          // Q4_K / Q5_K: elements 0-15 of K block kb0 + kb are the low
-          // (kb = 0) or high (kb = 1) nibbles of chunk 0, elements 16-31
-          // of chunk 1; Q5_K adds bit j of the staged high-bit word.
-          const unsigned shift = 4U * static_cast<unsigned>(kb);
-          const std::uint32_t words[8] = {raw[u][0].x, raw[u][0].y, raw[u][0].z,
-                                          raw[u][0].w, raw[u][1].x, raw[u][1].y,
-                                          raw[u][1].z, raw[u][1].w};
-          const std::uint32_t high = kQ5K ? s_high[(kb * BM) + row] : 0U;
+            for (int i = 0; i < 4; ++i) {
+              nib[i] = (words[i] & 0x0F0F0F0FU) |
+                       SpreadHighBits((high >> (4 * i)) & 0xFU);
+              nib[4 + i] = ((words[i] >> 4U) & 0x0F0F0F0FU) |
+                           SpreadHighBits((high >> (16 + 4 * i)) & 0xFU);
+            }
+          } else {
+            // Q4_K / Q5_K: elements 0-15 of K block kb0 + kb are the low
+            // (kb = 0) or high (kb = 1) nibbles of chunk 0, elements 16-31
+            // of chunk 1; Q5_K adds bit j of the staged high-bit word.
+            const unsigned shift = 4U * static_cast<unsigned>(kb);
+            const std::uint32_t words[8] = {
+                raw[u][0].x, raw[u][0].y, raw[u][0].z, raw[u][0].w,
+                raw[u][1].x, raw[u][1].y, raw[u][1].z, raw[u][1].w};
+            const std::uint32_t high = kQ5K ? s_high[(kb * BM) + row] : 0U;
 #pragma unroll
-          for (int i = 0; i < 8; ++i) {
-            nib[i] = (words[i] >> shift) & 0x0F0F0F0FU;
-            if constexpr (kQ5K) {
-              nib[i] |= SpreadHighBits((high >> (4 * i)) & 0xFU);
+            for (int i = 0; i < 8; ++i) {
+              nib[i] = (words[i] >> shift) & 0x0F0F0F0FU;
+              if constexpr (kQ5K) {
+                nib[i] |= SpreadHighBits((high >> (4 * i)) & 0xFU);
+              }
             }
           }
-        }
-        __half2 h[16];
+          __half2 h[16];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          CodesToHalves(nib[i], magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
-        }
-        __builtin_memcpy(&a_lo[u], &h[0], 32);
-        __builtin_memcpy(&a_hi[u], &h[8], 32);
+          for (int i = 0; i < 8; ++i) {
+            CodesToHalves(nib[i], magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
+          }
+          __builtin_memcpy(&a_lo[u], &h[0], 32);
+          __builtin_memcpy(&a_hi[u], &h[8], 32);
         }
       }
 #pragma unroll
@@ -840,7 +839,7 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
                          out_half, m, k, nullptr);
-        return true;
+      return true;
     case WeightType::kQ8_0:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ8_0, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,

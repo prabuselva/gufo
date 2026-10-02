@@ -51,16 +51,16 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   // The MTP draft block is optional: artifacts without it load and decode
-// single-token, artifacts with it enable draft-verify speculation.
-const auto mtp = MtpWeights::Bind(*m->reader_, c);
+  // single-token, artifacts with it enable draft-verify speculation.
+  const auto mtp = MtpWeights::Bind(*m->reader_, c);
   m->device_ = rocm::DeviceModel::Upload(
       *m->weights_, *m->reader_, mtp.has_value() ? &*mtp : nullptr, error_msg);
   if (!m->device_) {
     return nullptr;
   }
-  m->executor_ = rocm::Executor::Create(*m->device_, options.max_context,
-                                        error_msg, options.attn_window,
-                                        options.attn_sink);
+  m->executor_ =
+      rocm::Executor::Create(*m->device_, options.max_context, error_msg,
+                             options.attn_window, options.attn_sink);
   if (!m->executor_) {
     return nullptr;
   }
@@ -112,8 +112,8 @@ bool Model::HasMtp() const noexcept {
 }
 
 std::string Model::ModelName() const {
-  return std::string(reader_->GetMetadataString("general.name")
-                         .value_or("Qwen3.6-35B-A3B"));
+  return std::string(
+      reader_->GetMetadataString("general.name").value_or("Qwen3.6-35B-A3B"));
 }
 
 const Config& Model::config() const noexcept {
@@ -232,8 +232,9 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   if (result == nullptr || max_tokens == 0 || tokens_.empty()) {
-    AssignError(error_msg,
-                "decode needs an output, a positive budget and a synced prompt");
+    AssignError(
+        error_msg,
+        "decode needs an output, a positive budget and a synced prompt");
     return false;
   }
   *result = {};
@@ -305,8 +306,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
           sampler.SampleGreedy(std::span<const float>(draft_logits_)));
       continue;
     }
-    const auto q =
-        sampler.Distribution(std::span<const float>(draft_logits_));
+    const auto q = sampler.Distribution(std::span<const float>(draft_logits_));
     draft_ids[i].reserve(q.entries().size());
     draft_probs[i].reserve(q.entries().size());
     for (const auto& entry : q.entries()) {
@@ -335,14 +335,13 @@ bool Session::DecodeStep(std::size_t max_tokens,
   std::size_t accepted = 0;
   std::int32_t correction = -1;
   if (!sampled) {
-    while (accepted < k &&
-           static_cast<std::int32_t>(sampler.SampleGreedy(row(accepted))) ==
-               drafts[accepted]) {
+    while (accepted < k && static_cast<std::int32_t>(sampler.SampleGreedy(
+                               row(accepted))) == drafts[accepted]) {
       ++accepted;
     }
     if (accepted < k) {
-      correction = static_cast<std::int32_t>(
-          sampler.SampleGreedy(row(accepted)));
+      correction =
+          static_cast<std::int32_t>(sampler.SampleGreedy(row(accepted)));
     }
   } else {
     for (; accepted < k; ++accepted) {
@@ -351,9 +350,9 @@ bool Session::DecodeStep(std::size_t max_tokens,
           p.probability(static_cast<sampling::TokenId>(drafts[accepted]))) {
         continue;
       }
-      correction = static_cast<std::int32_t>(p.SampleResidual(
-          draft_ids[accepted], draft_probs[accepted],
-          sampler.mutable_rng_state()));
+      correction = static_cast<std::int32_t>(
+          p.SampleResidual(draft_ids[accepted], draft_probs[accepted],
+                           sampler.mutable_rng_state()));
       break;
     }
   }
@@ -378,8 +377,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   if (accepted == k) {
     if (!executor_->MtpAdvance(
             drafts[k - 1],
-            executor_->verify_hidden() +
-                (k - 1) * model_->config().hidden_size,
+            executor_->verify_hidden() + (k - 1) * model_->config().hidden_size,
             error_msg)) {
       return false;
     }
@@ -408,8 +406,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
     tokens_.push_back(correction);
     result->tokens.push_back(correction);
     sampler.Accept(static_cast<sampling::TokenId>(correction));
-    (void)hipMemcpy(logits_.data(), executor_->logits(),
-                    vocab * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(logits_.data(), executor_->logits(), vocab * sizeof(float),
+                    hipMemcpyDeviceToHost);
     result->stop = is_stop(correction);
   } else if (stopped) {
     result->stop = true;

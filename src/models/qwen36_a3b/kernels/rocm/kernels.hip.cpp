@@ -177,8 +177,7 @@ __global__ void SwigluKernel(float* gate, const float* up, std::size_t count) {
 // out[(t*k + s)*cols + i] = x[t*cols + i]: replicate each of the `tokens`
 // activation rows `k` times so the grouped expert GEMVs can index x by slot.
 __global__ void DupRowsKernel(const float* x, std::uint32_t tokens,
-                              std::uint32_t k, std::uint32_t cols,
-                              float* out) {
+                              std::uint32_t k, std::uint32_t cols, float* out) {
   const std::size_t total = static_cast<std::size_t>(tokens) * k * cols;
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
@@ -395,16 +394,16 @@ __global__ void GdnDeltaDecodeKernel(const float* qn, const float* kn,
   const float decay = expf(a[h] * DSoftplus(alpha[h] + dt[h]));
   const float b = DSigmoid(beta[h]);
   float4* __restrict__ r4 =
-      reinterpret_cast<float4*>(state +
-                                (static_cast<std::size_t>(h) * head_dim + j) *
-                                    head_dim) +
+      reinterpret_cast<float4*>(
+          state + (static_cast<std::size_t>(h) * head_dim + j) * head_dim) +
       lane;
   float4 s = *r4;
   s.x *= decay;
   s.y *= decay;
   s.z *= decay;
   s.w *= decay;
-  double du = static_cast<double>(s.x) * kv.x + static_cast<double>(s.y) * kv.y +
+  double du = static_cast<double>(s.x) * kv.x +
+              static_cast<double>(s.y) * kv.y +
               static_cast<double>(s.z) * kv.z + static_cast<double>(s.w) * kv.w;
   du = WarpReduceSumD(du);
   const float delta = (v[h * head_dim + j] - static_cast<float>(du)) * b;
@@ -413,10 +412,9 @@ __global__ void GdnDeltaDecodeKernel(const float* qn, const float* kn,
   o.y = s.y + delta * kv.y;
   o.z = s.z + delta * kv.z;
   o.w = s.w + delta * kv.w;
-  const double dq = static_cast<double>(o.x) * qv.x +
-                    static_cast<double>(o.y) * qv.y +
-                    static_cast<double>(o.z) * qv.z +
-                    static_cast<double>(o.w) * qv.w;
+  const double dq =
+      static_cast<double>(o.x) * qv.x + static_cast<double>(o.y) * qv.y +
+      static_cast<double>(o.z) * qv.z + static_cast<double>(o.w) * qv.w;
   const float q_scale = 1.0F / sqrtf(static_cast<float>(head_dim));
   attn[h * head_dim + j] = static_cast<float>(WarpReduceSumD(dq)) * q_scale;
   *r4 = o;
@@ -597,7 +595,7 @@ __global__ void AttentionDecodeSplitKernel(
 // cache is read once for the block; row o attends [0, n_kv0 + o). Partials
 // use the AttentionDecodeSplitKernel layout per row:
 // [row][head][split][hd + 2].
-template <std::uint32_t Rows>
+template<std::uint32_t Rows>
 __global__ void AttentionDecodeSplitRowsKernel(
     const float* q, const float* k_cache, const float* v_cache, float* part,
     std::uint32_t n_kv0, std::uint32_t heads, std::uint32_t kv_heads,
@@ -700,8 +698,7 @@ __global__ void AttentionDecodeSplitRowsKernel(
   for (std::uint32_t o = 0; o < Rows; ++o) {
     // A row whose whole chunk is causally masked keeps wmax = -INF; its
     // contribution is zero, not the NaN that expf(-INF - -INF) would give.
-    const float r =
-        (wmax[o] == -INFINITY) ? 0.0F : expf(wmax[o] - bmax[o]);
+    const float r = (wmax[o] == -INFINITY) ? 0.0F : expf(wmax[o] - bmax[o]);
 #pragma unroll
     for (std::uint32_t m = 0; m < 8U; ++m) {
       s_acc[o][wave][lane + 32U * m] = acc[o][m] * r;
@@ -760,7 +757,8 @@ __global__ void AttentionDecodeCombineRowsKernel(const float* part,
     const float w =
         expf(pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim] - m);
     num += pp[static_cast<std::size_t>(s) * (head_dim + 2U) + i] * w;
-    den += pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim + 1U] * w;
+    den +=
+        pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim + 1U] * w;
   }
   const std::size_t off =
       static_cast<std::size_t>(o) * heads * head_dim + h * head_dim + i;
@@ -776,7 +774,8 @@ __global__ void AttentionDecodeCombineKernel(const float* part,
                                              std::uint32_t head_dim) {
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t i = threadIdx.x;
-  const float* pp = part + static_cast<std::size_t>(h) * splits * (head_dim + 2U);
+  const float* pp =
+      part + static_cast<std::size_t>(h) * splits * (head_dim + 2U);
   float m = -INFINITY;
   for (std::uint32_t s = 0; s < splits; ++s) {
     m = fmaxf(m, pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim]);
@@ -787,7 +786,8 @@ __global__ void AttentionDecodeCombineKernel(const float* part,
     const float w =
         expf(pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim] - m);
     num += pp[static_cast<std::size_t>(s) * (head_dim + 2U) + i] * w;
-    den += pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim + 1U] * w;
+    den +=
+        pp[static_cast<std::size_t>(s) * (head_dim + 2U) + head_dim + 1U] * w;
   }
   out[static_cast<std::size_t>(h) * head_dim + i] =
       (num / den) * DSigmoid(gate[static_cast<std::size_t>(h) * head_dim + i]);
@@ -864,9 +864,9 @@ __global__ void AttentionPrefillNaive(const float* q, const float* k_cache,
 
     if (i < head_dim) {
       for (std::uint32_t t = 0; t < len; ++t) {
-        const float* vj = v_cache +
-                          (static_cast<std::size_t>(base + t) * kv_heads + kvh) *
-                              head_dim;
+        const float* vj =
+            v_cache +
+            (static_cast<std::size_t>(base + t) * kv_heads + kvh) * head_dim;
         acc += static_cast<double>(score[t]) * vj[i];
       }
     }
@@ -889,8 +889,7 @@ __global__ void AttentionPrefillNaive(const float* q, const float* k_cache,
 __global__ void AttentionPrefillTiled(const float* q, const float* k_cache,
                                       const float* v_cache, const float* gate,
                                       float* out, std::uint32_t start,
-                                      std::uint32_t tokens,
-                                      std::uint32_t heads,
+                                      std::uint32_t tokens, std::uint32_t heads,
                                       std::uint32_t kv_heads,
                                       std::uint32_t head_dim, float scale) {
   constexpr std::uint32_t kQT = 32;
@@ -914,8 +913,7 @@ __global__ void AttentionPrefillTiled(const float* q, const float* k_cache,
     rsum[tid] = 0.0F;
   }
 
-  const std::uint32_t q_last =
-      q0 + kQT < tokens ? q0 + kQT : tokens;
+  const std::uint32_t q_last = q0 + kQT < tokens ? q0 + kQT : tokens;
   const std::uint32_t causal_max = start + q_last;
   float acc[kQT];
   for (std::uint32_t i = 0; i < kQT; ++i) {
@@ -1023,7 +1021,8 @@ constexpr std::uint32_t kWmmaKeys = 16;       // keys per tile
 constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
 constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
 
-using WmmaV16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using WmmaV16h =
+    __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using WmmaV8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 __device__ __forceinline__ WmmaV8f WmmaOp(WmmaV16h a, WmmaV16h b, WmmaV8f c) {
@@ -1048,18 +1047,20 @@ __device__ __forceinline__ WmmaV16h WmmaLoadFrag(const __half* p) {
 // 32, so they collide. Both strides are multiples of 8, so every fragment base
 // and every packed dword stays aligned.
 template<std::uint32_t kVtStride, std::uint32_t kVtSwizzle>
-__device__ __forceinline__ constexpr std::uint32_t WmmaVtRow(
-    std::uint32_t d) {
+__device__ __forceinline__ constexpr std::uint32_t WmmaVtRow(std::uint32_t d) {
   return (d * kVtStride) + ((d / 8) * kVtSwizzle);
 }
 
 template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads, bool kSparse>
-__launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
-    const float* __restrict__ q, const float* __restrict__ gate,
-    const __half* __restrict__ k_cache_f16,
-    const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
-    std::uint32_t start_pos, std::size_t batch_size, std::uint32_t window,
-    std::uint32_t sink) {
+__launch_bounds__(256, 2) __global__
+    void WmmaCausalAttentionKernel(const float* __restrict__ q,
+                                   const float* __restrict__ gate,
+                                   const __half* __restrict__ k_cache_f16,
+                                   const __half* __restrict__ v_cache_f16,
+                                   float* __restrict__ out_context,
+                                   std::uint32_t start_pos,
+                                   std::size_t batch_size, std::uint32_t window,
+                                   std::uint32_t sink) {
   constexpr std::uint32_t kHeadDim = kWmmaHeadDim;
   constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
   constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
@@ -1083,9 +1084,9 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   static_assert(kKStepsPerWave * 8 / kSTiles == kWmmaKSteps, "k split");
   static_assert(kKeys == 16 && kHeadDim == 256,
                 "packed V mapping assumes 4 lanes x 32 dims per key");
-  static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0 &&
-                    kVtSwizzle % 8 == 0,
-                "fragment rows must start on a 16-byte boundary");
+  static_assert(
+      kWmmaKStride % 8 == 0 && kVtStride % 8 == 0 && kVtSwizzle % 8 == 0,
+      "fragment rows must start on a 16-byte boundary");
   static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
 
   const std::uint32_t tid = threadIdx.x;
@@ -1212,12 +1213,12 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       const std::uint32_t idx = tid + (n * 256);
       const std::uint32_t key_position = key_start + (idx / (kHeadDim / 8));
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      dst[n] = (key_position < context_end)
-                   ? *reinterpret_cast<const uint4*>(
-                         k_base +
-                         (static_cast<std::size_t>(key_position) * kv_stride) +
-                         d8)
-                   : make_uint4(0u, 0u, 0u, 0u);
+      dst[n] =
+          (key_position < context_end)
+              ? *reinterpret_cast<const uint4*>(
+                    k_base +
+                    (static_cast<std::size_t>(key_position) * kv_stride) + d8)
+              : make_uint4(0u, 0u, 0u, 0u);
     }
   };
 
@@ -1393,10 +1394,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
                     static_cast<int>(half_id) >= relative_key +
                                                      static_cast<int>(key) -
                                                      static_cast<int>(2 * i)) {
-                  tail[i] = fmaf(
-                      __half2float(
-                          p_lds[rb * 16 + 2 * i + half_id][kb * 16 + key]),
-                      value, tail[i]);
+                  tail[i] =
+                      fmaf(__half2float(
+                               p_lds[rb * 16 + 2 * i + half_id][kb * 16 + key]),
+                           value, tail[i]);
                 }
               }
             }
@@ -1468,8 +1469,8 @@ __global__ void ConvertKvChunkF16Kernel(const float* __restrict__ k,
                                         __half* __restrict__ k_f16,
                                         __half* __restrict__ v_f16,
                                         std::size_t count) {
-  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                      threadIdx.x;
+  for (std::size_t i =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
     k_f16[i] = __float2half_rn(k[i]);
     v_f16[i] = __float2half_rn(v[i]);
@@ -1498,12 +1499,12 @@ __global__ void GdnConvPrefillKernel(const float* qkv, const float* conv_w,
       const std::int64_t s = static_cast<std::int64_t>(t) -
                              static_cast<std::int64_t>(kernel - 1) +
                              static_cast<std::int64_t>(k);
-      const float xv = s >= 0
-                           ? qkv[static_cast<std::size_t>(s) * channels + ch]
-                           : history[static_cast<std::size_t>(
-                                 static_cast<std::int64_t>(kernel - 1) + s) *
-                                 channels +
-                             ch];
+      const float xv =
+          s >= 0 ? qkv[static_cast<std::size_t>(s) * channels + ch]
+                 : history[static_cast<std::size_t>(
+                               static_cast<std::int64_t>(kernel - 1) + s) *
+                               channels +
+                           ch];
       acc += w[k] * xv;
     }
     convolved[idx] = DSilu(acc);
@@ -1517,8 +1518,7 @@ __global__ void GdnHistoryUpdateKernel(const float* qkv, const float* history,
                                        float* out, std::uint32_t tokens,
                                        std::uint32_t channels,
                                        std::uint32_t kernel) {
-  const std::size_t total =
-      static_cast<std::size_t>(kernel - 1) * channels;
+  const std::size_t total = static_cast<std::size_t>(kernel - 1) * channels;
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t idx =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1528,11 +1528,12 @@ __global__ void GdnHistoryUpdateKernel(const float* qkv, const float* history,
     const std::int64_t src = static_cast<std::int64_t>(tokens) -
                              static_cast<std::int64_t>(kernel - 1) +
                              static_cast<std::int64_t>(j);
-    out[idx] = src >= 0 ? qkv[static_cast<std::size_t>(src) * channels + ch]
-                        : history[static_cast<std::size_t>(
-                              static_cast<std::int64_t>(kernel - 1) + src) *
-                              channels +
-                          ch];
+    out[idx] = src >= 0
+                   ? qkv[static_cast<std::size_t>(src) * channels + ch]
+                   : history[static_cast<std::size_t>(
+                                 static_cast<std::int64_t>(kernel - 1) + src) *
+                                 channels +
+                             ch];
   }
 }
 
@@ -1547,8 +1548,7 @@ __global__ void GdnNormQkPrefillKernel(const float* convolved, float* qn,
   const std::uint32_t token = blockIdx.x / k_heads;
   const bool is_key = blockIdx.y != 0;
   const float* src =
-      convolved +
-      static_cast<std::size_t>(token) * channels +
+      convolved + static_cast<std::size_t>(token) * channels +
       static_cast<std::size_t>(is_key ? k_heads + head : head) * head_dim;
   float* dst = (is_key ? kn : qn) +
                (static_cast<std::size_t>(token) * k_heads + head) * head_dim;
@@ -1571,22 +1571,18 @@ __global__ void GdnNormQkPrefillKernel(const float* convolved, float* qn,
 // no shared memory and no barriers on the token recurrence. o[r] reuses
 // dot(s_new[r], q) = oq[r] + delta[r] * dot(k, q), and the next token's q/k
 // elements are prefetched while the current one reduces.
-template <std::uint32_t kRows, std::uint32_t kCols>
-__global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
-                                   const float* convolved, const float* alpha,
-                                   const float* beta, const float* a,
-                                   const float* dt, float* state, float* attn,
-                                   std::uint32_t tokens, std::uint32_t k_heads,
-                                   std::uint32_t v_heads,
-                                   std::uint32_t head_dim,
-                                   std::uint32_t channels, float* snap,
-                                   std::uint32_t snap_rows) {
+template<std::uint32_t kRows, std::uint32_t kCols>
+__global__ void GdnDeltaLoopKernel(
+    const float* qn, const float* kn, const float* convolved,
+    const float* alpha, const float* beta, const float* a, const float* dt,
+    float* state, float* attn, std::uint32_t tokens, std::uint32_t k_heads,
+    std::uint32_t v_heads, std::uint32_t head_dim, std::uint32_t channels,
+    float* snap, std::uint32_t snap_rows) {
   const std::uint32_t h = blockIdx.y;
   const std::uint32_t kh = h % k_heads;
   const std::uint32_t j0 = blockIdx.x * kRows;
   const std::uint32_t lane = threadIdx.x;
-  const std::size_t attn_stride =
-      static_cast<std::size_t>(v_heads) * head_dim;
+  const std::size_t attn_stride = static_cast<std::size_t>(v_heads) * head_dim;
   const std::size_t v_base = 2 * static_cast<std::size_t>(k_heads) * head_dim +
                              static_cast<std::size_t>(h) * head_dim;
   const float q_scale = 1.0F / sqrtf(static_cast<float>(head_dim));
@@ -1614,8 +1610,8 @@ __global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
     float knx[kCols];
     float qnx[kCols];
     if (t + 1 < tokens) {
-      const std::size_t off = (static_cast<std::size_t>(t + 1) * k_heads +
-                               kh) * head_dim + lane;
+      const std::size_t off =
+          (static_cast<std::size_t>(t + 1) * k_heads + kh) * head_dim + lane;
       for (std::uint32_t c = 0; c < kCols; ++c) {
         knx[c] = kn[off + c * blockDim.x];
         qnx[c] = qn[off + c * blockDim.x];
@@ -1658,10 +1654,10 @@ __global__ void GdnDeltaLoopKernel(const float* qn, const float* kn,
     }
     if (snap != nullptr && t < snap_rows) {
       for (std::uint32_t r = 0; r < kRows; ++r) {
-        float* row = snap + ((static_cast<std::size_t>(t) * v_heads + h) *
-                                 head_dim +
-                             j0 + r) *
-                                head_dim;
+        float* row =
+            snap +
+            ((static_cast<std::size_t>(t) * v_heads + h) * head_dim + j0 + r) *
+                head_dim;
         for (std::uint32_t c = 0; c < kCols; ++c) {
           row[lane + c * blockDim.x] = s[r][c];
         }
@@ -1701,12 +1697,15 @@ __device__ __forceinline__ float RowXorAdd(float v) {
 // four-lane butterfly instead of the full 32-lane shuffle. State stays in
 // registers for the whole chunk and k/q are prefetched one token ahead. The
 // arithmetic matches GdnDeltaLoopKernel on the pre-normalized qn/kn.
-template <std::uint32_t kRowsPerLane>
-__global__ void __launch_bounds__(256) GdnDeltaLoopRowSplitKernel(
-    const float* qn, const float* kn, const float* convolved,
-    const float* alpha, const float* beta, const float* a, const float* dt,
-    float* state, float* attn, std::uint32_t tokens, std::uint32_t k_heads,
-    std::uint32_t v_heads, std::uint32_t head_dim, std::uint32_t channels) {
+template<std::uint32_t kRowsPerLane>
+__global__ void __launch_bounds__(256)
+    GdnDeltaLoopRowSplitKernel(const float* qn, const float* kn,
+                               const float* convolved, const float* alpha,
+                               const float* beta, const float* a,
+                               const float* dt, float* state, float* attn,
+                               std::uint32_t tokens, std::uint32_t k_heads,
+                               std::uint32_t v_heads, std::uint32_t head_dim,
+                               std::uint32_t channels) {
   constexpr int kLanesPerRow = 4;
   constexpr int kRowGroups = 32 / kLanesPerRow;            // 8
   constexpr int kRowsPerWave = kRowGroups * kRowsPerLane;  // 8 or 16
@@ -1737,9 +1736,9 @@ __global__ void __launch_bounds__(256) GdnDeltaLoopRowSplitKernel(
 
   const float* q_base = qn + static_cast<std::size_t>(kh) * head_dim;
   const float* k_base = kn + static_cast<std::size_t>(kh) * head_dim;
-  const float* v_base =
-      convolved + 2 * static_cast<std::size_t>(k_heads) * head_dim +
-      static_cast<std::size_t>(h) * head_dim;
+  const float* v_base = convolved +
+                        2 * static_cast<std::size_t>(k_heads) * head_dim +
+                        static_cast<std::size_t>(h) * head_dim;
   const float* a_base = alpha + h;
   const float* b_base = beta + h;
   float* o_base = attn + static_cast<std::size_t>(h) * head_dim;
@@ -2026,9 +2025,8 @@ void GdnConvPrefill(const float* qkv, const float* conv_w, const float* history,
   const std::size_t total = static_cast<std::size_t>(tokens) * channels;
   const std::size_t grid =
       std::min<std::size_t>((total + block - 1) / block, 65535);
-  GdnConvPrefillKernel<<<grid, block, 0, stream>>>(qkv, conv_w, history,
-                                                   convolved, tokens, channels,
-                                                   kernel);
+  GdnConvPrefillKernel<<<grid, block, 0, stream>>>(
+      qkv, conv_w, history, convolved, tokens, channels, kernel);
 }
 
 void GdnHistoryUpdate(const float* qkv, const float* history, float* out,
@@ -2048,9 +2046,8 @@ void GdnNormQkPrefill(const float* convolved, float* qn, float* kn,
                       hipStream_t stream) {
   const dim3 grid(static_cast<std::uint32_t>(tokens) * k_heads, 2);
   const dim3 block(head_dim);
-  GdnNormQkPrefillKernel<<<grid, block, 0, stream>>>(convolved, qn, kn, tokens,
-                                                     k_heads, channels,
-                                                     head_dim, eps);
+  GdnNormQkPrefillKernel<<<grid, block, 0, stream>>>(
+      convolved, qn, kn, tokens, k_heads, channels, head_dim, eps);
 }
 
 void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
@@ -2147,14 +2144,13 @@ __global__ void MtpConcatKernel(const float* e, const float* h,
 }
 
 void MtpConcat(const float* e, const float* h, const float* h_prev, float* out,
-               std::uint32_t tokens, std::uint32_t hidden,
-               hipStream_t stream) {
+               std::uint32_t tokens, std::uint32_t hidden, hipStream_t stream) {
   MtpConcatKernel<<<tokens, 256, 0, stream>>>(e, h, h_prev, out, hidden);
 }
 
 void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
-                     const float* gate, float* out, float* scratch,
-                     float* part, std::uint32_t n_kv, std::uint32_t heads,
+                     const float* gate, float* out, float* scratch, float* part,
+                     std::uint32_t n_kv, std::uint32_t heads,
                      std::uint32_t kv_heads, std::uint32_t head_dim,
                      float scale, hipStream_t stream) {
   if (head_dim == 256U && n_kv > 0U) {
@@ -2179,10 +2175,10 @@ void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
 
 void AttentionDecodeRows(const float* q, const float* k_cache,
                          const float* v_cache, const float* gate, float* out,
-                         float* part, std::uint32_t n_kv0,
-                         std::uint32_t rows, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t head_dim,
-                         float scale, hipStream_t stream) {
+                         float* part, std::uint32_t n_kv0, std::uint32_t rows,
+                         std::uint32_t heads, std::uint32_t kv_heads,
+                         std::uint32_t head_dim, float scale,
+                         hipStream_t stream) {
   const std::uint32_t n_kv_last = n_kv0 + rows - 1U;
   std::uint32_t splits = (n_kv_last + 63U) / 64U;
   if (splits > 32U) {
@@ -2190,12 +2186,12 @@ void AttentionDecodeRows(const float* q, const float* k_cache,
   }
   std::uint32_t chunk = (n_kv_last + splits - 1U) / splits;
   splits = (n_kv_last + chunk - 1U) / chunk;
-#define GUFO_ATTN_DECODE_ROWS(R)                                             \
-  case R:                                                                    \
-    AttentionDecodeSplitRowsKernel<R><<<dim3(heads, splits), 256, 0,         \
-                                         stream>>>(                          \
-        q, k_cache, v_cache, part, n_kv0, heads, kv_heads, head_dim, scale,  \
-        splits, chunk);                                                      \
+#define GUFO_ATTN_DECODE_ROWS(R)                                         \
+  case R:                                                                \
+    AttentionDecodeSplitRowsKernel<R>                                    \
+        <<<dim3(heads, splits), 256, 0, stream>>>(                       \
+            q, k_cache, v_cache, part, n_kv0, heads, kv_heads, head_dim, \
+            scale, splits, chunk);                                       \
     break;
   switch (rows) {
     GUFO_ATTN_DECODE_ROWS(2U)
@@ -2222,8 +2218,8 @@ void KvCacheWriteF16(const float* k, const float* v, void* k_cache_f16,
   auto* v_dst = static_cast<__half*>(v_cache_f16) + start;
   constexpr std::uint32_t kBlock = 256;
   const std::size_t want = (count + kBlock - 1) / kBlock;
-  const std::uint32_t blocks = static_cast<std::uint32_t>(
-      want < 4096 ? (want == 0 ? 1 : want) : 4096);
+  const std::uint32_t blocks =
+      static_cast<std::uint32_t>(want < 4096 ? (want == 0 ? 1 : want) : 4096);
   ConvertKvChunkF16Kernel<<<blocks, kBlock, 0, stream>>>(k_src, v_src, k_dst,
                                                          v_dst, count);
 }
@@ -2243,9 +2239,9 @@ void AttentionPrefill(const float* q, const float* k_cache,
   // kernel byte-for-byte.
   if (k_cache_f16 != nullptr && v_cache_f16 != nullptr && head_dim == 256U &&
       heads == 16U && kv_heads == 2U) {
-    const dim3 grid(static_cast<unsigned>((tokens + kWmmaQueryRows - 1) /
-                                          kWmmaQueryRows),
-                    kv_heads * ((heads / kv_heads) / kWmmaHeads));
+    const dim3 grid(
+        static_cast<unsigned>((tokens + kWmmaQueryRows - 1) / kWmmaQueryRows),
+        kv_heads * ((heads / kv_heads) / kWmmaHeads));
     if (window > 0U) {
       WmmaCausalAttentionKernel<16, 2, true><<<grid, 256, 0, stream>>>(
           q, gate, static_cast<const __half*>(k_cache_f16),
@@ -2261,9 +2257,9 @@ void AttentionPrefill(const float* q, const float* k_cache,
   if (head_dim <= 256U) {
     constexpr std::uint32_t kQT = 32;
     const dim3 grid(heads, (tokens + kQT - 1) / kQT);
-    AttentionPrefillTiled<<<grid, 256, 0, stream>>>(
-        q, k_cache, v_cache, gate, out, start, tokens, heads, kv_heads,
-        head_dim, scale);
+    AttentionPrefillTiled<<<grid, 256, 0, stream>>>(q, k_cache, v_cache, gate,
+                                                    out, start, tokens, heads,
+                                                    kv_heads, head_dim, scale);
     return;
   }
   const dim3 grid(static_cast<std::uint32_t>(tokens) * heads);
