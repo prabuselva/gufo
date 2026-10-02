@@ -26,6 +26,11 @@ __device__ __forceinline__ float WarpReduceSum(float v) {
   return v;
 }
 
+// Bit-identical to kernels.hip.cpp DSilu (x * sigmoid(x), sigmoid via expf).
+__device__ __forceinline__ float DSiluF(float x) {
+  return x * (1.0F / (1.0F + expf(-x)));
+}
+
 // One block of four waves handles four consecutive output rows: wave w owns
 // row blockIdx.x*4+w. Each wave walks its row with a four-block unrolled
 // stream so several weight loads stay in flight, then reduces within the
@@ -166,6 +171,45 @@ __global__ void GemvGroupedQ8_0Pair(
     } else {
       out_b[pair] = acc;
     }
+  }
+}
+
+// Routed gate+up+SwiGLU in one launch: a wave folds the gate and up dots for
+// the same (slot, row) pair and writes silu(gate) * up directly, so the
+// activation never round-trips through global memory as two separate buffers.
+// Each per-row dot is bit-identical to GemvGroupedQ8_0Pair, and the epilogue
+// matches SwigluKernel's `gate[i] = DSilu(gate[i]) * up[i]` exactly.
+__global__ void GemvGroupedQ8_0Swiglu(
+    const Q8_0Block* __restrict__ wa, const Q8_0Block* __restrict__ wb,
+    const std::int32_t* __restrict__ ids, std::size_t expert_stride_blocks,
+    const float* __restrict__ x, std::uint32_t x_stride, float* __restrict__ out,
+    std::uint32_t used, std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (pair >= used * rows) {
+    return;
+  }
+  const std::uint32_t s = pair / rows;
+  const std::uint32_t r = pair - s * rows;
+  const std::uint32_t nblocks = cols / 32;
+  const std::size_t ebase =
+      static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
+      static_cast<std::size_t>(r) * nblocks;
+  const Q8_0Block* __restrict__ rowa = wa + ebase;
+  const Q8_0Block* __restrict__ rowb = wb + ebase;
+  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acca = 0.0f;
+  float accb = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const float xv = xs[b * 32 + lane];
+    acca += __half2float(rowa[b].d) * static_cast<float>(rowa[b].qs[lane]) * xv;
+    accb += __half2float(rowb[b].d) * static_cast<float>(rowb[b].qs[lane]) * xv;
+  }
+  acca = WarpReduceSum(acca);
+  accb = WarpReduceSum(accb);
+  if (lane == 0) {
+    out[pair] = DSiluF(acca) * accb;
   }
 }
 
@@ -474,6 +518,22 @@ bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
       static_cast<const Q8_0Block*>(wa), static_cast<const Q8_0Block*>(wb), ids,
       expert_stride / sizeof(Q8_0Block), x, x_stride, out_a, out_b, used, rows,
       cols);
+  return true;
+}
+
+bool GemvGroupedSwiglu(const void* wa, const void* wb, GemvType type,
+                       std::size_t expert_stride, const std::int32_t* ids,
+                       std::uint32_t used, std::uint32_t rows,
+                       std::uint32_t cols, const float* x,
+                       std::uint32_t x_stride, float* out, hipStream_t stream) {
+  if (type != GemvType::kQ8_0) {
+    return false;
+  }
+  const std::size_t pairs = static_cast<std::size_t>(used) * rows;
+  GemvGroupedQ8_0Swiglu<<<static_cast<std::uint32_t>((pairs + 3U) / 4U),
+                          dim3(128), 0, stream>>>(
+      static_cast<const Q8_0Block*>(wa), static_cast<const Q8_0Block*>(wb), ids,
+      expert_stride / sizeof(Q8_0Block), x, x_stride, out, used, rows, cols);
   return true;
 }
 

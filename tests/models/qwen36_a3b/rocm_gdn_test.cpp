@@ -349,12 +349,75 @@ bool RunPrefillCase(std::uint32_t tokens) {
   return ok;
 }
 
+// The fused decode front-end (conv + q/k RMSNorm in one launch) must be
+// bit-identical to the unfused GdnConv + GdnNormQk chain: same qn, kn, the value
+// half of convolved that the delta recurrence consumes, and the advanced
+// convolution history.
+bool TestFusedConvNormQk() {
+  const std::size_t conv_state =
+      static_cast<std::size_t>(kKernel - 1) * kChannels;
+  const auto qkv = t::MakeValues(kChannels, 0x9E3779B9U, 1.0F);
+  const auto conv_w = t::MakeValues(
+      static_cast<std::size_t>(kChannels) * kKernel, 0x85EBCA6BU, 0.5F);
+  const auto history = t::MakeValues(conv_state, 0xC2B2AE35U, 1.0F);
+
+  t::HipBuffer<float> u_qkv(kChannels);
+  t::HipBuffer<float> u_conv_w(conv_w.size());
+  t::HipBuffer<float> u_history(conv_state);
+  t::HipBuffer<float> u_conv(kChannels);
+  t::HipBuffer<float> u_qn(kKeyDim);
+  t::HipBuffer<float> u_kn(kKeyDim);
+  t::Upload(&u_qkv, qkv);
+  t::Upload(&u_conv_w, conv_w);
+  t::Upload(&u_history, history);
+  q::GdnConv(u_qkv.get(), u_conv_w.get(), u_history.get(), u_conv.get(),
+             kChannels, kKernel, nullptr);
+  q::GdnNormQk(u_conv.get(), u_qn.get(), u_kn.get(), kKHeads, kDim, kEps,
+               nullptr);
+
+  t::HipBuffer<float> f_qkv(kChannels);
+  t::HipBuffer<float> f_conv_w(conv_w.size());
+  t::HipBuffer<float> f_history(conv_state);
+  t::HipBuffer<float> f_conv(kChannels);
+  t::HipBuffer<float> f_qn(kKeyDim);
+  t::HipBuffer<float> f_kn(kKeyDim);
+  t::Upload(&f_qkv, qkv);
+  t::Upload(&f_conv_w, conv_w);
+  t::Upload(&f_history, history);
+  q::GdnConvNormQk(f_qkv.get(), f_conv_w.get(), f_history.get(), f_conv.get(),
+                   f_qn.get(), f_kn.get(), kChannels, kKernel, kKHeads, kVHeads,
+                   kDim, kEps, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "fused conv+normqk synchronization");
+
+  const auto value_dim = static_cast<std::size_t>(kValueDim);
+  const auto conv_v_ref = t::Download(&u_conv, kChannels);
+  const auto conv_v_fused = t::Download(&f_conv, kChannels);
+  const std::vector<float> ref_v(conv_v_ref.begin() + 2 * kKeyDim,
+                                  conv_v_ref.end());
+  const std::vector<float> fused_v(conv_v_fused.begin() + 2 * kKeyDim,
+                                    conv_v_fused.end());
+
+  bool ok = true;
+  const auto report = [&](const char* name, bool eq) {
+    std::cout << "GdnConvNormQk " << name << " bit-exact: " << (eq ? "yes" : "no")
+              << '\n';
+    ok = ok && eq;
+  };
+  report("qn", t::Download(&u_qn, kKeyDim) == t::Download(&f_qn, kKeyDim));
+  report("kn", t::Download(&u_kn, kKeyDim) == t::Download(&f_kn, kKeyDim));
+  report("convolved_v", ref_v == fused_v);
+  report("history", t::Download(&u_history, conv_state) ==
+                        t::Download(&f_history, conv_state));
+  (void)value_dim;
+  return ok;
+}
+
 }  // namespace
 
 int main() {
   try {
-    bool ok = RunCase(false);
-    ok = RunCase(true) && ok;
+    bool ok = TestFusedConvNormQk();
+    ok = RunCase(false) && ok;
     for (std::uint32_t tokens : {1U, 2U, 5U, 17U, 64U}) {
       ok = RunPrefillCase(tokens) && ok;
     }

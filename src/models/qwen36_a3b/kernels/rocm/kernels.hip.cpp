@@ -122,6 +122,30 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
   }
 }
 
+// Residual add fused with the following RMSNorm: x += addend, then
+// out = rmsnorm(x) * gamma. Bit-identical to AddKernel followed by
+// RmsNormKernel for a single row (grid == 1): the sum is formed as a float in
+// the same order, accumulated as double, and reduced with the same block size.
+__global__ void FusedAddRmsNormKernel(float* x, const float* addend,
+                                      const float* gamma, float* out,
+                                      std::uint32_t dim, float eps) {
+  __shared__ double reduce[32];
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float sum = x[i] + addend[i];
+    x[i] = sum;
+    const double v = sum;
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(dim)) +
+                   eps);
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    out[i] = x[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+  }
+}
+
 __global__ void RopeKernel(float* x, const std::uint32_t* pos,
                            std::uint32_t heads, std::uint32_t head_dim,
                            std::uint32_t rotary_dim, float theta) {
@@ -143,6 +167,140 @@ __global__ void RopeKernel(float* x, const std::uint32_t* pos,
   const float b = v[i + half];
   v[i] = a * c - b * s;
   v[i + half] = a * s + b * c;
+}
+
+// Fused decode attention front-end: deinterleave the [q | gate] query
+// projection, per-head RMSNorm and NEOX partial RoPE on q and k, and publish
+// k/v into the FP32 KV planes and their FP16 mirror — all in one launch. Each
+// block owns one head (query, key or value). The per-head norm reuses the exact
+// RmsNormKernel reduction (double BlockReduceSum over a 256-thread block,
+// scale = 1/sqrtf((float)(sum/dim) + eps), out = x*scale*gamma) and keeps the
+// normalized value as a float in shared before RoPE, so the RoPE reads the same
+// rounded floats the unfused chain round-trips through global memory. The RoPE
+// expressions match RopeKernel bit-for-bit, and the cache mirror uses
+// __float2half_rn like ConvertKvChunkF16Kernel. head_dim must be <= 256.
+__global__ void FusedQKNormRoPEKvWriteKernel(
+    const float* __restrict__ qg, const float* __restrict__ k_in,
+    const float* __restrict__ v_in, const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm, float* __restrict__ q_out,
+    float* __restrict__ gate_out, float* __restrict__ k_out,
+    float* __restrict__ k_cache, float* __restrict__ v_cache,
+    __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
+    std::uint32_t pos, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps) {
+  __shared__ double reduce[32];
+  __shared__ float normed[256];
+  const std::uint32_t half = rotary_dim / 2;
+  const std::uint32_t b = blockIdx.x;
+  const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * head_dim;
+  const std::size_t cache_base = static_cast<std::size_t>(pos) * kv_row;
+
+  if (b < heads) {
+    // Query head: deinterleave q|gate, RMSNorm, RoPE the leading rotary_dim.
+    const float* src = qg + static_cast<std::size_t>(b) * 2 * head_dim;
+    const float* gate_src = src + head_dim;
+    double ss = 0.0;
+    for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      const double v = src[i];
+      ss += v * v;
+    }
+    const float scale = 1.0F / sqrtf(static_cast<float>(
+                                       BlockReduceSum(ss, reduce) /
+                                       static_cast<double>(head_dim)) +
+                                   eps);
+    for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      normed[i] = src[i] * scale * (q_norm != nullptr ? q_norm[i] : 1.0F);
+      gate_out[static_cast<std::size_t>(b) * head_dim + i] = gate_src[i];
+    }
+    __syncthreads();
+    float* dst = q_out + static_cast<std::size_t>(b) * head_dim;
+    if (threadIdx.x < half) {
+      const std::uint32_t i = threadIdx.x;
+      const float p = static_cast<float>(pos);
+      const float freq = powf(theta, -2.0F * static_cast<float>(i) /
+                                        static_cast<float>(rotary_dim));
+      const float angle = p * freq;
+      const float c = cosf(angle);
+      const float s = sinf(angle);
+      const float a = normed[i];
+      const float bb = normed[i + half];
+      dst[i] = a * c - bb * s;
+      dst[i + half] = a * s + bb * c;
+    }
+    for (std::uint32_t i = rotary_dim + threadIdx.x; i < head_dim;
+         i += blockDim.x) {
+      dst[i] = normed[i];
+    }
+  } else if (b < heads + kv_heads) {
+    // Key head: RMSNorm, RoPE, publish to k_out and the FP32/FP16 cache.
+    const std::uint32_t hk = b - heads;
+    const float* src = k_in + static_cast<std::size_t>(hk) * head_dim;
+    double ss = 0.0;
+    for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      const double v = src[i];
+      ss += v * v;
+    }
+    const float scale = 1.0F / sqrtf(static_cast<float>(
+                                       BlockReduceSum(ss, reduce) /
+                                       static_cast<double>(head_dim)) +
+                                   eps);
+    for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      normed[i] = src[i] * scale * (k_norm != nullptr ? k_norm[i] : 1.0F);
+    }
+    __syncthreads();
+    float* dst = k_out + static_cast<std::size_t>(hk) * head_dim;
+    float* kc = k_cache + cache_base + static_cast<std::size_t>(hk) * head_dim;
+    __half* kc16 = k_cache_f16 != nullptr
+                       ? k_cache_f16 + cache_base +
+                             static_cast<std::size_t>(hk) * head_dim
+                       : nullptr;
+    if (threadIdx.x < half) {
+      const std::uint32_t i = threadIdx.x;
+      const float p = static_cast<float>(pos);
+      const float freq = powf(theta, -2.0F * static_cast<float>(i) /
+                                        static_cast<float>(rotary_dim));
+      const float angle = p * freq;
+      const float c = cosf(angle);
+      const float s = sinf(angle);
+      const float a = normed[i];
+      const float bb = normed[i + half];
+      const float r0 = a * c - bb * s;
+      const float r1 = a * s + bb * c;
+      dst[i] = r0;
+      dst[i + half] = r1;
+      kc[i] = r0;
+      kc[i + half] = r1;
+      if (kc16 != nullptr) {
+        kc16[i] = __float2half_rn(r0);
+        kc16[i + half] = __float2half_rn(r1);
+      }
+    }
+    for (std::uint32_t i = rotary_dim + threadIdx.x; i < head_dim;
+         i += blockDim.x) {
+      const float val = normed[i];
+      dst[i] = val;
+      kc[i] = val;
+      if (kc16 != nullptr) {
+        kc16[i] = __float2half_rn(val);
+      }
+    }
+  } else {
+    // Value head: publish to the FP32/FP16 cache (v_out is the projection).
+    const std::uint32_t hv = b - heads - kv_heads;
+    const float* src = v_in + static_cast<std::size_t>(hv) * head_dim;
+    float* vc = v_cache + cache_base + static_cast<std::size_t>(hv) * head_dim;
+    __half* vc16 = v_cache_f16 != nullptr
+                       ? v_cache_f16 + cache_base +
+                             static_cast<std::size_t>(hv) * head_dim
+                       : nullptr;
+    for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      const float val = src[i];
+      vc[i] = val;
+      if (vc16 != nullptr) {
+        vc16[i] = __float2half_rn(val);
+      }
+    }
+  }
 }
 
 // One thread per output channel: deinterleave the per-head [q | gate] pair.
@@ -326,6 +484,49 @@ __global__ void GdnNormQkKernel(const float* convolved, float* qn, float* kn,
       1.0f / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce)) + eps);
   for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
     dst[i] = src[i] * scale;
+  }
+}
+
+// Fused decode GDN front-end: the depthwise causal conv and the per-head RMSNorm
+// of the q and k groups in one launch. Each block owns one head (q, k or v) and
+// each thread owns one channel of that head, so the conv is the same per-channel
+// dot over the kernel taps plus the in-place history shift as GdnConvKernel. The
+// q and k blocks then reduce the head's convolved values with the identical
+// BlockReduceSum and blockDim (head_dim) as GdnNormQkKernel, so qn/kn are
+// bit-identical to the unfused conv + norm chain while the convolved q/k never
+// round-trips through global memory. The v block writes the convolved value the
+// delta recurrence consumes.
+__global__ void GdnConvNormQkKernel(const float* qkv, const float* conv_w,
+                                    float* history, float* convolved, float* qn,
+                                    float* kn, std::uint32_t channels,
+                                    std::uint32_t kernel,
+                                    std::uint32_t k_heads,
+                                    std::uint32_t head_dim, float eps) {
+  __shared__ double reduce[32];
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t i = threadIdx.x;
+  const std::size_t ch = static_cast<std::size_t>(head) * head_dim + i;
+  const float* w = conv_w + ch * kernel;
+  float acc = w[kernel - 1] * qkv[ch];
+  for (std::uint32_t t = 0; t + 1 < kernel; ++t) {
+    acc += w[t] * history[static_cast<std::size_t>(t) * channels + ch];
+  }
+  const float c = DSilu(acc);
+  for (std::uint32_t t = 0; t + 2 < kernel; ++t) {
+    history[static_cast<std::size_t>(t) * channels + ch] =
+        history[static_cast<std::size_t>(t + 1) * channels + ch];
+  }
+  history[static_cast<std::size_t>(kernel - 2) * channels + ch] = qkv[ch];
+  if (head < 2U * k_heads) {
+    const bool is_key = head >= k_heads;
+    const std::uint32_t local = is_key ? head - k_heads : head;
+    float* dst = (is_key ? kn : qn) + static_cast<std::size_t>(local) * head_dim;
+    const double ss = static_cast<double>(c) * c;
+    const float scale =
+        1.0f / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce)) + eps);
+    dst[i] = c * scale;
+  } else {
+    convolved[ch] = c;
   }
 }
 
@@ -1872,6 +2073,14 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
   RmsNormKernel<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
 }
 
+void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,
+                     float* out, std::uint32_t dim, float eps,
+                     hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  FusedAddRmsNormKernel<<<1, block, 0, stream>>>(x, addend, gamma, out, dim,
+                                                 eps);
+}
+
 void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
           std::uint32_t heads, std::uint32_t head_dim, std::uint32_t rotary_dim,
           float theta, hipStream_t stream) {
@@ -1890,6 +2099,26 @@ void SplitQGate(const float* qg, float* q, float* gate, std::uint32_t heads,
       std::min<std::size_t>((count + block - 1) / block, 65535);
   SplitQGateKernel<<<grid, block, 0, stream>>>(qg, q, gate, heads, head_dim,
                                                tokens);
+}
+
+bool FusedQKNormRoPEKvWrite(
+    const float* qg, const float* k_in, const float* v_in, const float* q_norm,
+    const float* k_norm, float* q_out, float* gate_out, float* k_out,
+    float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    std::uint32_t pos, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps,
+    hipStream_t stream) {
+  if (head_dim == 0U || head_dim > 256U || rotary_dim % 2U != 0U ||
+      rotary_dim > head_dim) {
+    return false;
+  }
+  const dim3 grid(heads + 2U * kv_heads);
+  const dim3 block(head_dim);
+  FusedQKNormRoPEKvWriteKernel<<<grid, block, 0, stream>>>(
+      qg, k_in, v_in, q_norm, k_norm, q_out, gate_out, k_out, k_cache, v_cache,
+      static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16), pos,
+      heads, kv_heads, head_dim, rotary_dim, theta, eps);
+  return true;
 }
 
 void Swiglu(float* gate, const float* up, std::size_t count,
@@ -1989,6 +2218,17 @@ void GdnNormQk(const float* convolved, float* qn, float* kn,
   const dim3 block(head_dim);
   GdnNormQkKernel<<<grid, block, 0, stream>>>(convolved, qn, kn, k_heads,
                                               head_dim, eps);
+}
+
+void GdnConvNormQk(const float* qkv, const float* conv_w, float* history,
+                   float* convolved, float* qn, float* kn,
+                   std::uint32_t channels, std::uint32_t kernel,
+                   std::uint32_t k_heads, std::uint32_t v_heads,
+                   std::uint32_t head_dim, float eps, hipStream_t stream) {
+  const std::uint32_t heads = 2U * k_heads + v_heads;
+  GdnConvNormQkKernel<<<heads, head_dim, 0, stream>>>(
+      qkv, conv_w, history, convolved, qn, kn, channels, kernel, k_heads,
+      head_dim, eps);
 }
 
 void GdnDelta(const float* qn, const float* kn, const float* v,
