@@ -456,11 +456,18 @@ void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
   }
 
   prof_.Mark("lin_conv");
-  GdnConv(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], gdn_convolved_,
-          channels, kern, nullptr);
-  prof_.Mark("lin_normqk");
-  GdnNormQk(gdn_convolved_, gdn_qn_, gdn_kn_, c_.ssm_num_k_heads, d, c_.rms_eps,
-            nullptr);
+  const std::uint32_t v_heads = c_.ssm_num_v_heads;
+  if (d <= 1024U && channels == (2U * c_.ssm_num_k_heads + v_heads) * d) {
+    GdnConvNormQk(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il],
+                  gdn_convolved_, gdn_qn_, gdn_kn_, channels, kern,
+                  c_.ssm_num_k_heads, v_heads, d, c_.rms_eps, nullptr);
+  } else {
+    GdnConv(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], gdn_convolved_,
+            channels, kern, nullptr);
+    prof_.Mark("lin_normqk");
+    GdnNormQk(gdn_convolved_, gdn_qn_, gdn_kn_, c_.ssm_num_k_heads, d,
+              c_.rms_eps, nullptr);
+  }
   prof_.Mark("lin_delta");
   GdnDelta(gdn_qn_, gdn_kn_, gdn_convolved_ + 2 * key_dim, gdn_alpha_,
            gdn_beta_, l.ssm_a.f32(), l.ssm_dt.f32(), gdn_state_[il], gdn_attn_,
@@ -500,23 +507,33 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
   }
 
   prof_.Mark("attn_rope_norm");
-  SplitQGate(gqa_qg_, gqa_q_, gqa_gate_, nh, hd, 1, nullptr);
-  RmsNormRows(gqa_q_, l.attn_q_norm.f32(), gqa_q_, nh, hd, c_.rms_eps, nullptr);
-  RmsNormRows(gqa_k_, l.attn_k_norm.f32(), gqa_k_, nkv, hd, c_.rms_eps,
-              nullptr);
-  Rope(gqa_q_, pos_dev, 1, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr);
-  Rope(gqa_k_, pos_dev, 1, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr);
+  const std::size_t kv_row = static_cast<std::size_t>(nkv) * hd;
+  // Fast path: deinterleave + per-head RMSNorm + partial RoPE + KV-cache write
+  // (FP32 planes and FP16 mirror) in one launch, bit-identical to the unfused
+  // chain below. Falls back when the head shape is unsupported.
+  if (!FusedQKNormRoPEKvWrite(gqa_qg_, gqa_k_, gqa_v_, l.attn_q_norm.f32(),
+                              l.attn_k_norm.f32(), gqa_q_, gqa_gate_, gqa_k_,
+                              k_cache, v_cache, k_cache_f16, v_cache_f16, pos,
+                              nh, nkv, hd, c_.rotary_dim, c_.rope_theta,
+                              c_.rms_eps, nullptr)) {
+    SplitQGate(gqa_qg_, gqa_q_, gqa_gate_, nh, hd, 1, nullptr);
+    RmsNormRows(gqa_q_, l.attn_q_norm.f32(), gqa_q_, nh, hd, c_.rms_eps,
+                nullptr);
+    RmsNormRows(gqa_k_, l.attn_k_norm.f32(), gqa_k_, nkv, hd, c_.rms_eps,
+                nullptr);
+    Rope(gqa_q_, pos_dev, 1, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr);
+    Rope(gqa_k_, pos_dev, 1, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr);
+    (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(pos) * kv_row,
+                         gqa_k_, kv_row * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+    (void)hipMemcpyAsync(v_cache + static_cast<std::size_t>(pos) * kv_row,
+                         gqa_v_, kv_row * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+    KvCacheWriteF16(k_cache, v_cache, k_cache_f16, v_cache_f16, pos * kv_row,
+                    kv_row, nullptr);
+  }
 
   prof_.Mark("attn_core");
-  const std::size_t kv_row = static_cast<std::size_t>(nkv) * hd;
-  (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(pos) * kv_row, gqa_k_,
-                       kv_row * sizeof(float), hipMemcpyDeviceToDevice,
-                       nullptr);
-  (void)hipMemcpyAsync(v_cache + static_cast<std::size_t>(pos) * kv_row, gqa_v_,
-                       kv_row * sizeof(float), hipMemcpyDeviceToDevice,
-                       nullptr);
-  KvCacheWriteF16(k_cache, v_cache, k_cache_f16, v_cache_f16, pos * kv_row,
-                  kv_row, nullptr);
 
   const float scale = 1.0F / std::sqrt(static_cast<float>(hd));
   AttentionDecode(gqa_q_, k_cache, v_cache, gqa_gate_, gqa_ctx_, gqa_scratch_,
@@ -540,23 +557,33 @@ void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
   const bool pair_routed = l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
                            l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&
                            l.ffn_up_exps.row_bytes == l.ffn_gate_exps.row_bytes;
-  if (!pair_routed ||
-      !GemvGroupedPair(l.ffn_gate_exps.data, l.ffn_up_exps.data,
-                       ToGemvType(l.ffn_gate_exps.type),
-                       l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows,
-                       moe_ids_, c_.num_experts_used, l.ffn_gate_exps.rows,
-                       l.ffn_gate_exps.cols, x, 0U, moe_gate_, moe_up_,
-                       nullptr)) {
-    GemvGrouped(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
-                l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_,
-                c_.num_experts_used, l.ffn_gate_exps.rows, l.ffn_gate_exps.cols,
-                x, 0U, moe_gate_, nullptr);
-    GemvGrouped(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
-                l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_,
-                c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols, x,
-                0U, moe_up_, nullptr);
+  // Fast path: fold gate+up+SwiGLU into one launch (bit-identical to the pair
+  // GEMV followed by Swiglu), so the routed activation stays in registers and
+  // the separate Swiglu pass and its two global buffers disappear.
+  if (!(pair_routed && ToGemvType(l.ffn_gate_exps.type) == GemvType::kQ8_0) ||
+      !GemvGroupedSwiglu(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                         ToGemvType(l.ffn_gate_exps.type),
+                         l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows,
+                         moe_ids_, c_.num_experts_used, l.ffn_gate_exps.rows,
+                         l.ffn_gate_exps.cols, x, 0U, moe_gate_, nullptr)) {
+    if (!pair_routed ||
+        !GemvGroupedPair(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                         ToGemvType(l.ffn_gate_exps.type),
+                         l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows,
+                         moe_ids_, c_.num_experts_used, l.ffn_gate_exps.rows,
+                         l.ffn_gate_exps.cols, x, 0U, moe_gate_, moe_up_,
+                         nullptr)) {
+      GemvGrouped(l.ffn_gate_exps.data, ToGemvType(l.ffn_gate_exps.type),
+                  l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_,
+                  c_.num_experts_used, l.ffn_gate_exps.rows,
+                  l.ffn_gate_exps.cols, x, 0U, moe_gate_, nullptr);
+      GemvGrouped(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
+                  l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_,
+                  c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols, x,
+                  0U, moe_up_, nullptr);
+    }
+    Swiglu(moe_gate_, moe_up_, c_.num_experts_used * c_.expert_ff, nullptr);
   }
-  Swiglu(moe_gate_, moe_up_, c_.num_experts_used * c_.expert_ff, nullptr);
   prof_.Mark("moe_routed_down");
   GemvGrouped(l.ffn_down_exps.data, ToGemvType(l.ffn_down_exps.type),
               l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, moe_ids_,
@@ -1057,11 +1084,13 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
   EmbedRow(model_.token_embd().data, ToGemvType(model_.token_embd().type),
            static_cast<std::uint32_t>(token), c_.hidden_size, x_, nullptr);
 
+  if (c_.num_layers > 0) {
+    RmsNormRows(x_, model_.layers()[0].attn_norm.f32(), normed_, 1,
+                c_.hidden_size, c_.rms_eps, nullptr);
+  }
   for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
     const DeviceLayer& l = model_.layers()[il];
     prof_.Mark("attn");
-    RmsNormRows(x_, l.attn_norm.f32(), normed_, 1, c_.hidden_size, c_.rms_eps,
-                nullptr);
     if (c_.IsLinearLayer(il)) {
       LinearAttention(l, il, normed_, attn_);
     } else {
@@ -1069,18 +1098,21 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
                 k_cache_f16_[il], v_cache_f16_[il], pos_dev_);
     }
     prof_.Mark("add");
-    Add(x_, attn_, c_.hidden_size, nullptr);
+    FusedAddRmsNorm(x_, attn_, l.post_attention_norm.f32(), normed_,
+                    c_.hidden_size, c_.rms_eps, nullptr);
     prof_.Mark("ffn");
-    RmsNormRows(x_, l.post_attention_norm.f32(), normed_, 1, c_.hidden_size,
-                c_.rms_eps, nullptr);
     Moe(l, normed_, ffn_);
     prof_.Mark("add");
-    Add(x_, ffn_, c_.hidden_size, nullptr);
+    if (il + 1 < c_.num_layers) {
+      FusedAddRmsNorm(x_, ffn_, model_.layers()[il + 1].attn_norm.f32(),
+                      normed_, c_.hidden_size, c_.rms_eps, nullptr);
+    } else {
+      FusedAddRmsNorm(x_, ffn_, model_.output_norm().f32(), x_, c_.hidden_size,
+                      c_.rms_eps, nullptr);
+    }
   }
 
   prof_.Mark("output");
-  RmsNormRows(x_, model_.output_norm().f32(), x_, 1, c_.hidden_size, c_.rms_eps,
-              nullptr);
   (void)hipMemcpy(h_out_, x_, c_.hidden_size * sizeof(float),
                   hipMemcpyDeviceToDevice);
   Gemv(model_.output().data, ToGemvType(model_.output().type),

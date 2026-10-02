@@ -22,6 +22,13 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
                  hipStream_t stream);
 
+/// Single-row residual add fused with the following RMSNorm: `x += addend`,
+/// then `out = rmsnorm(x) * gamma`. Bit-identical to Add then RmsNormRows with
+/// rows == 1. `out` may alias `x`; `gamma` may be null (scale 1).
+void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,
+                     float* out, std::uint32_t dim, float eps,
+                     hipStream_t stream);
+
 /// NEOX partial rotary on x [rows][heads][head_dim] at positions pos[row].
 /// Only the leading `rotary_dim` channels of each head rotate; pair (i,
 /// i + rotary_dim/2) turns by pos * theta^(-2i/rotary_dim).
@@ -36,6 +43,21 @@ void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
 void SplitQGate(const float* qg, float* q, float* gate, std::uint32_t heads,
                 std::uint32_t head_dim, std::uint32_t tokens,
                 hipStream_t stream);
+
+/// Fused single-token decode attention front-end. Deinterleaves the
+/// `[heads][2 * head_dim]` query projection `qg` into `q_out` and `gate_out`,
+/// applies per-head RMSNorm (`q_norm`, `k_norm`, may be null) and NEOX partial
+/// RoPE to `q_out` and `k_out` (from `k_in`), and publishes `k_out`/`v_in` into
+/// the FP32 KV planes at row `pos` plus their FP16 mirror (may be null).
+/// Bit-identical to SplitQGate + RmsNormRows + Rope + KV write. Returns false
+/// (launching nothing) when the shape is unsupported so the caller falls back.
+bool FusedQKNormRoPEKvWrite(
+    const float* qg, const float* k_in, const float* v_in, const float* q_norm,
+    const float* k_norm, float* q_out, float* gate_out, float* k_out,
+    float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    std::uint32_t pos, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps,
+    hipStream_t stream);
 
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`, over `count` floats.
 void Swiglu(float* gate, const float* up, std::size_t count,
@@ -90,6 +112,19 @@ void GdnConv(const float* qkv, const float* conv_w, float* history,
 void GdnNormQk(const float* convolved, float* qn, float* kn,
                std::uint32_t k_heads, std::uint32_t head_dim, float eps,
                hipStream_t stream);
+
+/// Fused decode front-end: `GdnConv` followed by `GdnNormQk` in one launch. The
+/// conv reads `qkv`/`conv_w` and advances `history` in place exactly as
+/// `GdnConv`; the q and k groups are RMS-normalized into `qn`/`kn` bit-identical
+/// to `GdnNormQk` (same `BlockReduceSum`, `blockDim == head_dim`), and the value
+/// group is written to `convolved` for the delta recurrence. The convolved q/k
+/// halves are consumed in-kernel and never materialized. Requires
+/// `channels == (2 * k_heads + v_heads) * head_dim` and `head_dim <= 1024`.
+void GdnConvNormQk(const float* qkv, const float* conv_w, float* history,
+                   float* convolved, float* qn, float* kn,
+                   std::uint32_t channels, std::uint32_t kernel,
+                   std::uint32_t k_heads, std::uint32_t v_heads,
+                   std::uint32_t head_dim, float eps, hipStream_t stream);
 
 /// One Gated DeltaNet recurrence step for every value head. `qn`/`kn` are the
 /// normalized key-head vectors [k_heads * head_dim]; value head h reads key

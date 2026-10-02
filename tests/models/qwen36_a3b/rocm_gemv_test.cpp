@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/models/qwen36_a3b/kernels/rocm/gemv.hpp"
+#include "src/models/qwen36_a3b/kernels/rocm/kernels.hpp"
 #include "tests/models/qwen36_a3b/hip_test.hpp"
 
 namespace q = gufo::models::qwen36_a3b::rocm;
@@ -353,6 +354,60 @@ bool TestGroupedPair() {
   return ok_a && ok_b;
 }
 
+// The fused gate+up+SwiGLU launch must be bit-identical to running the grouped
+// pair GEMV followed by the standalone Swiglu pass: same per-row dots, same
+// silu(gate) * up epilogue, just folded into one kernel.
+bool TestGroupedSwiglu() {
+  constexpr std::uint32_t kExperts = 4;
+  constexpr std::uint32_t kUsed = 2;
+  const std::int32_t ids[kUsed] = {2, 0};
+  const std::size_t expert_bytes =
+      static_cast<std::size_t>(kRows) * (kCols / 32) * 34;
+  const auto x = t::MakeValues(kCols, 0x55AA0204U, 1.0F);
+  const auto wa = EncodeQ8_0(kExperts * kRows, kCols, 0x33330003U);
+  const auto wb = EncodeQ8_0(kExperts * kRows, kCols, 0x44440004U);
+  t::HipBuffer<std::uint8_t> d_wa(wa.size());
+  t::CheckHip(
+      hipMemcpy(d_wa.get(), wa.data(), wa.size(), hipMemcpyHostToDevice),
+      "upload swiglu matrix A");
+  t::HipBuffer<std::uint8_t> d_wb(wb.size());
+  t::CheckHip(
+      hipMemcpy(d_wb.get(), wb.data(), wb.size(), hipMemcpyHostToDevice),
+      "upload swiglu matrix B");
+  t::HipBuffer<float> d_x(x.size());
+  t::Upload(&d_x, x);
+  t::HipBuffer<std::int32_t> d_ids(kUsed);
+  t::CheckHip(hipMemcpy(d_ids.get(), ids, sizeof(ids), hipMemcpyHostToDevice),
+              "upload swiglu expert ids");
+  // Reference: grouped pair GEMV into gate/up, then the standalone Swiglu.
+  t::HipBuffer<float> d_ref_gate(kUsed * kRows);
+  t::HipBuffer<float> d_ref_up(kUsed * kRows);
+  if (!q::GemvGroupedPair(d_wa.get(), d_wb.get(), q::GemvType::kQ8_0,
+                          expert_bytes, d_ids.get(), kUsed, kRows, kCols,
+                          d_x.get(), 0U, d_ref_gate.get(), d_ref_up.get(),
+                          nullptr)) {
+    std::cerr << "GemvGroupedPair unexpectedly returned false for Q8_0\n";
+    return false;
+  }
+  q::Swiglu(d_ref_gate.get(), d_ref_up.get(),
+            static_cast<std::size_t>(kUsed) * kRows, nullptr);
+  // Fused: one launch writes silu(gate) * up directly.
+  t::HipBuffer<float> d_out(kUsed * kRows);
+  if (!q::GemvGroupedSwiglu(d_wa.get(), d_wb.get(), q::GemvType::kQ8_0,
+                            expert_bytes, d_ids.get(), kUsed, kRows, kCols,
+                            d_x.get(), 0U, d_out.get(), nullptr)) {
+    std::cerr << "GemvGroupedSwiglu unexpectedly returned false for Q8_0\n";
+    return false;
+  }
+  t::CheckHip(hipDeviceSynchronize(), "GemvGroupedQ8_0Swiglu synchronization");
+  const auto ref = t::Download(&d_ref_gate, kUsed * kRows);
+  const auto got = t::Download(&d_out, kUsed * kRows);
+  const bool exact = ref == got;
+  std::cout << "GemvGroupedQ8_0Swiglu bit-exact: " << (exact ? "yes" : "no")
+            << '\n';
+  return exact;
+}
+
 // The multi-row verify GEMV must be bit-identical to single-row Gemv calls
 // for every row count in [2, 5] and every stored type: same per-row walk,
 // weight row read once for all activation rows.
@@ -430,6 +485,7 @@ int main() {
     ok = TestBf16() && ok;
     ok = TestMulti() && ok;
     ok = TestGroupedPair() && ok;
+    ok = TestGroupedSwiglu() && ok;
     ok = TestMultiRow() && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {

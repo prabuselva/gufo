@@ -383,11 +383,179 @@ bool RunDecodeRowsCase(std::uint32_t start, std::uint32_t tokens) {
                1e-4);
 }
 
+// The fused decode front-end (deinterleave + per-head RMSNorm + partial RoPE +
+// KV-cache write) must be bit-identical to the unfused chain of SplitQGate +
+// RmsNormRows + Rope + KV write, over q, gate, k and both KV planes plus their
+// FP16 mirrors.
+bool TestFusedQKNormRoPEKvWrite() {
+  constexpr std::uint32_t kRotary = 64;
+  constexpr float kTheta = 1.0e7F;
+  constexpr float kEps = 1.0e-6F;
+  constexpr std::uint32_t kPos = 7;
+  constexpr std::uint32_t kRows = 8;
+  const std::size_t q_count = static_cast<std::size_t>(kHeads) * kHeadDim;
+  const std::size_t kv_row = static_cast<std::size_t>(kKvHeads) * kHeadDim;
+  const std::size_t cache_count = static_cast<std::size_t>(kRows) * kv_row;
+
+  const auto qg = t::MakeValues(static_cast<std::size_t>(kHeads) * 2 * kHeadDim,
+                                0x13579BDFU, 1.0F);
+  const auto k_in =
+      t::MakeValues(kv_row, 0x2468ACE0U, 1.0F);
+  const auto v_in = t::MakeValues(kv_row, 0x0FEDCBA9U, 1.0F);
+  const auto q_norm = t::MakeValues(kHeadDim, 0x5A5A5A5AU, 0.5F, 1.0F);
+  const auto k_norm = t::MakeValues(kHeadDim, 0x6B6B6B6BU, 0.5F, 1.0F);
+
+  t::HipBuffer<float> d_qg(qg.size());
+  t::HipBuffer<float> d_kin(k_in.size());
+  t::HipBuffer<float> d_vin(v_in.size());
+  t::HipBuffer<float> d_qnorm(q_norm.size());
+  t::HipBuffer<float> d_knorm(k_norm.size());
+  t::Upload(&d_qg, qg);
+  t::Upload(&d_kin, k_in);
+  t::Upload(&d_vin, v_in);
+  t::Upload(&d_qnorm, q_norm);
+  t::Upload(&d_knorm, k_norm);
+  t::HipBuffer<std::uint32_t> d_pos(1);
+  t::CheckHip(hipMemcpy(d_pos.get(), &kPos, sizeof(kPos), hipMemcpyHostToDevice),
+              "upload pos");
+
+  // Reference: the unfused chain the executor falls back to.
+  t::HipBuffer<float> r_q(q_count);
+  t::HipBuffer<float> r_gate(q_count);
+  t::HipBuffer<float> r_k(kv_row);
+  t::HipBuffer<float> r_kc(cache_count);
+  t::HipBuffer<float> r_vc(cache_count);
+  t::HipBuffer<std::uint16_t> r_kc16(cache_count);
+  t::HipBuffer<std::uint16_t> r_vc16(cache_count);
+  t::CheckHip(hipMemset(r_kc.get(), 0, r_kc.bytes()), "zero ref kc");
+  t::CheckHip(hipMemset(r_vc.get(), 0, r_vc.bytes()), "zero ref vc");
+  t::CheckHip(hipMemset(r_kc16.get(), 0, r_kc16.bytes()), "zero ref kc16");
+  t::CheckHip(hipMemset(r_vc16.get(), 0, r_vc16.bytes()), "zero ref vc16");
+  q::SplitQGate(d_qg.get(), r_q.get(), r_gate.get(), kHeads, kHeadDim, 1,
+                nullptr);
+  q::RmsNormRows(r_q.get(), d_qnorm.get(), r_q.get(), kHeads, kHeadDim, kEps,
+                 nullptr);
+  t::CheckHip(hipMemcpy(r_k.get(), d_kin.get(), kv_row * sizeof(float),
+                        hipMemcpyDeviceToDevice),
+              "copy k");
+  q::RmsNormRows(r_k.get(), d_knorm.get(), r_k.get(), kKvHeads, kHeadDim, kEps,
+                 nullptr);
+  q::Rope(r_q.get(), d_pos.get(), 1, kHeads, kHeadDim, kRotary, kTheta,
+          nullptr);
+  q::Rope(r_k.get(), d_pos.get(), 1, kKvHeads, kHeadDim, kRotary, kTheta,
+          nullptr);
+  t::CheckHip(hipMemcpy(r_kc.get() + static_cast<std::size_t>(kPos) * kv_row,
+                        r_k.get(), kv_row * sizeof(float),
+                        hipMemcpyDeviceToDevice),
+              "ref k cache write");
+  t::CheckHip(hipMemcpy(r_vc.get() + static_cast<std::size_t>(kPos) * kv_row,
+                        d_vin.get(), kv_row * sizeof(float),
+                        hipMemcpyDeviceToDevice),
+              "ref v cache write");
+  q::KvCacheWriteF16(r_kc.get(), r_vc.get(), r_kc16.get(), r_vc16.get(),
+                     static_cast<std::size_t>(kPos) * kv_row, kv_row, nullptr);
+
+  // Fused: one launch.
+  t::HipBuffer<float> f_q(q_count);
+  t::HipBuffer<float> f_gate(q_count);
+  t::HipBuffer<float> f_k(kv_row);
+  t::HipBuffer<float> f_kc(cache_count);
+  t::HipBuffer<float> f_vc(cache_count);
+  t::HipBuffer<std::uint16_t> f_kc16(cache_count);
+  t::HipBuffer<std::uint16_t> f_vc16(cache_count);
+  t::CheckHip(hipMemset(f_kc.get(), 0, f_kc.bytes()), "zero fused kc");
+  t::CheckHip(hipMemset(f_vc.get(), 0, f_vc.bytes()), "zero fused vc");
+  t::CheckHip(hipMemset(f_kc16.get(), 0, f_kc16.bytes()), "zero fused kc16");
+  t::CheckHip(hipMemset(f_vc16.get(), 0, f_vc16.bytes()), "zero fused vc16");
+  if (!q::FusedQKNormRoPEKvWrite(
+          d_qg.get(), d_kin.get(), d_vin.get(), d_qnorm.get(), d_knorm.get(),
+          f_q.get(), f_gate.get(), f_k.get(), f_kc.get(), f_vc.get(),
+          f_kc16.get(), f_vc16.get(), kPos, kHeads, kKvHeads, kHeadDim, kRotary,
+          kTheta, kEps, nullptr)) {
+    std::cerr << "FusedQKNormRoPEKvWrite unexpectedly returned false\n";
+    return false;
+  }
+  t::CheckHip(hipDeviceSynchronize(), "FusedQKNormRoPEKvWrite synchronization");
+
+  const auto dl16 = [](t::HipBuffer<std::uint16_t>* b) {
+    std::vector<std::uint16_t> v(b->bytes() / sizeof(std::uint16_t));
+    t::CheckHip(hipMemcpy(v.data(), b->get(), b->bytes(),
+                          hipMemcpyDeviceToHost),
+                "download f16");
+    return v;
+  };
+  bool ok = true;
+  const auto cmp = [&](const char* name, const std::vector<float>& a,
+                       const std::vector<float>& b) {
+    const bool eq = a == b;
+    std::cout << "FusedQKNormRoPEKvWrite " << name << " bit-exact: "
+              << (eq ? "yes" : "no") << '\n';
+    ok = ok && eq;
+  };
+  cmp("q", t::Download(&r_q, q_count), t::Download(&f_q, q_count));
+  cmp("gate", t::Download(&r_gate, q_count), t::Download(&f_gate, q_count));
+  cmp("k", t::Download(&r_k, kv_row), t::Download(&f_k, kv_row));
+  cmp("k_cache", t::Download(&r_kc, cache_count),
+      t::Download(&f_kc, cache_count));
+  cmp("v_cache", t::Download(&r_vc, cache_count),
+      t::Download(&f_vc, cache_count));
+  const bool kc16_eq = dl16(&r_kc16) == dl16(&f_kc16);
+  const bool vc16_eq = dl16(&r_vc16) == dl16(&f_vc16);
+  std::cout << "FusedQKNormRoPEKvWrite f16 mirror bit-exact: "
+            << (kc16_eq && vc16_eq ? "yes" : "no") << '\n';
+  return ok && kc16_eq && vc16_eq;
+}
+
+// FusedAddRmsNorm must be bit-identical to Add then RmsNormRows (rows == 1)
+// across block-boundary dims (block = min(dim, 256)).
+bool TestFusedAddRmsNormDim(std::uint32_t dim) {
+  constexpr float kEps = 1.0e-6F;
+  const auto x = t::MakeValues(dim, 0x9E3779B9U ^ dim, 1.0F);
+  const auto addend = t::MakeValues(dim, 0x85EBCA6BU ^ dim, 1.0F);
+  const auto gamma = t::MakeValues(dim, 0xC2B2AE35U ^ dim, 0.5F, 1.0F);
+
+  t::HipBuffer<float> r_gamma(gamma.size());
+  t::Upload(&r_gamma, gamma);
+  t::HipBuffer<float> r_x(x.size());
+  t::Upload(&r_x, x);
+  t::HipBuffer<float> r_add(addend.size());
+  t::Upload(&r_add, addend);
+  t::HipBuffer<float> r_out(dim);
+  q::Add(r_x.get(), r_add.get(), dim, nullptr);
+  q::RmsNormRows(r_x.get(), r_gamma.get(), r_out.get(), 1, dim, kEps, nullptr);
+
+  t::HipBuffer<float> f_x(x.size());
+  t::Upload(&f_x, x);
+  t::HipBuffer<float> f_add(addend.size());
+  t::Upload(&f_add, addend);
+  t::HipBuffer<float> f_out(dim);
+  q::FusedAddRmsNorm(f_x.get(), r_add.get(), r_gamma.get(), f_out.get(), dim,
+                     kEps, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "FusedAddRmsNorm synchronization");
+
+  const bool x_eq = t::Download(&r_x, dim) == t::Download(&f_x, dim);
+  const bool out_eq = t::Download(&r_out, dim) == t::Download(&f_out, dim);
+  std::cout << "FusedAddRmsNorm dim=" << dim
+            << " x bit-exact: " << (x_eq ? "yes" : "no")
+            << ", out bit-exact: " << (out_eq ? "yes" : "no") << '\n';
+  return x_eq && out_eq;
+}
+
+bool TestFusedAddRmsNorm() {
+  bool ok = true;
+  for (std::uint32_t dim : {2048U, 256U, 128U, 1024U, 3072U, 4096U}) {
+    ok = TestFusedAddRmsNormDim(dim) && ok;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
   try {
     bool ok = true;
+    ok = TestFusedQKNormRoPEKvWrite() && ok;
+    ok = TestFusedAddRmsNorm() && ok;
     for (std::uint32_t n_kv : {1U, 5U, 33U, 128U, 1000U, 2400U}) {
       ok = RunCase(n_kv) && ok;
     }

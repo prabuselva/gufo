@@ -56,6 +56,18 @@ bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
                      const float* x, std::uint32_t x_stride, float* out_a,
                      float* out_b, hipStream_t stream);
 
+/// Fused gate+up+SwiGLU of the grouped expert projections: one launch folds
+/// both dots for each (slot, row) and writes `silu(gate) * up` into `out`, so
+/// the routed activation never round-trips through two global buffers plus a
+/// separate Swiglu pass. Both stacks must share the shape and `expert_stride`.
+/// Bit-identical to GemvGroupedPair followed by Swiglu. Returns false for types
+/// without a fused kernel (the caller falls back to the pair + Swiglu path).
+bool GemvGroupedSwiglu(const void* wa, const void* wb, GemvType type,
+                       std::size_t expert_stride, const std::int32_t* ids,
+                       std::uint32_t used, std::uint32_t rows, std::uint32_t cols,
+                       const float* x, std::uint32_t x_stride, float* out,
+                       hipStream_t stream);
+
 /// One projection of a fused multi launch (see GemvMulti).
 struct GemvMultiProj {
   const void* base;
