@@ -161,8 +161,8 @@ void MtpConcat(const float* e, const float* h, const float* h_prev, float* out,
 /// path). For head_dim == 256 a flash-decoding split runs instead: `part`
 /// (heads * 32 * (head_dim + 2) floats) receives the per-split partials.
 void AttentionDecode(const float* q, const float* k_cache, const float* v_cache,
-                     const float* gate, float* out, float* scratch,
-                     float* part, std::uint32_t n_kv, std::uint32_t heads,
+                     const float* gate, float* out, float* scratch, float* part,
+                     std::uint32_t n_kv, std::uint32_t heads,
                      std::uint32_t kv_heads, std::uint32_t head_dim,
                      float scale, hipStream_t stream);
 
