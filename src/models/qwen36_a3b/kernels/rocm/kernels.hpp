@@ -166,15 +166,36 @@ void GdnNormQkPrefill(const float* convolved, float* qn, float* kn,
                       std::uint32_t tokens, std::uint32_t k_heads,
                       std::uint32_t channels, std::uint32_t head_dim, float eps,
                       hipStream_t stream);
+/// Fused prefill front-end: `GdnConvPrefill` followed by `GdnNormQkPrefill` in
+/// one launch. Each block owns one (token, head); the conv is bit-identical to
+/// `GdnConvPrefill` and the q/k groups are RMS-normalized into `qn`/`kn`
+/// bit-identical to `GdnNormQkPrefill` (same `BlockReduceSum`, `blockDim ==
+/// head_dim`), while the convolved q/k halves are consumed in-kernel and never
+/// materialized. The value group is written to `convolved` for the delta
+/// recurrence. `history` is read only (advanced separately by
+/// `GdnHistoryUpdate`).
+void GdnConvNormQkPrefill(const float* qkv, const float* conv_w,
+                          const float* history, float* convolved, float* qn,
+                          float* kn, std::uint32_t tokens,
+                          std::uint32_t channels, std::uint32_t kernel,
+                          std::uint32_t k_heads, std::uint32_t v_heads,
+                          std::uint32_t head_dim, float eps,
+                          hipStream_t stream);
 /// When `snap` is non-null the state after each of the first `snap_rows`
 /// tokens is also written to `snap` ([snap_rows][v_heads][head_dim][head_dim]),
 /// slot t holding the state once tokens [0, t] are consumed. The live `state`
 /// still ends the chunk fully advanced. Used by speculative verify to roll the
 /// recurrent state back to the last accepted token.
+void GdnPrep(const float* alpha, const float* beta, const float* a,
+             const float* dt, const float* qn, const float* kn,
+             float* alpha_pre, float* beta_pre, float* kq_pre,
+             std::uint32_t tokens, std::uint32_t k_heads, std::uint32_t v_heads,
+             std::uint32_t head_dim, hipStream_t stream);
 void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
                   const float* alpha, const float* beta, const float* a,
-                  const float* dt, float* state, float* attn,
-                  std::uint32_t tokens, std::uint32_t k_heads,
+                  const float* dt, const float* alpha_pre,
+                  const float* beta_pre, const float* kq_pre, float* state,
+                  float* attn, std::uint32_t tokens, std::uint32_t k_heads,
                   std::uint32_t v_heads, std::uint32_t head_dim,
                   std::uint32_t channels, float* snap, std::uint32_t snap_rows,
                   hipStream_t stream);
