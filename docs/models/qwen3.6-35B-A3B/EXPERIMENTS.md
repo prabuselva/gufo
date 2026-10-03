@@ -815,3 +815,55 @@ context (pp16384 +1.6 % both rounds, tight error bars). The fused kernel reads `
 once, halves the gate+up launches, and drops the gate's F32 write/read round trip.
 It is now the default for chunks of ≥1024 tokens whose gate and up share an
 encoding; smaller chunks and mismatched encodings keep the two-launch path.
+
+## Dense `mul_mat_q` int8 WMMA: at the bit-exact ceiling (no kernel written)
+
+After the routed win the single biggest kernel is the dense `mul_mat_q`
+(23.4 % of GPU-busy at pp16384). The F16-WMMA record above measured **+4 %** by
+routing the dense projections through the tuned `RoutedF16GEMMKernel`, and
+concluded the bit-exact way to recover it was "a purpose-built int8 WMMA dense
+kernel (its own warp/LDS/epilogue structure)". This record closes that thread:
+a bounded investigation (structural analysis against the exact accumulation,
+before writing code) shows the +4 % is **not** int8-recoverable and the generic
+MMQ is already at its practical bit-exact ceiling.
+
+**The bit-exactness contract.** Our dense path is int8×int8→int32 WMMA
+(`vec_dot_q8_0_q8_1_mma`, `mmq.hpp:1056-1126`). Per output element the result is
+a sequential float chain over Q8_0 blocks of 32, in increasing K order:
+`acc = __fmaf_rn(__fmul_rn(float(C_kb), w_scale_kb), a_scale_kb, acc)`, where
+`C_kb` is the int32 dot of one 32-element block. int32 addition is exact and
+associative, so `C_kb` is order-free *within* a block, but the float chain over
+the 64 blocks (K = 2048) is order-dependent and must stay one accumulator per
+element in increasing K.
+
+**Why the F16 +4 % is not int8-recoverable.** The F16 kernel folds the block
+scales into its f16 operands and accumulates f32 *continuously* across all K in
+the WMMA accumulator — no per-block flush. Bit-exact int8 **cannot**: the block
+scales are per-32-element, so the int32 accumulator must be flushed to the float
+chain every block (64× for K = 2048), each flush a `fmul_rn`+`fmaf_rn` per output
+element on the VALU (≈9 % of the WMMA MAC count, on the slower fp32 path). That
+flush is forced by bit-exactness and is exactly what the generic MMQ already
+does. Roughly half the F16 +4 % is this flush-free accumulation; the rest is
+staging/structure, which the generic MMQ already tunes (ldmatrix fragments,
+`ncw` column sharing).
+
+**The last structural lever already loses.** The generic MMQ's one remaining
+parallelism knob — `QFN_WMMA_MMQ_NCW`, warps sharing a row group and splitting
+column tiles (`mmq.hpp:277-304`) — was measured 2026-09-03 at a 4096-token
+chunk: NCW 1 gives 406.94 / 429.48 / 422.49 tok/s, NCW 2 gives 367.93 / 350.56 /
+346.34, an **18 % regression**. Doubling resident waves per CU (8→16) does not
+help because "halving the columns per warp also halves the matrix ops each
+A-fragment load feeds". `mmq_y` cannot add waves either (LDS scales with it, so
+resident waves are invariant). With `mmq_x` width neutral, quantize-dedup
+neutral, and NCW −18 %, there is no structural headroom left to capture.
+
+**Decision: no kernel written.** A from-scratch int8 WMMA dense kernel would
+keep the same forced per-block flush, on a kernel whose obvious parallelism lever
+already loses 18 % and whose width is neutral — it would almost certainly land
+neutral like the two prior probes. The residual dense-side gap to the reference is
+not untuned code: the reference reaches its higher rate with a *cheaper
+accumulation that is not bit-exact with ours* (it does not preserve our
+per-block int32→float scale chain). Recovering it would require changing the
+numerics, which the optimize-kernel contract forbids. The dense-GEMM hunt is
+closed; the remaining prefill gap is the reference's cheaper non-bit-exact
+arithmetic, not a kernel-efficiency gap we can close bit-exactly.
