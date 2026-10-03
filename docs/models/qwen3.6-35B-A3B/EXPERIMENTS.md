@@ -569,3 +569,50 @@ so the recurrence win stands on its own.
 **Decision: retained as the default.** Bit-exact, no env switch, positive at every
 depth. The next GDN sub-gap (core-recurrence launch batching, epilogue fusion)
 remains open.
+
+## GDN recurrence: prefetch the critical-path scalars one token ahead
+
+After the prep kernels the loop reads `decay`, `b`, `kq` as scalars, but it still
+loaded them (and the convolved `v` row) fresh at the top of every token iteration
+and used them immediately, so four global-load latencies sat on the serial
+recurrence's critical path. The loop is latency-bound, not compute-bound: at
+~1600 cycles/token for ~100 FMA, the exposed load latency dominates. The `k`/`q`
+vectors were already double-buffered (prefetched for `t+1`); the scalars were not.
+
+Double-buffered `decay`, `b`, `kq` and `vcur[r]` exactly like `k`/`q`: load the
+current token's before the loop, prefetch `t+1`'s inside the existing prefetch
+block, swap at the bottom. Pure load scheduling — the arithmetic, its order, and
+the two `RowXorAdd` reductions are untouched, so the result is bit-identical.
+
+**Bit-exact.** The GDN unit test passes and a greedy `prompt` over the 3200-token
+(2-chunk) prefix is byte-identical to the prep baseline (204 bytes, only the
+model-load timing line differs).
+
+**Kernel time (profiler, pp16384, exclusive GPU).** The target kernel drops
+directly, with the attention kernel unchanged:
+
+| kernel | baseline (prep) | +prefetch | delta |
+| --- | ---: | ---: | ---: |
+| `GdnDeltaLoopRowSplitKernel` mean | 2217.7 µs | 1801.4 µs | **−18.8 %** |
+| `GdnDeltaLoopRowSplitKernel` total | 1729.8 ms | 1405.1 ms | −324.7 ms |
+| `WmmaCausalAttentionKernel` mean | 13272 µs | 13384 µs | noise |
+
+**Throughput (interleaved, exclusive GPU, 3 passes, `-r 3`).** Baseline = prep
+binary, candidate = +scalar prefetch. The kernel is 6.8 % of GPU-busy and ~30 % of
+the span is idle, so the −18.8 % kernel win lands as a smaller end-to-end gain:
+
+| depth | baseline | candidate | delta |
+| ---: | ---: | ---: | ---: |
+| pp2048 | 2247.4 | 2265.8 | **+0.8 %** |
+| pp8192 | 2161.9 | 2171.3 | **+0.4 %** |
+| pp16384 | 1970.4 | 1984.9 | **+0.7 %** |
+
+Candidate beat baseline in 2 of 3 passes at every depth and the mean is positive
+everywhere; the effect is modest relative to run-to-run spread but the change is
+provably not a regression (it only removes exposed latency, adding four register
+copies per iteration).
+
+**Decision: retained as the default.** Bit-exact, no env switch, positive at every
+depth. The remaining GDN sub-gap is the recurrence's low parallelism (64 blocks:
+32 value heads × 2 row halves) — raising it needs a chunked-scan reformulation
+that changes the summation order, so it is not a bit-exact lever.

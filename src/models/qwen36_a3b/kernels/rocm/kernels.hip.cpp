@@ -2062,10 +2062,27 @@ __global__ void __launch_bounds__(256)
       qv[vi] = qp[seg * kVec + vi];
     }
   }
+  // Double-buffer the per-token scalars that sit on the recurrence's critical
+  // path (decay, beta, k.q and the convolved v row) one iteration ahead,
+  // exactly as k/q are prefetched, so their global-load latency hides behind
+  // the current token's FMA chain. Pure load scheduling: the arithmetic and its
+  // order are unchanged, so the result is bit-identical.
+  float decay = *ap_base;
+  float b = *bp_base;
+  float kq = *kqp_base;
+  float vcur[kRowsPerLane];
+#pragma unroll
+  for (int r = 0; r < kRowsPerLane; ++r) {
+    vcur[r] = v_base[row0 + r * kRowGroups];
+  }
 
   for (std::uint32_t t = 0; t < tokens; ++t) {
     float4 knx[kVec];
     float4 qnx[kVec];
+    float decay_n = 0.0F;
+    float b_n = 0.0F;
+    float kq_n = 0.0F;
+    float v_n[kRowsPerLane];
     if (t + 1 < tokens) {
       const float4* kp =
           reinterpret_cast<const float4*>(k_base + k_heads * head_dim);
@@ -2076,10 +2093,14 @@ __global__ void __launch_bounds__(256)
         knx[vi] = kp[seg * kVec + vi];
         qnx[vi] = qp[seg * kVec + vi];
       }
+      decay_n = *(ap_base + v_heads);
+      b_n = *(bp_base + v_heads);
+      kq_n = *(kqp_base + k_heads);
+#pragma unroll
+      for (int r = 0; r < kRowsPerLane; ++r) {
+        v_n[r] = v_base[channels + row0 + r * kRowGroups];
+      }
     }
-    const float decay = *ap_base;
-    const float b = *bp_base;
-    const float kq = *kqp_base;
 #pragma unroll
     for (int r = 0; r < kRowsPerLane; ++r) {
       float u = 0.0F;
@@ -2100,7 +2121,7 @@ __global__ void __launch_bounds__(256)
       u = RowXorAdd(u);
       p = RowXorAdd(p);
       const int row = row0 + r * kRowGroups;
-      const float delta = (v_base[row] - u) * b;
+      const float delta = (vcur[r] - u) * b;
       if (seg == 0) {
         o_base[row] = p * q_scale + delta * kq;
       }
@@ -2125,6 +2146,13 @@ __global__ void __launch_bounds__(256)
     for (int vi = 0; vi < kVec; ++vi) {
       kv[vi] = knx[vi];
       qv[vi] = qnx[vi];
+    }
+    decay = decay_n;
+    b = b_n;
+    kq = kq_n;
+#pragma unroll
+    for (int r = 0; r < kRowsPerLane; ++r) {
+      vcur[r] = v_n[r];
     }
   }
 
