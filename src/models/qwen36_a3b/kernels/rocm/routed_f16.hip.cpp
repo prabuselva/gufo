@@ -609,9 +609,12 @@ __launch_bounds__(256) __global__
             __half values[2];
 #pragma unroll
             for (int v = 0; v < 2; ++v) {
-              float product = base[idx + v + 4 * plane] * base[idx + v];
-              asm volatile("" : "+v"(product));
-              float value = product * SigmoidF(base[idx + v]);
+              // Match the separate up epilogue's `up * SiluF(gate)` exactly:
+              // silu = gate * SigmoidF(gate), then up * silu.
+              const float gate = base[idx + v];
+              float silu = gate * SigmoidF(gate);
+              asm volatile("" : "+v"(silu));
+              float value = base[idx + v + 4 * plane] * silu;
               asm volatile("" : "+v"(value));
               values[v] = __float2half(value);
             }
@@ -894,6 +897,63 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       return LaunchRoutedF16<64>(w, type, x, tiles, n_tiles, pad_bounds,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
+    default:
+      return false;
+  }
+}
+
+// Fused gate+up: one launch reads x once and decodes the gate rows from `gate`
+// and the matching up rows from `up` over a 64-row grid, applying SwiGLU in the
+// epilogue and writing F16 activation rows. Bit-identical to the separate gate
+// (F32) then up (SwiGLU) launches: the K accumulation order is unchanged and
+// the epilogue reproduces `up * SiluF(gate)`.
+template<int BN>
+bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
+                          const __half* x, const std::int32_t* tiles,
+                          std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+                          const std::int32_t* rows_in,
+                          const std::int32_t* rows_out, __half* out_half,
+                          std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned int>((m + 63) / 64), n_tiles);
+  switch (type) {
+    case WeightType::kQ8_0:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ8_0, 128, BN, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out_half, m, k, up);
+      return true;
+    case WeightType::kBF16:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kBF16, 128, BN, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out_half, m, k, up);
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
+                        const __half* x, const std::int32_t* tiles,
+                        std::uint32_t n_tiles, std::uint32_t tile_rows,
+                        const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, __half* out_half,
+                        std::size_t m, std::size_t k, hipStream_t stream) {
+  const std::size_t block_elems = type == WeightType::kBF16 ? 32 : 64;
+  if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
+      out_half == nullptr) {
+    return false;
+  }
+  switch (tile_rows) {
+    case 64:
+      return LaunchRoutedGatedF16<64>(gate, up, type, x, tiles, n_tiles,
+                                      pad_bounds, rows_in, rows_out, out_half,
+                                      m, k, stream);
+    case 128:
+      return LaunchRoutedGatedF16<128>(gate, up, type, x, tiles, n_tiles,
+                                       pad_bounds, rows_in, rows_out, out_half,
+                                       m, k, stream);
     default:
       return false;
   }

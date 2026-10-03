@@ -276,7 +276,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->pf_cursors_ = e->AllocInts(c.num_experts, error_msg);
   e->pf_rows_token_ = e->AllocInts(compact_rows, error_msg);
   e->pf_rows_slot_ = e->AllocInts(compact_rows, error_msg);
-  const std::size_t max_tiles = pairs / 16 + c.num_experts + 16;
+  // The 64-row map plus an optional paired (gate+up) map of the same bound.
+  const std::size_t max_tiles = pairs / 16 + 2 * (c.num_experts + 16);
   e->pf_tiles_dev_ = e->AllocInts(max_tiles, error_msg);
   e->pf_tiles_host_.assign(max_tiles, 0);
   e->pf_x_half_ = e->AllocBytes(
@@ -732,7 +733,15 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                     supported(l.ffn_down_exps.type) && hidden % 64 == 0 &&
                     expert_ff % 64 == 0;
 
+  // The fused gate+up route pairs the two projections over a second tile map
+  // once the chunk is large enough to amortise the wider tiles and gate/up
+  // share an encoding. It writes F16 activation rows, so the down projection
+  // (which reads F16) stays valid.
+  const bool pair =
+      wmma && tokens >= 1024 && l.ffn_gate_exps.type == l.ffn_up_exps.type;
   std::uint32_t n_tiles = 0;
+  std::uint32_t n_pair = 0;
+  std::uint32_t pair_rows = 64;
   if (wmma) {
     // Build the (expert, row-tile) map: one entry per 64-row tile of each
     // expert's 16-padded bucket, packed as expert | (tile << 16).
@@ -742,9 +751,29 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
         pf_tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
       }
     }
-    if (n_tiles > 0) {
+    if (pair) {
+      // Prefer 128-row paired tiles when they cut the launch to at most three
+      // quarters of the 64-row tile count.
+      std::uint32_t tiles_64 = 0;
+      std::uint32_t tiles_128 = 0;
+      for (std::uint32_t e = 0; e < experts; ++e) {
+        const std::uint32_t padded = (pf_counts_host_[e] + 15u) / 16u * 16u;
+        tiles_64 += (padded + 63u) / 64u;
+        tiles_128 += (padded + 127u) / 128u;
+      }
+      pair_rows = tiles_128 * 4u <= tiles_64 * 3u ? 128u : 64u;
+      for (std::uint32_t e = 0; e < experts; ++e) {
+        const std::uint32_t padded = (pf_counts_host_[e] + 15u) / 16u * 16u;
+        for (std::uint32_t j = 0; j * pair_rows < padded; ++j) {
+          pf_tiles_host_[n_tiles + n_pair++] =
+              static_cast<std::int32_t>(e | (j << 16));
+        }
+      }
+    }
+    if (n_tiles + n_pair > 0) {
       (void)hipMemcpy(pf_tiles_dev_, pf_tiles_host_.data(),
-                      n_tiles * sizeof(std::int32_t), hipMemcpyHostToDevice);
+                      (n_tiles + n_pair) * sizeof(std::int32_t),
+                      hipMemcpyHostToDevice);
     }
   } else {
     // Bound the routed MMQ column grid to the real largest expert bucket.
@@ -771,16 +800,20 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                       static_cast<std::size_t>(tokens) * hidden, nullptr);
     const auto* x_half = static_cast<const __half*>(pf_x_half_);
     auto* up_half = static_cast<__half*>(pf_up_half_);
-    prof_.Mark("moe_gate");
-    if (n_tiles > 0) {
+    prof_.Mark("moe_gate_up");
+    if (pair) {
+      // Fused gate+up -> F16 up_half in one launch over the paired tile map
+      // (stored after the 64-row map). Bit-identical to the two launches below.
+      (void)RoutedGatedF16Gemm(
+          l.ffn_gate_exps.data, l.ffn_up_exps.data, wtype(l.ffn_gate_exps.type),
+          x_half, pf_tiles_dev_ + n_tiles, n_pair, pair_rows, pf_pad_bounds_,
+          pf_rows_token_, pf_rows_slot_, up_half, expert_ff, hidden, nullptr);
+    } else if (n_tiles > 0) {
       // gate -> F32 pf_gate_ (indexed by slot).
       (void)RoutedF16Gemm(l.ffn_gate_exps.data, wtype(l.ffn_gate_exps.type),
                           x_half, pf_tiles_dev_, n_tiles, 64, pf_pad_bounds_,
                           pf_rows_token_, pf_rows_slot_, nullptr, pf_gate_,
                           nullptr, expert_ff, hidden, nullptr);
-    }
-    prof_.Mark("moe_up");
-    if (n_tiles > 0) {
       // up -> F16 up_half with the SwiGLU gate folded in from pf_gate_.
       (void)RoutedF16Gemm(l.ffn_up_exps.data, wtype(l.ffn_up_exps.type), x_half,
                           pf_tiles_dev_, n_tiles, 64, pf_pad_bounds_,
