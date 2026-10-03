@@ -124,6 +124,11 @@ public:
   /// drafts, grows while drafts keep being fully accepted and shrinks on
   /// rejections down to `min`; `min` == `max` pins the count.
   void SetDraftLimits(std::uint32_t min_drafts, std::uint32_t max_drafts);
+  /// Enables the MTP draft cache and speculative decoding for this session.
+  /// Must be called before the first Sync: the draft cache is filled during
+  /// prefill and cannot be rebuilt lazily. A plain (non-speculative) session
+  /// leaves it off so prefill skips the draft block entirely.
+  void SetMtpEnabled(bool enabled);
 
 private:
   friend class Model;

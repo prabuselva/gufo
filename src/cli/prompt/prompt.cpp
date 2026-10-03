@@ -1342,6 +1342,9 @@ int RunChat(std::span<const char* const> args) {
       std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
       return 1;
     }
+    // Interactive chat decodes with MTP speculative decoding, so the draft
+    // cache must be filled during prefill.
+    qwen36_session->SetMtpEnabled(true);
     tokenizer = &qwen36_model->tokenizer();
     architecture = "qwen35moe";
   }

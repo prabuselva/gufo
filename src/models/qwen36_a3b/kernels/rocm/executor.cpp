@@ -366,6 +366,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   if (model.has_mtp()) {
     e->mtp_k_cache_ = e->AllocFloats(kv_elems, error_msg);
     e->mtp_v_cache_ = e->AllocFloats(kv_elems, error_msg);
+    e->mtp_k_cache_f16_ = e->AllocBytes(kv_elems * sizeof(__half), error_msg);
+    e->mtp_v_cache_f16_ = e->AllocBytes(kv_elems * sizeof(__half), error_msg);
     // Speculative verify: kMaxVerifyRows rows of logits and hidden states,
     // the batched MTP fill scratch, and one recurrent-state snapshot row per
     // droppable verify row (all but the last).
@@ -421,6 +423,10 @@ void Executor::Reset() {
   if (model_.has_mtp()) {
     (void)hipMemsetAsync(mtp_k_cache_, 0, kv_elems * sizeof(float), nullptr);
     (void)hipMemsetAsync(mtp_v_cache_, 0, kv_elems * sizeof(float), nullptr);
+    (void)hipMemsetAsync(mtp_k_cache_f16_, 0, kv_elems * sizeof(__half),
+                         nullptr);
+    (void)hipMemsetAsync(mtp_v_cache_f16_, 0, kv_elems * sizeof(__half),
+                         nullptr);
     (void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
                          nullptr);
   }
@@ -1031,7 +1037,12 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
       (void)hipMemcpyAsync(x_, pf_normed_ + (rows - 1) * hidden,
                            hidden * sizeof(float), hipMemcpyDeviceToDevice,
                            nullptr);
-      MtpPrefillChunk(tokens + done, rows, start, pf_normed_);
+      // The draft cache is only consumed when this session decodes with MTP.
+      // A plain prefill leaves mtp_enabled_ false so the draft's attention
+      // never runs; the last-row hidden above still feeds the logits stage.
+      if (mtp_enabled_) {
+        MtpPrefillChunk(tokens + done, rows, start, pf_normed_);
+      }
     }
     done += rows;
     last_rows = rows;
@@ -1155,7 +1166,7 @@ void Executor::MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
   RmsNormRows(pf_mtp_cur_, l.attn_norm.f32(), pf_normed_, rows, hidden,
               c_.rms_eps, nullptr);
   AttentionBatch(l, pf_normed_, start, pf_attn_, mtp_k_cache_, mtp_v_cache_,
-                 nullptr, nullptr, pf_pos_, rows);
+                 mtp_k_cache_f16_, mtp_v_cache_f16_, pf_pos_, rows);
   Add(pf_mtp_cur_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
   RmsNormRows(pf_mtp_cur_, l.post_attention_norm.f32(), pf_normed_, rows,
               hidden, c_.rms_eps, nullptr);
@@ -1212,7 +1223,7 @@ bool Executor::MtpForward(std::int32_t token, const float* hidden,
   RmsNormRows(mtp_cur_, l.attn_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
   Attention(l, normed_, mtp_position_, attn_, mtp_k_cache_, mtp_v_cache_,
-            nullptr, nullptr, mtp_pos_dev_);
+            mtp_k_cache_f16_, mtp_v_cache_f16_, mtp_pos_dev_);
   Add(mtp_cur_, attn_, c_.hidden_size, nullptr);
   RmsNormRows(mtp_cur_, l.post_attention_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
