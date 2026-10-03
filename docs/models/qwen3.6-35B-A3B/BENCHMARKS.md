@@ -79,9 +79,13 @@ not methodology:
   adds a further ~2 % bit-exact, and prefetching the recurrence's critical-path
   scalars one token ahead adds ~0.5 % more, so the current tree is ~2-3 % above
   the table at every depth (prep measured pp2048 +3.4 %, pp16384 +2.8 %,
-  pp102400 +1.6 %; prefetch +0.4-0.8 % on top). The
-  residual 88 % at 16384 is the remaining kernel-efficiency gap in the attention
-  core. The reference's
+pp102400 +1.6 %; prefetch +0.4-0.8 % on top). A separate routed-MoE lever
+   fuses the gate and up projections into one `RoutedF16GEMMKernel` launch over a
+   paired tile map (reads `x` once, drops the gate's F32 round trip), bit-exact and
+   worth a further +0.8 % (pp2048) to +1.7 % (pp102400) on top — see
+   [EXPERIMENTS.md](EXPERIMENTS.md) "Routed MoE fused gate+up". The
+   residual 88 % at 16384 is the remaining kernel-efficiency gap in the attention
+   core. The reference's
   **head-major packed KV fast path** (`attention_wmma.hip`, gated to
   `batch_size >= 1024`) repacks each KV head into a contiguous `[context]
   [head_dim]` slab so consecutive key rows sit 512 B apart (fully coalesced)

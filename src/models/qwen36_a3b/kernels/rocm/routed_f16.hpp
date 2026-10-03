@@ -61,6 +61,20 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
+/// Fused gate+up routed GEMM. `gate` and `up` are the [n_experts][m][k] weight
+/// tensors in the same `type`; the kernel reads the F16 activation rows once
+/// and writes the SwiGLU product `up * SiluF(gate)` as F16 to `out_half`
+/// (indexed by `rows_out`). `tile_rows` is 64 or 128. Bit-identical to a gate
+/// GEMM into F32 followed by an up GEMM with `swiglu_gate`, but one launch and
+/// no gate round trip. Returns false for an unsupported shape.
+bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
+                        const __half* x, const std::int32_t* tiles,
+                        std::uint32_t n_tiles, std::uint32_t tile_rows,
+                        const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, __half* out_half,
+                        std::size_t m, std::size_t k, hipStream_t stream);
+
 }  // namespace gufo::models::qwen36_a3b::rocm
 
 #endif  // GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_ROUTED_F16_HPP_

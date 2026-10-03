@@ -616,3 +616,202 @@ copies per iteration).
 depth. The remaining GDN sub-gap is the recurrence's low parallelism (64 blocks:
 32 value heads × 2 row halves) — raising it needs a chunked-scan reformulation
 that changes the summation order, so it is not a bit-exact lever.
+
+## Dense projections on the matrix cores: F16 WMMA (rejected — not numerics-preserving)
+
+After the GDN wins the residual prefill gap vs the reference widens with depth
+(pp2048 +4.3 %, pp8192 +6.9 %, pp16384 +9.9 %), the signature of per-token dense
+compute. A pp16384 profile puts `mul_mat_q` at 23.4 % of GPU-busy — the single
+biggest kernel — while the routed experts already run on the matrix cores.
+
+**Premise correction (verified after the fact).** This record originally framed
+`mul_mat_q` as the dp4a tier and the reference's int8 WMMA GEMM as the missing
+piece. That is wrong. On gfx1151 `__GFX11__` maps to `AMD_WMMA_AVAILABLE` (not
+`AMD_MFMA_AVAILABLE`), and `mul_mat_q_process_tile` selects `vec_dot_mma` under
+that macro (`mmq.hpp:3422-3428`); the int8 `mma` overload then emits
+`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32` (`mma.hpp:1008-1013`). So our dense
+Q8_0 projections **already run int8×int8→int32 on the WMMA matrix cores** — the
+same hardware path as the reference's `W8A8BlockedWmmaGEMMKernel`. The gap is
+therefore a *kernel-tuning* difference (the generic `mul_mat_q` tile/warp
+selection vs a purpose-built GEMM), not a dp4a-vs-matrix-core difference. The
+F16 experiment below is reinterpreted accordingly: it swapped the tuned
+`RoutedF16GEMMKernel` in for `mul_mat_q`, and its +4 % is that tuning delta.
+
+**Lever tried (bounded).** Feed a dense Q8_0 projection through the existing
+matrix-core `RoutedF16GEMMKernel` by treating the token batch as a single
+64-row-tiled bucket: identity `rows_in`/`rows_out` over `[0, tokens)`, pad bounds
+`{0, tokens}`, one tile per `ceil(tokens/64)` packed as `j<<16`, activations
+narrowed F32→F16, F32 output. Wired into the attention/linear-attention `proj`
+dispatch and the shared expert (router left on dp4a for exact top-k; reduction
+dims not a multiple of 64 and `rows < 64` fall back to the dp4a GEMM). The kernel
+already masks rows past `bucket_rows` on both load and store, and with `expert=0`
+the weight pointer is the plain `[rows][cols]` block_q8_0 base, so the mapping is
+correct.
+
+**Throughput (interleaved, exclusive GPU, 3 passes, `-r 3`).** Baseline = the
+committed dp4a tree, candidate = +F16 WMMA dense.
+
+| depth | baseline | candidate | delta |
+| ---: | ---: | ---: | ---: |
+| pp2048 | 2287.2 | 2314.0 | **+1.2 %** |
+| pp8192 | 2198.0 | 2256.5 | **+2.7 %** |
+| pp16384 | 2011.3 | 2091.2 | **+4.0 %** |
+
+The lever is real and grows with depth — a better-tuned matrix-core kernel for
+the dense projections closes roughly half the 16K gap to the reference.
+
+**Quality (greedy, exclusive GPU).** The 3200-token `long` prompt is byte-identical
+at 64 and 256 tokens, but the harder arithmetic prompt diverges by token ~15:
+baseline `Step-by-Step**` → candidate `Step-by-Step Solution**`, and
+`Train B leaves at 10` → `Train B leaves at 1`. The F16 route dequantizes Q8_0
+weights and narrows F32 activations to F16, so `wmma_f32_16x16x16_f16` products
+differ from the baseline int8×int8→int32 WMMA path; on borderline tokens the
+argmax flips.
+
+**Decision: rejected.** The optimize-kernel contract is to preserve the product
+and accumulation sequence; F16×F16→F32 cannot. Because our baseline is *already*
+int8 WMMA, the bit-exact way to recover this +4 % is **not** a port — it is to
+tune the existing int8 WMMA `mul_mat_q` for the dense prefill shapes (M≈2048–4096,
+K=2048, N=tokens): the column-tile width (`mmq_x`), `mmq_y`, warp count and the
+`ncols_grid_max`/`mmq_x_request` knobs the struct already exposes. That keeps the
+int8×int8→int32 products exact. The F16 experiment is kept here as evidence of the
+tuning headroom, not as a candidate.
+
+*Update:* the `mmq_x` width knob was tested (see the next record) and is neutral —
+the default already uses the widest tile. The remaining headroom is in the kernel's
+warp/LDS/epilogue structure, not in the exposed tile-geometry knobs.
+
+**Ceiling check (`gfx1151_peak`, exclusive GPU, 2.90 GHz, 20 CUs).** int8 WMMA
+is not slower than float WMMA on this part, so the +4 % cannot be an int8-vs-f16
+hardware gap — it is tuning:
+
+| path | sustained |
+| --- | ---: |
+| WMMA int8 | 56.99 TOPS |
+| WMMA fp16 | 55.19 TFLOPS |
+| WMMA bf16 | 55.20 TFLOPS |
+| VALU fp32 fma | 23.81 TFLOPS |
+
+The dense `mul_mat_q` therefore has the same matrix-core ceiling available to it
+as the F16 kernel; the headroom is in tile/warp selection, not the instruction.
+
+## Shared-input activation quantize dedup (neutral — launch-overhead-bound)
+
+The pp16384 profile shows `quantize_mmq_q8_1` at 3.6 % of GPU-busy over 3960
+launches. The linear-attention input projections (`ssm_qkv`, `ssm_gate`,
+`ssm_alpha`, `ssm_beta`) all read the same activation `x`, and the attention
+projections (`attn_q`, `attn_k`, `attn_v`) all read the same `x`. Each dense
+`mul_mat_q` call quantizes `x` independently, so the shared quantize is issued
+4× (linear) and 3× (attention) per layer instead of once.
+
+**Lever tried.** Factor the quantize and the GEMM out of `qfn_mmq_dense_impl`
+into `mmq_quantize_src1` + `qfn_mmq_dense_gemm<type>`, and add
+`qfn_mmq_q8_0_dense_group` (quantize `x` once into one `block_q8_1_mmq` scratch,
+then run one MMQ GEMM per weight). Exposed as `GemmGroupQ8_0` and dispatched from
+`LinearAttentionBatch`/`AttentionBatch` when `tokens > kMaxVerifyRows`, every
+member is Q8_0, and the input widths match; otherwise fall back to the
+per-projection `proj`.
+
+**Bit-exactness (greedy, exclusive GPU).** The quantized activation depends only
+on `(tokens, K)`, not on any weight's output width, so the group's single buffer
+is byte-identical to each per-call buffer and every GEMM reads the same bytes.
+Both the 3200-token `long` prompt (1051 B) and the harder `hard` prompt (717 B)
+are byte-identical at 256 tokens greedy.
+
+**Throughput (interleaved B,N,B,N, exclusive GPU, `-r 3`).**
+
+| depth | baseline | candidate | delta |
+| ---: | ---: | ---: | ---: |
+| pp2048  | 2272.4 | 2251.0 | −0.9 % (R1 −1.9 %, R2 +0.05 %) |
+| pp8192  | 2190.0 | 2163.1 | −1.2 % |
+| pp16384 | 2011.7 | 2011.1 | −0.03 % (wash) |
+
+**Decision: not retained.** Bit-exact and strictly less work (≈5 fewer quantize
+launches per layer per chunk), but the saving is launch-overhead-bound: a
+`[2048×2048]` quantize is ~0.1 ms and the removed launches are ~µs each, so the
+total is well under the ±1 % run-to-run floor. pp16384 is a wash and pp2048 flips
+sign between rounds. The change was reverted; the lever is recorded so the
+quantize-dedup idea is not retried expecting a win. The dense-GEMM headroom is in
+`mul_mat_q` tile tuning (see the F16 record above), not in the quantize.
+
+## Dense `mul_mat_q` column-tile width: `mmq_x` 80 → 128 (neutral — default already optimal)
+
+The F16 record points at tile tuning as the bit-exact way to recover the dense
++4 %. The default selection loop in `mul_mat_q_case` picks the *widest* usable
+`mmq_x` (fewest column tiles), so dense currently runs at the host cap of **80**
+(`get_mmq_x_max_host`). That cap's comment says it was swept only for the
+**IQ2_XXS routed-MoE** workload, and the device supports up to **128**
+(`get_mmq_x_max_device`). Dense token columns are contiguous and padding-free, so
+a wider tile could amortize the per-tile dequant better than the scattered routed
+buckets that set the 80 cap.
+
+**Lever tried.** Let a caller *request* a width up to the device max while keeping
+the default loop bounded to the host cap (so routed/MoE defaults are untouched):
+widen the `mmq_x_request` gate to `get_mmq_x_max_device()` and set
+`args.mmq_x_request = 128` in `qfn_mmq_dense_impl`.
+
+**Bit-exactness (greedy, exclusive GPU).** Non-split-K (`use_stream_k=false`)
+means each output element's K-reduction is one warp's fixed template loop,
+independent of the grid tile width. Both the 3200-token `long` prompt (1051 B) and
+the `hard` prompt (717 B) are byte-identical at 256 tokens greedy.
+
+**Throughput (interleaved B,N,B,N, exclusive GPU, `-r 3`).**
+
+| depth | baseline (x=80) | candidate (x=128) | delta |
+| ---: | ---: | ---: | ---: |
+| pp2048  | 2259.6 | 2267.2 | +0.34 % (R1 +0.71 %, R2 −0.03 %) |
+| pp8192  | 2184.9 | 2169.8 | −0.69 % (R1 −1.52 %, R2 +0.15 %) |
+| pp16384 | 2010.3 | 1998.7 | −0.58 % (R1 −1.12 %, R2 −0.03 %) |
+
+**Decision: not retained.** Bit-exact but neutral-to-slightly-negative, exactly as
+the cap comment predicted for the routed sweep (64/96/112/128 all tie 80 within
+noise) — and now confirmed for the dense Q8_0 shapes too. The default already uses
+the widest tile, so there is no width left to win. The dense-GEMM headroom is
+therefore **not** a knob tweak: recovering the F16 kernel's +4 % bit-exactly needs a
+purpose-built int8 WMMA dense kernel (its own warp/LDS/epilogue structure), not a
+retune of the generic `mul_mat_q` tile geometry. Reverted.
+
+## Routed MoE fused gate+up (`kPair`): one launch, bit-exact (retained)
+
+The routed MoE gate and up projections each launched a separate
+`RoutedF16GEMMKernel` over the same 64-row tile map and the same F16 activation
+rows: the gate wrote F32 to `pf_gate_`, then the up kernel read it back and applied
+SwiGLU. `RoutedF16GEMMKernel` already carried an un-dispatched `kPair` path (a 5th
+template param plus a `w_up` argument) that decodes the gate rows from `w` and the
+matching up rows from `w_up` in one launch and applies SwiGLU in the epilogue — it
+was simply never wired up. The pp16384 profile puts `RoutedF16GEMMKernel` at 21 %
+of GPU-busy, so this is the routed-side lever.
+
+**Lever.** Dispatch `kPair`. Add `LaunchRoutedGatedF16<BN>` + `RoutedGatedF16Gemm`
+(`grid.x = ceil(m/64)`, `BN` 64 or 128, gate as `w`, up as `w_up`, F16 out only).
+The executor builds a *second* paired tile map after the 64-row map — one entry per
+`pair_rows`-row tile, `pair_rows = 128` when it cuts the launch to at most three
+quarters of the 64-row tile count — and, when `wmma && tokens >= 1024 &&
+gate_type == up_type`, replaces the two launches with one fused call. The down
+projection is unchanged (it reads the same F16 activation rows indexed by slot).
+
+**Bit-exactness (greedy, exclusive GPU).** The fused epilogue reproduces the
+separate up epilogue's `up * SiluF(gate)` exactly (`silu = gate * SigmoidF(gate)`,
+then `up * silu`); the K accumulation order is unchanged (same `BK = 2` WMMA loop —
+`BN` only changes the token-tile count, not a given element's reduction), and the
+in-register gate accumulator equals the F32 `pf_gate_` the separate path round
+trips. `-ffast-math` is off for this target, so nothing reassociates. Both the
+3200-token `long` prompt (1051 B) and the harder `hard` prompt (717 B) are
+byte-identical at 256 tokens greedy.
+
+**Throughput (interleaved B,N,B,N, exclusive GPU; `-r 3` at ≤16K, `-r 1` at ≥32K).**
+
+| depth | baseline | fused | delta |
+| ---: | ---: | ---: | ---: |
+| pp2048   | 2268.8 | 2286.7 | **+0.79 %** |
+| pp8192   | 2175.4 | 2201.2 | **+1.19 %** |
+| pp16384  | 2010.2 | 2042.2 | **+1.59 %** |
+| pp32768  | 1767.1 | 1792.1 | **+1.41 %** |
+| pp65536  | 1379.5 | 1399.5 | **+1.46 %** |
+| pp102400 | 1125.0 | 1143.9 | **+1.68 %** |
+
+**Decision: retained.** Bit-exact and positive at every depth, strongest at long
+context (pp16384 +1.6 % both rounds, tight error bars). The fused kernel reads `x`
+once, halves the gate+up launches, and drops the gate's F32 write/read round trip.
+It is now the default for chunks of ≥1024 tokens whose gate and up share an
+encoding; smaller chunks and mismatched encodings keep the two-launch path.
