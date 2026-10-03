@@ -2985,6 +2985,9 @@ public:
       throw std::runtime_error("Failed to create Qwen3.6-35B-A3B session: " +
                                error);
     }
+    // Serve decodes with MTP speculative decoding, so the draft cache must be
+    // filled during prefill. Enable it before the first Sync.
+    session_->SetMtpEnabled(true);
     session_->SetDraftLimits(min_drafts, max_drafts);
   }
 

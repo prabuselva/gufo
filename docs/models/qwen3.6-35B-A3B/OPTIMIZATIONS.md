@@ -41,7 +41,8 @@ full-attention layers are O(n²); the 30 GDN layers and MoE are O(n)).
    32 query rows × 2 heads/block. Replaces the scalar `AttentionPrefillTiled`
    (kept as oracle; parity in `qwen36_a3b_rocm_attention_test`).
 2. **FP16 KV mirror** (`KvCacheWriteF16`) — written alongside every fp32 KV
-   write so the WMMA kernel reads half the bytes; MTP caches stay fp32.
+   write so the WMMA kernel reads half the bytes; the MTP draft caches gained
+   their own mirrors later (see the draft-skip section below).
 3. **Row-split GDN delta loop** (`GdnDeltaLoopRowSplitKernel`,
    `kernels.hip.cpp:~1624`) — prefill-only (`snap==nullptr`): 4 lanes per
    128-wide state row, 8 row-groups/wave, register-resident fp32 state, DPP
@@ -220,6 +221,38 @@ Served sweep (greedy, pinned `k`): **k = 2 → 60.8 tps** (90.6 %
 acceptance, 128-token completion), k = 3 → 56–58 tps, k = 4 (CLI 6
 clamped) → 49 tps. Acceptance falls faster than the verify rows amortize
 beyond k = 2; the adaptive default should settle there.
+
+## MTP draft skip-by-default + f16 KV mirror (prefill collapse fix)
+
+Plain (non-speculative) prefill was running the MTP draft layer through the
+scalar oracle attention (`AttentionPrefillTiled`, 19.3 % of pp16384 GPU time):
+`MtpPrefillChunk` passed null f16 mirrors to `AttentionBatch`, so the draft fell
+off the WMMA path, and the draft block ran unconditionally on `model.has_mtp()`
+even when the session would never decode with MTP. This — not the head-major
+coalescing gap — was the dominant cause of the depth-dependent collapse; the
+earlier "4× redundant read" note in the Phase 1/2a section was the wrong lever.
+
+Fix (matches the reference, which gates the draft on the speculative session
+mode):
+
+1. **Skip by default** — `Executor::mtp_enabled_` (default `false`); `Prefill`
+   only calls `MtpPrefillChunk` when it is set. `Session::SetMtpEnabled` exposes
+   it and `DecodeStep` also requires it, so a skipped-draft session can never
+   read a stale cache. The flag must be set before the first `Sync` (the draft
+   cache is filled during prefill and cannot be rebuilt lazily). Serve, the
+   speculative bench `tg` loop and interactive chat enable it; plain bench `pp`
+   leaves it off.
+2. **f16 KV mirror for the draft** — `mtp_k_cache_f16_`/`mtp_v_cache_f16_`,
+   written by `AttentionBatch`/`Attention` alongside the fp32 draft cache, so
+   when MTP *is* enabled the draft uses the same `WmmaCausalAttentionKernel` as
+   the trunk (supersedes "MTP caches stay fp32" above).
+
+Exclusive-GPU `gufo bench` (same machine/session as BENCHMARKS.md): pp16384
+1515 → 1883 t/s (+24 %), pp8192 1778 → 2040 (+15 %), curve flattened (peak
+2172). MTP acceptance is bit-identical to the pre-fix scalar draft (n=1 56/64,
+n=2 63/90) with an identical output hash — the WMMA draft reproduces the oracle
+exactly. The residual 84 % at 16384 vs the reference is the head-major packed-KV
+coalescing gap (see BENCHMARKS.md), the next lever.
 
 ## Roofline and open work
 

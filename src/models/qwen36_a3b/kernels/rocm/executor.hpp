@@ -90,6 +90,15 @@ public:
     return max_context_;
   }
 
+  /// Enables building the MTP draft cache during prefill and using speculative
+  /// decoding. Off by default: a plain prefill never touches the draft block,
+  /// so it skips the draft's attention entirely. Callers that will decode with
+  /// MTP (serve, speculative bench) enable this before the first Prefill; the
+  /// flag must not change mid-session because the draft cache is filled during
+  /// prefill and cannot be rebuilt lazily afterwards.
+  void SetMtpEnabled(bool enabled) noexcept { mtp_enabled_ = enabled; }
+  [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
+
 private:
   Executor(const Config& c, const DeviceModel& model) : c_(c), model_(model) {}
 
@@ -145,6 +154,7 @@ private:
   std::uint32_t max_context_{0};
   std::uint32_t position_{0};
   std::uint32_t mtp_position_{0};
+  bool mtp_enabled_{false};
   /// Trunk position before the most recent Verify, the rewind base.
   std::uint32_t verify_base_pos_{0};
 
@@ -298,6 +308,11 @@ private:
   std::vector<float*> gdn_hist_snap_;
   float* mtp_k_cache_{nullptr};
   float* mtp_v_cache_{nullptr};
+  // Half-precision mirrors of the draft KV caches, consumed by the WMMA
+  // prefill attention kernel (same role as k_cache_f16_/v_cache_f16_ for the
+  // trunk). Without them the draft falls back to the scalar oracle.
+  void* mtp_k_cache_f16_{nullptr};
+  void* mtp_v_cache_f16_{nullptr};
 
   std::vector<void*> allocations_;
 

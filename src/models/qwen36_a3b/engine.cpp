@@ -139,6 +139,10 @@ void Session::SetDraftLimits(std::uint32_t min_drafts,
   draft_k_ = draft_max_;
 }
 
+void Session::SetMtpEnabled(bool enabled) {
+  executor_->SetMtpEnabled(enabled);
+}
+
 Session::~Session() = default;
 
 std::uint32_t Session::Position() const noexcept {
@@ -249,7 +253,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // so a hit costs ~1.2 tokens' time. Greedy samplers take the exact-match
   // path; temperature sampling uses the standard accept-and-residual rule.
   std::size_t k = 0;
-  if (model_->HasMtp() && max_tokens >= 2 &&
+  if (model_->HasMtp() && executor_->mtp_enabled() && max_tokens >= 2 &&
       !sampler.config().penalties_enabled() &&
       tokens_.size() + 2 <= ContextSize()) {
     k = std::min<std::size_t>(draft_k_, max_tokens - 1);

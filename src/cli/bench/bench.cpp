@@ -1311,6 +1311,10 @@ int RunQwen36A3BBenchmark(
         }
         session->Reset();
         if (mtp) {
+          // Speculative decode consumes the draft cache, so it must be filled
+          // during the prefill below; enable it before Sync. The pp loop leaves
+          // it off so plain prefill skips the draft block.
+          session->SetMtpEnabled(true);
           session->SetDraftLimits(options.min_draft_tokens,
                                   options.draft_tokens);
         }
