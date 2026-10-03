@@ -76,8 +76,10 @@ not methodology:
   ([EXPERIMENTS.md](EXPERIMENTS.md)) adds ~1 % more, to a peak 2203 (pp2048)
   and 1953 at 16 K (the table's gufo column). Hoisting the GDN decay/beta/q·k
   out of the serial recurrence (prep kernels, [EXPERIMENTS.md](EXPERIMENTS.md))
-  adds a further ~2 % bit-exact, so the current tree is ~2 % above the table at
-  every depth (measured pp2048 +3.4 %, pp16384 +2.8 %, pp102400 +1.6 %). The
+  adds a further ~2 % bit-exact, and prefetching the recurrence's critical-path
+  scalars one token ahead adds ~0.5 % more, so the current tree is ~2-3 % above
+  the table at every depth (prep measured pp2048 +3.4 %, pp16384 +2.8 %,
+  pp102400 +1.6 %; prefetch +0.4-0.8 % on top). The
   residual 88 % at 16384 is the remaining kernel-efficiency gap in the attention
   core. The reference's
   **head-major packed KV fast path** (`attention_wmma.hip`, gated to
