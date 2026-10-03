@@ -18,16 +18,55 @@ start_pos=98304 (the 100K last chunk). Microbench `tools/bench/attn_causal_bench
 | 32 keys / 16 waves tile | microbench | 3.22 ms (regress) | rejected |
 | 3 blocks/CU | microbench | 1.745 ms (vs 1.693 at 2) | rejected |
 | `kVtPad=0` (no V^T pad) | microbench | 1.993 ms (regress) | rejected |
+| Head-major packed KV (repack + pre-transposed V, ported from reference `attention_wmma.hip`) | end-to-end prefill | −4 % @32K, −6 % @64K, −9 % @100K (interleaved A/B; bit-exact, 0/4.2 M mismatches) | **rejected** |
 
-**Key finding:** the WMMA attention kernel is LDS-transpose-bound in isolation
-but **global-KV-bandwidth-bound** in the real 100K path. Ablations on the
-production tile put the global K/V load at 31–50 % of kernel time; packed-V and
-the swizzle only reduce LDS transpose conflicts, so a 1.15× microbench gain
-collapses to ~0.8 % end-to-end. The dominant 100K cost is the **4× redundant
-global KV re-read**: the grid `(query_tiles, 8 head_pairs)` with `kWmmaHeads=2`
-streams each KV head's prefix from HBM once per head-pair block. The next lever
-is one block covering a full KV group (all `heads_per_kv` query heads) to cut
-that traffic ~4× — not further LDS-transpose tuning.
+**Key finding (corrected for the packed production kernel):** the earlier
+"global-KV-bandwidth-bound / 4× redundant re-read is dominant" note was measured
+on the **unpacked** kernel, where the global K/V load really is ~49 % of time
+(`ablate: no K/V global loads` 1.707 ms vs unpacked 3.345 ms). Once packed-V +
+swizzle + prefetch shipped, the bottleneck moved: a fresh phase ablation of the
+**production packed tile** at the 100 K chunk (16 q / 2 kv, head_dim 256,
+b=2048, start_pos=98304, `attn_causal_bench -DKQUERY_HEADS=16 -DKKV_HEADS=2`)
+shows the kernel is **WMMA-compute-bound**, not KV-bound:
+
+| ablation (packed `pipe: all three` = 1.811 ms) | ms | % of kernel |
+| --- | --- | --- |
+| no S wmma | 1.224 | 32.4 % |
+| no PV wmma | 1.398 | 22.8 % |
+| no V transpose | 1.632 | 9.9 % |
+| no K/V global load | 1.717 | **5.2 %** |
+| no softmax | 1.793 | 1.0 % |
+
+So the two matrix multiplies are ~55 % of the kernel and the global KV traffic
+is only ~5 %. This **prices out the full-KV-group lever**: even deleting *all*
+global KV traffic saves 5 %, and covering a full KV group forces `kWaves=16`,
+which breaks the packed-V mapping (it assumes 8 waves × 32 dims = 256) and drops
+back to the unpacked path — a ~45 % loss (unpacked 3.345 vs packed 1.811) to
+chase a ≤5 % traffic cut. Rejected without building it.
+
+The reference's head-major packed-KV fast path was ported bit-exactly and
+measured to test whether it closes the long-context gap. It does not: the
+repack reads the whole `[0, context_end)` prefix and writes a head-major copy on
+every prefill chunk, so it *adds* global KV traffic (the very term that
+dominates the *unpacked* kernel) to save an LDS transpose our packed kernel
+already performs cheaply. The loss grows with context (−4 % → −9 %), the
+opposite of the O(n²) win the reference sees only because its unpacked path is
+the slow one. Reverted; the packed WMMA kernel stays the default.
+
+The only remaining structural lever is eliminating the V LDS transpose (~10 %
+ceiling, the `no V transpose` row) by storing the f16 V mirror **pre-transposed
+into the WMMA fragment layout** — the reference's design, and unlike the repack
+it is amortized (transpose each token once at KV-write time, O(1)/token, not
+O(context)/chunk). It is *not* pursued here: a simple `[dim][position]` mirror
+makes each PV fragment lane read 16 contiguous halves from 32 different dim rows
+(32 × 32 B transactions, uncoalesced), which can erase the transpose saving, and
+a coalesced variant must bake the 16 × 16 fragment tiling into the cache layout
+— fragile, tiling-coupled, and touching `KvCacheWriteF16`, the dense + sparse
+attention reads, the draft mirror and their tests. With the ceiling at ~10 % of
+attention and the last comparable change regressing end-to-end, its expected
+value does not justify that risk; the attention core is left at its packed
+default and the residual long-context gap is WMMA matmul efficiency (~34 % of
+peak), not data movement.
 
 ## Prefill attention — opt-in sliding-window + sink sparsity
 
@@ -296,3 +335,237 @@ decode kernel matches the reference — a strict like-for-like `gufo bench`
 comparison (same flags, same 16-token prefix, greedy) still shows real gaps to
 the reference on greedy decode, long-context prefill and MTP n=2, root-caused in
 [BENCHMARKS.md](BENCHMARKS.md) "Reading the numbers".
+
+## Prefill fusion — GDN conv + q/k RMSNorm in one launch
+
+The decode fusion 3 above had no prefill counterpart: `Executor::LinearAttentionBatch`
+ran the chunked depthwise causal conv (`GdnConvPrefill`) and then a separate
+per-head RMSNorm of the q and k groups (`GdnNormQkPrefill`) — two launches over
+the 30 linear-attention layers per prefill chunk, with the convolved q/k written
+to `pf_convolved_` only to be read straight back by the norm. Profiling the
+16k prefill put the GDN front-end at ~17 % of kernel time against the reference's
+~11 %, so this round-trip was the lowest-risk slice of that gap.
+
+`GdnConvNormQkPrefill` gives each block one (token, head) and each thread one
+channel: the conv is the same per-channel tap dot (halo from the qkv rows for
+`s >= 0`, from the history for `s < 0`) plus `DSilu`, and the q/k blocks reduce
+the head's convolved values with the identical `BlockReduceSum` and
+`blockDim == head_dim` as `GdnNormQkPrefill`, so `qn`/`kn` are bit-identical
+while the convolved q/k never leaves the block. The value block still writes the
+convolved value the delta recurrence consumes; the history is left for
+`GdnHistoryUpdate` to advance, exactly as before.
+
+The oracle test `qwen36_a3b.rocm_gdn` (`TestFusedConvNormQkPrefill`) compares the
+fused launch against `GdnConvPrefill` + `GdnNormQkPrefill` on the model's
+16-key/32-value/128-wide geometry at 1/2/5/17/64 tokens and reports qn, kn and
+the value half of convolved all `bit-exact: yes`; the existing prefill-vs-decode
+checks still pass within 1e-4.
+
+Interleaved same-session A/B (`gufo bench`, depths 2048/8192/16384, 2 passes ×
+3 repetitions, exclusive GPU, baseline and candidate run back-to-back per pass to
+cancel drift):
+
+| depth | baseline (pass 1, 2) | candidate (pass 1, 2) | gain |
+| ---: | ---: | ---: | ---: |
+| pp2048 | 2163.4, 2171.6 | 2194.4, 2192.1 | +1.2 % |
+| pp8192 | 2086.2, 2084.6 | 2114.7, 2102.5 | +1.1 % |
+| pp16384 | 1924.7, 1922.9 | 1940.0, 1938.4 | +0.8 % |
+
+**Decision: retained, always-on.** `GdnConvNormQkPrefill` is the default in
+`Executor::LinearAttentionBatch`. The candidate wins all six paired comparisons,
+and at pp16384 — where the baseline is tight (±2.5) — the +15 t/s gain is far
+outside the run-to-run band. It is bit-identical and removes one launch plus the
+convolved q/k round-trip per linear layer per chunk. The remaining GDN gap is now
+the delta recurrence itself, which is latency-bound (sequential over tokens) and
+needs a chunked reformulation rather than an epilogue.
+
+## Why the reference fork is faster at long context: a whole-pipeline profile diff
+
+Question: `gufo_slimsami` reaches pp102400 = 1331 t/s against our 1114 t/s
+(1.19x), and the gap widens with depth (88 % at 32k, 85 % at 65k, 84 % at 100k).
+Earlier rounds assumed the gap lived in the WMMA attention kernel. To test that
+without guessing, both binaries were profiled over an identical exclusive-GPU
+`bench --n-prompt 102400 --n-gen 1 --repetitions 1` run with
+`tools/prof/prof.py run --stages qwen`, then compared by kernel category (the
+two forks name kernels differently, so the shared stage map only matches the
+reference's names). The measured throughput was re-confirmed without the
+profiler first (1113.67 vs 1331.15 t/s), so the profile is not distorting it.
+
+Whole-run totals (both include the warm-up and timed passes; attention work is
+N^2/2 and therefore chunk-independent, so the totals are directly comparable):
+
+| metric | ours | reference |
+| --- | ---: | ---: |
+| kernel-time sum | 175.6 s | 151.4 s |
+| wall span | 200.8 s | 151.8 s |
+| idle in span | 25.2 s (12.6 %) | 0.43 s (0.3 %) |
+| dispatches | 372 140 | 75 500 |
+| attention kernel | 85.2 s | 67.4 s |
+| GDN (linear-attn) kernels | 17.1 s | 9.8 s |
+
+Three compounding causes, largest first:
+
+1. **Attention kernel — head-major packed path (ours +26 %).** The reference
+   runs `WmmaCausalAttention<16,2,32,16,true>` (`kHeadMajor=true`) as its
+   default for chunks >= 1024. It pre-packs the KV prefix into a WMMA-fragment
+   ordered buffer (`PackAttentionHeads`, only 0.4 % of time) so the kernel loads
+   V *directly as WMMA fragments* — no LDS transpose and no per-16-key barrier
+   (`attention_wmma.hip:266-279`). Our build runs the non-head-major packed-V
+   kernel that still does the strided global read + LDS transpose every tile.
+   Same N^2/2 work, 85.2 s vs 67.4 s. This is the head-major path ported and
+   reverted earlier this session; the revert measured a regression, so a
+   faithful re-port must reproduce the reference's fragment-ordered pack and its
+   direct `LoadFrag` V read, not a generic head-major layout.
+
+2. **GDN recurrence and epilogues (ours +74 %).** Ours spends 17.1 s on the 31
+   linear layers (`GdnDeltaLoopRowSplit` 9.5 s + `GdnOutNormPrefill` 3.9 s +
+   `GdnConvNormQkPrefill` 3.8 s) against the reference's 9.8 s
+   (`BatchedDeltaNetRowSplit` 5.7 s + `BatchedSSMConv` 1.9 s +
+   `BatchedFusedSSMPostNormGate` 1.7 s + `DeltaNetPrepKq` 0.6 s). The reference
+   fuses post-norm+gate+quantize and qk-norm+rope+kv-write into single batched
+   kernels; ours runs more, smaller, less-fused launches. The delta recurrence
+   itself is also slower per unit work because ours uses ~2x smaller prefill
+   chunks, doubling the per-chunk state load/store overhead of the sequential
+   recurrence.
+
+3. **Dispatch / launch-bound idle (ours 372k dispatches, 12.6 % idle vs 75k,
+   0.3 %).** Ours launches ~5x more kernels. The single largest contributor is a
+   per-token embedding loop (`executor.cpp:1001-1005`) that fires one 32-thread
+   `EmbedRowQ8_0` per token — 204 817 launches (about 2x the 102 400 tokens over
+   two passes) — where the reference issues one `LaunchBatchedEmbeddingLookup`.
+   Ours also caps `prefill_chunk_` at 2048 (`executor.cpp:222`, to bound the
+   MoE scratch near 230 MB) while the reference uses ~4096, halving its
+   per-chunk dispatch count.
+
+**Conclusion.** The long-context gap is not one magic kernel. It is (a) the
+head-major attention fast path, (b) broader GDN fusion/batching, and (c) larger
+chunks plus batched embedding that remove launch-bound idle. Ranked by expected
+throughput impact and risk: head-major attention is the only lever large enough
+to close most of the 19 % gap but is the fragile, tiling-coupled path already
+reverted once; batched embedding is the safest dispatch win (removes ~55 % of
+our launches, numerically identical) but mostly attacks idle rather than the
+timed-pass GPU busy time; the GDN recurrence needs the chunked reformulation
+already noted above.
+
+### Attempted lever: batched prefill embedding (neutral, not retained as a win)
+
+Cause 3 above names the per-token embedding loop (`executor.cpp:1001-1005`,
+204 817 `EmbedRowQ8_0` launches over a 100k prefill). A batched `EmbedRows`
+(grid over `rows x q8_blocks`, token ids copied once to a device buffer
+`pf_tokens_`) replaces the loop with one launch. The per-element arithmetic is
+unchanged, so each row is bit-identical; a greedy `prompt` over a 3200-token
+(2-chunk) prefix produced byte-identical generated text on the baseline and the
+candidate (only the model-load timing line differed).
+
+Interleaved same-session A/B (baseline = fused-GDN binary, candidate = +batched
+embedding; 3 passes, exclusive GPU):
+
+| depth | baseline median | candidate median | delta |
+| ---: | ---: | ---: | ---: |
+| pp32768 | 1698 | 1722 | +1.4 % (within noise) |
+| pp102400 | 1110 | 1112 | +0.2 % (within noise) |
+
+**Decision: throughput-neutral, not committed as a performance win.** Embedding
+is ~0.2 % of prefill GPU time, so removing its launches cannot move the timed
+pass; the 12.6 % idle is not embedding-launch-bound (it is dominated by the
+large host-side gaps around model setup, not the per-token kernels). The change
+is correct and strictly reduces dispatches, but it does not close the long-context
+gap, which lives in the attention kernel (cause 1) and the GDN recurrence
+(cause 2). Reverted to keep the working tree focused on levers that move the
+measured number.
+
+## Short-context profile diff (pp16384): the gap is GDN, not attention
+
+Established the short-context gap (interleaved, exclusive GPU, 3 passes, ours =
+fused-GDN binary, ref = gufo_slimsami):
+
+| depth | ours median | ref median | ratio |
+| ---: | ---: | ---: | ---: |
+| pp2048 | 2174 | 2387 | 91.1 % |
+| pp8192 | 2121 | 2344 | 90.5 % |
+| pp16384 | 1936 | 2205 | 87.8 % |
+| pp102400 | 1110 | 1331 | 84 % |
+
+A ~9 % gap exists even at pp2048 where attention is negligible, so most of the
+gap is **context-independent per-token work**, not the attention quadratic.
+Profiled both binaries at pp16384 (`prof.py run --stages '' --top 30`, DBs in
+`/tmp/opencode/prof_ours16k`, `/tmp/opencode/prof_ref16k`). Per-stage totals:
+
+| stage | ours | ref | delta |
+| --- | ---: | ---: | ---: |
+| GDN (delta loop + conv + out-norm + qk) | 2813 ms | 1571 ms | **+1242 ms (+79 %)** |
+| Attention | 2310 ms | 1763 ms | +547 ms (context-dependent) |
+| MoE experts (RoutedF16GEMM + grouped + epilogue) | ~4668 ms | ~4727 ms | ~equal |
+
+The GDN delta (~1242 ms) is essentially the whole 16K prefill gap (~1.03 s);
+MoE is already on par. GDN is linear in tokens, so this gap is present at every
+depth and is the ~9 % floor. Two sub-gaps:
+
+- **Core recurrence**: `GdnDeltaLoopRowSplitKernel` 1541 ms (510 launches,
+  grid 2x32) vs ref `BatchedDeltaNetRowSplitKernel` 899 ms (240 launches, grid
+  1x32). Same RowSplit algorithm, ours +71 %. Ref batches multiple chunks per
+  launch (fewer, larger grids).
+- **Epilogue**: ours `GdnOutNormPrefill` 647 + `GdnConvNormQkPrefill` 621 =
+  1268 ms (2 kernels) vs ref `BatchedSSMConv` 308 +
+  `BatchedFusedSSMPostNormGateQuantizeQ8_1` 265 + `BatchedDeltaNetPrepKq` 91 =
+  664 ms (3 batched/fused kernels). Ours +604 ms.
+
+**Lever: GDN.** Attack the core-recurrence efficiency first (biggest single
+sub-gap, +642 ms, context-independent), then the epilogue fusion. Test at
+pp2048/pp8192/pp16384 before escalating.
+
+## GDN prep kernels: hoist decay/beta/q·k out of the serial recurrence
+
+The row-split recurrence (`GdnDeltaLoopRowSplitKernel`) recomputed, for every
+token, three transcendentals (`expf`/softplus for the decay, sigmoid for beta)
+and a full 4-lane `RowXorAdd` reduction for `k·q` — all redundantly, because all
+256 threads of every block that shares a head computed the same head scalars, and
+the `k·q` dot does not depend on the state row. These sat in the issue slots of
+the serial token loop, which is latency-bound on the state recurrence.
+
+Added two prep kernels that run once per chunk before the loop:
+
+- `GdnPrepAlphaBetaKernel` — `alpha_pre[t,h] = expf(a[h]*softplus(alpha[t,h]+dt[h]))`,
+  `beta_pre[t,h] = sigmoid(beta[t,h])`, one thread per (token, value head).
+- `GdnPrepKqKernel` — `kq_pre[t,kh] = (q·k)*1/sqrt(d)`, four cooperating lanes per
+  (token, key head) accumulating the same eight `float4` in the same order and
+  reducing with the same `RowXorAdd` butterfly as the loop, so the stored value is
+  bit-identical to the in-loop `kq`.
+
+The loop now reads `decay`, `b`, `kq` as three scalars. The reduction *count* for
+`u`/`p` is unchanged (still two `RowXorAdd`); the win is removing one `RowXorAdd`
+plus four transcendentals from the serial loop's critical path.
+
+**Bit-exact.** The prep expressions and the `k·q` accumulation order/reduction
+match the removed in-loop code operand-for-operand. The GDN unit test
+(`qwen36_a3b.rocm_gdn`, prefill-vs-decode and the snapshot verify path) passes,
+and a greedy `prompt` over a 3200-token (2-chunk) prefix is byte-identical to the
+fused-GDN baseline (180 bytes, only the model-load timing line differs).
+
+**Throughput (interleaved, exclusive GPU).** Baseline = fused-GDN binary,
+candidate = +prep kernels. Short context (3 passes, `-r 3`), then long-context
+confirmation:
+
+| depth | baseline | candidate | delta |
+| ---: | ---: | ---: | ---: |
+| pp2048 | 2187.8 | 2262.8 | **+3.4 %** |
+| pp8192 | 2115.8 | 2177.4 | **+2.9 %** |
+| pp16384 | 1945.1 | 1999.8 | **+2.8 %** |
+| pp32768 | 1712.0 | 1742.5 | +1.8 % |
+| pp65536 | 1363.5 | 1379.3 | +1.2 % (3 passes) |
+| pp102400 | 1108.6 | 1126.0 | +1.6 % |
+
+Candidate beat baseline in every cell of both short-context passes, far above the
+per-run stddev. The gain shrinks with depth as expected: the per-token saving is
+constant (the loop runs per chunk, capped at 2048) while attention's quadratic
+share grows. A single-pass pp65536 first read −1.5 %; three interleaved passes
+resolved it to +1.2 % (candidate stable 1385/1377/1376).
+
+The short-context A/B above was measured with the (neutral) batched-embedding
+change still present. After reverting embedding to per-token `EmbedRow`, prep
+alone re-measured **+1.96 % (pp8192)** and **+1.95 % (pp16384)**, still bit-exact —
+so the recurrence win stands on its own.
+
+**Decision: retained as the default.** Bit-exact, no env switch, positive at every
+depth. The next GDN sub-gap (core-recurrence launch batching, epilogue fusion)
+remains open.

@@ -1765,6 +1765,59 @@ __global__ void GdnNormQkPrefillKernel(const float* convolved, float* qn,
   }
 }
 
+// Fused prefill GDN front-end: the batched depthwise causal conv and the
+// per-head RMS norm of the q and k groups in one launch, mirroring the decode
+// GdnConvNormQkKernel. Each block owns one (token, head); each thread owns one
+// channel of that head. The conv is the same per-channel dot over the kernel
+// taps as GdnConvPrefill (reading the halo from `qkv` for in-chunk positions
+// and from `history` for the leading taps), so the convolved value is
+// bit-identical. The q and k blocks then reduce the head's convolved values
+// with the identical BlockReduceSum and blockDim (head_dim) as
+// GdnNormQkPrefill, so qn/kn are bit-identical to the unfused conv + norm chain
+// while the convolved q/k never round-trips through global memory. The v blocks
+// write the convolved value the delta recurrence consumes. History is advanced
+// separately by GdnHistoryUpdate, so this kernel leaves `history` untouched.
+__global__ void GdnConvNormQkPrefillKernel(
+    const float* qkv, const float* conv_w, const float* history,
+    float* convolved, float* qn, float* kn, std::uint32_t tokens,
+    std::uint32_t channels, std::uint32_t kernel, std::uint32_t k_heads,
+    std::uint32_t v_heads, std::uint32_t head_dim, float eps) {
+  __shared__ double reduce[32];
+  const std::uint32_t heads = 2U * k_heads + v_heads;
+  const std::uint32_t head = blockIdx.x % heads;
+  const std::uint32_t token = blockIdx.x / heads;
+  const std::uint32_t i = threadIdx.x;
+  const std::size_t ch = static_cast<std::size_t>(head) * head_dim + i;
+  const std::size_t idx = static_cast<std::size_t>(token) * channels + ch;
+  const float* w = conv_w + ch * kernel;
+  float acc = w[kernel - 1] * qkv[idx];
+  for (std::uint32_t k = 0; k + 1 < kernel; ++k) {
+    const std::int64_t s = static_cast<std::int64_t>(token) -
+                           static_cast<std::int64_t>(kernel - 1) +
+                           static_cast<std::int64_t>(k);
+    const float xv =
+        s >= 0 ? qkv[static_cast<std::size_t>(s) * channels + ch]
+               : history[static_cast<std::size_t>(
+                             static_cast<std::int64_t>(kernel - 1) + s) *
+                             channels +
+                         ch];
+    acc += w[k] * xv;
+  }
+  const float c = DSilu(acc);
+  if (head < 2U * k_heads) {
+    const bool is_key = head >= k_heads;
+    const std::uint32_t local = is_key ? head - k_heads : head;
+    float* dst = (is_key ? kn : qn) +
+                 (static_cast<std::size_t>(token) * k_heads + local) * head_dim;
+    const double ss = static_cast<double>(c) * c;
+    const float scale =
+        1.0f / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce)) + eps);
+    dst[i] = c * scale;
+  } else {
+    convolved[idx] = c;
+  }
+}
+
 // Gated delta-rule recurrence over a chunk, sequential over tokens but fully
 // on-device. One warp owns kRows state rows of one value head; each lane
 // keeps kCols state columns (head_dim = 64 * kCols) in registers across the
@@ -1891,6 +1944,60 @@ __device__ __forceinline__ float RowXorAdd(float v) {
   return v;
 }
 
+// Per-token decay and beta, precomputed once per (token, value head) so the
+// recurrence loop reads two scalars instead of running expf/softplus/sigmoid.
+// The expressions match GdnDeltaLoopRowSplitKernel exactly, so every value is
+// bit-identical; only the location of the work changes (out of the serial
+// token loop, and computed once instead of redundantly by all 256 threads of
+// every block that shares a head).
+__global__ void GdnPrepAlphaBetaKernel(const float* alpha, const float* beta,
+                                       const float* a, const float* dt,
+                                       float* alpha_pre, float* beta_pre,
+                                       std::uint32_t count,
+                                       std::uint32_t v_heads) {
+  const std::size_t i =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const std::uint32_t h = static_cast<std::uint32_t>(i % v_heads);
+  alpha_pre[i] = expf(a[h] * DSoftplus(alpha[i] + dt[h]));
+  beta_pre[i] = DSigmoid(beta[i]);
+}
+
+// Per-token q.k dot for a key head, precomputed for the recurrence output term.
+// The four cooperating lanes accumulate the same eight float4 in the same order
+// as GdnDeltaLoopRowSplitKernel and reduce with the same RowXorAdd butterfly,
+// so the stored value equals the in-loop kq bit for bit.
+__global__ void GdnPrepKqKernel(const float* qn, const float* kn, float* kq_pre,
+                                std::uint32_t pairs, std::uint32_t k_heads,
+                                std::uint32_t head_dim) {
+  constexpr int kVec = 8;  // 32 columns / 4 lanes
+  const std::uint32_t pair =
+      blockIdx.x * 8U + (static_cast<std::uint32_t>(threadIdx.x) >> 2);
+  const int seg = static_cast<int>(threadIdx.x) & 3;
+  if (pair >= pairs) {
+    return;
+  }
+  const std::uint32_t kh = pair % k_heads;
+  const std::uint32_t t = pair / k_heads;
+  const std::size_t base =
+      (static_cast<std::size_t>(t) * k_heads + kh) * head_dim;
+  const float4* qp = reinterpret_cast<const float4*>(qn + base);
+  const float4* kp = reinterpret_cast<const float4*>(kn + base);
+  float kq = 0.0F;
+#pragma unroll
+  for (int vi = 0; vi < kVec; ++vi) {
+    const float4 q4 = qp[seg * kVec + vi];
+    const float4 k4 = kp[seg * kVec + vi];
+    kq += k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+  }
+  kq = RowXorAdd(kq) * (1.0F / sqrtf(static_cast<float>(head_dim)));
+  if (seg == 0) {
+    kq_pre[pair] = kq;
+  }
+}
+
 // Row-split gated delta-rule recurrence for a prefill chunk (no per-token
 // snapshots; the Verify path keeps GdnDeltaLoopKernel). head_dim == 128: four
 // lanes cooperate on one 128-wide state row (32 columns each as eight float4),
@@ -1901,12 +2008,11 @@ __device__ __forceinline__ float RowXorAdd(float v) {
 template<std::uint32_t kRowsPerLane>
 __global__ void __launch_bounds__(256)
     GdnDeltaLoopRowSplitKernel(const float* qn, const float* kn,
-                               const float* convolved, const float* alpha,
-                               const float* beta, const float* a,
-                               const float* dt, float* state, float* attn,
-                               std::uint32_t tokens, std::uint32_t k_heads,
-                               std::uint32_t v_heads, std::uint32_t head_dim,
-                               std::uint32_t channels) {
+                               const float* convolved, const float* alpha_pre,
+                               const float* beta_pre, const float* kq_pre,
+                               float* state, float* attn, std::uint32_t tokens,
+                               std::uint32_t k_heads, std::uint32_t v_heads,
+                               std::uint32_t head_dim, std::uint32_t channels) {
   constexpr int kLanesPerRow = 4;
   constexpr int kRowGroups = 32 / kLanesPerRow;            // 8
   constexpr int kRowsPerWave = kRowGroups * kRowsPerLane;  // 8 or 16
@@ -1940,11 +2046,10 @@ __global__ void __launch_bounds__(256)
   const float* v_base = convolved +
                         2 * static_cast<std::size_t>(k_heads) * head_dim +
                         static_cast<std::size_t>(h) * head_dim;
-  const float* a_base = alpha + h;
-  const float* b_base = beta + h;
+  const float* ap_base = alpha_pre + h;
+  const float* bp_base = beta_pre + h;
+  const float* kqp_base = kq_pre + kh;
   float* o_base = attn + static_cast<std::size_t>(h) * head_dim;
-  const float ah = a[h];
-  const float dth = dt[h];
 
   float4 kv[kVec];
   float4 qv[kVec];
@@ -1972,15 +2077,9 @@ __global__ void __launch_bounds__(256)
         qnx[vi] = qp[seg * kVec + vi];
       }
     }
-    const float decay = expf(ah * DSoftplus(*a_base + dth));
-    const float b = DSigmoid(*b_base);
-    float kq = 0.0F;
-#pragma unroll
-    for (int vi = 0; vi < kVec; ++vi) {
-      kq += kv[vi].x * qv[vi].x + kv[vi].y * qv[vi].y + kv[vi].z * qv[vi].z +
-            kv[vi].w * qv[vi].w;
-    }
-    kq = RowXorAdd(kq) * q_scale;
+    const float decay = *ap_base;
+    const float b = *bp_base;
+    const float kq = *kqp_base;
 #pragma unroll
     for (int r = 0; r < kRowsPerLane; ++r) {
       float u = 0.0F;
@@ -2018,8 +2117,9 @@ __global__ void __launch_bounds__(256)
     q_base += k_heads * head_dim;
     k_base += k_heads * head_dim;
     v_base += channels;
-    a_base += v_heads;
-    b_base += v_heads;
+    ap_base += v_heads;
+    bp_base += v_heads;
+    kqp_base += k_heads;
     o_base += attn_stride;
 #pragma unroll
     for (int vi = 0; vi < kVec; ++vi) {
@@ -2290,10 +2390,39 @@ void GdnNormQkPrefill(const float* convolved, float* qn, float* kn,
       convolved, qn, kn, tokens, k_heads, channels, head_dim, eps);
 }
 
+void GdnConvNormQkPrefill(const float* qkv, const float* conv_w,
+                          const float* history, float* convolved, float* qn,
+                          float* kn, std::uint32_t tokens,
+                          std::uint32_t channels, std::uint32_t kernel,
+                          std::uint32_t k_heads, std::uint32_t v_heads,
+                          std::uint32_t head_dim, float eps,
+                          hipStream_t stream) {
+  const dim3 grid(static_cast<std::uint32_t>(tokens) *
+                  (2U * k_heads + v_heads));
+  const dim3 block(head_dim);
+  GdnConvNormQkPrefillKernel<<<grid, block, 0, stream>>>(
+      qkv, conv_w, history, convolved, qn, kn, tokens, channels, kernel,
+      k_heads, v_heads, head_dim, eps);
+}
+
+void GdnPrep(const float* alpha, const float* beta, const float* a,
+             const float* dt, const float* qn, const float* kn,
+             float* alpha_pre, float* beta_pre, float* kq_pre,
+             std::uint32_t tokens, std::uint32_t k_heads, std::uint32_t v_heads,
+             std::uint32_t head_dim, hipStream_t stream) {
+  const std::uint32_t count = tokens * v_heads;
+  GdnPrepAlphaBetaKernel<<<(count + 255U) / 256U, 256, 0, stream>>>(
+      alpha, beta, a, dt, alpha_pre, beta_pre, count, v_heads);
+  const std::uint32_t pairs = tokens * k_heads;
+  GdnPrepKqKernel<<<(pairs + 7U) / 8U, 32, 0, stream>>>(qn, kn, kq_pre, pairs,
+                                                        k_heads, head_dim);
+}
+
 void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
                   const float* alpha, const float* beta, const float* a,
-                  const float* dt, float* state, float* attn,
-                  std::uint32_t tokens, std::uint32_t k_heads,
+                  const float* dt, const float* alpha_pre,
+                  const float* beta_pre, const float* kq_pre, float* state,
+                  float* attn, std::uint32_t tokens, std::uint32_t k_heads,
                   std::uint32_t v_heads, std::uint32_t head_dim,
                   std::uint32_t channels, float* snap, std::uint32_t snap_rows,
                   hipStream_t stream) {
@@ -2310,8 +2439,8 @@ void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
     constexpr std::uint32_t kRowsPerWave = 8U;  // kRowsPerLane == 1
     const dim3 grid(head_dim / (kRowsPerWave * 8U), v_heads);
     GdnDeltaLoopRowSplitKernel<1><<<grid, dim3(256), 0, stream>>>(
-        qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
-        v_heads, head_dim, channels);
+        qn, kn, convolved, alpha_pre, beta_pre, kq_pre, state, attn, tokens,
+        k_heads, v_heads, head_dim, channels);
     return;
   }
   constexpr std::uint32_t kRows = 8;

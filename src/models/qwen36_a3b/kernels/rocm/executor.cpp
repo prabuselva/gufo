@@ -306,6 +306,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       static_cast<std::size_t>(chunk) * c.ssm_num_v_heads, error_msg);
   e->pf_beta_ = e->AllocFloats(
       static_cast<std::size_t>(chunk) * c.ssm_num_v_heads, error_msg);
+  e->pf_alpha_pre_ = e->AllocFloats(
+      static_cast<std::size_t>(chunk) * c.ssm_num_v_heads, error_msg);
+  e->pf_beta_pre_ = e->AllocFloats(
+      static_cast<std::size_t>(chunk) * c.ssm_num_v_heads, error_msg);
+  e->pf_kq_pre_ = e->AllocFloats(
+      static_cast<std::size_t>(chunk) * c.ssm_num_k_heads, error_msg);
   e->pf_convolved_ =
       e->AllocFloats(static_cast<std::size_t>(chunk) * c_chan, error_msg);
   e->pf_qn_ =
@@ -857,17 +863,20 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
   proj(l.ssm_alpha, x, pf_alpha_);
   proj(l.ssm_beta, x, pf_beta_);
 
-  prof_.Mark("lin_conv");
-  GdnConvPrefill(pf_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], pf_convolved_,
-                 tokens, channels, kern, nullptr);
-  prof_.Mark("lin_normqk");
-  GdnNormQkPrefill(pf_convolved_, pf_qn_, pf_kn_, tokens, c_.ssm_num_k_heads,
-                   channels, d, c_.rms_eps, nullptr);
+  prof_.Mark("lin_conv_normqk");
+  GdnConvNormQkPrefill(pf_qkv_, l.ssm_conv1d.f32(), gdn_history_[il],
+                       pf_convolved_, pf_qn_, pf_kn_, tokens, channels, kern,
+                       c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, c_.rms_eps,
+                       nullptr);
   prof_.Mark("lin_delta");
+  GdnPrep(pf_alpha_, pf_beta_, l.ssm_a.f32(), l.ssm_dt.f32(), pf_qn_, pf_kn_,
+          pf_alpha_pre_, pf_beta_pre_, pf_kq_pre_, tokens, c_.ssm_num_k_heads,
+          c_.ssm_num_v_heads, d, nullptr);
   GdnDeltaLoop(pf_qn_, pf_kn_, pf_convolved_, pf_alpha_, pf_beta_,
-               l.ssm_a.f32(), l.ssm_dt.f32(), gdn_state_[il], pf_gdn_attn_,
-               tokens, c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, channels,
-               state_snap, state_snap != nullptr ? tokens - 1 : 0, nullptr);
+               l.ssm_a.f32(), l.ssm_dt.f32(), pf_alpha_pre_, pf_beta_pre_,
+               pf_kq_pre_, gdn_state_[il], pf_gdn_attn_, tokens,
+               c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, channels, state_snap,
+               state_snap != nullptr ? tokens - 1 : 0, nullptr);
   prof_.Mark("lin_outnorm");
   GdnOutNormPrefill(pf_gdn_attn_, pf_z_, l.ssm_norm.f32(), tokens,
                     c_.ssm_num_v_heads, d, c_.rms_eps, nullptr);

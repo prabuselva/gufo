@@ -255,6 +255,9 @@ private:
   float* pf_z_{nullptr};
   float* pf_alpha_{nullptr};
   float* pf_beta_{nullptr};
+  float* pf_alpha_pre_{nullptr};
+  float* pf_beta_pre_{nullptr};
+  float* pf_kq_pre_{nullptr};
   float* pf_convolved_{nullptr};
   float* pf_qn_{nullptr};
   float* pf_kn_{nullptr};

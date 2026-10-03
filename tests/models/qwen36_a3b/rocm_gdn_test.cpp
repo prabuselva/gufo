@@ -242,6 +242,9 @@ bool RunPrefillCase(std::uint32_t tokens) {
   t::HipBuffer<float> d_convolved(qkv_count);
   t::HipBuffer<float> d_qn(static_cast<std::size_t>(tokens) * kKeyDim);
   t::HipBuffer<float> d_kn(static_cast<std::size_t>(tokens) * kKeyDim);
+  t::HipBuffer<float> d_alpha_pre(alpha.size());
+  t::HipBuffer<float> d_beta_pre(beta.size());
+  t::HipBuffer<float> d_kq_pre(static_cast<std::size_t>(tokens) * kKHeads);
   t::HipBuffer<float> d_attn(attn_count);
   t::HipBuffer<float> d_state(state_count);
   t::HipBuffer<float> d_history(conv_state);
@@ -263,10 +266,14 @@ bool RunPrefillCase(std::uint32_t tokens) {
                       kChannels, kKernel, nullptr);
   q::GdnNormQkPrefill(d_convolved.get(), d_qn.get(), d_kn.get(), tokens,
                       kKHeads, kChannels, kDim, kEps, nullptr);
+  q::GdnPrep(d_alpha.get(), d_beta.get(), d_a.get(), d_dt.get(), d_qn.get(),
+             d_kn.get(), d_alpha_pre.get(), d_beta_pre.get(), d_kq_pre.get(),
+             tokens, kKHeads, kVHeads, kDim, nullptr);
   q::GdnDeltaLoop(d_qn.get(), d_kn.get(), d_convolved.get(), d_alpha.get(),
-                  d_beta.get(), d_a.get(), d_dt.get(), d_state.get(),
-                  d_attn.get(), tokens, kKHeads, kVHeads, kDim, kChannels,
-                  nullptr, 0, nullptr);
+                  d_beta.get(), d_a.get(), d_dt.get(), d_alpha_pre.get(),
+                  d_beta_pre.get(), d_kq_pre.get(), d_state.get(), d_attn.get(),
+                  tokens, kKHeads, kVHeads, kDim, kChannels, nullptr, 0,
+                  nullptr);
   q::GdnOutNormPrefill(d_attn.get(), d_z.get(), d_norm_w.get(), tokens, kVHeads,
                        kDim, kEps, nullptr);
   t::CheckHip(hipDeviceSynchronize(), "GDN prefill synchronization");
@@ -329,7 +336,8 @@ bool RunPrefillCase(std::uint32_t tokens) {
                                state_count);
     t::Upload(&d_state, state);
     q::GdnDeltaLoop(d_qn.get(), d_kn.get(), d_convolved.get(), d_alpha.get(),
-                    d_beta.get(), d_a.get(), d_dt.get(), d_state.get(),
+                    d_beta.get(), d_a.get(), d_dt.get(), d_alpha_pre.get(),
+                    d_beta_pre.get(), d_kq_pre.get(), d_state.get(),
                     d_attn.get(), tokens, kKHeads, kVHeads, kDim, kChannels,
                     d_snap.get(), tokens - 1, nullptr);
     t::CheckHip(hipDeviceSynchronize(), "GDN snapshot synchronization");
@@ -412,6 +420,76 @@ bool TestFusedConvNormQk() {
   return ok;
 }
 
+// The fused prefill front-end (conv + q/k RMSNorm in one launch) must be
+// bit-identical to the unfused GdnConvPrefill + GdnNormQkPrefill chain for
+// every token: same qn, kn, and the value half of convolved that the delta
+// recurrence consumes. The leading tokens exercise the history halo path.
+bool TestFusedConvNormQkPrefill(std::uint32_t tokens) {
+  const std::size_t conv_state =
+      static_cast<std::size_t>(kKernel - 1) * kChannels;
+  const std::size_t qkv_count = static_cast<std::size_t>(tokens) * kChannels;
+  const std::size_t qk_count = static_cast<std::size_t>(tokens) * kKeyDim;
+
+  const auto qkv = t::MakeValues(qkv_count, 0x9E3779B9U, 1.0F);
+  const auto conv_w = t::MakeValues(
+      static_cast<std::size_t>(kChannels) * kKernel, 0x85EBCA6BU, 0.5F);
+  const auto history = t::MakeValues(conv_state, 0xC2B2AE35U, 1.0F);
+
+  t::HipBuffer<float> u_qkv(qkv_count);
+  t::HipBuffer<float> u_conv_w(conv_w.size());
+  t::HipBuffer<float> u_history(conv_state);
+  t::HipBuffer<float> u_conv(qkv_count);
+  t::HipBuffer<float> u_qn(qk_count);
+  t::HipBuffer<float> u_kn(qk_count);
+  t::Upload(&u_qkv, qkv);
+  t::Upload(&u_conv_w, conv_w);
+  t::Upload(&u_history, history);
+  q::GdnConvPrefill(u_qkv.get(), u_conv_w.get(), u_history.get(), u_conv.get(),
+                    tokens, kChannels, kKernel, nullptr);
+  q::GdnNormQkPrefill(u_conv.get(), u_qn.get(), u_kn.get(), tokens, kKHeads,
+                      kChannels, kDim, kEps, nullptr);
+
+  t::HipBuffer<float> f_qkv(qkv_count);
+  t::HipBuffer<float> f_conv_w(conv_w.size());
+  t::HipBuffer<float> f_history(conv_state);
+  t::HipBuffer<float> f_conv(qkv_count);
+  t::HipBuffer<float> f_qn(qk_count);
+  t::HipBuffer<float> f_kn(qk_count);
+  t::Upload(&f_qkv, qkv);
+  t::Upload(&f_conv_w, conv_w);
+  t::Upload(&f_history, history);
+  q::GdnConvNormQkPrefill(f_qkv.get(), f_conv_w.get(), f_history.get(),
+                          f_conv.get(), f_qn.get(), f_kn.get(), tokens,
+                          kChannels, kKernel, kKHeads, kVHeads, kDim, kEps,
+                          nullptr);
+  t::CheckHip(hipDeviceSynchronize(),
+              "fused prefill conv+normqk synchronization");
+
+  // Only the value half of convolved is materialized by the fused kernel; the
+  // unfused chain writes all halves, so compare the v slice the delta consumes.
+  const auto conv_u = t::Download(&u_conv, qkv_count);
+  const auto conv_f = t::Download(&f_conv, qkv_count);
+  std::vector<float> v_u, v_f;
+  for (std::uint32_t tk = 0; tk < tokens; ++tk) {
+    const auto base = static_cast<std::size_t>(tk) * kChannels + 2 * kKeyDim;
+    v_u.insert(v_u.end(), conv_u.begin() + base,
+               conv_u.begin() + base + kValueDim);
+    v_f.insert(v_f.end(), conv_f.begin() + base,
+               conv_f.begin() + base + kValueDim);
+  }
+
+  bool ok = true;
+  const auto report = [&](const char* name, bool eq) {
+    std::cout << "GdnConvNormQkPrefill tokens=" << tokens << " " << name
+              << " bit-exact: " << (eq ? "yes" : "no") << '\n';
+    ok = ok && eq;
+  };
+  report("qn", t::Download(&u_qn, qk_count) == t::Download(&f_qn, qk_count));
+  report("kn", t::Download(&u_kn, qk_count) == t::Download(&f_kn, qk_count));
+  report("convolved_v", v_u == v_f);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -420,6 +498,7 @@ int main() {
     ok = RunCase(false) && ok;
     for (std::uint32_t tokens : {1U, 2U, 5U, 17U, 64U}) {
       ok = RunPrefillCase(tokens) && ok;
+      ok = TestFusedConvNormQkPrefill(tokens) && ok;
     }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {

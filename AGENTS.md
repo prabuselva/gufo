@@ -86,6 +86,43 @@ via the launch script and polls `/v1/models` until ready before returning
 `--settle`). Never time a benchmark while the server is resident; contention
 and lazy allocation make such numbers meaningless.
 
+### Running a benchmark from the harness
+
+`gpu_exclusive.sh` blocks for the whole run (stop server -> benchmark -> respawn
+-> poll), which can exceed a tool's wall-clock limit. Do NOT run it directly in
+one blocking tool call. Instead split it across two processes:
+
+1. Launch the benchmark DETACHED in the background with
+   `tools/bench/bench_bg.sh <name> <inner_timeout_sec> <cmd...>`. It wraps
+   `gpu_exclusive.sh` under `timeout`, writes
+   `${GUFO_BENCH_STATE_DIR:-/tmp/opencode}/gufo_bench_<name>.{log,pid,status}`,
+   and returns immediately. Launch it with `setsid ... & disown` so its PID is a
+   process group the watchdog can kill as a unit.
+2. Run `tools/bench/bench_wait.sh <name> <total_sec> <ready_grace>` in the
+   FOREGROUND with a tool timeout LARGER than `total_sec`. This is the harness
+   process that stays alive, polls the background run, kills the process group if
+   the budget is exceeded, and confirms `/v1/models` is serving again before it
+   returns. The watchdog is what waits for the server to respawn; never continue
+   the session until it reports done.
+
+```sh
+tools/bench/bench_bg.sh pp16k 600 \
+  build/release/gufo bench --model "$MODEL" --n-prompt 16384 --n-gen 1 & disown
+tools/bench/bench_wait.sh pp16k 660 90   # foreground; tool timeout > 660s
+cat /tmp/opencode/gufo_bench_pp16k.log   # read the real numbers afterwards
+```
+
+The watchdog may print `finished rc=0` immediately when the benchmark completed
+between tool calls; always read the `.log` for the actual results.
+
+### Iterate at short context first
+
+Long-context prefill is slow (pp102400 ~90 s/prefill) and the long-context gap
+widens with depth, so a lever that helps at 16K may not at 100K. But benchmarking
+small levers at 32-100K wastes minutes per A/B. Iterate every candidate at
+**<=16K context first** (pp2048/pp8192/pp16384, ~1-20 s/prefill); only escalate a
+lever that shows a real win at short context to 32K/65K/100K confirmation.
+
 ## Development
 
 - Keep model code, tests, tools and numerical contracts with their model.
