@@ -30,10 +30,12 @@ set_tests_properties(qwen36_a3b.reference PROPERTIES
 if (ENGINE_ENABLE_HIP)
   # Fused-operator checks: synthetic activations through each kernel against a
   # CPU reference of the scalar oracle's formulas. No model artifact required.
+  # gufo_core supplies the canonical Q4_K/Q5_K/Q6_K dequantizers the quantized
+  # checks use as their ground truth.
   foreach(name IN ITEMS rocm_ops rocm_gdn rocm_attention rocm_gemv rocm_gemm)
     add_executable(qwen36_a3b_${name}_test ${name}_test.cpp)
     target_link_libraries(qwen36_a3b_${name}_test PRIVATE
-      gufo_qwen36_a3b_kernels)
+      gufo_qwen36_a3b_kernels gufo_core)
     add_test(NAME qwen36_a3b.${name} COMMAND qwen36_a3b_${name}_test)
     set_tests_properties(qwen36_a3b.${name} PROPERTIES
       LABELS "qwen36_a3b;hip;gpu;gfx1151")

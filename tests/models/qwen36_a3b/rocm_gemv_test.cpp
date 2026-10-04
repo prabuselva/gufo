@@ -12,6 +12,7 @@
 #include <iostream>
 #include <vector>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/gemv.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/kernels.hpp"
 #include "tests/models/qwen36_a3b/hip_test.hpp"
@@ -475,6 +476,131 @@ bool TestMultiRow() {
   return ok;
 }
 
+// Encode a random Q4_K matrix: per 256-element super-block a half d, half dmin,
+// twelve packed (scale, minimum) bytes and 128 packed nibble bytes. The
+// oracle's DequantizeQ4_K defines the semantics the grouped kernel must
+// reproduce.
+std::vector<std::uint8_t> EncodeQ4K(std::uint32_t rows, std::uint32_t cols,
+                                    std::uint32_t seed) {
+  using gufo::quant::block_q4_K;
+  const std::size_t nblocks = static_cast<std::size_t>(rows) * (cols / 256);
+  std::vector<std::uint8_t> bytes(nblocks * sizeof(block_q4_K));
+  auto* blk = reinterpret_cast<block_q4_K*>(bytes.data());
+  for (std::size_t i = 0; i < nblocks; ++i) {
+    const float d =
+        0.5F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
+    const float dmin =
+        0.25F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
+    const __half dh = __float2half(d);
+    const __half dmh = __float2half(dmin);
+    std::memcpy(&blk[i].d, &dh, sizeof(blk[i].d));
+    std::memcpy(&blk[i].dmin, &dmh, sizeof(blk[i].dmin));
+    for (int s = 0; s < 12; ++s) {
+      blk[i].scales[s] =
+          static_cast<std::uint8_t>(t::NextRandom(&seed) & 0xFFU);
+    }
+    for (int s = 0; s < 128; ++s) {
+      blk[i].qs[s] = static_cast<std::uint8_t>(t::NextRandom(&seed) & 0xFFU);
+    }
+  }
+  return bytes;
+}
+
+// Encode a random Q5_K matrix: the Q4_K super-block plus 32 high-bit bytes.
+std::vector<std::uint8_t> EncodeQ5K(std::uint32_t rows, std::uint32_t cols,
+                                    std::uint32_t seed) {
+  using gufo::quant::block_q5_K;
+  const std::size_t nblocks = static_cast<std::size_t>(rows) * (cols / 256);
+  std::vector<std::uint8_t> bytes(nblocks * sizeof(block_q5_K));
+  auto* blk = reinterpret_cast<block_q5_K*>(bytes.data());
+  for (std::size_t i = 0; i < nblocks; ++i) {
+    const float d =
+        0.5F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
+    const float dmin =
+        0.25F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
+    const __half dh = __float2half(d);
+    const __half dmh = __float2half(dmin);
+    std::memcpy(&blk[i].d, &dh, sizeof(blk[i].d));
+    std::memcpy(&blk[i].dmin, &dmh, sizeof(blk[i].dmin));
+    for (int s = 0; s < 12; ++s) {
+      blk[i].scales[s] =
+          static_cast<std::uint8_t>(t::NextRandom(&seed) & 0xFFU);
+    }
+    for (int s = 0; s < 32; ++s) {
+      blk[i].qh[s] = static_cast<std::uint8_t>(t::NextRandom(&seed) & 0xFFU);
+    }
+    for (int s = 0; s < 128; ++s) {
+      blk[i].qs[s] = static_cast<std::uint8_t>(t::NextRandom(&seed) & 0xFFU);
+    }
+  }
+  return bytes;
+}
+
+// The grouped Q4_K / Q5_K expert GEMV (the decode route for a Q4_K_XL
+// artifact's routed experts) must match a CPU reference that dequantizes each
+// selected expert row with the canonical oracle and dots in double.
+bool TestGroupedQuant(bool q5k) {
+  constexpr std::uint32_t kExperts = 4;
+  constexpr std::uint32_t kUsed = 2;
+  const std::int32_t ids[kUsed] = {2, 0};
+  const std::size_t block =
+      q5k ? sizeof(gufo::quant::block_q5_K) : sizeof(gufo::quant::block_q4_K);
+  const std::size_t row_blocks = kCols / 256;
+  const std::size_t expert_bytes =
+      static_cast<std::size_t>(kRows) * row_blocks * block;
+  const auto x = t::MakeValues(kCols, 0x55AA0204U, 1.0F);
+  const auto w = q5k ? EncodeQ5K(kExperts * kRows, kCols, 0x77AA0005U)
+                     : EncodeQ4K(kExperts * kRows, kCols, 0x66AA0004U);
+  t::HipBuffer<std::uint8_t> d_w(w.size());
+  t::CheckHip(hipMemcpy(d_w.get(), w.data(), w.size(), hipMemcpyHostToDevice),
+              "upload grouped quant weights");
+  t::HipBuffer<float> d_x(x.size());
+  t::Upload(&d_x, x);
+  t::HipBuffer<std::int32_t> d_ids(kUsed);
+  t::CheckHip(hipMemcpy(d_ids.get(), ids, sizeof(ids), hipMemcpyHostToDevice),
+              "upload grouped quant ids");
+  t::HipBuffer<float> d_out(kUsed * kRows);
+  q::GemvGrouped(d_w.get(), q5k ? q::GemvType::kQ5_K : q::GemvType::kQ4_K,
+                 expert_bytes, d_ids.get(), kUsed, kRows, kCols, d_x.get(), 0U,
+                 d_out.get(), nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "GemvGroupedQuant synchronization");
+  const auto got = t::Download(&d_out, kUsed * kRows);
+
+  std::vector<float> ref(static_cast<std::size_t>(kUsed) * kRows);
+  std::vector<float> deq(kCols);
+  for (std::uint32_t s = 0; s < kUsed; ++s) {
+    for (std::uint32_t r = 0; r < kRows; ++r) {
+      const std::size_t row_index =
+          static_cast<std::size_t>(ids[s]) * kRows + r;
+      const void* row = w.data() + row_index * row_blocks * block;
+      if (q5k) {
+        gufo::quant::DequantizeQ5_K(row, deq.data(), kCols);
+      } else {
+        gufo::quant::DequantizeQ4_K(row, deq.data(), kCols);
+      }
+      double acc = 0.0;
+      for (std::uint32_t i = 0; i < kCols; ++i) {
+        acc += static_cast<double>(deq[i]) * x[i];
+      }
+      ref[static_cast<std::size_t>(s) * kRows + r] = static_cast<float>(acc);
+    }
+  }
+  return Check(q5k ? "GemvGroupedQ5K" : "GemvGroupedQ4K",
+               t::WorstRelative(ref, got), 2e-3);
+}
+
 }  // namespace
 
 int main() {
@@ -486,6 +612,8 @@ int main() {
     ok = TestMulti() && ok;
     ok = TestGroupedPair() && ok;
     ok = TestGroupedSwiglu() && ok;
+    ok = TestGroupedQuant(false) && ok;
+    ok = TestGroupedQuant(true) && ok;
     ok = TestMultiRow() && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {

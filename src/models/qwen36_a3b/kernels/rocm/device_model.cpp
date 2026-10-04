@@ -1,14 +1,56 @@
 #include "src/models/qwen36_a3b/kernels/rocm/device_model.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {
 namespace {
+
+/// Requantizes one Q6_K row (`cols` elements, `cols % 256 == 0`) to Q8_0 at
+/// `q8` (`cols / 32` blocks of 34 bytes). The Q6_K row is dequantized to float
+/// through the canonical oracle routine, then each 32-element group is encoded
+/// as {half d; int8 qs[32]} with d = amax / 127 rounded to half and qs the
+/// nearest integer of v / d. Q8_0 is finer than Q6_K, so the requant error is
+/// below the source quant's own step; `scratch` holds `cols` floats.
+void RequantQ6KRowToQ8_0(const void* q6, std::uint8_t* q8, std::size_t cols,
+                         float* scratch) {
+  gufo::quant::DequantizeQ6_K(q6, scratch, cols);
+  const std::size_t nblocks = cols / 32;
+  for (std::size_t b = 0; b < nblocks; ++b) {
+    const float* v = scratch + b * 32;
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      const float a = std::fabs(v[i]);
+      if (a > amax) {
+        amax = a;
+      }
+    }
+    const __half dh = __float2half_rn(amax * (1.0f / 127.0f));
+    const float d = __half2float(dh);
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    gufo::quant::block_q8_0 blk;
+    std::memcpy(&blk.d, &dh, sizeof(blk.d));
+    for (int i = 0; i < 32; ++i) {
+      long q = std::lrintf(v[i] * id);
+      if (q > 127) {
+        q = 127;
+      } else if (q < -127) {
+        q = -127;
+      }
+      blk.qs[i] = static_cast<std::int8_t>(q);
+    }
+    std::memcpy(q8 + b * sizeof(gufo::quant::block_q8_0), &blk, sizeof(blk));
+  }
+}
 
 /// Streams one tensor's payload from disk into a fresh device allocation. The
 /// GEMV tier reads exactly `row_bytes` per row, so no tail margin is needed.
@@ -31,6 +73,9 @@ struct Uploader {
     if (t.empty() || !ok) {
       return d;
     }
+    if (t.type == core::GgmlType::kQ6_K) {
+      return CopyQ6Upcast(t);
+    }
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
     if (hipMalloc(&ptr, size) != hipSuccess) {
@@ -51,6 +96,51 @@ struct Uploader {
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
     d.row_bytes = t.RowBytes();
+    return d;
+  }
+
+  // The GEMV and WMMA tiers decode Q8_0 but not Q6_K, so the few Q6_K expert
+  // tensors this artifact stores are requantized to Q8_0 on the host during
+  // upload (see RequantQ6KRowToQ8_0). The rows are read straight from the
+  // mapped file and copied up in one transfer; the resident tensor is then a
+  // plain Q8_0 stack the rest of the pipeline already handles.
+  DeviceTensor CopyQ6Upcast(const TensorRef& t) {
+    DeviceTensor d;
+    const std::size_t cols = static_cast<std::size_t>(t.cols);
+    const std::size_t rows = static_cast<std::size_t>(t.rows);
+    const std::size_t experts = static_cast<std::size_t>(t.experts);
+    const std::size_t q6_row = t.RowBytes();
+    const std::size_t q8_row = (cols / 32) * sizeof(gufo::quant::block_q8_0);
+    const std::size_t total = q8_row * rows * experts;
+    std::vector<std::uint8_t> host(total);
+    std::vector<float> scratch(cols);
+    for (std::size_t e = 0; e < experts; ++e) {
+      const std::uint8_t* src = t.Expert(e);
+      for (std::size_t r = 0; r < rows; ++r) {
+        RequantQ6KRowToQ8_0(src + q6_row * r,
+                            host.data() + q8_row * (e * rows + r), cols,
+                            scratch.data());
+      }
+    }
+    void* ptr = nullptr;
+    if (hipMalloc(&ptr, total) != hipSuccess) {
+      Fail("hipMalloc failed for " + std::string(t.name) + " (" +
+           std::to_string(total) + " bytes)");
+      return d;
+    }
+    allocations.push_back(ptr);
+    bytes += total;
+    if (hipMemcpy(ptr, host.data(), total, hipMemcpyHostToDevice) !=
+        hipSuccess) {
+      Fail("upload failed for " + std::string(t.name));
+      return d;
+    }
+    d.data = ptr;
+    d.type = core::GgmlType::kQ8_0;
+    d.cols = static_cast<std::uint32_t>(cols);
+    d.rows = static_cast<std::uint32_t>(rows);
+    d.experts = static_cast<std::uint32_t>(experts);
+    d.row_bytes = q8_row;
     return d;
   }
 

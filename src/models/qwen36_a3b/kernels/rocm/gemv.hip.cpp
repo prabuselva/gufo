@@ -18,12 +18,47 @@ struct Q8_0Block {
   std::int8_t qs[32];
 };
 
+// Q4_K / Q5_K super-blocks (256 elements each), the routed-expert encodings of
+// a Q4_K_XL artifact. Field order and size match the canonical GGUF layout
+// (src/core/quant/ggml_dequant.hpp) and the WMMA path's copies.
+struct Q4KBlock {
+  __half d;
+  __half dmin;
+  std::uint8_t scales[12];
+  std::uint8_t qs[128];
+};
+static_assert(sizeof(Q4KBlock) == 144, "block_q4_K must be 144 bytes");
+
+struct Q5KBlock {
+  __half d;
+  __half dmin;
+  std::uint8_t scales[12];
+  std::uint8_t qh[32];
+  std::uint8_t qs[128];
+};
+static_assert(sizeof(Q5KBlock) == 176, "block_q5_K must be 176 bytes");
+
 __device__ __forceinline__ float WarpReduceSum(float v) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     v += __shfl_down(v, offset);
   }
   return v;
+}
+
+// Sub-block (scale, minimum) unpack for the Q4_K / Q5_K super-block header, a
+// device port of the oracle's GetQ4ScaleMin. `index` is the 32-element group
+// (0..7) within the super-block.
+__device__ __forceinline__ void Q4ScaleMin(int index,
+                                           const std::uint8_t* packed,
+                                           int& scale, int& minimum) {
+  if (index < 4) {
+    scale = packed[index] & 0x3F;
+    minimum = packed[index + 4] & 0x3F;
+  } else {
+    scale = (packed[index + 4] & 0x0F) | ((packed[index - 4] >> 6) << 4);
+    minimum = (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4);
+  }
 }
 
 // Bit-identical to kernels.hip.cpp DSilu (x * sigmoid(x), sigmoid via expf).
@@ -125,6 +160,103 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
   for (std::uint32_t b = 0; b < nblocks; ++b) {
     const float d = __half2float(row[b].d);
     acc += d * static_cast<float>(row[b].qs[lane]) * xs[b * 32 + lane];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[pair] = acc;
+  }
+}
+
+// Grouped expert GEMV for the Q4_K routed stacks. Same (slot, row) pairing as
+// GemvGroupedQ8_0, but a warp walks 256-element super-blocks: lane L takes the
+// element at offset L of each of the eight 32-element groups (e = L + 32 j), so
+// the nibble reads coalesce across the warp. The dequant mirrors the oracle's
+// Q4Value: value = d * scale_j * q - dmin * min_j, with the nibble low for even
+// j and high for odd j.
+__global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
+                               const std::int32_t* __restrict__ ids,
+                               std::size_t expert_stride_blocks,
+                               const float* __restrict__ x,
+                               std::uint32_t x_stride, float* __restrict__ out,
+                               std::uint32_t used, std::uint32_t rows,
+                               std::uint32_t cols) {
+  const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (pair >= used * rows) {
+    return;
+  }
+  const std::uint32_t s = pair / rows;
+  const std::uint32_t r = pair - s * rows;
+  const std::uint32_t nblocks = cols / 256;
+  const Q4KBlock* __restrict__ row =
+      w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
+      static_cast<std::size_t>(r) * nblocks;
+  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const Q4KBlock& blk = row[b];
+    const float d = __half2float(blk.d);
+    const float dmin = __half2float(blk.dmin);
+    const float* xb = xs + b * 256 + lane;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
+      const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
+      int sc = 0;
+      int mn = 0;
+      Q4ScaleMin(j, blk.scales, sc, mn);
+      acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
+              dmin * static_cast<float>(mn)) *
+             xb[32 * j];
+    }
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[pair] = acc;
+  }
+}
+
+// Grouped expert GEMV for the Q5_K routed stacks. A 5-bit code is the Q4_K
+// nibble plus a fifth bit from qh[lane] at position j; the sub-block scale
+// index is j, matching the oracle's Q5Value.
+__global__ void GemvGroupedQ5K(const Q5KBlock* __restrict__ w,
+                               const std::int32_t* __restrict__ ids,
+                               std::size_t expert_stride_blocks,
+                               const float* __restrict__ x,
+                               std::uint32_t x_stride, float* __restrict__ out,
+                               std::uint32_t used, std::uint32_t rows,
+                               std::uint32_t cols) {
+  const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (pair >= used * rows) {
+    return;
+  }
+  const std::uint32_t s = pair / rows;
+  const std::uint32_t r = pair - s * rows;
+  const std::uint32_t nblocks = cols / 256;
+  const Q5KBlock* __restrict__ row =
+      w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
+      static_cast<std::size_t>(r) * nblocks;
+  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const Q5KBlock& blk = row[b];
+    const float d = __half2float(blk.d);
+    const float dmin = __half2float(blk.dmin);
+    const std::uint8_t qhb = blk.qh[lane];
+    const float* xb = xs + b * 256 + lane;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint8_t qb = blk.qs[(j >> 1) * 32 + lane];
+      const int quant4 = (j & 1) ? (qb >> 4) : (qb & 0xF);
+      const int quant = quant4 + (((qhb >> j) & 1) ? 16 : 0);
+      int sc = 0;
+      int mn = 0;
+      Q4ScaleMin(j, blk.scales, sc, mn);
+      acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
+              dmin * static_cast<float>(mn)) *
+             xb[32 * j];
+    }
   }
   acc = WarpReduceSum(acc);
   if (lane == 0) {
@@ -417,6 +549,11 @@ void EmbedRow(const void* base, GemvType type, std::uint32_t row,
       EmbedRowBf16<<<grid, block, 0, stream>>>(w, out, cols);
       break;
     }
+    // Q4_K/Q5_K are routed-expert encodings; ValidateTypes keeps them off the
+    // embedding lookup, which only ever sees the Q8_0/F32/BF16 token table.
+    case GemvType::kQ4_K:
+    case GemvType::kQ5_K:
+      break;
   }
 }
 
@@ -436,6 +573,11 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
     case GemvType::kBF16:
       GemvBf16<<<grid, dim3(32), 0, stream>>>(
           static_cast<const hip_bfloat16*>(base), x, out, rows, cols);
+      break;
+    // Routed-expert encodings never reach the dense single-row GEMV; they are
+    // decoded by GemvGrouped (decode) and the WMMA routed GEMM (prefill).
+    case GemvType::kQ4_K:
+    case GemvType::kQ5_K:
       break;
   }
 }
@@ -464,6 +606,10 @@ void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
             static_cast<const hip_bfloat16*>(base), x, x_stride, out,          \
             out_stride, rows, cols);                                           \
         break;                                                                 \
+      /* Routed-expert encodings never reach the dense row GEMV. */            \
+      case GemvType::kQ4_K:                                                    \
+      case GemvType::kQ5_K:                                                    \
+        break;                                                                 \
     }                                                                          \
     break;
   switch (tokens) {
@@ -489,6 +635,16 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
           static_cast<const Q8_0Block*>(base), ids,
           expert_stride / sizeof(Q8_0Block), x, x_stride, out, used, rows,
           cols);
+      break;
+    case GemvType::kQ4_K:
+      GemvGroupedQ4K<<<grid, dim3(128), 0, stream>>>(
+          static_cast<const Q4KBlock*>(base), ids,
+          expert_stride / sizeof(Q4KBlock), x, x_stride, out, used, rows, cols);
+      break;
+    case GemvType::kQ5_K:
+      GemvGroupedQ5K<<<grid, dim3(128), 0, stream>>>(
+          static_cast<const Q5KBlock*>(base), ids,
+          expert_stride / sizeof(Q5KBlock), x, x_stride, out, used, rows, cols);
       break;
     case GemvType::kF32:
       GemvGroupedDense<float><<<grid, dim3(128), 0, stream>>>(

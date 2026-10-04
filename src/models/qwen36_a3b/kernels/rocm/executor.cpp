@@ -16,8 +16,10 @@
 namespace gufo::models::qwen36_a3b::rocm {
 namespace {
 
-/// Maps the artifact's GGUF type onto the GEMV tier's row format. Only the
-/// three formats this model stores appear; anything else is a load error.
+/// Maps the artifact's GGUF type onto the GEMV tier's row format. The dense
+/// tensors store Q8_0/F32/BF16; the routed experts additionally store the Q4_K
+/// and Q5_K super-block encodings of a Q4_K_XL artifact. Anything else is a
+/// load error (ValidateTypes).
 [[nodiscard]] GemvType ToGemvType(core::GgmlType t) noexcept {
   switch (t) {
     case core::GgmlType::kQ8_0:
@@ -26,6 +28,10 @@ namespace {
       return GemvType::kF32;
     case core::GgmlType::kBF16:
       return GemvType::kBF16;
+    case core::GgmlType::kQ4_K:
+      return GemvType::kQ4_K;
+    case core::GgmlType::kQ5_K:
+      return GemvType::kQ5_K;
     default:
       return GemvType::kF32;  // unreachable: Create rejects other types
   }
@@ -36,11 +42,32 @@ namespace {
          t == core::GgmlType::kBF16;
 }
 
+// The routed-expert stacks (ffn_gate/up/down_exps) additionally accept the
+// Q4_K/Q5_K super-block encodings, decoded natively by the grouped GEMV and the
+// WMMA routed GEMM. Q6_K experts are upcast to Q8_0 during upload, so they
+// never reach here.
+[[nodiscard]] bool ExpertType(core::GgmlType t) noexcept {
+  return SupportedType(t) || t == core::GgmlType::kQ4_K ||
+         t == core::GgmlType::kQ5_K;
+}
+
 /// Rejects any resident tensor the GEMV tier cannot decode, so a mis-quantized
 /// artifact fails at Create rather than as a wrong number later.
 bool ValidateTypes(const DeviceModel& m, std::string* error) {
   const auto check = [&](const DeviceTensor& t, const char* name) {
     if (t.empty() || SupportedType(t.type)) {
+      return true;
+    }
+    if (error != nullptr) {
+      *error = std::string("tensor ") + name +
+               " has a format the GEMV tier cannot decode";
+    }
+    return false;
+  };
+  // The routed expert stacks carry the wider Q4_K/Q5_K encodings; every other
+  // tensor is restricted to the dense Q8_0/F32/BF16 set.
+  const auto check_expert = [&](const DeviceTensor& t, const char* name) {
+    if (t.empty() || ExpertType(t.type)) {
       return true;
     }
     if (error != nullptr) {
@@ -63,11 +90,13 @@ bool ValidateTypes(const DeviceModel& m, std::string* error) {
         !check(l.attn_k, base) || !check(l.attn_v, base) ||
         !check(l.attn_out, base) || !check(l.attn_q_norm, base) ||
         !check(l.attn_k_norm, base) || !check(l.router, base) ||
-        !check(l.ffn_gate_exps, base) || !check(l.ffn_up_exps, base) ||
-        !check(l.ffn_down_exps, base) || !check(l.shexp_gate_inp, base) ||
-        !check(l.shexp_gate, base) || !check(l.shexp_up, base) ||
-        !check(l.shexp_down, base) || !check(l.nextn_enorm, base) ||
-        !check(l.nextn_hnorm, base) || !check(l.nextn_eh_proj, base) ||
+        !check_expert(l.ffn_gate_exps, base) ||
+        !check_expert(l.ffn_up_exps, base) ||
+        !check_expert(l.ffn_down_exps, base) ||
+        !check(l.shexp_gate_inp, base) || !check(l.shexp_gate, base) ||
+        !check(l.shexp_up, base) || !check(l.shexp_down, base) ||
+        !check(l.nextn_enorm, base) || !check(l.nextn_hnorm, base) ||
+        !check(l.nextn_eh_proj, base) ||
         !check(l.nextn_shared_head_norm, base)) {
       return false;
     }
@@ -820,15 +849,31 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   ExpertCounts(pf_ids_, pf_expert_counts_, tokens, experts, used, nullptr);
   (void)hipMemcpy(pf_counts_host_.data(), pf_expert_counts_,
                   experts * sizeof(std::uint32_t), hipMemcpyDeviceToHost);
-  // Per-tensor route: the WMMA matrix-core path decodes Q8_0 and BF16 expert
-  // weights (this dynamic quant keeps a few BF16 expert tensors). Each of
-  // gate/up/down is dispatched with its own encoding; a layer with any other
-  // encoding (Q6_K, F16, F32) falls back to the dp4a MMQ grouped GEMM below.
+  // Per-tensor route: the WMMA matrix-core path decodes Q8_0, BF16 and the
+  // Q4_K/Q5_K super-block expert weights (a Q4_K_XL artifact stores its routed
+  // experts in the latter two). Each of gate/up/down is dispatched with its own
+  // encoding; a layer with any other encoding (F16, F32) falls back to the dp4a
+  // MMQ grouped GEMM below.
   const auto supported = [](core::GgmlType t) {
+    return t == core::GgmlType::kQ8_0 || t == core::GgmlType::kBF16 ||
+           t == core::GgmlType::kQ4_K || t == core::GgmlType::kQ5_K;
+  };
+  // The fused gate+up kernel only decodes Q8_0 and BF16, so a Q4_K/Q5_K layer
+  // runs gate and up as two separate WMMA launches instead.
+  const auto gated_supported = [](core::GgmlType t) {
     return t == core::GgmlType::kQ8_0 || t == core::GgmlType::kBF16;
   };
   const auto wtype = [](core::GgmlType t) {
-    return t == core::GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kQ8_0;
+    switch (t) {
+      case core::GgmlType::kBF16:
+        return WeightType::kBF16;
+      case core::GgmlType::kQ4_K:
+        return WeightType::kQ4_K;
+      case core::GgmlType::kQ5_K:
+        return WeightType::kQ5_K;
+      default:
+        return WeightType::kQ8_0;
+    }
   };
   const bool wmma = supported(l.ffn_gate_exps.type) &&
                     supported(l.ffn_up_exps.type) &&
@@ -837,10 +882,11 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 
   // The fused gate+up route pairs the two projections over a second tile map
   // once the chunk is large enough to amortise the wider tiles and gate/up
-  // share an encoding. It writes F16 activation rows, so the down projection
-  // (which reads F16) stays valid.
-  const bool pair =
-      wmma && tokens >= 1024 && l.ffn_gate_exps.type == l.ffn_up_exps.type;
+  // share a fused-decodable encoding. It writes F16 activation rows, so the
+  // down projection (which reads F16) stays valid.
+  const bool pair = wmma && tokens >= 1024 &&
+                    gated_supported(l.ffn_gate_exps.type) &&
+                    l.ffn_gate_exps.type == l.ffn_up_exps.type;
   std::uint32_t n_tiles = 0;
   std::uint32_t n_pair = 0;
   std::uint32_t pair_rows = 64;

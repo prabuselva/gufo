@@ -116,6 +116,12 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
           HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
       break;
     }
+    case GemvType::kQ4_K:
+    case GemvType::kQ5_K:
+      // Routed-expert encodings only. The dense GEMM tier never sees a K-quant
+      // tensor: ValidateTypes restricts every non-expert tensor to Q8_0/F32/
+      // BF16, and the routed experts go through the WMMA route, not this tier.
+      break;
   }
 }
 
