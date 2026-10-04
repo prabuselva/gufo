@@ -52,8 +52,8 @@ struct LayerWeights {
   TensorRef ssm_qkv;     ///< [hidden -> 2*key_dim + value_dim]
   TensorRef ssm_gate;    ///< [hidden -> value_dim], the z output gate.
   TensorRef ssm_conv1d;  ///< [conv_kernel, 2*key_dim + value_dim], F32.
-  TensorRef ssm_alpha;   ///< [hidden -> v_heads], F32.
-  TensorRef ssm_beta;    ///< [hidden -> v_heads], F32.
+  TensorRef ssm_alpha;   ///< [hidden -> v_heads], F32 or Q8_0.
+  TensorRef ssm_beta;    ///< [hidden -> v_heads], F32 or Q8_0.
   TensorRef ssm_dt;      ///< [v_heads] softplus bias, F32.
   TensorRef ssm_a;       ///< [v_heads] = -exp(A_log), F32.
   TensorRef ssm_norm;    ///< [ssm_head_dim], F32.

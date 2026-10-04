@@ -273,7 +273,7 @@ Open items, in priority order:
 3. **Same-`x` projection fusion — done** — `GemvMulti` (bit-exact per
     oracle test) folds the Q8_0 projections sharing one activation row
     into a single launch and runs the F32 side vectors (`ssm_alpha`,
-    `ssm_beta`, `ffn_gate_inp_shexp` — F32 in the GGUF) as plain `Gemv`:
+    `ssm_beta`, `ffn_gate_inp_shexp` when stored as F32) as plain `Gemv`:
     `lin_gemm_in` fuses qkv+gate, `attn_gemm_qkv` is 3-in-1,
     `moe_shared` fuses gate+up. The first revision rejected any group
     containing a non-Q8_0 tensor, so `lin_gemm_in`/`moe_shared` silently

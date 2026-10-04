@@ -41,6 +41,8 @@ port="8083"
 expect_model=""
 ready_timeout=900
 settle=0
+launch_attempts=10
+launch_retry_sleep=30
 respawn_log="/tmp/gufo_serve_respawn.log"
 cmdline_file="${GUFO_SERVE_CMDLINE:-/tmp/gufo_serve_cmdline}"
 
@@ -73,10 +75,43 @@ launch_captured() {
   local -a argv=()
   mapfile -d '' -t argv < "$cmdline_file" 2>/dev/null || return 1
   [ "${#argv[@]}" -gt 0 ] || return 1
-  log "respawning captured command (log: $respawn_log): ${argv[*]}"
-  setsid "${argv[@]}" </dev/null >"$respawn_log" 2>&1 &
-  pid=$!
-  disown "$pid" 2>/dev/null || true
+
+  # A server stopped while its binary was being rebuilt can expose its exe link
+  # as "/path/to/gufo (deleted)". The replacement build recreates the same path,
+  # so strip the kernel suffix and retry until the file is executable again.
+  if [[ "${argv[0]}" == *" (deleted)" && ! -x "${argv[0]}" ]]; then
+    argv[0]="${argv[0]% (deleted)}"
+  fi
+
+  local attempt
+  for attempt in $(seq 1 "$launch_attempts"); do
+    pid=""
+    if [ ! -x "${argv[0]}" ]; then
+      log "captured binary is not executable yet (attempt $attempt/$launch_attempts): ${argv[0]}"
+      sleep "$launch_retry_sleep"
+      continue
+    fi
+
+    log "respawning captured command (attempt $attempt/$launch_attempts, log: $respawn_log): ${argv[*]}"
+    setsid "${argv[@]}" </dev/null >"$respawn_log" 2>&1 &
+    pid=$!
+    disown "$pid" 2>/dev/null || true
+
+    # Give exec a moment to fail (for example, a deleted binary or bad shebang).
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+
+    log "captured launch exited early (attempt $attempt/$launch_attempts); tail of $respawn_log:"
+    tail -n 5 "$respawn_log" 2>/dev/null || true
+    if [ "$attempt" -lt "$launch_attempts" ]; then
+      sleep "$launch_retry_sleep"
+    fi
+  done
+
+  pid=""
+  return 1
 }
 
 launch_fallback() {
