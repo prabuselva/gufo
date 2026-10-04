@@ -4,8 +4,10 @@
 # gpu_exclusive.sh blocks for the whole benchmark (stop server -> run -> respawn
 # server -> poll /v1/models), which can exceed a tool's wall-clock limit. So run
 # it detached here and wait on it in the foreground with bench_wait.sh, which is
-# the harness process that stays alive until the benchmark finishes and the
-# resident server is serving again.
+# the harness process that stays alive until the benchmark finishes. This run
+# uses --no-respawn: it only stops the server and runs the benchmark. The
+# FOREGROUND bench_wait.sh does the respawn, so a killed benchmark can never take
+# an in-flight respawn down with it and leave the server down.
 #
 # Usage: bench_bg.sh <name> <inner_timeout_sec> <cmd...>
 #   <inner_timeout_sec> bounds the benchmark itself (timeout -k 60).
@@ -35,7 +37,7 @@ echo "$$" > "${base}.pid"
 cd "$root"
 # shellcheck disable=SC1091
 source ./rocm_env.sh >>"$log" 2>&1
-timeout -k 60 "$inner_timeout" tools/bench/gpu_exclusive.sh --settle 30 -- "$@" >>"$log" 2>&1
+timeout -k 60 "$inner_timeout" tools/bench/gpu_exclusive.sh --no-respawn -- "$@" >>"$log" 2>&1
 rc=$?
 echo "END $(date -Is) rc=$rc" >> "$log"
 echo "$rc" > "$status"

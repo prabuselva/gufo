@@ -60,35 +60,41 @@ quality; successful optimizations become the default, without extra switches.
 A resident `gufo serve` holds most VRAM and contends for the GPU, so any GPU
 benchmark needs exclusive access. Run it through
 `tools/bench/gpu_exclusive.sh [options] -- <command>`: it stops the server,
-waits for VRAM to release, runs one command, then always respawns the server
-via the launch script and polls `/v1/models` until ready before returning
-(override with `--launch-script`, `--port`, `--expect-model`, `--ready-timeout`,
-`--settle`). Never time a benchmark while the server is resident; contention
-and lazy allocation make such numbers meaningless.
+waits for VRAM to release, runs one command, then respawns the server via the
+launch script and polls `/v1/models` until ready before returning (override with
+`--launch-script`, `--port`, `--expect-model`, `--ready-timeout`, `--settle`).
+`--no-respawn` stops + runs only, leaving the respawn to a foreground harness;
+`tools/bench/gpu_respawn_server.sh` is the canonical foreground respawn. Never
+time a benchmark while the server is resident; contention and lazy allocation
+make such numbers meaningless.
 
 ### Running a benchmark from the harness
 
 `gpu_exclusive.sh` blocks for the whole run (stop server -> benchmark -> respawn
 -> poll), which can exceed a tool's wall-clock limit. Do NOT run it directly in
-one blocking tool call. Instead split it across two processes:
+one blocking tool call, and do NOT background the respawn: an automated harness
+kills a call's whole process tree on timeout, which would take an in-flight
+respawn down with it and leave the server down. Split it so the benchmark runs in
+the background but the respawn runs in the foreground:
 
 1. Launch the benchmark DETACHED in the background with
-   `tools/bench/bench_bg.sh <name> <inner_timeout_sec> <cmd...>`. It wraps
-   `gpu_exclusive.sh` under `timeout`, writes
+   `tools/bench/bench_bg.sh <name> <inner_timeout_sec> <cmd...>`. It runs
+   `gpu_exclusive.sh --no-respawn` (stop + run only) under `timeout`, writes
    `${GUFO_BENCH_STATE_DIR:-/tmp/opencode}/gufo_bench_<name>.{log,pid,status}`,
    and returns immediately. Launch it with `setsid ... & disown` so its PID is a
    process group the watchdog can kill as a unit.
 2. Run `tools/bench/bench_wait.sh <name> <total_sec> <ready_grace>` in the
-   FOREGROUND with a tool timeout LARGER than `total_sec`. This is the harness
-   process that stays alive, polls the background run, kills the process group if
-   the budget is exceeded, and confirms `/v1/models` is serving again before it
-   returns. The watchdog is what waits for the server to respawn; never continue
-   the session until it reports done.
+   FOREGROUND with a tool timeout LARGER than `total_sec` plus the respawn time.
+   This harness process stays alive, polls the background run, kills the process
+   group if the budget is exceeded, then respawns the resident server in the
+   foreground (`gpu_respawn_server.sh`) and confirms `/v1/models` before it
+   returns. The watchdog is what brings the server back; never continue the
+   session until it reports done.
 
 ```sh
 tools/bench/bench_bg.sh pp16k 600 \
   build/release/gufo bench --model "$MODEL" --n-prompt 16384 --n-gen 1 & disown
-tools/bench/bench_wait.sh pp16k 660 90   # foreground; tool timeout > 660s
+tools/bench/bench_wait.sh pp16k 660 90   # foreground; tool timeout > 660s + respawn
 cat /tmp/opencode/gufo_bench_pp16k.log   # read the real numbers afterwards
 ```
 
