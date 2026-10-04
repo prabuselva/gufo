@@ -13,8 +13,11 @@
 namespace gufo::models::qwen36_a3b::rocm {
 
 /// The quantized row formats the GEMV tier decodes. The executor maps the
-/// artifact's GGUF type onto this; only these three appear in the model.
-enum class GemvType { kQ8_0, kF32, kBF16 };
+/// artifact's GGUF type onto this. Q8_0/F32/BF16 back the dense projections;
+/// Q4_K/Q5_K back the routed expert stacks of a Q4_K_XL artifact, which the
+/// grouped decode GEMV decodes on the fly (the fused pair/SwiGLU kernels are
+/// Q8_0-only, so those experts fall back to the plain grouped GEMV).
+enum class GemvType { kQ8_0, kF32, kBF16, kQ4_K, kQ5_K };
 
 /// out[r] = sum_k W[r][k] * x[k] for r in [0, rows). `base` points at the first
 /// row of a row-major [rows x cols] matrix stored in `type`; `row_bytes` is the

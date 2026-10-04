@@ -828,15 +828,11 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
   const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
   switch (type) {
     case WeightType::kQ4_K:
-      if constexpr (BN > 48) {
-        return false;
-      } else {
-        hipLaunchKernelGGL(
-            (RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>), grid,
-            dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-            rows_out, swiglu_gate, out, out_half, m, k, nullptr);
-        return true;
-      }
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k, nullptr);
+      return true;
     case WeightType::kQ5_1:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_1, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
@@ -856,15 +852,11 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                          out_half, m, k, nullptr);
       return true;
     case WeightType::kQ5_K:
-      if constexpr (BN > 48) {
-        return false;
-      } else {
-        hipLaunchKernelGGL(
-            (RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>), grid,
-            dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-            rows_out, swiglu_gate, out, out_half, m, k, nullptr);
-        return true;
-      }
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k, nullptr);
+      return true;
     default:
       return false;
   }
