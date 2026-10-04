@@ -148,6 +148,183 @@ void* Executor::AllocBytes(std::size_t bytes, std::string* error) {
   return p;
 }
 
+Session::~Session() {
+  for (void* p : allocations_) {
+    (void)hipFree(p);
+  }
+}
+
+float* Session::AllocFloats(std::size_t n) {
+  float* p = nullptr;
+  if (n > 0 && hipMalloc(&p, n * sizeof(float)) != hipSuccess) {
+    alloc_failed_ = true;
+    return nullptr;
+  }
+  if (p != nullptr) {
+    allocations_.push_back(p);
+    allocated_bytes_ += n * sizeof(float);
+  }
+  return p;
+}
+
+void* Session::AllocBytes(std::size_t bytes) {
+  void* p = nullptr;
+  if (bytes > 0 && hipMalloc(&p, bytes) != hipSuccess) {
+    alloc_failed_ = true;
+    return nullptr;
+  }
+  if (p != nullptr) {
+    allocations_.push_back(p);
+    allocated_bytes_ += bytes;
+  }
+  return p;
+}
+
+void Session::Reset() {
+  position_ = 0;
+  mtp_position_ = 0;
+  const std::size_t state_elems = static_cast<std::size_t>(c_.ssm_num_v_heads) *
+                                  c_.ssm_head_dim * c_.ssm_head_dim;
+  const std::size_t history_elems =
+      static_cast<std::size_t>(c_.ssm_conv_kernel - 1) * c_.SsmConvChannels();
+  const std::size_t kv_elems =
+      static_cast<std::size_t>(c_.num_kv_heads) * c_.head_dim * max_context_;
+  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+    if (c_.IsLinearLayer(il)) {
+      (void)hipMemsetAsync(gdn_state_[il], 0, state_elems * sizeof(float),
+                           nullptr);
+      (void)hipMemsetAsync(gdn_history_[il], 0, history_elems * sizeof(float),
+                           nullptr);
+    } else {
+      (void)hipMemsetAsync(k_cache_[il], 0, kv_elems * sizeof(float), nullptr);
+      (void)hipMemsetAsync(v_cache_[il], 0, kv_elems * sizeof(float), nullptr);
+      (void)hipMemsetAsync(k_cache_f16_[il], 0, kv_elems * sizeof(__half),
+                           nullptr);
+      (void)hipMemsetAsync(v_cache_f16_[il], 0, kv_elems * sizeof(__half),
+                           nullptr);
+    }
+  }
+  if (has_mtp_) {
+    (void)hipMemsetAsync(mtp_k_cache_, 0, kv_elems * sizeof(float), nullptr);
+    (void)hipMemsetAsync(mtp_v_cache_, 0, kv_elems * sizeof(float), nullptr);
+    (void)hipMemsetAsync(mtp_k_cache_f16_, 0, kv_elems * sizeof(__half),
+                         nullptr);
+    (void)hipMemsetAsync(mtp_v_cache_f16_, 0, kv_elems * sizeof(__half),
+                         nullptr);
+    (void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
+                         nullptr);
+  }
+}
+
+std::unique_ptr<Session> Executor::CreateSession(
+    std::uint32_t max_context, std::string* error_msg) const {
+  if (max_context == 0) {
+    if (error_msg != nullptr) {
+      *error_msg = "max_context must be positive";
+    }
+    return nullptr;
+  }
+  if (max_context > scratch_context_) {
+    if (error_msg != nullptr) {
+      *error_msg = "session context exceeds the executor scratch bound";
+    }
+    return nullptr;
+  }
+  const Config& c = model_.config();
+  std::unique_ptr<Session> s(new Session(c, model_.has_mtp()));
+  s->max_context_ = max_context;
+
+  // Recurrent state, per layer, sized to this session's context.
+  const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
+                                  c.ssm_head_dim * c.ssm_head_dim;
+  const std::size_t history_elems =
+      static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
+  const std::size_t kv_elems =
+      static_cast<std::size_t>(c.num_kv_heads) * c.head_dim * max_context;
+  s->gdn_state_.assign(c.num_layers, nullptr);
+  s->gdn_history_.assign(c.num_layers, nullptr);
+  s->k_cache_.assign(c.num_layers, nullptr);
+  s->v_cache_.assign(c.num_layers, nullptr);
+  s->k_cache_f16_.assign(c.num_layers, nullptr);
+  s->v_cache_f16_.assign(c.num_layers, nullptr);
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (c.IsLinearLayer(il)) {
+      s->gdn_state_[il] = s->AllocFloats(state_elems);
+      s->gdn_history_[il] = s->AllocFloats(history_elems);
+    } else {
+      s->k_cache_[il] = s->AllocFloats(kv_elems);
+      s->v_cache_[il] = s->AllocFloats(kv_elems);
+      s->k_cache_f16_[il] = s->AllocBytes(kv_elems * sizeof(__half));
+      s->v_cache_f16_[il] = s->AllocBytes(kv_elems * sizeof(__half));
+    }
+  }
+  s->gdn_state_snap_.assign(c.num_layers, nullptr);
+  s->gdn_hist_snap_.assign(c.num_layers, nullptr);
+  if (s->has_mtp_) {
+    s->mtp_k_cache_ = s->AllocFloats(kv_elems);
+    s->mtp_v_cache_ = s->AllocFloats(kv_elems);
+    s->mtp_k_cache_f16_ = s->AllocBytes(kv_elems * sizeof(__half));
+    s->mtp_v_cache_f16_ = s->AllocBytes(kv_elems * sizeof(__half));
+    s->mtp_prev_hidden_ = s->AllocFloats(c.hidden_size);
+    // One recurrent-state snapshot row per droppable verify row (all but the
+    // last), so a rejected draft can rewind to any committed prefix.
+    constexpr std::size_t kRows = Executor::kMaxVerifyRows;
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (c.IsLinearLayer(il)) {
+        s->gdn_state_snap_[il] = s->AllocFloats((kRows - 1U) * state_elems);
+        s->gdn_hist_snap_[il] = s->AllocFloats((kRows - 1U) * history_elems);
+      }
+    }
+  }
+
+  // Any allocation failure leaves a null pointer; free the partial session and
+  // report once.
+  if (s->alloc_failed_) {
+    if (error_msg != nullptr) {
+      *error_msg = "hipMalloc failed for session state";
+    }
+    return nullptr;
+  }
+  s->Reset();
+  return s;
+}
+
+std::size_t Executor::SessionBytes(std::uint32_t max_context) const noexcept {
+  if (max_context == 0) {
+    return 0;
+  }
+  const Config& c = model_.config();
+  const std::size_t state_bytes =
+      static_cast<std::size_t>(c.ssm_num_v_heads) * c.ssm_head_dim *
+      c.ssm_head_dim * sizeof(float);
+  const std::size_t history_bytes =
+      static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels() *
+      sizeof(float);
+  const std::size_t kv_f32 =
+      static_cast<std::size_t>(c.num_kv_heads) * c.head_dim * max_context;
+  const std::size_t kv_bytes = kv_f32 * sizeof(float);
+  const std::size_t kv_f16_bytes = kv_f32 * sizeof(__half);
+  std::size_t bytes = 0;
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (c.IsLinearLayer(il)) {
+      bytes += state_bytes + history_bytes;
+    } else {
+      bytes += 2 * kv_bytes + 2 * kv_f16_bytes;
+    }
+  }
+  if (model_.has_mtp()) {
+    bytes += 2 * kv_bytes + 2 * kv_f16_bytes;  // draft KV + FP16 mirrors
+    bytes += static_cast<std::size_t>(c.hidden_size) * sizeof(float);
+    constexpr std::size_t kRows = Executor::kMaxVerifyRows;
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (c.IsLinearLayer(il)) {
+        bytes += (kRows - 1U) * (state_bytes + history_bytes);
+      }
+    }
+  }
+  return bytes;
+}
+
 std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                                            std::uint32_t max_context,
                                            std::string* error_msg,
@@ -167,7 +344,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   static std::once_flag mmq_once;
   std::call_once(mmq_once, [] { (void)qfn_mmq_init(0); });
   std::unique_ptr<Executor> e(new Executor(model.config(), model));
-  e->max_context_ = max_context;
+  e->scratch_context_ = max_context;
   const Config& c = e->c_;
 
   // Residual stream and outputs.
@@ -344,40 +521,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->mtp_cur_ = e->AllocFloats(c.hidden_size, error_msg);
   e->mtp_chain_ = e->AllocFloats(c.hidden_size, error_msg);
 
-  // Recurrent state, per layer.
-  const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
-                                  c.ssm_head_dim * c.ssm_head_dim;
-  const std::size_t history_elems =
-      static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-  const std::size_t kv_elems =
-      static_cast<std::size_t>(c.num_kv_heads) * c.head_dim * max_context;
-  e->gdn_state_.assign(c.num_layers, nullptr);
-  e->gdn_history_.assign(c.num_layers, nullptr);
-  e->k_cache_.assign(c.num_layers, nullptr);
-  e->v_cache_.assign(c.num_layers, nullptr);
-  e->k_cache_f16_.assign(c.num_layers, nullptr);
-  e->v_cache_f16_.assign(c.num_layers, nullptr);
-  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-    if (c.IsLinearLayer(il)) {
-      e->gdn_state_[il] = e->AllocFloats(state_elems, error_msg);
-      e->gdn_history_[il] = e->AllocFloats(history_elems, error_msg);
-    } else {
-      e->k_cache_[il] = e->AllocFloats(kv_elems, error_msg);
-      e->v_cache_[il] = e->AllocFloats(kv_elems, error_msg);
-      e->k_cache_f16_[il] = e->AllocBytes(kv_elems * sizeof(__half), error_msg);
-      e->v_cache_f16_[il] = e->AllocBytes(kv_elems * sizeof(__half), error_msg);
-    }
-  }
-  e->gdn_state_snap_.assign(c.num_layers, nullptr);
-  e->gdn_hist_snap_.assign(c.num_layers, nullptr);
+  // Speculative verify scratch: kMaxVerifyRows rows of logits and hidden
+  // states and the batched MTP fill buffers. These are shared across sessions
+  // (compute is serialized); the per-session recurrent state, KV caches and
+  // verify snapshots are allocated by CreateSession.
   if (model.has_mtp()) {
-    e->mtp_k_cache_ = e->AllocFloats(kv_elems, error_msg);
-    e->mtp_v_cache_ = e->AllocFloats(kv_elems, error_msg);
-    e->mtp_k_cache_f16_ = e->AllocBytes(kv_elems * sizeof(__half), error_msg);
-    e->mtp_v_cache_f16_ = e->AllocBytes(kv_elems * sizeof(__half), error_msg);
-    // Speculative verify: kMaxVerifyRows rows of logits and hidden states,
-    // the batched MTP fill scratch, and one recurrent-state snapshot row per
-    // droppable verify row (all but the last).
     constexpr std::size_t kRows = Executor::kMaxVerifyRows;
     e->verify_logits_ = e->AllocFloats(kRows * c.vocab_size, error_msg);
     e->verify_h_ = e->AllocFloats(kRows * c.hidden_size, error_msg);
@@ -385,62 +533,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         static_cast<std::size_t>(chunk) * 2 * c.hidden_size, error_msg);
     e->pf_mtp_cur_ = e->AllocFloats(
         static_cast<std::size_t>(chunk) * c.hidden_size, error_msg);
-    e->mtp_prev_hidden_ = e->AllocFloats(c.hidden_size, error_msg);
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      if (c.IsLinearLayer(il)) {
-        e->gdn_state_snap_[il] =
-            e->AllocFloats((kRows - 1U) * state_elems, error_msg);
-        e->gdn_hist_snap_[il] =
-            e->AllocFloats((kRows - 1U) * history_elems, error_msg);
-      }
-    }
   }
 
   if (error_msg != nullptr && !error_msg->empty()) {
     return nullptr;
   }
-  e->Reset();
   return e;
 }
 
-void Executor::Reset() {
-  position_ = 0;
-  mtp_position_ = 0;
-  const std::size_t state_elems = static_cast<std::size_t>(c_.ssm_num_v_heads) *
-                                  c_.ssm_head_dim * c_.ssm_head_dim;
-  const std::size_t history_elems =
-      static_cast<std::size_t>(c_.ssm_conv_kernel - 1) * c_.SsmConvChannels();
-  const std::size_t kv_elems =
-      static_cast<std::size_t>(c_.num_kv_heads) * c_.head_dim * max_context_;
-  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
-    if (c_.IsLinearLayer(il)) {
-      (void)hipMemsetAsync(gdn_state_[il], 0, state_elems * sizeof(float),
-                           nullptr);
-      (void)hipMemsetAsync(gdn_history_[il], 0, history_elems * sizeof(float),
-                           nullptr);
-    } else {
-      (void)hipMemsetAsync(k_cache_[il], 0, kv_elems * sizeof(float), nullptr);
-      (void)hipMemsetAsync(v_cache_[il], 0, kv_elems * sizeof(float), nullptr);
-      (void)hipMemsetAsync(k_cache_f16_[il], 0, kv_elems * sizeof(__half),
-                           nullptr);
-      (void)hipMemsetAsync(v_cache_f16_[il], 0, kv_elems * sizeof(__half),
-                           nullptr);
-    }
-  }
-  if (model_.has_mtp()) {
-    (void)hipMemsetAsync(mtp_k_cache_, 0, kv_elems * sizeof(float), nullptr);
-    (void)hipMemsetAsync(mtp_v_cache_, 0, kv_elems * sizeof(float), nullptr);
-    (void)hipMemsetAsync(mtp_k_cache_f16_, 0, kv_elems * sizeof(__half),
-                         nullptr);
-    (void)hipMemsetAsync(mtp_v_cache_f16_, 0, kv_elems * sizeof(__half),
-                         nullptr);
-    (void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
-                         nullptr);
-  }
-}
-
-void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
-                               const float* x, float* out) {
+void Executor::LinearAttention(Session& session, const DeviceLayer& l,
+                               std::uint32_t il, const float* x, float* out) {
   const std::uint32_t channels = c_.SsmConvChannels();
   const std::uint32_t key_dim = c_.SsmKeyDim();
   const std::uint32_t d = c_.ssm_head_dim;
@@ -471,20 +573,20 @@ void Executor::LinearAttention(const DeviceLayer& l, std::uint32_t il,
   prof_.Mark("lin_conv");
   const std::uint32_t v_heads = c_.ssm_num_v_heads;
   if (d <= 1024U && channels == (2U * c_.ssm_num_k_heads + v_heads) * d) {
-    GdnConvNormQk(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il],
+    GdnConvNormQk(gdn_qkv_, l.ssm_conv1d.f32(), session.gdn_history_[il],
                   gdn_convolved_, gdn_qn_, gdn_kn_, channels, kern,
                   c_.ssm_num_k_heads, v_heads, d, c_.rms_eps, nullptr);
   } else {
-    GdnConv(gdn_qkv_, l.ssm_conv1d.f32(), gdn_history_[il], gdn_convolved_,
-            channels, kern, nullptr);
+    GdnConv(gdn_qkv_, l.ssm_conv1d.f32(), session.gdn_history_[il],
+            gdn_convolved_, channels, kern, nullptr);
     prof_.Mark("lin_normqk");
     GdnNormQk(gdn_convolved_, gdn_qn_, gdn_kn_, c_.ssm_num_k_heads, d,
               c_.rms_eps, nullptr);
   }
   prof_.Mark("lin_delta");
   GdnDelta(gdn_qn_, gdn_kn_, gdn_convolved_ + 2 * key_dim, gdn_alpha_,
-           gdn_beta_, l.ssm_a.f32(), l.ssm_dt.f32(), gdn_state_[il], gdn_attn_,
-           c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, nullptr);
+           gdn_beta_, l.ssm_a.f32(), l.ssm_dt.f32(), session.gdn_state_[il],
+           gdn_attn_, c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, nullptr);
   prof_.Mark("lin_outnorm");
   GdnOutNorm(gdn_attn_, gdn_z_, l.ssm_norm.f32(), c_.ssm_num_v_heads, d,
              c_.rms_eps, nullptr);
@@ -869,10 +971,10 @@ void Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
               1, out, tokens, used, hidden, nullptr);
 }
 
-void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
-                                    const float* x, float* out,
-                                    std::uint32_t tokens, float* state_snap,
-                                    float* hist_snap) {
+void Executor::LinearAttentionBatch(Session& session, const DeviceLayer& l,
+                                    std::uint32_t il, const float* x,
+                                    float* out, std::uint32_t tokens,
+                                    float* state_snap, float* hist_snap) {
   const std::uint32_t channels = c_.SsmConvChannels();
   const std::uint32_t d = c_.ssm_head_dim;
   const std::uint32_t kern = c_.ssm_conv_kernel;
@@ -897,7 +999,7 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
   proj(l.ssm_beta, x, pf_beta_);
 
   prof_.Mark("lin_conv_normqk");
-  GdnConvNormQkPrefill(pf_qkv_, l.ssm_conv1d.f32(), gdn_history_[il],
+  GdnConvNormQkPrefill(pf_qkv_, l.ssm_conv1d.f32(), session.gdn_history_[il],
                        pf_convolved_, pf_qn_, pf_kn_, tokens, channels, kern,
                        c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, c_.rms_eps,
                        nullptr);
@@ -907,7 +1009,7 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
           c_.ssm_num_v_heads, d, nullptr);
   GdnDeltaLoop(pf_qn_, pf_kn_, pf_convolved_, pf_alpha_, pf_beta_,
                l.ssm_a.f32(), l.ssm_dt.f32(), pf_alpha_pre_, pf_beta_pre_,
-               pf_kq_pre_, gdn_state_[il], pf_gdn_attn_, tokens,
+               pf_kq_pre_, session.gdn_state_[il], pf_gdn_attn_, tokens,
                c_.ssm_num_k_heads, c_.ssm_num_v_heads, d, channels, state_snap,
                state_snap != nullptr ? tokens - 1 : 0, nullptr);
   prof_.Mark("lin_outnorm");
@@ -924,15 +1026,15 @@ void Executor::LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
   if (hist_snap != nullptr) {
     const std::size_t hist_row = static_cast<std::size_t>(kern - 1U) * channels;
     for (std::uint32_t t = 1; t < tokens; ++t) {
-      GdnHistoryUpdate(pf_qkv_, gdn_history_[il],
+      GdnHistoryUpdate(pf_qkv_, session.gdn_history_[il],
                        hist_snap + (t - 1U) * hist_row, t, channels, kern,
                        nullptr);
     }
   }
-  GdnHistoryUpdate(pf_qkv_, gdn_history_[il], pf_hist_new_, tokens, channels,
-                   kern, nullptr);
+  GdnHistoryUpdate(pf_qkv_, session.gdn_history_[il], pf_hist_new_, tokens,
+                   channels, kern, nullptr);
   (void)hipMemcpyAsync(
-      gdn_history_[il], pf_hist_new_,
+      session.gdn_history_[il], pf_hist_new_,
       static_cast<std::size_t>(kern - 1) * channels * sizeof(float),
       hipMemcpyDeviceToDevice, nullptr);
 }
@@ -1000,8 +1102,8 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
   proj(l.attn_out, pf_ctx_, out);
 }
 
-bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
-                       std::string* error_msg) {
+bool Executor::Prefill(Session& session, const std::int32_t* tokens,
+                       std::uint32_t count, std::string* error_msg) {
   if (tokens == nullptr || count == 0) {
     if (error_msg != nullptr) {
       *error_msg = "no tokens to prefill";
@@ -1017,7 +1119,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
       return false;
     }
   }
-  if (count > max_context_ - position_) {
+  if (count > session.max_context_ - session.position_) {
     if (error_msg != nullptr) {
       *error_msg = "context length exceeded";
     }
@@ -1031,7 +1133,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
   while (done < count) {
     const std::uint32_t rows =
         (count - done) < prefill_chunk_ ? (count - done) : prefill_chunk_;
-    const std::uint32_t start = position_ + done;
+    const std::uint32_t start = session.position_ + done;
 
     std::vector<std::uint32_t> host_pos(rows);
     for (std::uint32_t t = 0; t < rows; ++t) {
@@ -1053,11 +1155,11 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
       RmsNormRows(pf_x_, l.attn_norm.f32(), pf_normed_, rows, hidden,
                   c_.rms_eps, nullptr);
       if (c_.IsLinearLayer(il)) {
-        LinearAttentionBatch(l, il, pf_normed_, pf_attn_, rows);
+        LinearAttentionBatch(session, l, il, pf_normed_, pf_attn_, rows);
       } else {
-        AttentionBatch(l, pf_normed_, start, pf_attn_, k_cache_[il],
-                       v_cache_[il], k_cache_f16_[il], v_cache_f16_[il],
-                       pf_pos_, rows);
+        AttentionBatch(l, pf_normed_, start, pf_attn_, session.k_cache_[il],
+                       session.v_cache_[il], session.k_cache_f16_[il],
+                       session.v_cache_f16_[il], pf_pos_, rows);
       }
       prof_.Mark("add");
       Add(pf_x_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
@@ -1082,8 +1184,8 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
       // The draft cache is only consumed when this session decodes with MTP.
       // A plain prefill leaves mtp_enabled_ false so the draft's attention
       // never runs; the last-row hidden above still feeds the logits stage.
-      if (mtp_enabled_) {
-        MtpPrefillChunk(tokens + done, rows, start, pf_normed_);
+      if (session.mtp_enabled_) {
+        MtpPrefillChunk(session, tokens + done, rows, start, pf_normed_);
       }
     }
     done += rows;
@@ -1102,7 +1204,7 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
   Gemv(model_.output().data, ToGemvType(model_.output().type),
        model_.output().rows, model_.output().cols, model_.output().row_bytes,
        x_, logits_, nullptr);
-  position_ += count;
+  session.position_ += count;
   if (prof_.enabled()) {
     char header[128];
     std::snprintf(header, sizeof(header), "prefill %u tokens, chunk %u", count,
@@ -1112,21 +1214,22 @@ bool Executor::Prefill(const std::int32_t* tokens, std::uint32_t count,
   return true;
 }
 
-bool Executor::Step(std::int32_t token, std::string* error_msg) {
+bool Executor::Step(Session& session, std::int32_t token,
+                    std::string* error_msg) {
   if (token < 0 || static_cast<std::uint32_t>(token) >= c_.vocab_size) {
     if (error_msg != nullptr) {
       *error_msg = "token id out of range";
     }
     return false;
   }
-  if (position_ >= max_context_) {
+  if (session.position_ >= session.max_context_) {
     if (error_msg != nullptr) {
       *error_msg = "context length exceeded";
     }
     return false;
   }
 
-  pos_host_ = position_;
+  pos_host_ = session.position_;
   if (prof_.enabled() && decode_steps_ % 32 == 0) {
     prof_.Reset();
   }
@@ -1145,10 +1248,11 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
     const DeviceLayer& l = model_.layers()[il];
     prof_.Mark("attn");
     if (c_.IsLinearLayer(il)) {
-      LinearAttention(l, il, normed_, attn_);
+      LinearAttention(session, l, il, normed_, attn_);
     } else {
-      Attention(l, normed_, position_, attn_, k_cache_[il], v_cache_[il],
-                k_cache_f16_[il], v_cache_f16_[il], pos_dev_);
+      Attention(l, normed_, session.position_, attn_, session.k_cache_[il],
+                session.v_cache_[il], session.k_cache_f16_[il],
+                session.v_cache_f16_[il], pos_dev_);
     }
     prof_.Mark("add");
     FusedAddRmsNorm(x_, attn_, l.post_attention_norm.f32(), normed_,
@@ -1174,7 +1278,7 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
   // Close the GPU-side output stage here; the logits readback and host
   // sampling between steps get their own row instead of inflating lm_head.
   prof_.Mark("sample");
-  ++position_;
+  ++session.position_;
   if (prof_.enabled()) {
     ++decode_steps_;
     if (decode_steps_ % 32 == 0) {
@@ -1184,8 +1288,9 @@ bool Executor::Step(std::int32_t token, std::string* error_msg) {
   return true;
 }
 
-void Executor::MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
-                               std::uint32_t start, const float* hidden_rows) {
+void Executor::MtpPrefillChunk(Session& session, const std::int32_t* tokens,
+                               std::uint32_t rows, std::uint32_t start,
+                               const float* hidden_rows) {
   const std::uint32_t hidden = c_.hidden_size;
   const DeviceLayer& l = model_.mtp();
 
@@ -1199,30 +1304,32 @@ void Executor::MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
   }
   RmsNormRows(pf_x_, l.nextn_enorm.f32(), pf_x_, rows, hidden, c_.rms_eps,
               nullptr);
-  MtpConcat(pf_x_, hidden_rows, mtp_prev_hidden_, pf_mtp_concat_, rows, hidden,
-            nullptr);
+  MtpConcat(pf_x_, hidden_rows, session.mtp_prev_hidden_, pf_mtp_concat_, rows,
+            hidden, nullptr);
   Gemm(l.nextn_eh_proj.data, ToGemvType(l.nextn_eh_proj.type),
        l.nextn_eh_proj.rows, l.nextn_eh_proj.cols, l.nextn_eh_proj.row_bytes,
        pf_mtp_concat_, pf_mtp_cur_, rows, nullptr);
 
   RmsNormRows(pf_mtp_cur_, l.attn_norm.f32(), pf_normed_, rows, hidden,
               c_.rms_eps, nullptr);
-  AttentionBatch(l, pf_normed_, start, pf_attn_, mtp_k_cache_, mtp_v_cache_,
-                 mtp_k_cache_f16_, mtp_v_cache_f16_, pf_pos_, rows);
+  AttentionBatch(l, pf_normed_, start, pf_attn_, session.mtp_k_cache_,
+                 session.mtp_v_cache_, session.mtp_k_cache_f16_,
+                 session.mtp_v_cache_f16_, pf_pos_, rows);
   Add(pf_mtp_cur_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
   RmsNormRows(pf_mtp_cur_, l.post_attention_norm.f32(), pf_normed_, rows,
               hidden, c_.rms_eps, nullptr);
   MoeBatch(l, pf_normed_, pf_ffn_, rows);
   Add(pf_mtp_cur_, pf_ffn_, static_cast<std::size_t>(rows) * hidden, nullptr);
 
-  (void)hipMemcpyAsync(mtp_prev_hidden_, hidden_rows + (rows - 1) * hidden,
-                       hidden * sizeof(float), hipMemcpyDeviceToDevice,
-                       nullptr);
-  mtp_position_ += rows;
+  (void)hipMemcpyAsync(
+      session.mtp_prev_hidden_, hidden_rows + (rows - 1) * hidden,
+      hidden * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
+  session.mtp_position_ += rows;
 }
 
-bool Executor::MtpForward(std::int32_t token, const float* hidden,
-                          bool with_logits, std::string* error_msg) {
+bool Executor::MtpForward(Session& session, std::int32_t token,
+                          const float* hidden, bool with_logits,
+                          std::string* error_msg) {
   if (!model_.has_mtp()) {
     if (error_msg != nullptr) {
       *error_msg = "model has no MTP block";
@@ -1235,7 +1342,7 @@ bool Executor::MtpForward(std::int32_t token, const float* hidden,
     }
     return false;
   }
-  if (mtp_position_ >= max_context_) {
+  if (session.mtp_position_ >= session.max_context_) {
     if (error_msg != nullptr) {
       *error_msg = "context length exceeded";
     }
@@ -1244,7 +1351,7 @@ bool Executor::MtpForward(std::int32_t token, const float* hidden,
 
   const DeviceLayer& l = model_.mtp();
   prof_.Mark("mtp");
-  mtp_pos_host_ = mtp_position_;
+  mtp_pos_host_ = session.mtp_position_;
   (void)hipMemcpy(mtp_pos_dev_, &mtp_pos_host_, sizeof(std::uint32_t),
                   hipMemcpyHostToDevice);
 
@@ -1264,8 +1371,9 @@ bool Executor::MtpForward(std::int32_t token, const float* hidden,
 
   RmsNormRows(mtp_cur_, l.attn_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
-  Attention(l, normed_, mtp_position_, attn_, mtp_k_cache_, mtp_v_cache_,
-            mtp_k_cache_f16_, mtp_v_cache_f16_, mtp_pos_dev_);
+  Attention(l, normed_, session.mtp_position_, attn_, session.mtp_k_cache_,
+            session.mtp_v_cache_, session.mtp_k_cache_f16_,
+            session.mtp_v_cache_f16_, mtp_pos_dev_);
   Add(mtp_cur_, attn_, c_.hidden_size, nullptr);
   RmsNormRows(mtp_cur_, l.post_attention_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
@@ -1282,25 +1390,28 @@ bool Executor::MtpForward(std::int32_t token, const float* hidden,
          model_.output().rows, model_.output().cols, model_.output().row_bytes,
          mtp_cur_, mtp_logits_, nullptr);
   }
-  ++mtp_position_;
+  ++session.mtp_position_;
   return true;
 }
 
-bool Executor::MtpStep(std::int32_t token, std::string* error_msg) {
-  return MtpForward(token, h_out_, true, error_msg);
+bool Executor::MtpStep(Session& session, std::int32_t token,
+                       std::string* error_msg) {
+  return MtpForward(session, token, h_out_, true, error_msg);
 }
 
-bool Executor::MtpDraft(std::int32_t token, std::string* error_msg) {
-  return MtpForward(token, mtp_chain_, true, error_msg);
+bool Executor::MtpDraft(Session& session, std::int32_t token,
+                        std::string* error_msg) {
+  return MtpForward(session, token, mtp_chain_, true, error_msg);
 }
 
-bool Executor::MtpAdvance(std::int32_t token, const float* hidden,
-                          std::string* error_msg) {
-  return MtpForward(token, hidden, false, error_msg);
+bool Executor::MtpAdvance(Session& session, std::int32_t token,
+                          const float* hidden, std::string* error_msg) {
+  return MtpForward(session, token, hidden, false, error_msg);
 }
 
-bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
-                      std::uint32_t k, std::string* error_msg) {
+bool Executor::Verify(Session& session, std::int32_t t0,
+                      const std::int32_t* drafts, std::uint32_t k,
+                      std::string* error_msg) {
   if (!model_.has_mtp()) {
     if (error_msg != nullptr) {
       *error_msg = "model has no MTP block";
@@ -1329,7 +1440,7 @@ bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
     }
   }
   const std::uint32_t rows = k + 1U;
-  if (position_ + rows > max_context_) {
+  if (session.position_ + rows > session.max_context_) {
     if (error_msg != nullptr) {
       *error_msg = "context length exceeded";
     }
@@ -1341,10 +1452,10 @@ bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
     prof_.Reset();
   }
   prof_.Mark("verify");
-  verify_base_pos_ = position_;
+  session.verify_base_pos_ = session.position_;
   std::uint32_t host_pos[kMaxVerifyRows];
   for (std::uint32_t r = 0; r < rows; ++r) {
-    host_pos[r] = position_ + r;
+    host_pos[r] = session.position_ + r;
   }
   (void)hipMemcpyAsync(pf_pos_, host_pos, rows * sizeof(std::uint32_t),
                        hipMemcpyHostToDevice, nullptr);
@@ -1363,12 +1474,14 @@ bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
     if (c_.IsLinearLayer(il)) {
       // Snapshot the recurrent state and conv history after each of the
       // first rows so a rejected draft can rewind to any committed prefix.
-      LinearAttentionBatch(l, il, pf_normed_, pf_attn_, rows,
-                           gdn_state_snap_[il], gdn_hist_snap_[il]);
+      LinearAttentionBatch(session, l, il, pf_normed_, pf_attn_, rows,
+                           session.gdn_state_snap_[il],
+                           session.gdn_hist_snap_[il]);
     } else {
-      AttentionBatch(l, pf_normed_, position_, pf_attn_, k_cache_[il],
-                     v_cache_[il], k_cache_f16_[il], v_cache_f16_[il], pf_pos_,
-                     rows);
+      AttentionBatch(l, pf_normed_, session.position_, pf_attn_,
+                     session.k_cache_[il], session.v_cache_[il],
+                     session.k_cache_f16_[il], session.v_cache_f16_[il],
+                     pf_pos_, rows);
     }
     Add(pf_x_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
     RmsNormRows(pf_x_, l.post_attention_norm.f32(), pf_normed_, rows, hidden,
@@ -1388,7 +1501,7 @@ bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
            model_.output().row_bytes, verify_h_, hidden, verify_logits_,
            model_.output().rows, nullptr);
   prof_.Mark("sample");
-  position_ += rows;
+  session.position_ += rows;
   if (prof_.enabled()) {
     ++spec_rounds_;
     if (spec_rounds_ % 16 == 0) {
@@ -1398,7 +1511,7 @@ bool Executor::Verify(std::int32_t t0, const std::int32_t* drafts,
   return true;
 }
 
-void Executor::RollbackVerify(std::uint32_t keep) {
+void Executor::RollbackVerify(Session& session, std::uint32_t keep) {
   const std::size_t hidden = c_.hidden_size;
   const std::size_t state_elems = static_cast<std::size_t>(c_.ssm_num_v_heads) *
                                   c_.ssm_head_dim * c_.ssm_head_dim;
@@ -1412,17 +1525,19 @@ void Executor::RollbackVerify(std::uint32_t keep) {
     if (!c_.IsLinearLayer(il)) {
       continue;
     }
-    (void)hipMemcpyAsync(
-        gdn_state_[il], gdn_state_snap_[il] + snap * state_elems,
-        state_elems * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
-    (void)hipMemcpyAsync(
-        gdn_history_[il], gdn_hist_snap_[il] + snap * history_elems,
-        history_elems * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
+    (void)hipMemcpyAsync(session.gdn_state_[il],
+                         session.gdn_state_snap_[il] + snap * state_elems,
+                         state_elems * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+    (void)hipMemcpyAsync(session.gdn_history_[il],
+                         session.gdn_hist_snap_[il] + snap * history_elems,
+                         history_elems * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
   }
-  position_ = verify_base_pos_ + keep;
+  session.position_ = session.verify_base_pos_ + keep;
   // The draft cache already holds an entry per chained draft, so it is
   // aligned with the committed prefix once the trunk rewinds to it.
-  mtp_position_ = verify_base_pos_ + keep;
+  session.mtp_position_ = session.verify_base_pos_ + keep;
   (void)hipMemcpyAsync(h_out_, verify_h_ + snap * hidden,
                        hidden * sizeof(float), hipMemcpyDeviceToDevice,
                        nullptr);

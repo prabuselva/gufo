@@ -109,6 +109,12 @@ int RunPrefillBench(const rocm::DeviceModel& device_model,
               << "): " << error << "\n";
     return 1;
   }
+  const auto session = executor->CreateSession(max_len, &error);
+  if (session == nullptr) {
+    std::cerr << "bench session create failed (max_context=" << max_len
+              << "): " << error << "\n";
+    return 1;
+  }
   std::vector<std::int32_t> tokens(max_len);
   for (std::uint32_t i = 0; i < max_len; ++i) {
     tokens[i] = static_cast<std::int32_t>(i % 1000U);
@@ -117,17 +123,17 @@ int RunPrefillBench(const rocm::DeviceModel& device_model,
   std::cout << "prefill throughput sweep (chunk="
             << (max_len < 2048U ? max_len : 2048U) << "):\n";
   for (const std::uint32_t n : lengths) {
-    executor->Reset();
-    if (!executor->Prefill(tokens.data(), n, &error)) {
+    session->Reset();
+    if (!executor->Prefill(*session, tokens.data(), n, &error)) {
       std::cerr << "prefill " << n << " failed: " << error << "\n";
       return 1;
     }
     (void)hipDeviceSynchronize();
     double best = 0.0;
     for (int rep = 0; rep < 3; ++rep) {
-      executor->Reset();
+      session->Reset();
       const auto start = std::chrono::steady_clock::now();
-      if (!executor->Prefill(tokens.data(), n, &error)) {
+      if (!executor->Prefill(*session, tokens.data(), n, &error)) {
         std::cerr << "prefill " << n << " failed: " << error << "\n";
         return 1;
       }
@@ -190,6 +196,11 @@ int main() {
     std::cerr << "executor create failed: " << error << "\n";
     return 1;
   }
+  const auto session = executor->CreateSession(max_context, &error);
+  if (session == nullptr) {
+    std::cerr << "session create failed: " << error << "\n";
+    return 1;
+  }
 
   const std::vector<std::int32_t> prompt = {100, 200, 300};
   q36::ReferenceModel reference(*weights, max_context);
@@ -197,7 +208,7 @@ int main() {
   std::vector<float> ref_hidden(c.hidden_size);
 
   for (std::size_t i = 0; i < prompt.size(); ++i) {
-    if (!executor->Step(prompt[i], &error)) {
+    if (!executor->Step(*session, prompt[i], &error)) {
       std::cerr << "GPU step " << i << " failed: " << error << "\n";
       return 1;
     }
@@ -209,10 +220,10 @@ int main() {
         Download(executor->logits(), c.vocab_size);
     CheckLogits(ref_logits, gpu_logits, "trunk step " + std::to_string(i));
   }
-  Expect(executor->position() == reference.Position(), "position matches");
+  Expect(session->position() == reference.Position(), "position matches");
 
   // The MTP draft consumes the last trunk hidden and the next token.
-  if (!executor->MtpStep(/*token=*/400, &error)) {
+  if (!executor->MtpStep(*session, /*token=*/400, &error)) {
     std::cerr << "GPU MTP step failed: " << error << "\n";
     return 1;
   }

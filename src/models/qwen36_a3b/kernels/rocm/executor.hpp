@@ -9,53 +9,162 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen36_a3b/config.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/profile.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {
 
+class Executor;
+
+/// Per-sequence state on the device: the Gated DeltaNet recurrent state and
+/// conv history, the full-attention KV caches (and their FP16 mirrors), the
+/// MTP draft KV caches, and the trunk/draft positions. The forward scratch is
+/// shared across sessions in the Executor (the scheduler serializes compute
+/// through one worker), so a session owns only the buffers that must persist
+/// between forward calls. A speculative session additionally keeps per-row
+/// snapshots of the recurrent state and conv history so a rejected draft can
+/// rewind to any committed prefix.
+class Session {
+ public:
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  [[nodiscard]] std::uint32_t max_context() const noexcept {
+    return max_context_;
+  }
+  [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
+  /// Enables building the MTP draft cache during prefill and using speculative
+  /// decoding. Off by default: a plain prefill never touches the draft block,
+  /// so it skips the draft's attention entirely. Callers that will decode with
+  /// MTP (serve, speculative bench) enable this before the first Prefill; the
+  /// flag must not change mid-session because the draft cache is filled during
+  /// prefill and cannot be rebuilt lazily afterwards.
+  void SetMtpEnabled(bool enabled) noexcept { mtp_enabled_ = enabled; }
+  /// Drops every token and zeroes the recurrent state and caches; the next
+  /// forward starts at position 0.
+  void Reset();
+  [[nodiscard]] std::size_t AllocatedBytes() const noexcept {
+    return allocated_bytes_;
+  }
+
+ private:
+  friend class Executor;
+  Session(const Config& c, bool has_mtp) : c_(c), has_mtp_(has_mtp) {}
+
+  float* AllocFloats(std::size_t n);
+  void* AllocBytes(std::size_t bytes);
+
+  const Config& c_;
+  const bool has_mtp_;
+  std::uint32_t max_context_{0};
+  std::uint32_t position_{0};
+  std::uint32_t mtp_position_{0};
+  /// Trunk position before the most recent Verify, the rewind base.
+  std::uint32_t verify_base_pos_{0};
+  bool mtp_enabled_{false};
+
+  // Recurrent state, indexed by layer (null where the layer does not use it).
+  std::vector<float*> gdn_state_;
+  std::vector<float*> gdn_history_;
+  std::vector<float*> k_cache_;
+  std::vector<float*> v_cache_;
+  // FP16 mirror of the full-attention KV cache, [position][kv_head][head_dim],
+  // consumed by the WMMA prefill kernel. The FP32 planes above stay the source
+  // of truth for decode and the scalar oracle; these are written alongside them
+  // for every prefill chunk.
+  std::vector<void*> k_cache_f16_;
+  std::vector<void*> v_cache_f16_;
+  // Per-linear-layer verify snapshots: the recurrent state and conv history
+  // after each of the first rows of the most recent Verify (null without an
+  // MTP block).
+  std::vector<float*> gdn_state_snap_;
+  std::vector<float*> gdn_hist_snap_;
+  float* mtp_k_cache_{nullptr};
+  float* mtp_v_cache_{nullptr};
+  // Half-precision mirrors of the draft KV caches, consumed by the WMMA
+  // prefill attention kernel (same role as k_cache_f16_/v_cache_f16_ for the
+  // trunk). Without them the draft falls back to the scalar oracle.
+  void* mtp_k_cache_f16_{nullptr};
+  void* mtp_v_cache_f16_{nullptr};
+  // The last prefill chunk's hidden row, the draft block's hidden input for
+  // the next chunk's first row.
+  float* mtp_prev_hidden_{nullptr};
+
+  std::vector<void*> allocations_;
+  std::size_t allocated_bytes_{0};
+  bool alloc_failed_{false};
+};
+
 /// Runs the trunk (and the MTP draft block) of the Qwen3.6-35B-A3B model on
-/// the GPU, one token at a time. Weights stay in their GGUF encoding and are
-/// decoded on the fly by the GEMV tier; the fused operators handle everything
-/// else. The forward pass mirrors the scalar oracle in reference.cpp exactly,
-/// so a GPU step and a CPU step agree to rounding.
+/// the GPU for one session at a time. Weights stay in their GGUF encoding and
+/// are decoded on the fly by the GEMV tier; the fused operators handle
+/// everything else. The forward pass mirrors the scalar oracle in
+/// reference.cpp exactly, so a GPU step and a CPU step agree to rounding.
+///
+/// The scratch buffers are sized once for the model's maximum context and
+/// shared by every session (compute is serialized), while each session owns
+/// its recurrent state and caches. `Create` allocates the shared scratch;
+/// `CreateSession` allocates one session's state at its own context length.
 class Executor {
-public:
+ public:
   ~Executor();
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
-  /// Allocates the recurrent state and scratch for up to `max_context` tokens
-  /// and binds the uploaded weights. Fails if any tensor is in a format the
-  /// GEMV tier cannot decode.
+  /// Allocates the shared forward scratch for up to `max_context` tokens and
+  /// binds the uploaded weights. Fails if any tensor is in a format the GEMV
+  /// tier cannot decode. Per-session state is allocated separately by
+  /// `CreateSession`.
   [[nodiscard]] static std::unique_ptr<Executor> Create(
       const DeviceModel& model, std::uint32_t max_context,
       std::string* error_msg = nullptr, std::uint32_t attn_window = 0,
       std::uint32_t attn_sink = 0);
 
+  /// Allocates one session's recurrent state and caches for up to
+  /// `max_context` tokens (bounded by the scratch `Create` was given). The
+  /// session is returned zeroed and ready for its first forward.
+  [[nodiscard]] std::unique_ptr<Session> CreateSession(
+      std::uint32_t max_context, std::string* error_msg = nullptr) const;
+  /// Device bytes one session allocates at `max_context` (recurrent state, KV
+  /// caches and their FP16 mirrors, MTP caches and verify snapshots). Matches
+  /// the allocations `CreateSession` makes, so callers can bound the resident
+  /// session count against free VRAM.
+  [[nodiscard]] std::size_t SessionBytes(
+      std::uint32_t max_context) const noexcept;
+  /// Scratch the Executor grows lazily after `Create`. All Qwen3.6-35B-A3B
+  /// scratch is allocated eagerly, so this is zero; it exists so the serve
+  /// resource claim can reserve the same shape as other models.
+  [[nodiscard]] std::size_t DeferredScratchBytes() const noexcept { return 0; }
+
   /// Advances the trunk by one token; the result is in logits() and h_out().
-  bool Step(std::int32_t token, std::string* error_msg = nullptr);
+  bool Step(Session& session, std::int32_t token,
+            std::string* error_msg = nullptr);
   /// Advances the trunk by `count` prompt tokens in prefill-sized chunks,
   /// driving the batched GEMM tier and the fused prefill operators so the whole
   /// prompt is consumed without a per-token host round-trip. Recurrent state
-  /// (Gated DeltaNet state/history and the KV caches) and `position_` advance
-  /// exactly as they would have under `count` Step() calls, so decoding resumes
-  /// from the next position. `logits()` and `h_out()` hold the final token's
-  /// result.
-  bool Prefill(const std::int32_t* tokens, std::uint32_t count,
-               std::string* error_msg = nullptr);
+  /// (Gated DeltaNet state/history and the KV caches) and the session position
+  /// advance exactly as they would have under `count` Step() calls, so decoding
+  /// resumes from the next position. `logits()` and `h_out()` hold the final
+  /// token's result.
+  bool Prefill(Session& session, const std::int32_t* tokens,
+               std::uint32_t count, std::string* error_msg = nullptr);
   /// Runs the MTP draft block for `token` using the trunk hidden state from
   /// the most recent Step; the result is in mtp_logits().
-  bool MtpStep(std::int32_t token, std::string* error_msg = nullptr);
+  bool MtpStep(Session& session, std::int32_t token,
+               std::string* error_msg = nullptr);
   /// Advances the MTP cache by `token` against the given device-side trunk
   /// hidden state, skipping the shared head and LM head. Used to keep the
   /// draft cache aligned with the trunk after an accepted draft.
-  bool MtpAdvance(std::int32_t token, const float* hidden,
+  bool MtpAdvance(Session& session, std::int32_t token, const float* hidden,
                   std::string* error_msg = nullptr);
   /// Chains one more MTP draft: feeds `token` back through the draft block
   /// against the previous draft's own hidden state, producing new
   /// mtp_logits(). The draft KV cache advances with each call.
-  bool MtpDraft(std::int32_t token, std::string* error_msg = nullptr);
+  bool MtpDraft(Session& session, std::int32_t token,
+                std::string* error_msg = nullptr);
   /// Upper bound on the rows a Verify pass may run (kMaxDraftTokens + 1).
   static constexpr std::uint32_t kMaxVerifyRows = 5U;
   /// Speculative verification: advances the trunk by `k` + 1 tokens (the
@@ -66,15 +175,13 @@ public:
   /// state. The Gated DeltaNet state and conv history after each of the
   /// first `k` rows are snapshotted so RollbackVerify() can commit any
   /// prefix of the block.
-  bool Verify(std::int32_t t0, const std::int32_t* drafts, std::uint32_t k,
-              std::string* error_msg = nullptr);
+  bool Verify(Session& session, std::int32_t t0, const std::int32_t* drafts,
+              std::uint32_t k, std::string* error_msg = nullptr);
   /// Commits the first `keep` rows of the most recent Verify (1 <= keep <= k)
   /// and discards the rest: restores the recurrent state from the snapshot
-  /// after row `keep` - 1, rewinds `position_` and the MTP cache to just past
-  /// the committed rows and leaves their hidden state in h_out().
-  void RollbackVerify(std::uint32_t keep);
-  /// Clears the recurrent state and both positions.
-  void Reset();
+  /// after row `keep` - 1, rewinds the session position and the MTP cache to
+  /// just past the committed rows and leaves their hidden state in h_out().
+  void RollbackVerify(Session& session, std::uint32_t keep);
 
   [[nodiscard]] const float* logits() const noexcept { return logits_; }
   [[nodiscard]] const float* mtp_logits() const noexcept { return mtp_logits_; }
@@ -85,25 +192,12 @@ public:
     return verify_h_;
   }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
-  [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
-  [[nodiscard]] std::uint32_t max_context() const noexcept {
-    return max_context_;
-  }
 
-  /// Enables building the MTP draft cache during prefill and using speculative
-  /// decoding. Off by default: a plain prefill never touches the draft block,
-  /// so it skips the draft's attention entirely. Callers that will decode with
-  /// MTP (serve, speculative bench) enable this before the first Prefill; the
-  /// flag must not change mid-session because the draft cache is filled during
-  /// prefill and cannot be rebuilt lazily afterwards.
-  void SetMtpEnabled(bool enabled) noexcept { mtp_enabled_ = enabled; }
-  [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
-
-private:
+ private:
   Executor(const Config& c, const DeviceModel& model) : c_(c), model_(model) {}
 
-  void LinearAttention(const DeviceLayer& l, std::uint32_t il, const float* x,
-                       float* out);
+  void LinearAttention(Session& session, const DeviceLayer& l,
+                       std::uint32_t il, const float* x, float* out);
   void Attention(const DeviceLayer& l, const float* x, std::uint32_t pos,
                  float* out, float* k_cache, float* v_cache, void* k_cache_f16,
                  void* v_cache_f16, const std::uint32_t* pos_dev);
@@ -116,26 +210,28 @@ private:
                 std::uint32_t tokens);
 
   /// Batched (prefill) Gated DeltaNet over `tokens` rows of `x`
-  /// ([tokens][hidden]) into `out` ([tokens][hidden]), advancing the layer's
+  /// ([tokens][hidden]) into `out` ([tokens][hidden]), advancing the session's
   /// recurrent state and conv history past the chunk. Mirrors
   /// LinearAttention(). When `state_snap` is non-null it receives the recurrent
   /// state after each of the first `tokens - 1` rows (see GdnDeltaLoop);
   /// `hist_snap` receives the conv history after the first row.
-  void LinearAttentionBatch(const DeviceLayer& l, std::uint32_t il,
-                            const float* x, float* out, std::uint32_t tokens,
-                            float* state_snap = nullptr,
+  void LinearAttentionBatch(Session& session, const DeviceLayer& l,
+                            std::uint32_t il, const float* x, float* out,
+                            std::uint32_t tokens, float* state_snap = nullptr,
                             float* hist_snap = nullptr);
   /// Batched MTP cache fill over one prefill chunk. `hidden_rows`
   /// ([rows][hidden]) is the trunk's post-output-norm hidden state for the
   /// chunk; the block's own hidden input for row 0 comes from
-  /// `mtp_prev_hidden_`. Advances the MTP KV caches and `mtp_position_`.
-  void MtpPrefillChunk(const std::int32_t* tokens, std::uint32_t rows,
-                       std::uint32_t start, const float* hidden_rows);
+  /// `session.mtp_prev_hidden_`. Advances the MTP KV caches and the session's
+  /// MTP position.
+  void MtpPrefillChunk(Session& session, const std::int32_t* tokens,
+                       std::uint32_t rows, std::uint32_t start,
+                       const float* hidden_rows);
   /// The MTP block forward. `hidden` is the device-side trunk (or previous
   /// draft) hidden state; with `with_logits` the shared head and LM head run
   /// into mtp_logits_.
-  bool MtpForward(std::int32_t token, const float* hidden, bool with_logits,
-                  std::string* error_msg);
+  bool MtpForward(Session& session, std::int32_t token, const float* hidden,
+                  bool with_logits, std::string* error_msg);
   /// Batched (prefill) gated grouped-query attention over `tokens` rows of `x`
   /// starting at absolute position `start`, writing the chunk's keys/values
   /// into the caches and reading them back causally. Mirrors Attention().
@@ -151,12 +247,6 @@ private:
 
   const Config& c_;
   const DeviceModel& model_;
-  std::uint32_t max_context_{0};
-  std::uint32_t position_{0};
-  std::uint32_t mtp_position_{0};
-  bool mtp_enabled_{false};
-  /// Trunk position before the most recent Verify, the rewind base.
-  std::uint32_t verify_base_pos_{0};
 
   // Residual stream and outputs.
   float* x_{nullptr};
@@ -201,6 +291,12 @@ private:
   float* moe_shared_down_{nullptr};
   float* moe_shared_gate_{nullptr};
 
+  // Upper bound on any session's context this scratch supports: the context
+  // `Create` was given. `gqa_scratch_` is sized to num_heads * scratch_context_
+  // so a decode at any position below it fits, and `CreateSession` rejects a
+  // session context above it. Per-session state is sized to each session's own
+  // (possibly divided) context, never to this bound.
+  std::uint32_t scratch_context_{0};
   // Batched prefill scratch, sized to prefill_chunk_ tokens. The decode path
   // reuses the single-token buffers above; prefill drives these and never
   // syncs to the host. The MoE buffers hold one row per (token, slot) pair, so
@@ -250,7 +346,7 @@ private:
 
   // Prefill Gated DeltaNet scratch (reused across linear layers), row-major
   // [chunk][...]. `pf_hist_new_` is the disjoint conv-history output the chunk
-  // writes back over the layer's rolling history.
+  // writes back over the session's rolling history.
   float* pf_qkv_{nullptr};
   float* pf_z_{nullptr};
   float* pf_alpha_{nullptr};
@@ -287,35 +383,9 @@ private:
   float* verify_logits_{nullptr};
   float* verify_h_{nullptr};
 
-  // Batched MTP cache fill scratch ([chunk][2 * hidden] and [chunk][hidden])
-  // and the last prefill chunk's hidden row, the draft block's hidden input
-  // for the next chunk's first row.
+  // Batched MTP cache fill scratch ([chunk][2 * hidden] and [chunk][hidden]).
   float* pf_mtp_concat_{nullptr};
   float* pf_mtp_cur_{nullptr};
-  float* mtp_prev_hidden_{nullptr};
-
-  // Recurrent state, indexed by layer (null where the layer does not use it).
-  std::vector<float*> gdn_state_;
-  std::vector<float*> gdn_history_;
-  std::vector<float*> k_cache_;
-  std::vector<float*> v_cache_;
-  // FP16 mirror of the full-attention KV cache, [position][kv_head][head_dim],
-  // consumed by the WMMA prefill kernel. The FP32 planes above stay the source
-  // of truth for decode and the scalar oracle; these are written alongside them
-  // for every prefill chunk.
-  std::vector<void*> k_cache_f16_;
-  std::vector<void*> v_cache_f16_;
-  // Per-linear-layer verify snapshots: the recurrent state and conv history
-  // after the first row of the most recent Verify (null without an MTP block).
-  std::vector<float*> gdn_state_snap_;
-  std::vector<float*> gdn_hist_snap_;
-  float* mtp_k_cache_{nullptr};
-  float* mtp_v_cache_{nullptr};
-  // Half-precision mirrors of the draft KV caches, consumed by the WMMA
-  // prefill attention kernel (same role as k_cache_f16_/v_cache_f16_ for the
-  // trunk). Without them the draft falls back to the scalar oracle.
-  void* mtp_k_cache_f16_{nullptr};
-  void* mtp_v_cache_f16_{nullptr};
 
   std::vector<void*> allocations_;
 

@@ -73,8 +73,12 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
     AssignError(error_msg, "session context is outside the model limits");
     return nullptr;
   }
+  auto native = executor_->CreateSession(max_context, error_msg);
+  if (!native) {
+    return nullptr;
+  }
   return std::unique_ptr<Session>(
-      new Session(shared_from_this(), executor_.get()));
+      new Session(shared_from_this(), std::move(native)));
 }
 
 std::vector<std::int32_t> Model::Tokenize(std::string_view text) const {
@@ -124,8 +128,19 @@ std::size_t Model::ResidentBytes() const noexcept {
   return device_->resident_bytes();
 }
 
-Session::Session(std::shared_ptr<Model> model, rocm::Executor* executor)
-    : model_(std::move(model)), executor_(executor) {
+std::size_t Model::SessionBytes(std::uint32_t context) const noexcept {
+  return executor_->SessionBytes(context);
+}
+
+std::size_t Model::DeferredScratchBytes() const {
+  return executor_->DeferredScratchBytes();
+}
+
+Session::Session(std::shared_ptr<Model> model,
+                 std::unique_ptr<rocm::Session> session)
+    : model_(std::move(model)),
+      session_(std::move(session)),
+      executor_(model_->executor_.get()) {
   logits_.resize(model_->VocabSize());
   draft_logits_.resize(model_->VocabSize());
   verify_rows_.resize(rocm::Executor::kMaxVerifyRows * model_->VocabSize());
@@ -140,22 +155,22 @@ void Session::SetDraftLimits(std::uint32_t min_drafts,
 }
 
 void Session::SetMtpEnabled(bool enabled) {
-  executor_->SetMtpEnabled(enabled);
+  session_->SetMtpEnabled(enabled);
 }
 
 Session::~Session() = default;
 
 std::uint32_t Session::Position() const noexcept {
-  return executor_->position();
+  return session_->position();
 }
 
 std::uint32_t Session::ContextSize() const noexcept {
-  return executor_->max_context();
+  return session_->max_context();
 }
 
 void Session::Reset() {
   valid_ = false;
-  executor_->Reset();
+  session_->Reset();
   tokens_.clear();
   valid_ = true;
 }
@@ -192,7 +207,7 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
   // runs at prefill throughput. The executor's position already equals the
   // common prefix length (reset to 0 above, or a pure extension), so Prefill
   // continues from there and leaves the final token's logits.
-  if (!executor_->Prefill(prompt.data() + common,
+  if (!executor_->Prefill(*session_, prompt.data() + common,
                           static_cast<std::uint32_t>(prompt.size() - common),
                           error_msg)) {
     return false;
@@ -217,7 +232,7 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
     return false;
   }
   valid_ = false;
-  if (!executor_->Step(token, error_msg)) {
+  if (!executor_->Step(*session_, token, error_msg)) {
     return false;
   }
   tokens_.push_back(token);
@@ -253,7 +268,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // so a hit costs ~1.2 tokens' time. Greedy samplers take the exact-match
   // path; temperature sampling uses the standard accept-and-residual rule.
   std::size_t k = 0;
-  if (model_->HasMtp() && executor_->mtp_enabled() && max_tokens >= 2 &&
+  if (model_->HasMtp() && session_->mtp_enabled() && max_tokens >= 2 &&
       !sampler.config().penalties_enabled() &&
       tokens_.size() + 2 <= ContextSize()) {
     k = std::min<std::size_t>(draft_k_, max_tokens - 1);
@@ -267,7 +282,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
       return true;
     }
     valid_ = false;
-    if (!executor_->Step(token, error_msg)) {
+    if (!executor_->Step(*session_, token, error_msg)) {
       return false;
     }
     tokens_.push_back(token);
@@ -290,7 +305,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // Draft chain: the first draft conditions on the trunk hidden state,
   // every later one on the previous draft's own output hidden.
   valid_ = false;
-  if (!executor_->MtpStep(token, error_msg)) {
+  if (!executor_->MtpStep(*session_, token, error_msg)) {
     return false;
   }
   std::int32_t drafts[rocm::Executor::kMaxVerifyRows - 1U];
@@ -300,7 +315,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   std::vector<std::vector<float>> draft_probs(k);
   std::vector<double> draft_p(k, 0.0);
   for (std::size_t i = 0; i < k; ++i) {
-    if (i > 0 && !executor_->MtpDraft(drafts[i - 1], error_msg)) {
+    if (i > 0 && !executor_->MtpDraft(*session_, drafts[i - 1], error_msg)) {
       return false;
     }
     (void)hipMemcpy(draft_logits_.data(), executor_->mtp_logits(),
@@ -322,8 +337,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
     draft_p[i] = q.probability(static_cast<sampling::TokenId>(drafts[i]));
   }
   result->drafted += k;
-  if (!executor_->Verify(token, drafts, static_cast<std::uint32_t>(k),
-                         error_msg)) {
+  if (!executor_->Verify(*session_, token, drafts,
+                         static_cast<std::uint32_t>(k), error_msg)) {
     return false;
   }
   (void)hipMemcpy(verify_rows_.data(), executor_->verify_logits(),
@@ -378,9 +393,9 @@ bool Session::DecodeStep(std::size_t max_tokens,
   for (std::size_t i = 0; i < accepted; ++i) {
     committed.push_back(static_cast<sampling::TokenId>(drafts[i]));
   }
-  if (accepted == k) {
+if (accepted == k) {
     if (!executor_->MtpAdvance(
-            drafts[k - 1],
+            *session_, drafts[k - 1],
             executor_->verify_hidden() + (k - 1) * model_->config().hidden_size,
             error_msg)) {
       return false;
@@ -390,7 +405,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
       draft_k_ = std::min(draft_max_, draft_k_ + 1U);
     }
   } else {
-    executor_->RollbackVerify(static_cast<std::uint32_t>(accepted + 1U));
+    executor_->RollbackVerify(*session_,
+                            static_cast<std::uint32_t>(accepted + 1U));
     if (accepted == 0) {
       draft_k_ = std::max(draft_min_, draft_k_ - 1U);
     }
@@ -404,7 +420,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   if (!stopped && correction >= 0) {
     // The target's own token at the first rejected row continues the
     // sequence; feeding it is the round's only extra cost.
-    if (!executor_->Step(correction, error_msg)) {
+    if (!executor_->Step(*session_, correction, error_msg)) {
       return false;
     }
     tokens_.push_back(correction);

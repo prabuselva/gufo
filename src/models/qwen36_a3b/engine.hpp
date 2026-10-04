@@ -23,6 +23,7 @@ struct ModelWeights;
 namespace rocm {
 class DeviceModel;
 class Executor;
+class Session;
 }  // namespace rocm
 
 struct ModelOptions {
@@ -67,6 +68,10 @@ public:
     return *tokenizer_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// Worst-case private device state one session of `context` tokens owns.
+  [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
+  /// Device scratch the executor keeps shared across every session.
+  [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
 private:
   Model() = default;
@@ -132,9 +137,12 @@ public:
 
 private:
   friend class Model;
-  Session(std::shared_ptr<Model> model, rocm::Executor* executor);
+  Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
   std::shared_ptr<Model> model_;
+  std::unique_ptr<rocm::Session> session_;
+  // Shared executor that runs every forward; owned by model_, which outlives
+  // this session. Kept as a raw pointer for the scratch/logit accessors.
   rocm::Executor* executor_;
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;

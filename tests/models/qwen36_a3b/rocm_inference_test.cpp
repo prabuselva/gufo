@@ -126,6 +126,11 @@ int main(int argc, char** argv) {
     std::cerr << "executor create failed: " << error << "\n";
     return 1;
   }
+  const auto session = executor->CreateSession(max_context, &error);
+  if (session == nullptr) {
+    std::cerr << "session create failed: " << error << "\n";
+    return 1;
+  }
 
   std::vector<float> gpu_logits(c.vocab_size);
   for (std::size_t i = 0; i < prompt.size(); ++i) {
@@ -134,7 +139,7 @@ int main(int argc, char** argv) {
       std::cerr << "CPU prefill step " << i << " failed: " << error << "\n";
       return 1;
     }
-    if (!executor->Step(token, &error)) {
+    if (!executor->Step(*session, token, &error)) {
       std::cerr << "GPU prefill step " << i << " failed: " << error << "\n";
       return 1;
     }
@@ -158,7 +163,7 @@ int main(int argc, char** argv) {
       });
   const auto gpu_tokens = Greedy(
       gpu_logits, steps, [&](std::int32_t token, std::vector<float>& logits) {
-        if (!executor->Step(token, &error)) {
+        if (!executor->Step(*session, token, &error)) {
           return false;
         }
         test::CheckHip(hipMemcpy(logits.data(), executor->logits(),
@@ -177,8 +182,14 @@ int main(int argc, char** argv) {
     std::cerr << "prefill executor create failed: " << error << "\n";
     return 1;
   }
-  if (!pf_executor->Prefill(prompt.data(),
-                            static_cast<std::uint32_t>(prompt.size()), &error)) {
+  const auto pf_session = pf_executor->CreateSession(max_context, &error);
+  if (pf_session == nullptr) {
+    std::cerr << "prefill session create failed: " << error << "\n";
+    return 1;
+  }
+  if (!pf_executor->Prefill(*pf_session, prompt.data(),
+                            static_cast<std::uint32_t>(prompt.size()),
+                            &error)) {
     std::cerr << "GPU batched prefill failed: " << error << "\n";
     return 1;
   }
@@ -195,7 +206,8 @@ int main(int argc, char** argv) {
               << (cpu_arg == pf_arg ? "  OK" : "  *** DIVERGED ***")
               << "  worst_rel=" << worst << "\n";
     Expect(cpu_arg == pf_arg, "batched prefill argmax matches oracle");
-    Expect(pf_executor->position() == static_cast<std::uint32_t>(prompt.size()),
+    Expect(pf_session->position() ==
+           static_cast<std::uint32_t>(prompt.size()),
            "batched prefill advanced position");
     // Decisive cross-check: compare the batched prefill directly against the
     // per-token GPU path (the original working path), not just the oracle. If
@@ -210,7 +222,7 @@ int main(int argc, char** argv) {
   }
   const auto pf_tokens = Greedy(
       pf_logits, steps, [&](std::int32_t token, std::vector<float>& logits) {
-        if (!pf_executor->Step(token, &error)) {
+        if (!pf_executor->Step(*pf_session, token, &error)) {
           return false;
         }
         test::CheckHip(hipMemcpy(logits.data(), pf_executor->logits(),
