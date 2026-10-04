@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen36_a3b/config.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/profile.hpp"
@@ -46,8 +47,14 @@ class Session {
   /// Drops every token and zeroes the recurrent state and caches; the next
   /// forward starts at position 0.
   void Reset();
+  /// Installs the vision prompt (image embeddings + MRoPE layout) so the next
+  /// Prefill injects the projected image rows and every attention uses the
+  /// vision rope positions. A null prompt clears the vision state (text-only).
+  void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
+                       std::shared_ptr<qwen::vision::Encoder> encoder,
+                       hipStream_t stream);
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept {
-    return allocated_bytes_;
+    return allocated_bytes_ + vision_input_.Bytes();
   }
 
  private:
@@ -92,6 +99,11 @@ class Session {
   // The last prefill chunk's hidden row, the draft block's hidden input for
   // the next chunk's first row.
   float* mtp_prev_hidden_{nullptr};
+
+  // Per-session image inputs: the projected vision embeddings and the MRoPE
+  // position descriptor shared by every attention in the forward. Empty for
+  // text-only prompts (rope() is null, attention falls back to physical).
+  qwen::vision::DeviceInput vision_input_;
 
   std::vector<void*> allocations_;
   std::size_t allocated_bytes_{0};
@@ -200,7 +212,8 @@ class Executor {
                        std::uint32_t il, const float* x, float* out);
   void Attention(const DeviceLayer& l, const float* x, std::uint32_t pos,
                  float* out, float* k_cache, float* v_cache, void* k_cache_f16,
-                 void* v_cache_f16, const std::uint32_t* pos_dev);
+                 void* v_cache_f16, const std::uint32_t* pos_dev,
+                 const qwen::vision::DeviceRope* rope = nullptr);
   void Moe(const DeviceLayer& l, const float* x, float* out);
   /// Batched (prefill) Mixture-of-Experts over `tokens` rows of `x`
   /// ([tokens][hidden]) into `out` ([tokens][hidden]). Mirrors Moe() but drives
@@ -238,7 +251,8 @@ class Executor {
   void AttentionBatch(const DeviceLayer& l, const float* x, std::uint32_t start,
                       float* out, float* k_cache, float* v_cache,
                       void* k_cache_f16, void* v_cache_f16,
-                      const std::uint32_t* pos_dev, std::uint32_t tokens);
+                      const std::uint32_t* pos_dev, std::uint32_t tokens,
+                      const qwen::vision::DeviceRope* rope = nullptr);
 
   float* AllocFloats(std::size_t n, std::string* error);
   std::int32_t* AllocInts(std::size_t n, std::string* error);

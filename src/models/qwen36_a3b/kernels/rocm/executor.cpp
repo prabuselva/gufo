@@ -240,9 +240,17 @@ void Session::Reset() {
                          nullptr);
     (void)hipMemsetAsync(mtp_v_cache_f16_, 0, kv_elems * sizeof(__half),
                          nullptr);
-    (void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
-                         nullptr);
+(void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
+                          nullptr);
   }
+}
+
+void Session::ConfigureVision(
+    std::shared_ptr<const qwen::vision::Prompt> prompt,
+    std::shared_ptr<qwen::vision::Encoder> encoder, hipStream_t stream) {
+  if (prompt)
+    prompt->rope.Validate(max_context_);
+  vision_input_.Configure(std::move(prompt), std::move(encoder), stream);
 }
 
 std::unique_ptr<Session> Executor::CreateSession(
@@ -627,7 +635,8 @@ void Executor::LinearAttention(Session& session, const DeviceLayer& l,
 void Executor::Attention(const DeviceLayer& l, const float* x,
                          std::uint32_t pos, float* out, float* k_cache,
                          float* v_cache, void* k_cache_f16, void* v_cache_f16,
-                         const std::uint32_t* pos_dev) {
+                         const std::uint32_t* pos_dev,
+                         const qwen::vision::DeviceRope* rope) {
   const std::uint32_t hd = c_.head_dim;
   const std::uint32_t nh = c_.num_heads;
   const std::uint32_t nkv = c_.num_kv_heads;
@@ -659,14 +668,16 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
                               l.attn_k_norm.f32(), gqa_q_, gqa_gate_, gqa_k_,
                               k_cache, v_cache, k_cache_f16, v_cache_f16, pos,
                               nh, nkv, hd, c_.rotary_dim, c_.rope_theta,
-                              c_.rms_eps, nullptr)) {
+                              c_.rms_eps, nullptr, rope)) {
     SplitQGate(gqa_qg_, gqa_q_, gqa_gate_, nh, hd, 1, nullptr);
     RmsNormRows(gqa_q_, l.attn_q_norm.f32(), gqa_q_, nh, hd, c_.rms_eps,
                 nullptr);
     RmsNormRows(gqa_k_, l.attn_k_norm.f32(), gqa_k_, nkv, hd, c_.rms_eps,
                 nullptr);
-    Rope(gqa_q_, pos_dev, 1, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr);
-    Rope(gqa_k_, pos_dev, 1, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr);
+    Rope(gqa_q_, pos_dev, 1, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr,
+         rope);
+    Rope(gqa_k_, pos_dev, 1, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr,
+         rope);
     (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(pos) * kv_row,
                          gqa_k_, kv_row * sizeof(float), hipMemcpyDeviceToDevice,
                          nullptr);
@@ -1089,7 +1100,8 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
                               std::uint32_t start, float* out, float* k_cache,
                               float* v_cache, void* k_cache_f16,
                               void* v_cache_f16, const std::uint32_t* pos_dev,
-                              std::uint32_t tokens) {
+                              std::uint32_t tokens,
+                              const qwen::vision::DeviceRope* rope) {
   const std::uint32_t hd = c_.head_dim;
   const std::uint32_t nh = c_.num_heads;
   const std::uint32_t nkv = c_.num_kv_heads;
@@ -1119,8 +1131,10 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
               nullptr);
   RmsNormRows(pf_k_, l.attn_k_norm.f32(), pf_k_, tokens * nkv, hd, c_.rms_eps,
               nullptr);
-  Rope(pf_q_, pos_dev, tokens, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr);
-  Rope(pf_k_, pos_dev, tokens, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr);
+  Rope(pf_q_, pos_dev, tokens, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr,
+      rope);
+  Rope(pf_k_, pos_dev, tokens, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr,
+      rope);
 
   // Publish the chunk's rotated keys/values at their absolute positions, then
   // read the whole prefix back causally.
@@ -1194,6 +1208,9 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
                static_cast<std::uint32_t>(tokens[done + t]), hidden,
                pf_x_ + static_cast<std::size_t>(t) * hidden, nullptr);
     }
+    // Overwrite the image-pad rows with the projected vision embeddings. A
+    // no-op for text-only prompts (no prompt installed).
+    session.vision_input_.Inject(pf_x_, start, rows, hidden, 1, nullptr);
 
     for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
       const DeviceLayer& l = model_.layers()[il];
@@ -1205,7 +1222,8 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
       } else {
         AttentionBatch(l, pf_normed_, start, pf_attn_, session.k_cache_[il],
                        session.v_cache_[il], session.k_cache_f16_[il],
-                       session.v_cache_f16_[il], pf_pos_, rows);
+                       session.v_cache_f16_[il], pf_pos_, rows,
+                       session.vision_input_.rope());
       }
       prof_.Mark("add");
       Add(pf_x_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
@@ -1298,7 +1316,8 @@ bool Executor::Step(Session& session, std::int32_t token,
     } else {
       Attention(l, normed_, session.position_, attn_, session.k_cache_[il],
                 session.v_cache_[il], session.k_cache_f16_[il],
-                session.v_cache_f16_[il], pos_dev_);
+                session.v_cache_f16_[il], pos_dev_,
+                session.vision_input_.rope());
     }
     prof_.Mark("add");
     FusedAddRmsNorm(x_, attn_, l.post_attention_norm.f32(), normed_,
@@ -1360,7 +1379,8 @@ void Executor::MtpPrefillChunk(Session& session, const std::int32_t* tokens,
               c_.rms_eps, nullptr);
   AttentionBatch(l, pf_normed_, start, pf_attn_, session.mtp_k_cache_,
                  session.mtp_v_cache_, session.mtp_k_cache_f16_,
-                 session.mtp_v_cache_f16_, pf_pos_, rows);
+                 session.mtp_v_cache_f16_, pf_pos_, rows,
+                 session.vision_input_.rope());
   Add(pf_mtp_cur_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
   RmsNormRows(pf_mtp_cur_, l.post_attention_norm.f32(), pf_normed_, rows,
               hidden, c_.rms_eps, nullptr);
@@ -1419,7 +1439,8 @@ bool Executor::MtpForward(Session& session, std::int32_t token,
               c_.rms_eps, nullptr);
   Attention(l, normed_, session.mtp_position_, attn_, session.mtp_k_cache_,
             session.mtp_v_cache_, session.mtp_k_cache_f16_,
-            session.mtp_v_cache_f16_, mtp_pos_dev_);
+            session.mtp_v_cache_f16_, mtp_pos_dev_,
+            session.vision_input_.rope());
   Add(mtp_cur_, attn_, c_.hidden_size, nullptr);
   RmsNormRows(mtp_cur_, l.post_attention_norm.f32(), normed_, 1, c_.hidden_size,
               c_.rms_eps, nullptr);
@@ -1527,7 +1548,7 @@ bool Executor::Verify(Session& session, std::int32_t t0,
       AttentionBatch(l, pf_normed_, session.position_, pf_attn_,
                      session.k_cache_[il], session.v_cache_[il],
                      session.k_cache_f16_[il], session.v_cache_f16_[il],
-                     pf_pos_, rows);
+                     pf_pos_, rows, session.vision_input_.rope());
     }
     Add(pf_x_, pf_attn_, static_cast<std::size_t>(rows) * hidden, nullptr);
     RmsNormRows(pf_x_, l.post_attention_norm.f32(), pf_normed_, rows, hidden,

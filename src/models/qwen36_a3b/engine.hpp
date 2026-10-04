@@ -11,6 +11,8 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen36_a3b/config.hpp"
 
 namespace gufo::core {
@@ -32,6 +34,10 @@ struct ModelOptions {
   // `attn_window` keys plus the first `attn_sink`. 0 disables sparsity (dense).
   std::uint32_t attn_window = 0;
   std::uint32_t attn_sink = 0;
+  // Optional Qwen vision sidecar (`mmproj-BF16.gguf`). Empty leaves image
+  // input disabled; a non-empty path enables the shared Qwen3.8 ViT encoder
+  // projecting into the model's hidden width.
+  std::string vision_model_path;
 };
 
 class Session;
@@ -67,6 +73,10 @@ public:
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
     return *tokenizer_;
   }
+  [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
+      const noexcept {
+    return vision_;
+  }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   /// Worst-case private device state one session of `context` tokens owns.
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
@@ -80,6 +90,7 @@ private:
   std::shared_ptr<core::GgufReader> reader_;
   std::unique_ptr<ModelWeights> weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  std::shared_ptr<qwen::vision::Encoder> vision_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
 
@@ -134,6 +145,10 @@ public:
   /// prefill and cannot be rebuilt lazily. A plain (non-speculative) session
   /// leaves it off so prefill skips the draft block entirely.
   void SetMtpEnabled(bool enabled);
+  /// Installs the vision prompt (image embeddings + MRoPE layout) for the next
+  /// Sync. Must be called before Sync whenever the prompt carries images; a
+  /// null prompt clears any previously installed vision state.
+  void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
 
 private:
   friend class Model;
@@ -154,6 +169,10 @@ private:
   std::uint32_t draft_max_{4};
   std::uint32_t draft_k_{4};
   bool valid_{true};
+  // cache_identity of the vision prompt currently installed, so a switch to a
+  // different (or empty) image set resets the session instead of reusing stale
+  // image-pad KV rows.
+  std::vector<std::uint8_t> image_identity_;
 };
 
 }  // namespace gufo::models::qwen36_a3b
