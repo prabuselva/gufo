@@ -3022,9 +3022,10 @@ const Qwen36A3BTextRunnerState& RequireQwen36A3BState(
   return *q36;
 }
 
-/// Serial single-session runner for Qwen3.6-35B-A3B. The model owns one shared
-/// executor (a single KV/recurrent/logits stream), so it backs exactly one
-/// request state; the pool is created with a single state.
+/// Serial runner for Qwen3.6-35B-A3B. The model owns one shared executor
+/// (weights and scratch) plus one private KV/recurrent/snapshot state per
+/// session; the pool creates up to the configured session count, each with a
+/// divided context window.
 class Qwen36A3BTextRunner final : public TextModelRunner {
 public:
   Qwen36A3BTextRunner(std::shared_ptr<Qwen36A3BModel> model,
@@ -3057,18 +3058,25 @@ public:
     };
   }
 
-  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-    // The single shared executor is allocated at model load; requests add no
-    // per-request device state.
-    return {
-        .resident_weights_bytes = model_->ResidentBytes(),
-        .state_capacity_bytes = std::nullopt,
-        .per_request_state_bytes = 0,
-        .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = 0,
-        .requires_device_runtime_lock = true,
-    };
+[[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  std::optional<std::size_t> capacity;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+    const auto deferred = model_->DeferredScratchBytes();
+    capacity = free_bytes > deferred ? free_bytes - deferred : 0;
   }
+  // Each session owns its KV/recurrent/snapshot state; the executor scratch
+  // is shared and already allocated at model load, so reserve it once.
+  return {
+      .resident_weights_bytes = model_->ResidentBytes(),
+      .state_capacity_bytes = capacity,
+      .per_request_state_bytes = model_->SessionBytes(max_context_),
+      .temporary_scratch_bytes = 0,
+      .retained_snapshot_capacity_bytes = 0,
+      .requires_device_runtime_lock = true,
+  };
+}
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
     return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
@@ -3911,10 +3919,11 @@ bool InferenceBackend::load(
     SetError(error, "HTTP session count must be at least one");
     return false;
   }
-  if (session_count > 1) {
+  constexpr std::size_t kMaxQwen36Sessions = 16;
+  if (session_count > kMaxQwen36Sessions) {
     SetError(error,
-             "Qwen3.6-35B-A3B serves a single shared executor and supports "
-             "exactly one concurrent HTTP session (--sessions 1)");
+             "Qwen3.6-35B-A3B supports at most 16 concurrent HTTP sessions "
+             "(--sessions 16)");
     return false;
   }
   if (max_context == 0 || max_context > model->MaxContext()) {
@@ -3922,6 +3931,11 @@ bool InferenceBackend::load(
              "HTTP context exceeds the loaded Qwen3.6-35B-A3B model context");
     return false;
   }
+  // Divide the configured context across the concurrent sessions so their
+  // combined KV/recurrent/snapshot state fits the device budget; a single
+  // session keeps the full window.
+  const auto per_session_context = static_cast<std::uint32_t>(
+      std::max<std::size_t>(1, max_context / session_count));
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
       speculative_config.backend != TextSpeculativeBackend::kMtp) {
     SetError(error,
@@ -3945,7 +3959,7 @@ bool InferenceBackend::load(
   try {
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<Qwen36A3BTextRunner>(
-        std::move(model), max_context, use_mtp,
+        std::move(model), per_session_context, use_mtp,
         speculative_config.min_draft_tokens,
         speculative_config.max_draft_tokens);
     new_state->model_id = runner->Descriptor().model_id;
