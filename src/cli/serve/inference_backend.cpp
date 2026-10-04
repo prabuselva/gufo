@@ -2911,6 +2911,18 @@ public:
         QwenChatOptions(request));
   }
 
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->tokenizer(),
+                             model_->VisionEncoder(), max_context_);
+  }
+
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    RequireQwen36A3BState(state).session().ConfigureVision(QwenPrompt(context));
+  }
+
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
     return QwenChatOptions(request).enable_thinking
@@ -3282,10 +3294,6 @@ const TextDiskCacheConfig& disk_cache_config,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    if (!vision_model_path.empty()) {
-      SetError(error, "Qwen3.6-35B-A3B does not support --mmproj");
-      return false;
-    }
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
@@ -3301,9 +3309,11 @@ const TextDiskCacheConfig& disk_cache_config,
     }
     auto model = models::qwen36_a3b::Model::Load(
         model_path,
-        models::qwen36_a3b::ModelOptions{.max_context = max_context,
-                                         .attn_window = attn_window,
-                                         .attn_sink = attn_sink},
+        models::qwen36_a3b::ModelOptions{
+            .max_context = max_context,
+            .attn_window = attn_window,
+            .attn_sink = attn_sink,
+            .vision_model_path = vision_model_path},
         &load_error);
     if (model == nullptr) {
       SetError(error, "Failed to create Qwen3.6-35B-A3B model: " + load_error);

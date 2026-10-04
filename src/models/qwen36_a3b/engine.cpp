@@ -45,6 +45,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                std::to_string(c.context_length) + " tokens");
     return nullptr;
   }
+  try {
+    m->vision_ = qwen::vision::Encoder::Open(
+        model_path, options.vision_model_path, c.hidden_size);
+  } catch (const std::exception& e) {
+    AssignError(error_msg, e.what());
+    return nullptr;
+  }
   m->tokenizer_ =
       tokenization::QwenTokenizer::CreateFromGguf(*m->reader_, error_msg);
   if (!m->tokenizer_) {
@@ -125,7 +132,7 @@ const Config& Model::config() const noexcept {
 }
 
 std::size_t Model::ResidentBytes() const noexcept {
-  return device_->resident_bytes();
+  return device_->resident_bytes() + (vision_ ? vision_->ResidentBytes() : 0);
 }
 
 std::size_t Model::SessionBytes(std::uint32_t context) const noexcept {
@@ -156,6 +163,19 @@ void Session::SetDraftLimits(std::uint32_t min_drafts,
 
 void Session::SetMtpEnabled(bool enabled) {
   session_->SetMtpEnabled(enabled);
+}
+
+void Session::ConfigureVision(
+    std::shared_ptr<const qwen::vision::Prompt> prompt) {
+  const auto identity =
+      prompt ? prompt->cache_identity : std::vector<std::uint8_t>{};
+  if (!tokens_.empty() && identity != image_identity_)
+    Reset();
+  const bool was_valid = valid_;
+  valid_ = false;
+  session_->ConfigureVision(std::move(prompt), model_->vision_, nullptr);
+  image_identity_ = identity;
+  valid_ = was_valid;
 }
 
 Session::~Session() = default;

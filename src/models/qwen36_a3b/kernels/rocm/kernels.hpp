@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/vision/rope.hpp"
+
 /// Model-private HIP launchers for the Qwen3.6-35B-A3B (qwen35moe) graph: the
 /// fused operators outside the quantized GEMM tier. Activations are row-major
 /// float32 [tokens][dim] unless noted; every launch is asynchronous on
@@ -34,7 +36,8 @@ void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,
 /// i + rotary_dim/2) turns by pos * theta^(-2i/rotary_dim).
 void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
           std::uint32_t heads, std::uint32_t head_dim, std::uint32_t rotary_dim,
-          float theta, hipStream_t stream);
+          float theta, hipStream_t stream,
+          const qwen::vision::DeviceRope* rope = nullptr);
 
 /// Splits the fused query/gate projection of a full-attention layer. `qg` is
 /// [heads][2 * head_dim] with query and gate channels interleaved per head;
@@ -57,7 +60,7 @@ bool FusedQKNormRoPEKvWrite(
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
     std::uint32_t pos, std::uint32_t heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps,
-    hipStream_t stream);
+    hipStream_t stream, const qwen::vision::DeviceRope* rope = nullptr);
 
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`, over `count` floats.
 void Swiglu(float* gate, const float* up, std::size_t count,

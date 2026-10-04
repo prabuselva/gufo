@@ -148,7 +148,8 @@ __global__ void FusedAddRmsNormKernel(float* x, const float* addend,
 
 __global__ void RopeKernel(float* x, const std::uint32_t* pos,
                            std::uint32_t heads, std::uint32_t head_dim,
-                           std::uint32_t rotary_dim, float theta) {
+                           std::uint32_t rotary_dim, float theta,
+                           const qwen::vision::DeviceRope* rope) {
   const std::uint32_t row = blockIdx.x / heads;
   const std::uint32_t head = blockIdx.x % heads;
   const std::uint32_t half = rotary_dim / 2;
@@ -156,7 +157,7 @@ __global__ void RopeKernel(float* x, const std::uint32_t* pos,
     return;
   }
   const std::uint32_t i = threadIdx.x;
-  const float p = static_cast<float>(pos[row]);
+  const float p = qwen::vision::RopePosition(rope, pos[row], i);
   const float freq = powf(
       theta, -2.0F * static_cast<float>(i) / static_cast<float>(rotary_dim));
   const float angle = p * freq;
@@ -187,7 +188,8 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
     float* __restrict__ k_cache, float* __restrict__ v_cache,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
     std::uint32_t pos, std::uint32_t heads, std::uint32_t kv_heads,
-    std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps) {
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps,
+    const qwen::vision::DeviceRope* rope) {
   __shared__ double reduce[32];
   __shared__ float normed[256];
   const std::uint32_t half = rotary_dim / 2;
@@ -216,7 +218,7 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
     float* dst = q_out + static_cast<std::size_t>(b) * head_dim;
     if (threadIdx.x < half) {
       const std::uint32_t i = threadIdx.x;
-      const float p = static_cast<float>(pos);
+      const float p = qwen::vision::RopePosition(rope, pos, i);
       const float freq = powf(theta, -2.0F * static_cast<float>(i) /
                                         static_cast<float>(rotary_dim));
       const float angle = p * freq;
@@ -256,7 +258,7 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
                        : nullptr;
     if (threadIdx.x < half) {
       const std::uint32_t i = threadIdx.x;
-      const float p = static_cast<float>(pos);
+      const float p = qwen::vision::RopePosition(rope, pos, i);
       const float freq = powf(theta, -2.0F * static_cast<float>(i) /
                                         static_cast<float>(rotary_dim));
       const float angle = p * freq;
@@ -2211,11 +2213,12 @@ void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,
 
 void Rope(float* x, const std::uint32_t* pos, std::uint32_t rows,
           std::uint32_t heads, std::uint32_t head_dim, std::uint32_t rotary_dim,
-          float theta, hipStream_t stream) {
+          float theta, hipStream_t stream,
+          const qwen::vision::DeviceRope* rope) {
   const dim3 grid(rows * heads);
   const dim3 block(rotary_dim / 2);
   RopeKernel<<<grid, block, 0, stream>>>(x, pos, heads, head_dim, rotary_dim,
-                                         theta);
+                                         theta, rope);
 }
 
 void SplitQGate(const float* qg, float* q, float* gate, std::uint32_t heads,
@@ -2235,7 +2238,7 @@ bool FusedQKNormRoPEKvWrite(
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
     std::uint32_t pos, std::uint32_t heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float theta, float eps,
-    hipStream_t stream) {
+    hipStream_t stream, const qwen::vision::DeviceRope* rope) {
   if (head_dim == 0U || head_dim > 256U || rotary_dim % 2U != 0U ||
       rotary_dim > head_dim) {
     return false;
@@ -2245,7 +2248,7 @@ bool FusedQKNormRoPEKvWrite(
   FusedQKNormRoPEKvWriteKernel<<<grid, block, 0, stream>>>(
       qg, k_in, v_in, q_norm, k_norm, q_out, gate_out, k_out, k_cache, v_cache,
       static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16), pos,
-      heads, kv_heads, head_dim, rotary_dim, theta, eps);
+      heads, kv_heads, head_dim, rotary_dim, theta, eps, rope);
   return true;
 }
 

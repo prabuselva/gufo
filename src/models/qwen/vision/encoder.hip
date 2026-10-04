@@ -345,9 +345,14 @@ struct Encoder::Impl {
     expect("clip.vision.attention.head_count", kHeads);
     expect("clip.vision.spatial_merge_size", 2);
     expect("clip.vision.image_size", 768);
-    const std::string_view model =
-        width == 5120 ? "Qwen3.8-27B" : "Qwen3.8-Flash-Next";
-    if ((width != 5120 && width != 2560) ||
+    std::string_view model;
+    if (width == 5120)
+      model = "Qwen3.8-27B";
+    else if (width == 2560)
+      model = "Qwen3.8-Flash-Next";
+    else if (width == 2048)
+      model = "Qwen3.6-35B-A3B";
+    if ((width != 5120 && width != 2560 && width != 2048) ||
         reader->GetMetadataString("general.architecture") != "clip" ||
         reader->GetMetadataString("general.type") != "mmproj" ||
         reader->GetMetadataString("general.basename") != model ||

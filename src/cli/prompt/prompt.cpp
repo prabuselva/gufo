@@ -747,7 +747,8 @@ std::shared_ptr<models::qwen36_a3b::Model> LoadQwen36A3BModel(
       opt.model_path,
       {.max_context = kDefaultContext,
        .attn_window = opt.attn_window,
-       .attn_sink = opt.attn_sink},
+       .attn_sink = opt.attn_sink,
+       .vision_model_path = opt.vision_model_path},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
@@ -1119,6 +1120,13 @@ int RunPrompt(std::span<const char* const> args) {
       return 1;
     }
     try {
+      if (!opt.image_paths.empty()) {
+        AttachImages(opt, messages.back());
+        auto vision = PrepareVision(opt, model->tokenizer(), messages,
+                                    model->VisionEncoder());
+        session->ConfigureVision(vision);
+        return GenerateQwen36A3BResponse(opt, *model, *session, vision->tokens);
+      }
       const auto ids = model->Tokenize(rendered_prompt);
       const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
       return GenerateQwen36A3BResponse(opt, *model, *session, prompt);
@@ -1330,10 +1338,6 @@ int RunChat(std::span<const char* const> args) {
   std::shared_ptr<models::qwen36_a3b::Model> qwen36_model;
   std::unique_ptr<models::qwen36_a3b::Session> qwen36_session;
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
-      std::cerr << "Qwen3.6-35B-A3B does not support image input\n";
-      return 2;
-    }
     qwen36_model = LoadQwen36A3BModel(opt, *reader, model_load_start);
     if (!qwen36_model)
       return 1;
@@ -1347,6 +1351,7 @@ int RunChat(std::span<const char* const> args) {
     qwen36_session->SetMtpEnabled(true);
     tokenizer = &qwen36_model->tokenizer();
     architecture = "qwen35moe";
+    vision_encoder = qwen36_model->VisionEncoder();
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
@@ -1460,6 +1465,8 @@ int RunChat(std::span<const char* const> args) {
         prompt_tokens = vision->tokens;
         if (flash_session)
           flash_session->ConfigureVision(vision);
+        if (qwen36_session)
+          qwen36_session->ConfigureVision(vision);
         if (gpu_executor)
           gpu_executor->ConfigureVision(vision, vision_encoder);
       }
