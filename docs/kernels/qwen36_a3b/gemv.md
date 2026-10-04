@@ -74,7 +74,7 @@ walks `off` to pick its tensor, then runs the identical unroll-4 +
 butterfly dot as `GemvQ8_0` — results are **bit-exact** to separate
 launches (verified by `qwen36_a3b_rocm_gemv_test`, including unequal
 rows and a narrower last tensor). The launcher fuses the **Q8_0 subset**
-into one launch, runs any non-Q8_0 projection (the GGUF stores
+into one launch, runs any non-Q8_0 projection (mixed artifacts may store
 `ssm_alpha`/`ssm_beta`/`ffn_gate_inp_shexp` as F32) as a plain `Gemv`,
 and skips empty ones; it returns `false` only for `n ∉ [1,4]`, in which
 case callers fall back to separate `Gemv` calls. Grid `ceil(total/4) ×
@@ -83,9 +83,10 @@ silently disabled the fusion for `lin_gemm_in` and `moe_shared` — the
 profile was unchanged until the subset split landed.)
 
 In-model call sites: `lin_gemm_in` (ssm_qkv + ssm_gate fused Q8_0,
-ssm_alpha + ssm_beta F32 plain), `attn_gemm_qkv` (q + k + v, all Q8_0,
-3-in-1), `moe_shared` (gate + up fused Q8_0, gate_inp F32 plain; down
-stays separate — different `x`). Cold-L2 bench
+ssm_alpha + ssm_beta fused when Q8_0 or plain when F32),
+`attn_gemm_qkv` (q + k + v, all Q8_0, 3-in-1), `moe_shared` (gate + up
+fused Q8_0, gate_inp F32 plain; down stays separate — different `x`).
+Cold-L2 bench
 (`tools/bench/moe_gemv_bench.hip`, rotating row windows, all-Q8_0):
 lin_gemm_in 0.1425 → 0.1271 ms (−10.8 %, 211 GB/s); shared expert
 0.0197 → 0.0096 ms warm.

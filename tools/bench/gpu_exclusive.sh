@@ -107,6 +107,12 @@ capture_cmdline() {
   local pid="$1" out="$2" exe a
   exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
   [ -n "$exe" ] || return 1
+  # If the binary was replaced while the server ran, /proc may report the old
+  # path with a " (deleted)" suffix. Store the normal path so respawn can wait
+  # for the recreated executable instead of trying to exec the suffix literally.
+  if [[ "$exe" == *" (deleted)" && ! -x "$exe" ]]; then
+    exe="${exe% (deleted)}"
+  fi
   local -a argv=()
   mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
   [ "${#argv[@]}" -gt 0 ] || return 1

@@ -129,6 +129,9 @@ struct Binder {
     const auto norm = {GgmlType::kF32};
     // The trunk records the router in F32; the MTP block reuses BF16.
     const auto router = {GgmlType::kF32, GgmlType::kBF16};
+    // Pure Q8_0 artifacts quantize the GDN alpha/beta projections too. The
+    // GEMV/GEMM tiers decode Q8_0 dense rows, so accept them alongside F32.
+    const auto ssm_scalar_proj = {GgmlType::kF32, GgmlType::kQ8_0};
 
     l.attn_norm = Get(p + "attn_norm.weight", hidden, 1, 1, norm);
     l.post_attention_norm =
@@ -142,9 +145,9 @@ struct Binder {
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, {GgmlType::kF32});
       l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,
-                        {GgmlType::kF32});
+                        ssm_scalar_proj);
       l.ssm_beta = Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1,
-                       {GgmlType::kF32});
+                       ssm_scalar_proj);
       l.ssm_dt =
           Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
@@ -242,6 +245,9 @@ std::optional<MtpWeights> MtpWeights::Bind(const core::GgufReader& reader,
                                            std::string* error_msg) {
   auto config = Config::FromGguf(reader, false, error_msg);
   if (!config.has_value()) {
+    return std::nullopt;
+  }
+  if (config->nextn_layers == 0) {
     return std::nullopt;
   }
   Binder b{reader, error_msg};
