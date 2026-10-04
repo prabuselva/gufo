@@ -9,7 +9,9 @@ order/thermal drift: **gufo** = this fork `082a8432` + the fused GDN prefill
 conv+RMSNorm kernel (`feat/support_qwen36_35b_a3b`, `build/release/gufo`);
 **reference** = `gufo_slimsami` `388ff05` (`feat/qwen35moe-35b-a3b`,
 `build_rocm10/gufo`). Artifact: `Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf` (36.41 GiB,
-262144-token context).
+262144-token context). A later section measures the **Q4_K_XL** artifact (20.82
+GiB) on the native Q4_K/Q5_K routed-expert path; the reference cannot load it, so
+that section compares Q4 against the Q8 `gufo` column.
 
 `gufo bench` is greedy argmax with no chat template (thinking off), 3
 repetitions, identical flags for both binaries. The `±` is the stddev over the
@@ -34,6 +36,40 @@ machine, so the same-machine ratios are lower than its self-reported ones.
 | Workload | gufo (t/s) | reference (t/s) | ratio |
 | --- | ---: | ---: | ---: |
 | tg128 (greedy, no MTP) | 44.87 ± 0.04 | 50.80 ± 0.04 | 88 % |
+
+## Qwen3.6-35B-A3B, UD-Q4_K_XL
+
+The Q4_K_XL artifact (`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, 20.82 GiB — 43 %
+smaller than the 36.41 GiB Q8_K_XL) runs on a new native path added in this
+fork: the routed experts are stored as Q4_K/Q5_K and decoded directly (WMMA
+prefill + grouped GEMV decode), and the four Q6_K tensors are upcast to Q8_0 at
+load. The reference build cannot load this artifact, so there is **no reference
+column**; the comparison is Q4 against the Q8_K_XL `gufo` column above. Measured
+October 4, 2026 with `build/release/gufo`, 3 repetitions, same exclusive-GPU
+session and flags as the Q8 sweep.
+
+| Prefill prompt (tokens) | Q4_K_XL (t/s) | Q8_K_XL gufo (t/s) | Q4 / Q8 |
+| ---: | ---: | ---: | ---: |
+| 512 | 1700.1 ± 9.6 | 1585.5 ± 7.8 | 107 % |
+| 1024 | 2156.4 ± 14.4 | 2009.6 ± 4.4 | 107 % |
+| 2048 | 2333.0 ± 6.3 | 2203.1 ± 3.8 | 106 % |
+| 4096 | 2313.5 ± 7.9 | 2194.7 ± 3.8 | 105 % |
+| 8192 | 2202.0 ± 3.1 | 2077.8 ± 2.4 | 106 % |
+| 16384 | 2063.8 ± 0.4 | 1952.7 ± 1.7 | 106 % |
+| 32768 | 1818.5 ± 1.6 | 1703.3 ± 11.8 | 107 % |
+| 65536 | 1437.0 ± 16.9 | 1358.4 ± 6.7 | 106 % |
+| 102400 | 1154.9 ± 4.1 | 1114.7 ± 7.9 | 104 % |
+
+| Workload | Q4_K_XL (t/s) | Q8_K_XL gufo (t/s) | Q4 / Q8 |
+| --- | ---: | ---: | ---: |
+| tg128 (greedy, no MTP) | 49.69 ± 0.16 | 44.87 ± 0.04 | 111 % |
+
+The Q8 column is the earlier tree (`082a8432` + fused GDN); the current tree is
+~2-3 % faster on both quantizations (see "Reading the numbers"), so the pure
+quantization gain is a couple of points below these ratios. The gain is larger
+for decode (+11 %) than prefill (+4-7 %): greedy decode is memory-bound, so the
+~43 % smaller weights cut bytes/token almost proportionally, while prefill is
+WMMA-compute-bound and only partly benefits from the narrower expert loads.
 
 ## MTP decode
 
@@ -143,6 +179,18 @@ for N in 1 2; do
     --draft-tokens $N --min-draft-tokens $N \
     --n-prompt 512 --n-gen 128 --repetitions 3
 done
+```
+
+For the Q4_K_XL section, run the same two sweeps against the Q4 artifact with
+`gufo` only (the reference cannot load it):
+
+```sh
+MODEL=.../Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+B=./build/release/gufo
+"$B" bench --model "$MODEL" \
+  --n-prompt 512,1024,2048,4096,8192,16384 --n-gen 128 --repetitions 3
+"$B" bench --model "$MODEL" \
+  --n-prompt 32768,65536,102400 --n-gen 1 --repetitions 3
 ```
 
 Greedy, thinking off. Kernel findings in [EXPERIMENTS.md](EXPERIMENTS.md) and
