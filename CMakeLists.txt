@@ -64,6 +64,9 @@ add_subdirectory(src/models/qwen38_flash_next)
 # Qwen3.6-35B-A3B (qwen35moe) — isolated hybrid GDN + gated-GQA + MoE engine.
 add_subdirectory(src/models/qwen36_a3b)
 
+# Gemma-4-26B-A4B (gemma4) — isolated hybrid SWA/full attention + MoE engine.
+add_subdirectory(src/models/gemma4)
+
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
 
@@ -188,7 +191,7 @@ add_library(gufo_llm_cli STATIC
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next gufo_qwen36_a3b_engine)
+    gufo_qwen38_flash_next gufo_qwen36_a3b_engine gufo_gemma4_engine)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -434,6 +437,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
   add_subdirectory(tests/models/qwen36_a3b)
+  add_subdirectory(tests/models/gemma4)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
