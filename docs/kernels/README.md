@@ -18,6 +18,7 @@ is built.
 | Model | Sources | Documents |
 | --- | --- | --- |
 | [Qwen3.6-35B-A3B](qwen36_a3b/README.md) | `src/models/qwen36_a3b/kernels/rocm/` | [fused ops](qwen36_a3b/fused-ops.md), [GEMV](qwen36_a3b/gemv.md), [GEMM tier](qwen36_a3b/gemm.md), [routed F16 MoE](qwen36_a3b/routed-f16-moe.md) |
+| [Gemma-4-26B-A4B](gemma4/README.md) | `src/models/gemma4/kernels/rocm/` | [fused ops](gemma4/fused-ops.md), [GEMV](gemma4/gemv.md), [GEMM tier](gemma4/gemm.md), [routed F16 MoE](gemma4/routed-f16-moe.md) |
 
 ## Hardware baseline (gfx1151)
 

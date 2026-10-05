@@ -34,6 +34,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/gemma4/engine.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -3067,6 +3068,301 @@ private:
   std::uint32_t min_drafts_;
   std::uint32_t max_drafts_;
 };
+
+using Gemma4Model = models::gemma4::Model;
+using Gemma4Session = models::gemma4::Session;
+
+constexpr std::string_view kGemma4StateAbi = "gemma4-rocm-session-v1";
+
+std::vector<TextRunnerToken> Gemma4RunnerTokens(
+    std::span<const std::int32_t> tokens) {
+  std::vector<TextRunnerToken> converted;
+  converted.reserve(tokens.size());
+  for (const std::int32_t token : tokens) {
+    if (token < 0) {
+      throw std::invalid_argument("Gemma-4 token ID must not be negative");
+    }
+    converted.push_back(static_cast<TextRunnerToken>(token));
+  }
+  return converted;
+}
+
+std::vector<std::int32_t> Gemma4EngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument(
+          "Gemma-4 token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class Gemma4TextRunnerState final : public TextRunnerState {
+public:
+  Gemma4TextRunnerState(const std::shared_ptr<Gemma4Model>& model,
+                        std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Gemma-4 session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->Reset();
+    position_ = 0;
+  }
+
+  [[nodiscard]] Gemma4Session& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<Gemma4Session> session_;
+  std::size_t position_{0};
+};
+
+Gemma4TextRunnerState& RequireGemma4State(TextRunnerState& state) {
+  auto* gemma = dynamic_cast<Gemma4TextRunnerState*>(&state);
+  if (gemma == nullptr) {
+    throw std::logic_error("text runner state is not Gemma-4");
+  }
+  return *gemma;
+}
+
+const Gemma4TextRunnerState& RequireGemma4State(
+    const TextRunnerState& state) {
+  const auto* gemma = dynamic_cast<const Gemma4TextRunnerState*>(&state);
+  if (gemma == nullptr) {
+    throw std::logic_error("text runner state is not Gemma-4");
+  }
+  return *gemma;
+}
+
+/// Serial runner for Gemma-4-26B-A4B. The model owns one shared executor
+/// (weights and scratch) plus one private context state per session; the pool
+/// creates up to the configured session count, each with a divided context
+/// window. Decode is single-token (no speculative drafting).
+class Gemma4TextRunner final : public TextModelRunner {
+public:
+  Gemma4TextRunner(std::shared_ptr<Gemma4Model> model,
+                   std::uint32_t max_context)
+      : model_(std::move(model)), max_context_(max_context) {}
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kGemma4StateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = false,
+                .batched_multi_token_decode = false,
+                .batched_multi_token_decode_max_width = 0u,
+                .prefix_reuse = true,
+            },
+        .persistence = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      capacity = free_bytes;
+    }
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = model_->SessionBytes(max_context_),
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = 0,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return Gemma4RunnerTokens(model_->Tokenize(text));
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    std::vector<models::gemma4::ChatMessage> messages;
+    messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      models::gemma4::ChatMessage converted{
+          .role = std::string(ChatRoleName(message.role)),
+          .content = message.content,
+          .reasoning_content = message.thought,
+          .tool_calls = {},
+          .tool_call_id = message.tool_call_id,
+      };
+      converted.tool_calls.reserve(message.tool_calls.size());
+      for (const auto& call : message.tool_calls) {
+        models::gemma4::ChatMessage::ToolCall converted_call{
+            .name = call.name,
+            .arguments = {},
+            .id = call.id,
+        };
+        converted_call.arguments.reserve(call.arguments.size());
+        for (const auto& argument : call.arguments) {
+          converted_call.arguments.push_back({
+              .name = argument.name,
+              .value = argument.value,
+              .is_string = argument.is_string,
+          });
+        }
+        converted.tool_calls.push_back(std::move(converted_call));
+      }
+      messages.push_back(std::move(converted));
+    }
+
+    std::vector<models::gemma4::ChatTool> tools;
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      tools.reserve(request.tools.size());
+      for (const auto& tool : request.tools) {
+        tools.push_back({
+            .name = tool.name,
+            .description = tool.description,
+            .parameters_json = tool.parameters_json,
+            .definition_json =
+                tool.definition_json.empty()
+                    ? std::string{}
+                    : json::parse(tool.definition_json)["function"].dump(),
+        });
+      }
+    }
+    auto tokens = Gemma4RunnerTokens(model_->EncodeChat(
+        messages, tools,
+        models::gemma4::ChatTemplateOptions{
+            .add_generation_prompt = true,
+            .enable_thinking = request.reasoning.enabled.value_or(false),
+            .preserve_thinking =
+                request.reasoning.preserve_thinking.value_or(false),
+        }));
+    if (tokens.empty()) {
+      return std::nullopt;
+    }
+    return tokens;
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return request.reasoning.enabled.value_or(false)
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return model_->Decode(Gemma4EngineTokens(tokens));
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<Gemma4TextRunnerState>(model_, max_context_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const auto& gemma = RequireGemma4State(state);
+    if (gemma.position() != prefix.size()) {
+      throw std::logic_error(
+          "Gemma-4 reused prefix does not match checkpoint");
+    }
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& gemma = RequireGemma4State(state);
+    if (offset != gemma.position()) {
+      throw std::logic_error(
+          "Gemma-4 prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("Gemma-4 prefill has no remaining input");
+    }
+    const std::size_t consumed =
+        std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
+    const std::size_t next_position = offset + consumed;
+    const auto prefix = Gemma4EngineTokens(prompt.first(next_position));
+    std::string error;
+    if (!gemma.session().Sync(prefix, &error)) {
+      gemma.set_position(0);
+      throw std::runtime_error("Gemma-4 prefill failed: " + error);
+    }
+    gemma.set_position(next_position);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = next_position == prompt.size(),
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& gemma = RequireGemma4State(state);
+    if (gemma.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    const auto logits = gemma.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error("Gemma-4 token selection has no logits");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (model_->IsStopToken(token)) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->TokenText(token),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Gemma-4 token ID exceeds engine range");
+    }
+    auto& gemma = RequireGemma4State(state);
+    std::string error;
+    if (!gemma.session().Evaluate(static_cast<std::int32_t>(token), &error)) {
+      throw std::runtime_error("Gemma-4 decode failed: " + error);
+    }
+    gemma.set_position(gemma.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireGemma4State(state).position();
+  }
+
+private:
+  std::shared_ptr<Gemma4Model> model_;
+  std::uint32_t max_context_;
+};
 #endif
 
 }  // namespace
@@ -3317,6 +3613,31 @@ const TextDiskCacheConfig& disk_cache_config,
         &load_error);
     if (model == nullptr) {
       SetError(error, "Failed to create Qwen3.6-35B-A3B model: " + load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
+  }
+  if (reader->GetMetadataString("general.architecture") == "gemma4") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "Gemma-4 does not support --mmproj yet");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error,
+               "Gemma-4 HTTP models do not support speculative decoding yet");
+      return false;
+    }
+    if (!models::gemma4::ValidateGgufTemplate(*reader, &load_error)) {
+      SetError(error, "Unsupported Gemma-4 chat template: " + load_error);
+      return false;
+    }
+    auto model = models::gemma4::Model::Load(
+        model_path, models::gemma4::ModelOptions{.max_context = max_context},
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Gemma-4 model: " + load_error);
       return false;
     }
     return load(std::move(model), error, max_context, session_count,
@@ -3713,6 +4034,55 @@ bool InferenceBackend::load(
         std::move(model), per_session_context, use_mtp,
         speculative_config.min_draft_tokens,
         speculative_config.max_draft_tokens);
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::gemma4::Model> model, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSpeculativeConfig speculative_config,
+    TextDiskCacheConfig disk_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Gemma-4 model must not be null");
+    return false;
+  }
+  if (session_count != 1) {
+    SetError(error,
+             "Gemma-4 HTTP models serialize compute on a shared executor and "
+             "support exactly one session (--sessions 1)");
+    return false;
+  }
+  if (max_context == 0 || max_context > model->MaxContext()) {
+    SetError(error,
+             "HTTP context exceeds the loaded Gemma-4 model context");
+    return false;
+  }
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    SetError(error, "Gemma-4 HTTP models do not support speculative decoding");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config)) {
+    SetError(error, "Gemma-4 HTTP models do not support the disk cache");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    auto runner =
+        std::make_shared<Gemma4TextRunner>(std::move(model), max_context);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);

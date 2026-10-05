@@ -30,6 +30,10 @@ namespace gufo::models::qwen36_a3b {
 class Model;
 }
 
+namespace gufo::models::gemma4 {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -122,6 +126,15 @@ public:
   bool load(std::shared_ptr<models::qwen36_a3b::Model> model,
             std::string* error, std::uint32_t max_context = 4096,
             std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
+
+  /// Installs a previously loaded Gemma-4 model. The model owns a single
+  /// shared executor, so it serves exactly one concurrent session.
+  bool load(std::shared_ptr<models::gemma4::Model> model, std::string* error,
+            std::uint32_t max_context = 4096, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
