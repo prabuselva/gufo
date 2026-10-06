@@ -884,8 +884,8 @@ bool TestAttention() {
                             hipMemcpyHostToDevice),
                   "prefill V upload");
       t::HipBuffer<float> d_out(q.size());
-      q::AttentionPrefill(d_q.get(), d_kc.get(), d_vc.get(), d_out.get(), start,
-                          tokens, kHeads, kvh, hd, window, nullptr);
+      q::AttentionPrefillScalar(d_q.get(), d_kc.get(), d_vc.get(), d_out.get(),
+                                start, tokens, kHeads, kvh, hd, window, nullptr);
       t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
       const auto got = t::Download(&d_out, q.size());
       std::vector<float> ref(q.size());
@@ -926,6 +926,20 @@ bool TestAttention() {
       }
       ok = Check(("AttentionPrefill " + tag).c_str(),
                  t::WorstRelativeToScale(ref, got), 1e-3) &&
+           ok;
+
+      // WMMA fast path against the same double reference. The F32-Q oracle above
+      // holds 1e-3; this F16-Q tensor-core path is bounded by Q quantization
+      // through the unscaled (scale 1.0) softmax, which is extremely peaked (see
+      // rocm_forward_test.cpp), so the floor on the uniform fixture is ~2e-3.
+      // The same kernel reaches ~4e-4 on smooth data. 3e-3 leaves margin.
+      t::HipBuffer<float> d_out_wmma(q.size());
+      q::AttentionPrefill(d_q.get(), d_kc.get(), d_vc.get(), d_out_wmma.get(),
+                          start, tokens, kHeads, kvh, hd, window, nullptr);
+      t::CheckHip(hipDeviceSynchronize(), "AttentionPrefillWmma synchronization");
+      const auto got_wmma = t::Download(&d_out_wmma, q.size());
+      ok = Check(("AttentionPrefillWmma " + tag).c_str(),
+                 t::WorstRelativeToScale(ref, got_wmma), 3e-3) &&
            ok;
     }
   }

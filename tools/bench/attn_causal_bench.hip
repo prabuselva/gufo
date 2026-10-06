@@ -35,10 +35,16 @@
     }                                                                   \
   } while (0)
 
-constexpr std::uint32_t kHeadDim = 256;
 // Shape is overridable at compile time so the same harness can reproduce other
 // models' full-attention layers. Defaults are Qwen3.8-27B (24q/4kv, GQA 6);
-// Qwen3.6-35B-A3B uses -DKQUERY_HEADS=16 -DKKV_HEADS=2 (GQA 8).
+// Qwen3.6-35B-A3B uses -DKQUERY_HEADS=16 -DKKV_HEADS=2 (GQA 8); Gemma4 full
+// attention uses -DKHEAD_DIM=512 -DKQUERY_HEADS=16 -DKKV_HEADS=2
+// -DATTENTION_SCALE=1.0F (GQA 8, scale 1.0), SWA uses -DKKV_HEADS=8 (GQA 2)
+// with -w 1024.
+#ifndef KHEAD_DIM
+#define KHEAD_DIM 256
+#endif
+constexpr std::uint32_t kHeadDim = KHEAD_DIM;
 #ifndef KQUERY_HEADS
 #define KQUERY_HEADS 24
 #endif
@@ -48,6 +54,11 @@ constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kQueryHeads = KQUERY_HEADS;
 constexpr std::uint32_t kKvHeads = KKV_HEADS;
 constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
+// Score scale folded into Q before the FP16 conversion. Qwen uses
+// 1/sqrt(head_dim) = 1/16; Gemma4's oracle pins its attention scale to 1.0.
+#ifndef ATTENTION_SCALE
+#define ATTENTION_SCALE (1.0F / 16.0F)
+#endif
 constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
 constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
 
@@ -57,9 +68,12 @@ constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
 // the policy header.
 // ---------------------------------------------------------------------------
 
-constexpr std::uint32_t kTileQueryRows = 16;
+constexpr std::uint32_t kTileQueryRows = (kHeadDim <= 256) ? 16u : 8u;
 constexpr std::uint32_t kTileHeadsPerBlock = 2;
 constexpr std::uint32_t kTileColumns = kTileQueryRows * kTileHeadsPerBlock;
+// The scalar control hard-codes a 64-row key tile (lane and lane+32 in the
+// score phase, two 32-row value groups), so kTileKeyRows stays 64; the head_dim
+// 512 LDS fit comes from halving kTileQueryRows (q_tile) instead.
 constexpr std::uint32_t kTileKeyRows = 64;
 constexpr std::uint32_t kTileHalf2Dim = kHeadDim / 2;
 constexpr std::uint32_t kTileKeyHalf2Dim = kTileHalf2Dim / 2;
@@ -106,7 +120,7 @@ __launch_bounds__(256, 3) __global__
   const std::uint32_t first_query_head =
       (kv_head * kGqa) + (pair_in_group * kTileHeadsPerBlock);
   constexpr std::size_t kv_half2_stride = kKvWidth / 2;
-  constexpr float attention_scale = 1.0F / 16.0F;
+  constexpr float attention_scale = ATTENTION_SCALE;
 
   __shared__ __half2 q_tile[kTileColumns][kTileHalf2Dim];
   __shared__ __half2 kv_tile[kTileKeyRows * kTileKeyRowStride];
@@ -457,7 +471,7 @@ __launch_bounds__(kWaves * 32, 1) __global__
   const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
       (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
-  constexpr float attention_scale = 1.0F / 16.0F;
+  constexpr float attention_scale = ATTENTION_SCALE;
 
   // Row block -> (query head, 16-query sub-block of this block's rows).
   const auto row_block_head = [&](std::uint32_t rb) {
@@ -825,7 +839,7 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
   const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
       (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
-  constexpr float attention_scale = 1.0F / 16.0F;
+  constexpr float attention_scale = ATTENTION_SCALE;
 
   const auto row_block_head = [&](std::uint32_t rb) {
     return first_query_head + (rb % kWmmaHeads);
@@ -1261,7 +1275,7 @@ void ReferenceAttention(const std::vector<float>& q,
                         std::uint32_t batch, std::uint32_t key_begin,
                         std::vector<float>& out) {
   const std::uint32_t context_end = start_pos + batch;
-  const double scale = 1.0 / 16.0;
+  const double scale = ATTENTION_SCALE;
   for (std::uint32_t t = 0; t < batch; ++t) {
     const std::uint32_t absolute = start_pos + t;
     for (std::uint32_t h = 0; h < kQueryHeads; ++h) {
@@ -1510,15 +1524,21 @@ int main(int argc, char** argv) {
                                    0u, 0u);                                 \
       },                                                                    \
       d_out_new, &ref)
+  #if KHEAD_DIM == 256
   PIPE(0, false, true, 8, "pipe: packed V only");
   PIPE(16, false, true, 8, "pipe: packed+swizzle");
+#endif
   PIPE(0, true, false, 8, "pipe: prefetch only");
+#if KHEAD_DIM == 256
   PIPE(0, true, true, 8, "pipe: packed+prefetch");
   PIPE(16, true, true, 8, "pipe: all three");
+#endif
   // kVtPad 0 drops the V^T row padding, so LDS falls under a third of the 64 KB
   // and three blocks fit per CU instead of two. The swizzle keeps the packed
   // writes conflict-free without it.
+  #if KHEAD_DIM == 256
   PIPE(16, true, true, 0, "pipe: all three, 3 blk/CU");
+#endif
   PIPE(16, true, false, 0, "pipe: prefetch, 3 blk/CU");
   PIPE(0, true, false, 0, "pipe: prefetch, pad0");
 #undef PIPE
@@ -1543,6 +1563,9 @@ int main(int argc, char** argv) {
   // kernel over the same key range (key_begin = 0 so the sink is reachable).
   // Correctness is covered by the unit test, so these report time only; the
   // TFLOPS column is dense-equivalent and the ms column is the real signal.
+  // The packed-V mapping is head_dim-256 only, so this path is compiled for the
+  // Qwen/SWA shapes; Gemma4 full attention (head_dim 512) is dense (window 0).
+#if KHEAD_DIM == 256
   if (window > 0) {
     std::printf("sparse: window=%u sink=%u (key_begin forced to 0)\n", window,
                 sink);
@@ -1564,6 +1587,7 @@ int main(int argc, char** argv) {
         },
         d_out_new, nullptr);
   }
+#endif
 
   // A 32-key tile halves the number of dependency-chain traversals per unit of
   // work. The eight-wave split cannot hold it, so this is 16 waves / 512

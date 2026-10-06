@@ -135,3 +135,49 @@ Quality: NOT a tolerance relaxation to hide a bug — the argmax-exact check is
 unchanged and greedy generation independently confirms correctness; the bound
 only absorbs router drift that is inherent to k-quant weights.
 Verdict: retained.
+
+### 2026-10-06 — WMMA flash-attention prefill kernel (M11)
+Hypothesis: the scalar prefill kernel (`AttentionPrefillTiledKernel`) computes
+each query·key score as a serial head_dim dot product in one thread with no
+tensor cores, so prefill is quadratic and ~16× slower than llama.cpp's WMMA
+flash-attention; a WMMA kernel (adapted from `tools/bench/attn_causal_bench.hip`,
+best variant `WmmaCausalAttention<32,16,8>`) closes the gap.
+Change: `AttentionPrefillWmmaKernel<kQueryRows,kKeys,kWaves,kHeadDim>` in
+`kernels/rocm/attention.hip.cpp` (unscaled-Q, scale 1.0, no gate/lse; sliding
+window via `key_begin` from block-causality plus a per-query
+`absolute_query − key_position < window` validity term in the softmax mask);
+`AttentionPrefill` dispatches WMMA for head_dim ∈ {256,512} and falls back to
+the scalar oracle otherwise; the scalar launcher is kept as
+`AttentionPrefillScalar`. `kWmmaHeads=2` packs two query heads per block (grid.y
+= heads/2 = 8), GQA maps `kv_head = head_pair / (gqa/2)`.
+Measurement: exclusive-GPU `gufo bench` (reps 1, greedy, Q8_K_XL) — pp512 951 →
+1703 (1.79×), pp2048 499 → 1749 (3.51×), pp4096 365 → 1699 (4.66×), pp8192 258
+→ 1581 (6.13×), pp16384 161 → 1381 (8.56×). Gufo now leads llama.cpp at every
+depth (+40% @512 → +57% @16K). A pp4096 profile drops attention from ~86% of
+prefill to ~13%; the remaining time is two already-WMMA GEMMs (routed experts
+`RoutedF16GEMM` ~51% MFU, dense Q8_0 `mul_mat_q` on int8 tensor cores).
+Quality: `gemma4.rocm_kernels` — the scalar oracle holds 1e-3 (measured 8e-6);
+the WMMA path is bounded at 3e-3 (measured 2.01e-3 full / 1.98e-3 SWA). The
+F16-Q WMMA floor on the uniform[-1,1] fixture is ~2e-3 because gemma4 pins the
+attention scale to 1.0 (not 1/√head_dim), giving an extremely peaked softmax
+where a 1-ulp F16 Q perturbation flips a near-tie; the F32-Q oracle is 250×
+tighter and both head_dims land at the same ~2e-3, so this is the encoding
+floor, not a kernel bug (the kernel math equals the validated microbench, whose
+smooth-sinusoid data reaches 4e-4). `gemma4.rocm_forward` (real Q8_K_XL weights)
+passes with the WMMA path: prefill argmax match + decode abs-logit ≤ 2.0.
+Verdict: retained as the production prefill path.
+
+### 2026-10-06 — Stop at the prefill ceiling (M11 close-out)
+Hypothesis: push prefill to 3000+ t/s @4K by rewriting the remaining GEMMs.
+Change: profiled pp4096 and calibrated against the sibling `qwen3.6-35B-A3B`.
+Measurement: the fully-optimized sibling (3B active) reaches 2194 t/s @4K
+(reference llama 2425); scaling by active params (×3/4) predicts ~1650–1800 t/s
+for gemma4 (4B active). We measure 1699 — at the ceiling, and slightly ahead of
+the param-scaled expectation (1699/2194 = 0.77 vs 0.75). 3000 t/s @4K would need
+~41% sustained end-to-end MFU (incl. attention, norms, RoPE, epilogues), above
+what the reference llama.cpp fork itself achieves for a *smaller* model. The
+sibling's experiments already closed the dense-GEMM lever (Q8_0 projections run
+int8×int8→int32 on WMMA; F16-WMMA dense rejected as not numerics-preserving).
+Quality: n/a (no change made).
+Verdict: rejected — 3000+ t/s is not physically reachable for a 4B-active MoE on
+gfx1151; M11 finalized at the WMMA-attention result.

@@ -52,4 +52,13 @@ void AttentionPrefill(const float* q, const __half* k_cache,
                       std::uint32_t kv_heads, std::uint32_t head_dim,
                       std::uint32_t window, hipStream_t stream);
 
+// Scalar tiled reference for the same contract. Kept as the numerical oracle
+// for the WMMA fast path above; production uses AttentionPrefill.
+void AttentionPrefillScalar(const float* q, const __half* k_cache,
+                            const __half* v_cache, float* out,
+                            std::uint32_t start, std::uint32_t tokens,
+                            std::uint32_t heads, std::uint32_t kv_heads,
+                            std::uint32_t head_dim, std::uint32_t window,
+                            hipStream_t stream);
+
 }  // namespace gufo::models::gemma4::rocm

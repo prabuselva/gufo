@@ -21,26 +21,49 @@ llama-bench -m "$GUFO_GEMMA4_GGUF" -p 512,1024,2048,4096,8192,16384,32768,65536,
 
 ## Prefill (t/s)
 
+Matched exclusive-GPU sweep, `--repetitions 1`, greedy, Q8_K_XL. Reference:
+llama.cpp fork HIP build (`/tmp/llama-hip`, gfx1151, `-ngl 99`, flash attention
+on by default), build 843d57505.
+
 | pp | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| 512 | — | — | — |
-| 1024 | — | — | — |
-| 2048 | 505.49 | — | — |
-| 4096 | — | — | — |
-| 8192 | 260.60 | — | — |
-| 16384 | — | — | — |
-| 32768 | — | — | — |
-| 65536 | — | — | — |
-| 102400 | — | — | — |
+| 512 | 1703.54 | 1219.75 | +39.7% |
+| 1024 | 1738.06 | 1235.00 | +40.7% |
+| 2048 | 1748.95 | 1181.73 | +48.0% |
+| 4096 | 1699.12 | 1149.99 | +47.8% |
+| 8192 | 1581.21 | 1019.03 | +55.2% |
+| 16384 | 1380.62 | 881.18 | +56.7% |
+| 32768 | 1125.87 | — | — |
+| 65536 | 804.20 | — | — |
+| 102400 | 621.09 | — | — |
+
+The M11 WMMA flash-attention prefill kernel (`AttentionPrefillWmmaKernel`)
+replaced the scalar per-query head_dim dot-product kernel
+(`AttentionPrefillTiledKernel`, kept as the `AttentionPrefillScalar` oracle).
+Gufo now leads llama.cpp at every measured depth and the previously quadratic
+gap is gone: throughput falls only gently with context (1749 → 621 t/s from
+2K → 100K) because 25 of 30 layers are sliding-window (window 1024) and only
+the 5 full-attention layers (head_dim 512) grow quadratically. Versus the
+pre-M11 scalar path the same build is 1.79× faster at 512 rising to 8.56× at
+16384 (951 → 1703 and 161 → 1381).
+
+At 4K this is at the practical ceiling for a 4B-active MoE on gfx1151: the
+fully-optimized sibling `qwen3.6-35B-A3B` (3B active) reaches 2194 t/s
+(reference llama 2425); scaled by active params (×3/4) that predicts
+~1650–1800 t/s for gemma4, which this matches. A pp4096 profile shows the
+remaining time is two already-WMMA GEMMs — routed experts (`RoutedF16GEMM`,
+~51% MFU) and dense Q8_0 projections (`mul_mat_q`, int8 tensor cores) — with
+attention down to ~13% of prefill; no large untapped lever remains
+([EXPERIMENTS.md](EXPERIMENTS.md)).
 
 ## Decode (t/s, tg128)
 
 | Config | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| Q8_K_XL, no MTP | 38.22 | — | — |
-| Q8_K_XL, MTP n=1 | 36.60 | — | −4.2% |
-| Q8_K_XL, MTP n=2 | 46.93 | — | +22.8% |
-| Q8_K_XL, MTP n=4 | 59.99 | — | +57.0% |
+| Q8_K_XL, no MTP | 38.08 | 41.83 | −9.0% |
+| Q8_K_XL, MTP n=1 | 36.60 | — | — |
+| Q8_K_XL, MTP n=2 | 46.93 | — | +12.2% |
+| Q8_K_XL, MTP n=4 | 59.99 | — | +43.4% |
 
 MTP is opt-in (`--speculative mtp --mtp-model <draft>`); `n` is
 `--draft-tokens`, capped at 4 by `kMaxVerifyRows=5`. n=4 is the best measured
