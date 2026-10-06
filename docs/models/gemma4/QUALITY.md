@@ -28,6 +28,8 @@ end-to-end greedy token streams are the final gate.
 | WMMA MoE (routed_f16, F16 narrowing) | not bit-exact; guarded by forward test, logits ≤ 5e-3 abs |
 | Attention WMMA (F16 KV mirror) | ≤ 5e-3 abs on attention output |
 | Full-model forward (`rocm_forward`, pos 0–4) | logits finite + argmax exact + worst_abs ≤ 2.0; `h_out` worst_abs ≤ 2.0 |
+| Full-model forward, k-quant artifact (Q4_K_M) | dense Q4_K/Q5_K/Q6_K upcast to Q8_0 at load, routed experts native (Q4_K gate/up + Q8_0 down). logits finite + argmax exact + worst_abs ≤ 6.0; `h_out` ≤ 6.0. The bound is quant-aware: a near-lossless Q8_0 artifact keeps 2.0, but a k-quant's requant noise perturbs the top-8 router so several near-tied experts flip vs the double oracle, amplifying absolute logit error (still ≪ the ±30 softcap; a logic bug is O(10) with argmax mismatch). Observed worst_abs 4.60, `h_out` 2.38, argmax matching at every position. |
+| End-to-end greedy, k-quant artifact (Q4_K_M) | `gufo prompt` returns coherent, factually-correct text ("eight planets") nearly identical to the Q8_K_XL control on the same prompt — an independent proof of the load-time requant path (a wrong Q4_K→Q8_0 upcast yields garbage, not near-miss text). |
 | End-to-end greedy (serve, M7+) | identical token stream vs oracle on the pinned prompts |
 | MTP speculative decode (M8b, opt-in) | lossless accept from the trunk verify pass; `gemma4.speculative` token-identical at 48 tokens. Not bit-identical to non-spec greedy at long range: the batched k+1-row verify that yields the speedup differs from single-token decode by the same GEMM-vs-GEMV rounding as the rows above, so a near-tied argmax can flip. Opt-in only; the default greedy path is unchanged. |
 | Vision tower F32 (`gemma4.vision_encoder`) | device vs CPU oracle on a fixed 96×96 image: checksums identical (−53.0989), max abs diff 2.9e-05, mean 4.5e-06 (F32 rounding). mmproj uploaded as F32 (BF16 upcast on host). |
@@ -39,7 +41,11 @@ graph is unscaled attention over 30 layers with a top-8 MoE, so a rare
 near-tied router flip shifts even the top-1 logit by O(1) and relative error
 is unbounded on near-zero logits. Observed worst_abs per position (0–4):
 0.008 / 0.743 / 0.15 / 0.083 / 0.062, argmax matching at every position; a
-logic bug against the ±30 softcap would show O(10) absolute error.
+logic bug against the ±30 softcap would show O(10) absolute error. The bound is
+chosen per artifact from its weight types: near-lossless Q8_0 artifacts use 2.0
+(tolerates a single expert flip), k-quant artifacts (Q4_K_M) use 6.0 because
+their requant noise drifts the router across several near-tied experts; the
+argmax-exact requirement is unchanged, and greedy generation is the final gate.
 
 ## Golden vectors
 

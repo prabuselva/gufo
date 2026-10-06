@@ -180,12 +180,27 @@ cache on the image bytes and reprocesses the whole prompt with the spliced rows.
 
 ### M10 — Quantizations (Q8_0, Q4_K_M)
 
-Q8_0 artifact loads natively (same tiers). Q4_K_M: routed experts Q4_K/Q5_K
-through `routed_f16` (already supports both), Q6_K tensors upcast to Q8_0 at
-load — port the qwen36 Q4_K_XL path.
+Q8_K_XL artifact loads natively (its tensors are Q8_0/BF16/F32). Q4_K_M: the
+routed experts stay native (`routed_f16` decodes Q4_K/Q5_K/Q8_0 in-kernel), but
+the **dense** Q4_K/Q5_K/Q6_K tensors are upcast to Q8_0 at load — the dense
+`Gemm` only handles Q8_0/F32/BF16, so a raw k-quant dense tensor would no-op and
+poison the activations. Upcast is quality-preserving (Q8_0 is finer than any
+k-quant; requant error ≈ 1/8.5 of the source step).
 
-Check: weights + forward tests on each artifact. Exit: BENCHMARKS.md gains
-per-quantization rows.
+**Status: met.** `device_model.cpp` `RequantKQuantRowToQ8_0` requantizes a
+Q4_K/Q5_K/Q6_K row to Q8_0 on the host; `Uploader::Copy(t, expert)` upcasts a
+dense k-quant (`!expert && type ∈ {Q4_K,Q5_K,Q6_K}`) via `CopyUpcast`
+(host requant → `hipMalloc`/`hipMemcpy`, `DeviceTensor.type = kQ8_0`), while
+`Layer()` passes `expert=true` for `ffn_gate_up_exps`/`ffn_down_exps` so the
+expert bulk (23B params) keeps its native quant and the memory win. Routed
+gate/up and down may now differ in type (Q4_K gate/up + Q8_0 down on Q4_K_M):
+the executor's prefill path splits the single `wt` into `wt_gu`/`wt_down`
+(`RoutedTypeOf` each) for the two independent `RoutedF16Gemm` calls; the decode
+path already used separate `gt`/`dt`. The forward test bound is quant-aware
+(2.0 near-lossless / 6.0 k-quant, see QUALITY.md). `gemma4.weights` and
+`gemma4.rocm_forward` pass on both artifacts (Q4_K_M worst_abs 4.60, argmax
+match at every position); greedy `gufo prompt` on Q4_K_M returns coherent,
+factually-correct text. BENCHMARKS.md gains the Q4_K_M vs Q8_K_XL rows.
 
 ### M11 — Performance tuning + benchmarks
 
@@ -334,6 +349,22 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
    `Model::EncodeChatVision` + `Session::Sync(prompt, slots)`, and
    `gufo prompt --mmproj --image`. `gemma4.vision_prompt` (CPU) pins resize,
 normalization and marker expansion. End-to-end OCR on the mtmd moon-landing
-    page returns the exact headline (greedy, Q8_K_XL + BF16 mmproj) through both
-    `gufo prompt` and HTTP `serve` (`/v1/chat/completions` `image_url`, cache
-    keyed on image bytes).
+page returns the exact headline (greedy, Q8_K_XL + BF16 mmproj) through both
+     `gufo prompt` and HTTP `serve` (`/v1/chat/completions` `image_url`, cache
+     keyed on image bytes).
+- M10: quantizations — done. Q4_K_M artifact
+  (`gemma-4-26B-A4B-it-Q4_K_M.gguf`, 18.35 GB, 5.32 BPW; final types
+  F32:392/Q6_K:14/Q4_K:192/Q8_0:60) loads and runs. Root cause of the original
+  crash: the dense `Gemm` no-ops on Q4_K/Q5_K, so a raw k-quant dense tensor
+  yields garbage activations → OOB → Q8_0 mmq fault. Fix: `device_model.cpp`
+  upcasts dense Q4_K/Q5_K/Q6_K → Q8_0 at load (`RequantKQuantRowToQ8_0` +
+  `CopyUpcast`) while routed experts stay native; `executor.cpp` allows mixed
+  expert types (`wt_gu`/`wt_down`); `rocm_forward_test.cpp` uses a quant-aware
+  bound (2.0 near-lossless / 6.0 k-quant). `gemma4.weights` +
+  `gemma4.rocm_forward` pass on both artifacts (Q4_K_M worst_abs 4.60, `h_out`
+  2.38, argmax match every position; Q8_K_XL unchanged at 0.74). Greedy
+  `gufo prompt` on Q4_K_M returns coherent, factually-correct text (independent
+  proof of the requant path). Exclusive-GPU `gufo bench` (reps 1, greedy):
+  Q4_K_M 17.09 GiB pp512 1004.83 / pp8192 261.66 / pp16384 163.14 / tg128 41.87;
+  Q8_K_XL 25.74 GiB pp512 966.06 / pp8192 251.19 / pp16384 160.66 / tg128 38.30
+  — Q4_K_M is 33.6% smaller and faster on every axis.

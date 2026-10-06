@@ -671,12 +671,13 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
   RoutedCompact(ids, pf_counts_, pf_pad_bounds_, pf_cursors_, pf_rows_token_,
                 pf_rows_slot_, tokens, used, c.num_experts, nullptr);
 
-  if (l.ffn_gate_up_exps.type != l.ffn_down_exps.type) {
-    return Fail(error_msg, "expert gate/up and down types differ");
-  }
-  const WeightType wt = RoutedTypeOf(l.ffn_gate_up_exps.type);
+  // gate/up and down are independent WMMA calls; a *_K_M artifact stores the
+  // gate/up stack as Q4_K and the down stack as Q8_0, so each GEMM dispatches
+  // on its own weight type (RoutedF16Gemm rejects an unsupported one below).
+  const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
+  const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
   const std::uint32_t n_tiles = static_cast<std::uint32_t>(tiles_host_.size());
-  if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt, pf_x_half_, pf_tiles_dev_,
+  if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, pf_tiles_dev_,
                      n_tiles, 64, pf_pad_bounds_, pf_rows_token_, pf_rows_slot_,
                      nullptr, pf_gu_half_, 2 * c.expert_ff, c.hidden_size,
                      nullptr)) {
@@ -684,7 +685,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
   }
   GegluF16(pf_gu_half_, pf_act_half_, slots * c.expert_ff, c.expert_ff,
            nullptr);
-  if (!RoutedF16Gemm(l.ffn_down_exps.data, wt, pf_act_half_, pf_tiles_dev_,
+  if (!RoutedF16Gemm(l.ffn_down_exps.data, wt_down, pf_act_half_, pf_tiles_dev_,
                      n_tiles, 64, pf_pad_bounds_, pf_rows_slot_, pf_rows_slot_,
                      pf_expert_out_, nullptr, c.hidden_size, c.expert_ff,
                      nullptr)) {

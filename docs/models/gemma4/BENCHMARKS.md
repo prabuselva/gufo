@@ -48,6 +48,23 @@ MTP is opt-in (`--speculative mtp --mtp-model <draft>`); `n` is
 bit-identical to non-speculative greedy beyond ~90 tokens (batched verify is
 the speedup source; see [EXPERIMENTS.md](EXPERIMENTS.md)).
 
+## Quantizations (Q4_K_M vs Q8_K_XL)
+
+`gufo bench --repetitions 1`, exclusive GPU, greedy. Q4_K_M upcasts the dense
+Q4_K/Q5_K/Q6_K tensors to Q8_0 at load and keeps the routed experts native
+(Q4_K gate/up + Q8_0 down); see [EXPERIMENTS.md](EXPERIMENTS.md).
+
+| Test | Q4_K_M (17.09 GiB) | Q8_K_XL (25.74 GiB) | gain |
+| --- | --- | --- | --- |
+| pp512 | 1004.83 | 966.06 | +4.0% |
+| pp8192 | 261.66 | 251.19 | +4.2% |
+| pp16384 | 163.14 | 160.66 | +1.5% |
+| tg128 | 41.87 | 38.30 | +9.3% |
+
+Q4_K_M is 33.6% smaller and faster on every axis: the dense upcast costs no
+throughput (Q8_0 is the native dense tier) and the smaller resident footprint
+helps decode bandwidth-bound tg most.
+
 ## Serve (t/s, streaming)
 
 | Scenario | Gufo | llama.cpp | gain |
