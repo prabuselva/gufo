@@ -165,6 +165,17 @@ wiring in prompt/serve.
 Check: `gemma4_vision_test` (encoder parity vs oracle on a fixed image).
 Exit: image prompts answer correctly end-to-end.
 
+**Status: met.** `vision/prompt.{hpp,cpp}` ports the reference smart-resize
+(align 48, 40..280 tokens) and Catmull-Rom bicubic to CHW `[0,1]`;
+`BuildPrompt` expands each `<|image|>` marker into `<|image>` + N fillers +
+`<image|>` and records a `VisionSlot`. The executor splices the tower rows over
+the scaled token embeddings during prefill; `Model::EncodeChatVision` +
+`Session::Sync(prompt, slots)` drive it, and `gufo prompt --mmproj --image`
+reaches it. `gemma4.vision_prompt` (CPU) pins the resize/normalization and the
+marker expansion. End-to-end OCR on the mtmd moon-landing page returns the
+exact headline "A Powdery Surface Is Closely Explored" (greedy, Q8_K_XL trunk +
+BF16 mmproj). HTTP `serve` image input is a follow-up.
+
 ### M10 — Quantizations (Q8_0, Q4_K_M)
 
 Q8_0 artifact loads natively (same tiers). Q4_K_M: routed experts Q4_K/Q5_K
@@ -312,5 +323,14 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   host): the tower is tiny next to the 26B trunk, so full precision costs nothing
   and matches the oracle exactly. `gemma4.vision_encoder` (external-model, skip
   77) checks device vs oracle on a fixed 96×96 gradient: checksums identical
-  (−53.0989), max abs diff 2.9e-05, mean 4.5e-06 — F32 rounding. Remaining:
-  bicubic preprocessing, `<|image|>` engine wiring.
+(−53.0989), max abs diff 2.9e-05, mean 4.5e-06 — F32 rounding. Engine wiring
+   done: `vision/prompt.{hpp,cpp}` (smart-resize align 48 / 40..280 tokens +
+   Catmull-Rom bicubic to CHW `[0,1]`, `BuildPrompt` marker expansion +
+   `VisionSlot`), `Tokenizer::FromVocabulary` optional `specials`,
+   `ChatMessage::image_count` + `<|image|>` markers, executor prefill splice
+   (`SetVision`/`VisionImage`, contiguous D2D over the scaled token rows),
+   `Model::EncodeChatVision` + `Session::Sync(prompt, slots)`, and
+   `gufo prompt --mmproj --image`. `gemma4.vision_prompt` (CPU) pins resize,
+   normalization and marker expansion. End-to-end OCR on the mtmd moon-landing
+   page returns the exact headline (greedy, Q8_K_XL + BF16 mmproj). Remaining:
+   HTTP `serve` image input.

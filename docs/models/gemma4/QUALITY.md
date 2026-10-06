@@ -30,6 +30,9 @@ end-to-end greedy token streams are the final gate.
 | Full-model forward (`rocm_forward`, pos 0–4) | logits finite + argmax exact + worst_abs ≤ 2.0; `h_out` worst_abs ≤ 2.0 |
 | End-to-end greedy (serve, M7+) | identical token stream vs oracle on the pinned prompts |
 | MTP speculative decode (M8b, opt-in) | lossless accept from the trunk verify pass; `gemma4.speculative` token-identical at 48 tokens. Not bit-identical to non-spec greedy at long range: the batched k+1-row verify that yields the speedup differs from single-token decode by the same GEMM-vs-GEMV rounding as the rows above, so a near-tied argmax can flip. Opt-in only; the default greedy path is unchanged. |
+| Vision tower F32 (`gemma4.vision_encoder`) | device vs CPU oracle on a fixed 96×96 image: checksums identical (−53.0989), max abs diff 2.9e-05, mean 4.5e-06 (F32 rounding). mmproj uploaded as F32 (BF16 upcast on host). |
+| Vision preprocessing (`gemma4.vision_prompt`) | smart-resize targets vs hand-computed `calc_size_preserved_ratio`; solid-color images survive resize unchanged in CHW `[0,1]`; `<|image|>` marker expands to `<|image>` + N fillers + `<image|>` with correct offsets/counts. |
+| Vision end-to-end OCR (M9) | greedy `gufo prompt --mmproj --image` on the mtmd moon-landing page returns the exact headline "A Powdery Surface Is Closely Explored" (Q8_K_XL trunk + BF16 mmproj). |
 
 The full-model forward contract is absolute-error + argmax, not relative: the
 graph is unscaled attention over 30 layers with a top-8 MoE, so a rare
