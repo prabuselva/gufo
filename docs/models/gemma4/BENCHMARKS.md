@@ -37,9 +37,16 @@ llama-bench -m "$GUFO_GEMMA4_GGUF" -p 512,1024,2048,4096,8192,16384,32768,65536,
 
 | Config | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| Q8_K_XL, no MTP | 38.26 | — | — |
-| Q8_K_XL, MTP n=1 | — | — | — |
-| Q8_K_XL, MTP n=2 | — | — | — |
+| Q8_K_XL, no MTP | 38.22 | — | — |
+| Q8_K_XL, MTP n=1 | 36.60 | — | −4.2% |
+| Q8_K_XL, MTP n=2 | 46.93 | — | +22.8% |
+| Q8_K_XL, MTP n=4 | 59.99 | — | +57.0% |
+
+MTP is opt-in (`--speculative mtp --mtp-model <draft>`); `n` is
+`--draft-tokens`, capped at 4 by `kMaxVerifyRows=5`. n=4 is the best measured
+(acceptance 92/110). Speculative decode is distribution-preserving but not
+bit-identical to non-speculative greedy beyond ~90 tokens (batched verify is
+the speedup source; see [EXPERIMENTS.md](EXPERIMENTS.md)).
 
 ## Serve (t/s, streaming)
 

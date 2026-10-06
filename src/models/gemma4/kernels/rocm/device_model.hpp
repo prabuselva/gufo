@@ -97,6 +97,59 @@ private:
   std::size_t bytes_{0};
 };
 
+/// The MTP draft uploaded to the GPU. Its four layers carry only the Q
+/// projection, the dense FFN and their norms (they read the trunk KV cache
+/// read-only), plus the pre/post projections that map between the doubled
+/// trunk-width input and the draft hidden width. The inverse-frequency tables
+/// are built from the draft's own `rope_freqs`, which the KV-share contract
+/// keeps consistent with the trunk layer whose cache each draft layer reads.
+class DeviceDraft {
+ public:
+  ~DeviceDraft();
+  DeviceDraft(const DeviceDraft&) = delete;
+  DeviceDraft& operator=(const DeviceDraft&) = delete;
+
+  /// Streams every draft tensor from the sidecar file used to bind it.
+  [[nodiscard]] static std::unique_ptr<DeviceDraft> Upload(
+      const DraftWeights& weights, const core::GgufReader& reader,
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] const Config& config() const noexcept { return config_; }
+  [[nodiscard]] const DeviceTensor& pre_projection() const noexcept {
+    return pre_projection_;
+  }
+  [[nodiscard]] const DeviceTensor& post_projection() const noexcept {
+    return post_projection_;
+  }
+  [[nodiscard]] const DeviceTensor& token_embd() const noexcept {
+    return token_embd_;
+  }
+  [[nodiscard]] const DeviceTensor& output_norm() const noexcept {
+    return output_norm_;
+  }
+  [[nodiscard]] const std::vector<DeviceLayer>& layers() const noexcept {
+    return layers_;
+  }
+  [[nodiscard]] const float* inv_freq(std::uint32_t layer) const noexcept {
+    return config_.IsSwa(layer) ? inv_freq_swa_ : inv_freq_full_;
+  }
+  [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+
+ private:
+  DeviceDraft() = default;
+
+  Config config_;
+  DeviceTensor pre_projection_;
+  DeviceTensor post_projection_;
+  DeviceTensor token_embd_;
+  DeviceTensor output_norm_;
+  float* inv_freq_swa_{nullptr};
+  float* inv_freq_full_{nullptr};
+  std::vector<DeviceLayer> layers_;
+  std::vector<void*> allocations_;
+  std::size_t bytes_{0};
+};
+
 }  // namespace gufo::models::gemma4::rocm
 
 #endif  // GUFO_MODELS_GEMMA4_KERNELS_ROCM_DEVICE_MODEL_HPP_

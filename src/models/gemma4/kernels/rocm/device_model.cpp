@@ -165,4 +165,63 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   return m;
 }
 
+DeviceDraft::~DeviceDraft() {
+  for (void* p : allocations_) {
+    (void)hipFree(p);
+  }
+}
+
+std::unique_ptr<DeviceDraft> DeviceDraft::Upload(const DraftWeights& w,
+                                                 const core::GgufReader& reader,
+                                                 std::string* error_msg) {
+  std::unique_ptr<DeviceDraft> m(new DeviceDraft());
+  m->config_ = w.config;
+  const auto regions = reader.GetMappedRegions();
+  std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
+  auto stager = hip::WeightUpload::Create(shards, error_msg);
+  if (!stager) {
+    return nullptr;
+  }
+  Uploader up{*stager, m->allocations_, m->bytes_, error_msg};
+  m->pre_projection_ = up.Copy(w.pre_projection);
+  m->post_projection_ = up.Copy(w.post_projection);
+  m->token_embd_ = up.Copy(w.token_embd);
+  m->output_norm_ = up.Copy(w.output_norm);
+
+  // The draft's own inverse-frequency tables, computed exactly as the trunk's
+  // but from the draft `rope_freqs`, so a draft layer's rope matches the trunk
+  // layer whose KV cache it reads.
+  const Config& c = m->config_;
+  std::vector<float> inv_swa(c.rope_dim_swa / 2);
+  for (std::size_t i = 0; i < inv_swa.size(); ++i) {
+    inv_swa[i] = static_cast<float>(std::pow(
+        static_cast<double>(c.rope_theta_swa),
+        -2.0 * static_cast<double>(i) / static_cast<double>(c.rope_dim_swa)));
+  }
+  std::vector<float> inv_full(c.rope_dim_full / 2);
+  const auto* factors = static_cast<const float*>(w.rope_freqs.data);
+  for (std::size_t i = 0; i < inv_full.size(); ++i) {
+    const double base = std::pow(
+        static_cast<double>(c.rope_theta),
+        -2.0 * static_cast<double>(i) / static_cast<double>(c.rope_dim_full));
+    inv_full[i] = factors != nullptr ? static_cast<float>(base / factors[i])
+                                     : static_cast<float>(base);
+  }
+  m->inv_freq_swa_ = up.CopyF32(inv_swa.data(), inv_swa.size(), "draft_inv_swa");
+  m->inv_freq_full_ =
+      up.CopyF32(inv_full.data(), inv_full.size(), "draft_inv_full");
+
+  m->layers_.reserve(w.layers.size());
+  for (std::uint32_t l = 0; l < w.layers.size(); ++l) {
+    m->layers_.push_back(up.Layer(w.layers[l], c.IsSwa(l)));
+    if (!up.ok) {
+      return nullptr;
+    }
+  }
+  if (!up.ok || !stager->Finish(error_msg)) {
+    return nullptr;
+  }
+  return m;
+}
+
 }  // namespace gufo::models::gemma4::rocm

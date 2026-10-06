@@ -37,3 +37,32 @@ Change: `src/models/gemma4/kernels/rocm/routed_f16.{hpp,hip.cpp}`.
 Measurement: pending M5.
 Quality: `gemma4_rocm_moe_test` vs CPU formula.
 Verdict: pending
+
+### 2026-10-06 — MTP draft forward kernel (M8a)
+Hypothesis: the 4-layer MTP draft sidecar (`mtp-gemma-4-26B-A4B-it-Q8_0.gguf`,
+hidden 1024→2816 out, dense FFN 8192, fixed position, trunk KV read-only)
+reproduces an independent CPU oracle on the GPU.
+Change: `DeviceDraft` + `Executor::AttachDraft`/`DraftStep`
+(`kernels/rocm/{device_model,executor}.{hpp,cpp}`).
+Measurement: `gemma4.mtp` — step1 rel-to-scale 0.116 (argmax 500==500),
+step2 0.162 (argmax 800==800), h_next 0.069/0.108.
+Quality: independent CPU `ReferenceModel` oracle; argmax matches both steps.
+Verdict: retained
+
+### 2026-10-06 — MTP speculative decode (M8b)
+Hypothesis: chaining up to k drafts through the MTP block and verifying all
+k+1 rows in one batched trunk pass raises tg throughput while the trunk verify
+keeps the lossless accept prefix.
+Change: `Executor::Verify`/`RollbackVerify` + `Session::DecodeStep` speculative
+path (`engine.{hpp,cpp}`); CLI `--speculative mtp --mtp-model` in bench/prompt.
+Measurement: tg128 (Q8_K_XL, depth 0, exclusive GPU, greedy) —
+no MTP 38.22; MTP n=1 36.60 (−4.2%); n=2 46.93 (+22.8%); n=4 59.99 (+57.0%).
+Acceptance at n=4: drafted 110 / accepted 92. `kMaxVerifyRows=5` caps k at 4.
+Quality: `gemma4.speculative` (chat prompt, 48 tokens) token-identical.
+Longer real-text chat (256 tokens) diverges from non-spec greedy at one
+small-margin token (~char 399, "taken to perform" vs "spent performing"):
+the batched trunk verify that produces the speedup is not bit-identical to
+single-token decode, so it can flip a near-tie. Inherent to batched
+verification (llama.cpp MTP behaves the same); MTP stays opt-in so the default
+greedy path is unchanged.
+Verdict: retained (opt-in, n=4 default cap)

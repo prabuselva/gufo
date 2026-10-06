@@ -45,6 +45,18 @@ add_test(NAME gemma4.reference COMMAND gemma4_reference_test)
 set_tests_properties(gemma4.reference PROPERTIES
   LABELS "gemma4;cpu;external-model;slow" SKIP_RETURN_CODE 77)
 
+# Binds the real mmproj and runs the scalar vision oracle over a small image.
+# Skips (77) without GUFO_GEMMA4_MMPROJ_GGUF.
+add_executable(gemma4_vision_reference_test EXCLUDE_FROM_ALL
+  vision_reference_test.cpp)
+target_link_libraries(gemma4_vision_reference_test PRIVATE
+  gufo_gemma4_reference)
+set_source_files_properties(vision_reference_test.cpp
+  PROPERTIES COMPILE_OPTIONS "-O2")
+add_test(NAME gemma4.vision_reference COMMAND gemma4_vision_reference_test)
+set_tests_properties(gemma4.vision_reference PROPERTIES
+  LABELS "gemma4;cpu;external-model;slow" SKIP_RETURN_CODE 77)
+
 if (ENGINE_ENABLE_HIP)
   # Kernel-tier checks: synthetic tensors at the artifact geometry through the
   # GEMV/GEMM tiers, the fused routing operators and the routed F16 MoE
@@ -66,5 +78,27 @@ if (ENGINE_ENABLE_HIP)
     gufo_gemma4_executor gufo_gemma4_reference gufo_core)
   add_test(NAME gemma4.rocm_forward COMMAND gemma4_rocm_forward_test)
   set_tests_properties(gemma4.rocm_forward PROPERTIES
+    LABELS "gemma4;hip;gpu;gfx1151;external-model;slow" SKIP_RETURN_CODE 77)
+
+  # MTP draft forward parity on the real trunk plus its sidecar: the GPU draft
+  # step against the scalar oracle over a shared hidden input (scale-relative
+  # logit bound, identical argmax, deterministic, chained h_next). Skips (77)
+  # without GUFO_GEMMA4_GGUF and GUFO_GEMMA4_MTP_GGUF; needs the full GPU.
+  add_executable(gemma4_mtp_test gemma4_mtp_test.cpp)
+  target_link_libraries(gemma4_mtp_test PRIVATE
+    gufo_gemma4_executor gufo_gemma4_reference gufo_core)
+  add_test(NAME gemma4.mtp COMMAND gemma4_mtp_test)
+  set_tests_properties(gemma4.mtp PROPERTIES
+    LABELS "gemma4;hip;gpu;gfx1151;external-model;slow" SKIP_RETURN_CODE 77)
+
+  # Speculative decode parity on the real trunk plus its sidecar: greedy output
+  # with MTP enabled is token-for-token identical to greedy without it, and the
+  # speculative run actually accepts drafts. Skips (77) without GUFO_GEMMA4_GGUF
+  # and GUFO_GEMMA4_MTP_GGUF; needs the full GPU.
+  add_executable(gemma4_speculative_test gemma4_speculative_test.cpp)
+  target_link_libraries(gemma4_speculative_test PRIVATE
+    gufo_gemma4_engine gufo_core)
+  add_test(NAME gemma4.speculative COMMAND gemma4_speculative_test)
+  set_tests_properties(gemma4.speculative PROPERTIES
     LABELS "gemma4;hip;gpu;gfx1151;external-model;slow" SKIP_RETURN_CODE 77)
 endif()

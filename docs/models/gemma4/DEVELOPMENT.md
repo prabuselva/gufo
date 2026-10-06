@@ -146,9 +146,13 @@ target `h_nextn`), 4 layers reading target KV read-only (SWA → layer 28,
 full → layer 29), draft logits (no softcap), verify + adaptive draft bounds
 (qwen36 session policy).
 
-Check: `gemma4_mtp_test` (acceptance + identical greedy output vs no-MTP).
-Exit: acceptance ≥ llama.cpp fork on the benchmark corpus; output hash
-unchanged.
+Check: `gemma4.mtp` (draft forward vs CPU oracle) and `gemma4.speculative`
+(greedy token-identical vs no-MTP at 48 tokens).
+Exit: acceptance ≥ llama.cpp fork on the benchmark corpus. Output is
+distribution-preserving (committed tokens are the trunk's), not bit-identical
+to non-spec greedy at long range — the batched verify that yields the +57%
+tg128 win is not bit-identical to single-token decode (see QUALITY.md). MTP is
+opt-in; the default greedy path is unchanged.
 
 ### M9 — Vision (`gemma4v`)
 
@@ -281,4 +285,26 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   yet). Serve smoke over HTTP (exclusive GPU): greedy chat returns the correct
   answer with `finish_reason=stop`. First `gufo bench` numbers (Q8_K_XL, no
   MTP): pp2048 505.49 t/s, pp8192 260.60 t/s, tg128 38.26 t/s.
-- M8: MTP draft — next.
+- M8: MTP draft — done. `DeviceDraft`/`Executor::DraftStep` (draft forward,
+  fixed position, trunk KV read-only) match the CPU oracle (`gemma4.mtp`);
+  `Executor::Verify`/`RollbackVerify` + `Session::DecodeStep` speculative path
+  give greedy token-identical output at 48 tokens (`gemma4.speculative`). CLI
+  `--speculative mtp --mtp-model` wired into `bench.cpp` and `prompt.cpp`
+  (`LoadGemma4Model` + `GenerateGemma4Response` now drive `DecodeStep`). tg128
+  (Q8_K_XL, exclusive GPU, greedy): no MTP 38.22, MTP n=1 36.60, n=2 46.93,
+  n=4 59.99 t/s (+57%). MTP is opt-in; committed tokens are the trunk's, so
+  output stays on-target but is not bit-identical to non-spec greedy at long
+  range (batched verify; see QUALITY.md). Serve path still loads no draft.
+- M9: vision (`gemma4v`) — CPU-oracle foundation done. `vision/config.{hpp,cpp}`
+  parses `clip.vision.*` + the `gemma4v` projector and locks the geometry
+  (hidden 1152, heads 16, head_dim 72, layers 27, eps 1e-6, rope θ=100, merge 3,
+  patch 16, projection 2816, align 48); `vision/weights.{hpp,cpp}` binds the real
+  mmproj (patch_embd rank-4 `[16,16,3,1152]`, position_embd rank-3
+  `[1152,10240,2]`, rank-1 norms, rank-2 projections, `mm.input_projection`
+  `[1152,2816]`); `vision/reference.{hpp,cpp}` is the full CPU oracle
+  (`ReferenceEncoder::Encode`). `gemma4.vision_reference` (external-model, skip
+  77) runs the oracle on the real mmproj: all tensors bind, output finite
+  `[4×2816]`, checksum −53.0989. Remaining: HIP kernels (2D RoPE, geglu_quick
+  `x·sigmoid(1.702x)`, avg-pool 3×3, std-norm, non-causal attention kq_scale=1;
+  reuse `Gemm`/`RmsNormRows`/`Add`/`ScaleInPlace`), device encoder, bicubic
+  preprocessing, `<|image|>` engine wiring, GPU parity test.

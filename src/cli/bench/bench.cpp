@@ -1404,9 +1404,14 @@ int RunGemma4Benchmark(
   const std::size_t required_context =
       std::max({std::size_t{4096}, max_depth + max_prompt + 1,
                 std::max<std::size_t>(max_depth, 16) + max_generation + 1});
-  if (!options.speculative_backend.empty()) {
-    std::cerr << "Error: Gemma-4-26B-A4B speculative decoding is not yet "
-                 "available; run without --speculative\n";
+  const bool mtp = options.speculative_backend == "mtp";
+  if (!options.speculative_backend.empty() && !mtp) {
+    std::cerr << "Error: Gemma-4-26B-A4B supports only --speculative mtp or "
+                 "off\n";
+    return 1;
+  }
+  if (mtp && options.mtp_model_path.empty()) {
+    std::cerr << "Error: --speculative mtp requires --mtp-model\n";
     return 1;
   }
   if (options.concurrency != std::vector<std::size_t>{1}) {
@@ -1423,10 +1428,17 @@ int RunGemma4Benchmark(
   auto model = g4::Model::Load(
       options.model_path,
       g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
-                           required_context)},
+                           required_context),
+                       .draft_path = mtp ? options.mtp_model_path : ""},
       &error);
   if (model == nullptr) {
     std::cerr << "Error creating Gemma-4-26B-A4B model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  if (mtp && !model->HasMtp()) {
+    std::cerr << "Error: --speculative mtp requested but the draft sidecar "
+                 "failed to load\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
@@ -1530,11 +1542,20 @@ int RunGemma4Benchmark(
           return 1;
         }
         session->Reset();
+        if (mtp) {
+          // Speculative decode reads the trunk KV the prefill below writes, so
+          // enable it before Sync; the pp loop leaves it off.
+          session->SetMtpEnabled(true);
+          session->SetDraftLimits(options.min_draft_tokens,
+                                  options.draft_tokens);
+        }
         if (!session->Sync(std::span(tokens).first(prefix_length), &error)) {
           std::cerr << "Error preparing generation: " << error << '\n';
           return 1;
         }
         std::vector<std::int32_t> generated;
+        std::size_t drafted = 0;
+        std::size_t accepted = 0;
         const std::vector<sampling::TokenId> history(tokens.begin(),
                                                      tokens.begin() +
                                                          prefix_length);
@@ -1542,20 +1563,28 @@ int RunGemma4Benchmark(
         const auto start = std::chrono::steady_clock::now();
         while (generated.size() < generation_length) {
           g4::Session::DecodeResult decoded;
-          if (!session->DecodeStep(1, sampler, &decoded, &error, false) ||
+          // A one-token budget disables the draft path (greedy); a larger one
+          // lets the session chain up to the pinned draft count.
+          const std::size_t budget =
+              mtp ? generation_length - generated.size() : 1;
+          if (!session->DecodeStep(budget, sampler, &decoded, &error, false) ||
               decoded.tokens.empty()) {
             std::cerr << "Error running Gemma-4 decode: " << error << '\n';
             return 1;
           }
           generated.insert(generated.end(), decoded.tokens.begin(),
                            decoded.tokens.end());
+          drafted += decoded.drafted;
+          accepted += decoded.accepted;
         }
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
         runs.push_back(static_cast<double>(generation_length) / seconds);
         if (options.verbose) {
-          std::cerr << "Gemma-4-26B-A4B tg depth=" << depth << " output_sha256="
+          std::cerr << "Gemma-4-26B-A4B tg depth=" << depth
+                    << " drafted=" << drafted << " accepted=" << accepted
+                    << " output_sha256="
                     << crypto::Sha256Hex(
                            std::span(reinterpret_cast<const std::uint8_t*>(
                                          generated.data()),

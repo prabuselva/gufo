@@ -632,8 +632,14 @@ std::shared_ptr<models::gemma4::Model> LoadGemma4Model(
     PrintModelLoadTime(load_start, false);
     return nullptr;
   }
-  if (!opt.speculative_backend.empty()) {
-    std::cerr << "Gemma-4-26B-A4B speculative decoding is not yet available\n";
+  const bool mtp = opt.speculative_backend == "mtp";
+  if (!opt.speculative_backend.empty() && !mtp) {
+    std::cerr << "Gemma-4-26B-A4B supports only --speculative mtp or off\n";
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  if (mtp && opt.mtp_model_path.empty()) {
+    std::cerr << "--speculative mtp requires --mtp-model\n";
     PrintModelLoadTime(load_start, false);
     return nullptr;
   }
@@ -646,9 +652,17 @@ std::shared_ptr<models::gemma4::Model> LoadGemma4Model(
   std::string error;
   auto model = models::gemma4::Model::Load(
       opt.model_path,
-      models::gemma4::ModelOptions{.max_context = kDefaultContext}, &error);
+      models::gemma4::ModelOptions{.max_context = kDefaultContext,
+                                   .draft_path = mtp ? opt.mtp_model_path : ""},
+      &error);
   if (model == nullptr) {
     std::cerr << "Error creating Gemma-4-26B-A4B model: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  if (mtp && !model->HasMtp()) {
+    std::cerr << "--speculative mtp requested but the draft sidecar failed to "
+                 "load\n";
     PrintModelLoadTime(load_start, false);
     return nullptr;
   }
@@ -698,26 +712,35 @@ int GenerateGemma4Response(
   sampling::SamplerState sampler(opt.sampling, sampling_history);
 
   const auto generation_start = std::chrono::steady_clock::now();
+  const bool mtp = opt.speculative_backend == "mtp";
   std::size_t generated = 0;
   std::vector<tokenization::TokenId> generated_ids;
-  for (; generated < opt.max_tokens; ++generated) {
-    const auto logits = session.Logits();
-    if (logits.empty()) {
-      std::cerr << "\nGemma-4-26B-A4B token selection failed\n";
-      return 1;
-    }
-    const std::int32_t token = static_cast<std::int32_t>(sampler.Sample(logits));
-    if (model->IsStopToken(token)) {
-      break;
-    }
-    sampler.Accept(static_cast<sampling::TokenId>(token));
-    emit(token);
-    if (opt.verbose)
-      generated_ids.push_back(token);
-    if ((reply != nullptr || generated + 1 < opt.max_tokens) &&
-        !session.Evaluate(token, &error)) {
+  while (generated < opt.max_tokens) {
+    // A one-token budget keeps the autoregressive path; a larger one lets the
+    // session chain drafts through the MTP block and verify them in one pass.
+    const std::size_t budget = mtp ? opt.max_tokens - generated : 1;
+    models::gemma4::Session::DecodeResult decoded;
+    if (!session.DecodeStep(budget, sampler, &decoded, &error, true)) {
       std::cerr << "\nGemma-4-26B-A4B decode failed: " << error << '\n';
       return 1;
+    }
+    if (decoded.tokens.empty()) {
+      break;
+    }
+    for (const std::int32_t token : decoded.tokens) {
+      if (model->IsStopToken(token)) {
+        decoded.stop = true;
+        break;
+      }
+      emit(token);
+      if (opt.verbose)
+        generated_ids.push_back(token);
+      if (++generated >= opt.max_tokens) {
+        break;
+      }
+    }
+    if (decoded.stop) {
+      break;
     }
   }
   std::cout << '\n';
@@ -755,6 +778,10 @@ int RunGemma4Prompt(const PromptOptions& opt, const core::GgufReader& reader,
     std::cerr << "Gemma-4 session creation failed: " << error << '\n';
     return 1;
   }
+  if (opt.speculative_backend == "mtp") {
+    session->SetMtpEnabled(true);
+    session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
+  }
   std::vector<std::int32_t> prompt_tokens;
   if (opt.use_chat_template) {
     std::vector<models::gemma4::ChatMessage> messages;
@@ -784,6 +811,10 @@ int RunGemma4Chat(const PromptOptions& opt, const core::GgufReader& reader,
   if (!session) {
     std::cerr << "Gemma-4 session creation failed: " << error << '\n';
     return 1;
+  }
+  if (opt.speculative_backend == "mtp") {
+    session->SetMtpEnabled(true);
+    session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
   }
   std::vector<models::gemma4::ChatMessage> history;
   if (!opt.system_prompt.empty()) {
