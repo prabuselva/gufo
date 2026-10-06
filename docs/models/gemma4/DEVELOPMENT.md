@@ -304,7 +304,13 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   `[1152,2816]`); `vision/reference.{hpp,cpp}` is the full CPU oracle
   (`ReferenceEncoder::Encode`). `gemma4.vision_reference` (external-model, skip
   77) runs the oracle on the real mmproj: all tensors bind, output finite
-  `[4×2816]`, checksum −53.0989. Remaining: HIP kernels (2D RoPE, geglu_quick
-  `x·sigmoid(1.702x)`, avg-pool 3×3, std-norm, non-causal attention kq_scale=1;
-  reuse `Gemm`/`RmsNormRows`/`Add`/`ScaleInPlace`), device encoder, bicubic
-  preprocessing, `<|image|>` engine wiring, GPU parity test.
+  `[4×2816]`, checksum −53.0989. HIP kernels + device encoder done
+  (`vision/kernels.{hpp,hip.cpp}`: im2col, position add, 2D RoPE, geglu_quick
+  `x·sigmoid(1.702x)`, avg-pool 3×3, std-norm, flash-style non-causal attention
+  kq_scale=1; reuses `Gemm`/`RmsNormRows`/`Add`). `vision/encoder.{hpp,cpp}`
+  drives the tower and uploads the mmproj as **F32** (BF16 weights upcast on the
+  host): the tower is tiny next to the 26B trunk, so full precision costs nothing
+  and matches the oracle exactly. `gemma4.vision_encoder` (external-model, skip
+  77) checks device vs oracle on a fixed 96×96 gradient: checksums identical
+  (−53.0989), max abs diff 2.9e-05, mean 4.5e-06 — F32 rounding. Remaining:
+  bicubic preprocessing, `<|image|>` engine wiring.
