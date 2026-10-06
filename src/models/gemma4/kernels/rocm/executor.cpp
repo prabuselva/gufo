@@ -146,6 +146,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
              static_cast<std::size_t>(c.num_heads) * 32U * (max_hd + 2U));
   GUFO_ALLOC(logits_, c.vocab_size);
   GUFO_ALLOC(h_out_, hidden);
+  GUFO_ALLOC(verify_logits_,
+             static_cast<std::size_t>(kMaxVerifyRows) * c.vocab_size);
+  GUFO_ALLOC(verify_hidden_, static_cast<std::size_t>(kMaxVerifyRows) * hidden);
 
   GUFO_ALLOC(pf_cur_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_next_, static_cast<std::size_t>(C) * hidden);
@@ -664,6 +667,268 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
   MoeEpilogue(pf_expert_out_, weights, ids, l.ffn_down_exps_scale.f32(), out,
               tokens, used, c.hidden_size, nullptr);
   return true;
+}
+
+bool Executor::AttachDraft(const DeviceDraft& draft, std::string* error_msg) {
+  if (draft_ != nullptr) {
+    return Fail(error_msg, "a draft is already attached");
+  }
+  const Config& dc = draft.config();
+  if (dc.num_experts != 0) {
+    return Fail(error_msg, "draft is not dense");
+  }
+  if (draft.pre_projection().empty() || draft.post_projection().empty() ||
+      draft.token_embd().empty() || draft.output_norm().empty()) {
+    return Fail(error_msg, "draft is missing a projection");
+  }
+  GemvType pt{};
+  if (!GemvTypeOf(draft.pre_projection().type, &pt) ||
+      !GemvTypeOf(draft.post_projection().type, &pt) ||
+      !GemvTypeOf(draft.token_embd().type, &pt)) {
+    return Fail(error_msg, "draft projection type unsupported by the GEMV tier");
+  }
+  const std::uint32_t hidden_out = c_.hidden_size;
+  const std::uint32_t hidden = dc.hidden_size;
+  const std::uint32_t max_hd = std::max(c_.head_dim_full, c_.head_dim_swa);
+  const std::uint32_t q_dim = dc.num_heads * max_hd;
+  const std::uint32_t dffn = dc.ffn_length;
+
+#define GUFO_DALLOC(member, n)            \
+  do {                                    \
+    member = AllocFloats((n), error_msg); \
+    if (member == nullptr) {              \
+      return false;                       \
+    }                                     \
+  } while (0)
+
+  GUFO_DALLOC(d_xh_, 2 * static_cast<std::size_t>(hidden_out));
+  GUFO_DALLOC(d_cur_, hidden);
+  GUFO_DALLOC(d_other_, hidden);
+  GUFO_DALLOC(d_normed_, hidden);
+  GUFO_DALLOC(d_q_, q_dim);
+  GUFO_DALLOC(d_qn_, q_dim);
+  GUFO_DALLOC(d_attn_, q_dim);
+  GUFO_DALLOC(d_proj_, hidden);
+  GUFO_DALLOC(d_attn_out_, hidden);
+  GUFO_DALLOC(d_gate_, dffn);
+  GUFO_DALLOC(d_up_, dffn);
+  GUFO_DALLOC(d_act_, dffn);
+  GUFO_DALLOC(d_mlp1_, hidden);
+  GUFO_DALLOC(draft_logits_, c_.vocab_size);
+  GUFO_DALLOC(draft_h_next_, hidden_out);
+#undef GUFO_DALLOC
+
+  draft_ = &draft;
+  return true;
+}
+
+bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
+                         std::string* error_msg) {
+  if (draft_ == nullptr) {
+    return Fail(error_msg, "no draft attached");
+  }
+  const Config& t = c_;
+  const Config& dc = draft_->config();
+  if (token < 0 || static_cast<std::uint32_t>(token) >= t.vocab_size) {
+    return Fail(error_msg, "token id out of range");
+  }
+  const std::uint32_t pos = session.position_;
+  if (pos == 0) {
+    return Fail(error_msg, "draft needs at least one trunk token in the cache");
+  }
+  const std::uint32_t hidden_out = t.hidden_size;
+  const std::uint32_t hidden = dc.hidden_size;
+  const std::uint32_t heads = dc.num_heads;
+  const std::uint32_t dffn = dc.ffn_length;
+
+  // xh = [trunk token embedding * sqrt(hidden_out), trunk hidden].
+  GemvType emb_type{};
+  if (!GemvTypeOf(model_.token_embd().type, &emb_type)) {
+    return Fail(error_msg, "unsupported token embedding type");
+  }
+  EmbedRow(model_.token_embd().data, emb_type, static_cast<std::uint32_t>(token),
+           hidden_out, d_xh_, nullptr);
+  ScaleInPlace(d_xh_, std::sqrt(static_cast<float>(hidden_out)), hidden_out,
+               nullptr);
+  if (hipMemcpyAsync(d_xh_ + hidden_out, h, hidden_out * sizeof(float),
+                     hipMemcpyDeviceToDevice) != hipSuccess) {
+    return Fail(error_msg, "draft hidden copy failed");
+  }
+
+  GemvType ppt{};
+  if (!GemvTypeOf(draft_->pre_projection().type, &ppt)) {
+    return Fail(error_msg, "unsupported draft pre_projection type");
+  }
+  Gemv(draft_->pre_projection().data, ppt, hidden, 2 * hidden_out,
+       draft_->pre_projection().row_bytes, d_xh_, d_cur_, nullptr);
+
+  for (std::uint32_t il = 0; il < dc.num_layers; ++il) {
+    const DeviceLayer& l = draft_->layers()[il];
+    const std::uint32_t head_dim = dc.HeadDim(il);
+    const std::uint32_t kvh = dc.NumKvHeads(il);
+    const bool swa = dc.IsSwa(il);
+    const float* inv_freq = draft_->inv_freq(il);
+    const std::uint32_t target = dc.DraftTargetLayer(il, t);
+    if (target >= t.num_layers) {
+      return Fail(error_msg, "draft target layer out of range");
+    }
+
+    RmsNormRows(d_cur_, l.attn_norm.f32(), d_normed_, 1, hidden, dc.rms_eps,
+                nullptr);
+    GemvType qt{};
+    if (!GemvTypeOf(l.attn_q.type, &qt)) {
+      return Fail(error_msg, "unsupported draft attn_q type");
+    }
+    Gemv(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
+         d_normed_, d_q_, nullptr);
+    QknormRope(d_q_, l.attn_q_norm.f32(), d_qn_, 1, heads, head_dim, inv_freq,
+               pos, nullptr);
+
+    // Read the trunk KV cache read-only over the rows the trunk has written.
+    const std::uint32_t window = swa ? dc.sliding_window : 0;
+    const std::uint32_t n_keys = pos;
+    const std::uint32_t lo =
+        (window > 0 && n_keys > window) ? n_keys - window : 0;
+    AttentionDecode(d_qn_, session.k_cache_[target], session.v_cache_[target],
+                    d_attn_, attn_scratch_, n_keys, lo, heads, kvh, head_dim,
+                    nullptr);
+
+    GemvType ot{};
+    if (!GemvTypeOf(l.attn_output.type, &ot)) {
+      return Fail(error_msg, "unsupported draft attn_output type");
+    }
+    Gemv(l.attn_output.data, ot, hidden, heads * head_dim,
+         l.attn_output.row_bytes, d_attn_, d_proj_, nullptr);
+    RmsNormRows(d_proj_, l.post_attention_norm.f32(), d_attn_out_, 1, hidden,
+                dc.rms_eps, nullptr);
+    Add(d_attn_out_, d_cur_, hidden, nullptr);
+
+    RmsNormRows(d_attn_out_, l.ffn_norm.f32(), d_normed_, 1, hidden, dc.rms_eps,
+                nullptr);
+    GemvType ft{};
+    if (!GemvTypeOf(l.ffn_up.type, &ft) || !GemvTypeOf(l.ffn_gate.type, &ft) ||
+        !GemvTypeOf(l.ffn_down.type, &ft)) {
+      return Fail(error_msg, "unsupported draft FFN type");
+    }
+    Gemv(l.ffn_up.data, ft, dffn, hidden, l.ffn_up.row_bytes, d_normed_, d_up_,
+         nullptr);
+    Gemv(l.ffn_gate.data, ft, dffn, hidden, l.ffn_gate.row_bytes, d_normed_,
+         d_gate_, nullptr);
+    GegluF32Separate(d_gate_, d_up_, d_act_, dffn, nullptr);
+    Gemv(l.ffn_down.data, ft, hidden, dffn, l.ffn_down.row_bytes, d_act_,
+         d_proj_, nullptr);
+    RmsNormRows(d_proj_, l.post_ffw_norm.f32(), d_mlp1_, 1, hidden, dc.rms_eps,
+                nullptr);
+
+    if (hipMemcpyAsync(d_other_, d_mlp1_, hidden * sizeof(float),
+                       hipMemcpyDeviceToDevice) != hipSuccess) {
+      return Fail(error_msg, "draft mlp copy failed");
+    }
+    Add(d_other_, d_attn_out_, hidden, nullptr);
+    ScaleInPlace(d_other_, l.layer_output_scale, hidden, nullptr);
+    std::swap(d_cur_, d_other_);
+  }
+
+  RmsNormRows(d_cur_, draft_->output_norm().f32(), d_normed_, 1, hidden,
+              dc.rms_eps, nullptr);
+  GemvType tet{};
+  if (!GemvTypeOf(draft_->token_embd().type, &tet)) {
+    return Fail(error_msg, "unsupported draft token_embd type");
+  }
+  Gemv(draft_->token_embd().data, tet, t.vocab_size, hidden,
+       draft_->token_embd().row_bytes, d_normed_, draft_logits_, nullptr);
+  GemvType pst{};
+  if (!GemvTypeOf(draft_->post_projection().type, &pst)) {
+    return Fail(error_msg, "unsupported draft post_projection type");
+  }
+  Gemv(draft_->post_projection().data, pst, hidden_out, hidden,
+       draft_->post_projection().row_bytes, d_normed_, draft_h_next_, nullptr);
+  return true;
+}
+
+bool Executor::Verify(Session& session, std::int32_t t0,
+                      const std::int32_t* drafts, std::uint32_t k,
+                      std::string* error_msg) {
+  const Config& c = c_;
+  if (drafts == nullptr || k == 0U || k + 1U > kMaxVerifyRows) {
+    return Fail(error_msg, "invalid speculative draft count");
+  }
+  if (t0 < 0 || static_cast<std::uint32_t>(t0) >= c.vocab_size) {
+    return Fail(error_msg, "token id out of range");
+  }
+  for (std::uint32_t i = 0; i < k; ++i) {
+    if (drafts[i] < 0 ||
+        static_cast<std::uint32_t>(drafts[i]) >= c.vocab_size) {
+      return Fail(error_msg, "token id out of range");
+    }
+  }
+  const std::uint32_t rows = k + 1U;
+  if (rows > prefill_chunk_) {
+    return Fail(error_msg, "verify block exceeds the prefill chunk");
+  }
+  if (session.position_ + rows > session.max_context()) {
+    return Fail(error_msg, "verify exceeds session context");
+  }
+  GemvType emb_type{};
+  if (!GemvTypeOf(model_.token_embd().type, &emb_type)) {
+    return Fail(error_msg, "unsupported token embedding type");
+  }
+  const std::uint32_t hidden = c.hidden_size;
+  session.verify_base_pos_ = session.position_;
+
+  // Embed the block [t0, drafts...] into the prefill residual and run the
+  // batched layers, which write the trunk KV at [position, position + rows)
+  // exactly as the matching Step() sequence would.
+  EmbedRow(model_.token_embd().data, emb_type, static_cast<std::uint32_t>(t0),
+           hidden, pf_cur_, nullptr);
+  for (std::uint32_t i = 0; i < k; ++i) {
+    EmbedRow(model_.token_embd().data, emb_type,
+             static_cast<std::uint32_t>(drafts[i]), hidden,
+             pf_cur_ + static_cast<std::size_t>(i + 1U) * hidden, nullptr);
+  }
+  ScaleInPlace(pf_cur_, std::sqrt(static_cast<float>(hidden)),
+               static_cast<std::size_t>(rows) * hidden, nullptr);
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (!PrefillLayer(session, il, session.position_, rows, error_msg)) {
+      return false;
+    }
+  }
+
+  // Per-row post-output-norm hidden and logits. The batched output GEMV is
+  // bit-identical per row to the single-token Gemv in Step(), so an accepted
+  // row's argmax matches the non-speculative path.
+  RmsNormRows(pf_cur_, model_.output_norm().f32(), verify_hidden_, rows, hidden,
+              c.rms_eps, nullptr);
+  GemvType out_type{};
+  if (!GemvTypeOf(model_.output().type, &out_type)) {
+    return Fail(error_msg, "unsupported output type");
+  }
+  GemvRows(model_.output().data, out_type, rows, c.vocab_size, hidden,
+           model_.output().row_bytes, verify_hidden_, hidden, verify_logits_,
+           c.vocab_size, nullptr);
+  if (c.logit_softcap > 0.0F) {
+    SoftcapInPlace(verify_logits_, c.logit_softcap,
+                   static_cast<std::size_t>(rows) * c.vocab_size, nullptr);
+  }
+  // A full accept continues from row k, so leave h_out() at that hidden.
+  if (hipMemcpyAsync(h_out_,
+                     verify_hidden_ + static_cast<std::size_t>(k) * hidden,
+                     hidden * sizeof(float), hipMemcpyDeviceToDevice) !=
+      hipSuccess) {
+    return Fail(error_msg, "hidden state copy failed");
+  }
+  session.position_ += rows;
+  return true;
+}
+
+void Executor::RollbackVerify(Session& session, std::uint32_t keep) {
+  const std::size_t hidden = c_.hidden_size;
+  session.position_ = session.verify_base_pos_ + keep;
+  // h_out() becomes the hidden of the last committed token (row keep - 1) so
+  // the next draft step conditions on the trunk state at the committed prefix.
+  (void)hipMemcpyAsync(
+      h_out_, verify_hidden_ + static_cast<std::size_t>(keep - 1U) * hidden,
+      hidden * sizeof(float), hipMemcpyDeviceToDevice);
 }
 
 }  // namespace gufo::models::gemma4::rocm

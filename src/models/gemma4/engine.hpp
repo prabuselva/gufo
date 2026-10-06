@@ -20,9 +20,11 @@ class GgufReader;
 namespace gufo::models::gemma4 {
 
 struct ModelWeights;
+struct DraftWeights;
 class Tokenizer;
 namespace rocm {
 class DeviceModel;
+class DeviceDraft;
 class Executor;
 class Session;
 }  // namespace rocm
@@ -32,6 +34,9 @@ struct ModelOptions {
   // Rows per batched prefill pass. Bounds the shared prefill scratch; the
   // executor loops over chunks of this size for longer prompts.
   std::uint32_t prefill_chunk = 512;
+  // Optional MTP draft sidecar artifact. When set, the draft is loaded and
+  // speculative decoding is available; sessions opt in with SetMtpEnabled.
+  std::string draft_path;
 };
 
 class Session;
@@ -72,6 +77,11 @@ public:
     return *tokenizer_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// True when an MTP draft sidecar was loaded and speculative decoding is
+  /// available to sessions.
+  [[nodiscard]] bool HasMtp() const noexcept {
+    return draft_device_ != nullptr;
+  }
   /// Worst-case private device state one session of `context` tokens owns.
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
 
@@ -84,6 +94,11 @@ private:
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
+  // Optional MTP draft sidecar: a separate GGUF whose tensors are uploaded to
+  // the device and attached to the trunk executor. Null when no draft loaded.
+  std::shared_ptr<core::GgufReader> draft_reader_;
+  std::unique_ptr<DraftWeights> draft_weights_;
+  std::unique_ptr<rocm::DeviceDraft> draft_device_;
 
   friend class Session;
 };
@@ -106,6 +121,10 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    // Speculative counters: drafts proposed and accepted across the round.
+    // Zero on the non-speculative path.
+    std::size_t drafted{0};
+    std::size_t accepted{0};
   };
   /// Samples one token from the current logits, checks for stop, then feeds
   /// the token. The logits of the new last token are kept.
@@ -125,6 +144,13 @@ public:
   }
   void Reset();
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
+  /// Enables or disables MTP speculation for this session. A no-op when the
+  /// model has no draft sidecar; the session then always decodes one token.
+  void SetMtpEnabled(bool enabled);
+  /// Bounds the speculative draft length to [min_drafts, max_drafts], clamped
+  /// to the executor's verified-block limit. The adaptive length starts at the
+  /// upper bound and shrinks toward the lower one on repeated rejections.
+  void SetDraftLimits(std::uint32_t min_drafts, std::uint32_t max_drafts);
 
 private:
   friend class Model;
@@ -137,6 +163,15 @@ private:
   rocm::Executor* executor_;
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
+  // Speculative scratch: the draft logits (one vocab row), the draft ids, the
+  // downloaded verify logits ([k + 1][vocab]) and the adaptive draft length.
+  std::vector<float> draft_logits_;
+  std::vector<std::int32_t> drafts_;
+  std::vector<float> verify_rows_;
+  std::uint32_t draft_min_{1U};
+  std::uint32_t draft_max_{4U};
+  std::uint32_t draft_k_{4U};
+  bool mtp_enabled_{false};
   bool valid_{true};
 };
 

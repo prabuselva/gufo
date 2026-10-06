@@ -46,6 +46,9 @@ private:
   const Config& c_;
   std::uint32_t max_context_{0};
   std::uint32_t position_{0};
+  // Position the last Verify() started from, so RollbackVerify() can rewind
+  // the trunk to any committed prefix of the verified block.
+  std::uint32_t verify_base_pos_{0};
   std::vector<__half*> k_cache_;
   std::vector<__half*> v_cache_;
   std::vector<void*> allocations_;
@@ -93,10 +96,60 @@ public:
   bool Prefill(Session& session, const std::int32_t* tokens,
                std::uint32_t count, std::string* error_msg = nullptr);
 
-  [[nodiscard]] const float* logits() const noexcept { return logits_; }
+[[nodiscard]] const float* logits() const noexcept { return logits_; }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
 
-private:
+  /// Attaches the MTP draft and allocates its forward scratch. The draft reads
+  /// the trunk KV cache read-only, so it shares this executor's sessions.
+  /// Fails if any draft tensor is in a format the GEMV tier cannot decode.
+  [[nodiscard]] bool AttachDraft(const DeviceDraft& draft,
+                                 std::string* error_msg = nullptr);
+  [[nodiscard]] bool has_draft() const noexcept { return draft_ != nullptr; }
+
+  /// Runs one MTP draft step: consumes `token` (embedded through the trunk
+  /// embedding) and the trunk-width hidden `h` (device), reads the trunk KV
+  /// cache at positions [0, session.position()), and leaves the uncapped draft
+  /// logits in draft_logits() and the next trunk-width hidden in
+  /// draft_h_next(). Mirrors the scalar oracle `DraftStep` exactly.
+  bool DraftStep(Session& session, std::int32_t token, const float* h,
+                 std::string* error_msg = nullptr);
+
+  [[nodiscard]] const float* draft_logits() const noexcept {
+    return draft_logits_;
+  }
+  [[nodiscard]] const float* draft_h_next() const noexcept {
+    return draft_h_next_;
+  }
+
+  /// Upper bound on the verified block (the trunk token plus its drafts). The
+  /// batched output GEMV (`GemvRows`) covers 2..5 rows, so k + 1 <= 5.
+  static constexpr std::uint32_t kMaxVerifyRows = 5U;
+
+  /// Runs the trunk over the speculative block `[t0, drafts[0..k-1]]` (k + 1
+  /// rows) at positions [position, position + k + 1) through the batched
+  /// prefill tier, writing the trunk KV cache exactly as the matching Step()
+  /// sequence would. Row `r` of verify_logits() ([k + 1][vocab], softcapped)
+  /// is the trunk's prediction after consuming row `r`; row `r` of
+  /// verify_hidden() ([k + 1][hidden]) is the post-output-norm hidden the next
+  /// draft step conditions on. h_out() is left at row k so a full accept needs
+  /// no extra work. The session position advances by k + 1; RollbackVerify()
+  /// rewinds it to any committed prefix.
+  bool Verify(Session& session, std::int32_t t0, const std::int32_t* drafts,
+              std::uint32_t k, std::string* error_msg = nullptr);
+  /// Rewinds the trunk to the first `keep` verified rows (1 <= keep <= k + 1):
+  /// the position returns to the verify base plus `keep` and h_out() is set to
+  /// row keep - 1, the hidden of the last committed token. Stale KV rows beyond
+  /// are never read before being rewritten.
+  void RollbackVerify(Session& session, std::uint32_t keep);
+
+  [[nodiscard]] const float* verify_logits() const noexcept {
+    return verify_logits_;
+  }
+  [[nodiscard]] const float* verify_hidden() const noexcept {
+    return verify_hidden_;
+  }
+
+ private:
   Executor(const Config& c, const DeviceModel& model) : c_(c), model_(model) {}
 
   /// One decode layer; swaps cur_/other_ so cur_ holds the new residual.
@@ -182,6 +235,30 @@ private:
   float* pf_expert_out_{nullptr};
   /// Prefill residual ping-pong: pf_cur_ alternates with pf_next_.
   float* pf_cur_{nullptr};
+
+  // MTP draft scratch (attached on demand). cur_/other_ ping-pong the draft
+  // residual; the draft attention reuses attn_scratch_ (same head geometry).
+  const DeviceDraft* draft_{nullptr};
+  float* d_xh_{nullptr};
+  float* d_cur_{nullptr};
+  float* d_other_{nullptr};
+  float* d_normed_{nullptr};
+  float* d_q_{nullptr};
+  float* d_qn_{nullptr};
+  float* d_attn_{nullptr};
+  float* d_proj_{nullptr};
+  float* d_attn_out_{nullptr};
+  float* d_gate_{nullptr};
+  float* d_up_{nullptr};
+  float* d_act_{nullptr};
+  float* d_mlp1_{nullptr};
+  float* draft_logits_{nullptr};
+  float* draft_h_next_{nullptr};
+
+  // Speculative verify scratch: per-row logits ([kMaxVerifyRows][vocab]) and
+  // post-output-norm hidden ([kMaxVerifyRows][hidden]).
+  float* verify_logits_{nullptr};
+  float* verify_hidden_{nullptr};
 
   std::vector<void*> allocations_;
 };

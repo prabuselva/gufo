@@ -29,6 +29,7 @@ end-to-end greedy token streams are the final gate.
 | Attention WMMA (F16 KV mirror) | ≤ 5e-3 abs on attention output |
 | Full-model forward (`rocm_forward`, pos 0–4) | logits finite + argmax exact + worst_abs ≤ 2.0; `h_out` worst_abs ≤ 2.0 |
 | End-to-end greedy (serve, M7+) | identical token stream vs oracle on the pinned prompts |
+| MTP speculative decode (M8b, opt-in) | lossless accept from the trunk verify pass; `gemma4.speculative` token-identical at 48 tokens. Not bit-identical to non-spec greedy at long range: the batched k+1-row verify that yields the speedup differs from single-token decode by the same GEMM-vs-GEMV rounding as the rows above, so a near-tied argmax can flip. Opt-in only; the default greedy path is unchanged. |
 
 The full-model forward contract is absolute-error + argmax, not relative: the
 graph is unscaled attention over 30 layers with a top-8 MoE, so a rare
@@ -60,4 +61,10 @@ logic bug against the ±30 softcap would show O(10) absolute error.
 - Any kernel change that alters rounding must keep the end-to-end greedy
   token stream identical, or the change must be justified in EXPERIMENTS.md
   with acceptance/quality measurements.
-- MTP must never change greedy output: verified tokens are the target's.
+- MTP is opt-in (`--speculative mtp`); the default greedy path must be
+  unchanged. When enabled, every committed token comes from the trunk verify
+  pass (never the draft), so output stays on the target's own distribution;
+  the batched verify is not bit-identical to single-token decode, so greedy
+  can diverge from non-speculative greedy at near-tied tokens at long range
+  (measured ~90 tokens on one chat prompt). This matches llama.cpp MTP and is
+  the accepted cost of batched verification.
