@@ -339,6 +339,98 @@ __global__ void GemvQ8_0Multi4(Multi4Args a, const float* __restrict__ x) {
   }
 }
 
+// ---- vec4 Q8_0 variants (cols % 128 == 0) -------------------------------
+//
+// The scalar kernels load one int8 per lane per quant block (a 32-byte warp
+// transaction every 34-byte stride). The vec4 variants load a uint32 per lane
+// covering four contiguous codes of one block: for a group of four blocks,
+// lane l reads block g*4 + l/8 at word (4l) % 32, so the warp pulls a full
+// 128-byte qs span per instruction. Each block's per-block scale d is applied
+// to the four codes the lane read, so dequantization stays exact; only the
+// summation order differs from the scalar kernel (a dot-product reorder, well
+// inside the GEMV tolerance). Requires cols % 128 == 0; the host dispatch
+// falls back to the scalar kernel otherwise.
+
+__global__ void GemvQ8_0Vec4(const Q8_0Block* __restrict__ w,
+                             const float* __restrict__ x,
+                             float* __restrict__ out, std::uint32_t rows,
+                             std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t groups = cols / 128U;
+  const Q8_0Block* __restrict__ row =
+      w + static_cast<std::size_t>(r) * (cols / 32U);
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t g = 0; g < groups; ++g) {
+    const std::uint32_t blk = g * 4U + lane / 8U;
+    const std::uint32_t word = (4U * lane) % 32U;
+    std::int32_t packed;
+    __builtin_memcpy(&packed, &row[blk].qs[word], 4);
+    const float d = __half2float(row[blk].d);
+    const std::uint32_t k = blk * 32U + word;
+    acc += d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) *
+           x[k];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 8) & 0xFF)) *
+           x[k + 1];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 16) & 0xFF)) *
+           x[k + 2];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 24) & 0xFF)) *
+           x[k + 3];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
+__global__ void GemvQ8_0Multi4Vec4(Multi4Args a, const float* __restrict__ x) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= a.off[4]) {
+    return;
+  }
+  std::uint32_t t = 0;
+  while (r >= a.off[t + 1]) {
+    ++t;
+  }
+  const std::uint32_t row_index = r - a.off[t];
+  const std::uint32_t groups = a.nb[t] / 4U;
+  const Q8_0Block* __restrict__ row =
+      a.w[t] + static_cast<std::size_t>(row_index) * a.nb[t];
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t g = 0; g < groups; ++g) {
+    const std::uint32_t blk = g * 4U + lane / 8U;
+    const std::uint32_t word = (4U * lane) % 32U;
+    std::int32_t packed;
+    __builtin_memcpy(&packed, &row[blk].qs[word], 4);
+    const float d = __half2float(row[blk].d);
+    const std::uint32_t k = blk * 32U + word;
+    acc += d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) *
+           x[k];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 8) & 0xFF)) *
+           x[k + 1];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 16) & 0xFF)) *
+           x[k + 2];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 24) & 0xFF)) *
+           x[k + 3];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    a.out[t][row_index] = acc;
+  }
+}
+
 // Grouped expert GEMV for the dense (F32/BF16) expert stacks: same
 // (slot, row) pairing as GemvGroupedQ8_0, element-strided within the row.
 template<typename T>
@@ -519,8 +611,13 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
   const dim3 grid(rows);
   switch (type) {
     case GemvType::kQ8_0:
-      GemvQ8_0<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
-          static_cast<const Q8_0Block*>(base), x, out, rows, cols);
+      if (cols % 128U == 0U) {
+        GemvQ8_0Vec4<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+            static_cast<const Q8_0Block*>(base), x, out, rows, cols);
+      } else {
+        GemvQ8_0<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+            static_cast<const Q8_0Block*>(base), x, out, rows, cols);
+      }
       break;
     case GemvType::kF32:
       GemvF32<<<grid, dim3(32), 0, stream>>>(static_cast<const float*>(base), x,
@@ -587,6 +684,9 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
   const std::uint32_t grid = static_cast<std::uint32_t>((pairs + 3U) / 4U);
   switch (type) {
     case GemvType::kQ8_0:
+      // The grouped MoE GEMV keeps the scalar 1-byte/lane order: its contract
+      // is 1e-4 (the expert outputs feed a weighted sum), and the vec4 reorder
+      // lands at ~2e-4. The dense and fused-qkv GEMVs (2e-3 contract) use vec4.
       GemvGroupedQ8_0<<<grid, dim3(128), 0, stream>>>(
           static_cast<const Q8_0Block*>(base), ids,
           expert_stride / sizeof(Q8_0Block), x, x_stride, out, used, rows,
@@ -644,6 +744,7 @@ bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
   Multi4Args a{};
   std::uint32_t total = 0;
   std::uint32_t m = 0;
+  bool vec4 = true;
   for (std::uint32_t i = 0; i < n; ++i) {
     if (projs[i].type != GemvType::kQ8_0 || projs[i].rows == 0U) {
       continue;
@@ -651,6 +752,7 @@ bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
     a.w[m] = static_cast<const Q8_0Block*>(projs[i].base);
     a.out[m] = projs[i].out;
     a.nb[m] = projs[i].cols / 32U;
+    vec4 = vec4 && (a.nb[m] % 4U == 0U);
     a.off[m] = total;
     total += projs[i].rows;
     ++m;
@@ -660,7 +762,11 @@ bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
   }
   a.off[4] = total;
   if (m > 1U) {
-    GemvQ8_0Multi4<<<(total + 3U) / 4U, dim3(128), 0, stream>>>(a, x);
+    if (vec4) {
+      GemvQ8_0Multi4Vec4<<<(total + 3U) / 4U, dim3(128), 0, stream>>>(a, x);
+    } else {
+      GemvQ8_0Multi4<<<(total + 3U) / 4U, dim3(128), 0, stream>>>(a, x);
+    }
   }
   for (std::uint32_t i = 0; i < n; ++i) {
     const bool fused =

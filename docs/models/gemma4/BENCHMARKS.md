@@ -60,10 +60,16 @@ attention down to ~13% of prefill; no large untapped lever remains
 
 | Config | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| Q8_K_XL, no MTP | 38.08 | 41.83 | −9.0% |
+| Q8_K_XL, no MTP | 40.15 | 41.83 | −4.0% |
 | Q8_K_XL, MTP n=1 | 36.60 | — | — |
 | Q8_K_XL, MTP n=2 | 46.93 | — | +12.2% |
 | Q8_K_XL, MTP n=4 | 59.99 | — | +43.4% |
+
+The no-MTP row is the current vec4-GEMV build (pp512 tg128 reps3); the vec4
+Q8_0 GEMV lifted it from 38.08 → 40.15 (+5.4%, bit-identical output — see
+[EXPERIMENTS.md](EXPERIMENTS.md)). The MTP rows predate vec4 and were measured
+on the scalar build; they run the same projections in the verify pass and would
+gain similarly, but are not re-measured here.
 
 MTP is opt-in (`--speculative mtp --mtp-model <draft>`); `n` is
 `--draft-tokens`, capped at 4 by `kMaxVerifyRows=5`. n=4 is the best measured
@@ -87,6 +93,10 @@ Q4_K/Q5_K/Q6_K tensors to Q8_0 at load and keeps the routed experts native
 Q4_K_M is 33.6% smaller and faster on every axis: the dense upcast costs no
 throughput (Q8_0 is the native dense tier) and the smaller resident footprint
 helps decode bandwidth-bound tg most.
+
+This table predates the vec4 Q8_0 GEMV (see the Decode section); both columns
+were measured on the scalar build and both would gain from vec4, so the
+relative Q4-vs-Q8 comparison is unaffected.
 
 ## Serve (t/s, streaming)
 

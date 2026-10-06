@@ -25,4 +25,14 @@ Measured values land here per phase.
 
 ## Retained wins
 
-(to be filled as M5–M11 land)
+### vec4 Q8_0 GEMV (decode)
+
+Decode projections and the fused-qkv GEMV load four int8 codes per lane (one
+`uint32` at byte `4·lane` of a 128-byte group of four Q8_0 blocks) instead of
+one byte per lane, applying each block's own scale to its four codes. Used for
+dense Q8_0 when `cols % 128 == 0` and for the fused-qkv `Multi4` when every
+projection has `nb % 4 == 0` (all gemma4 projections qualify). Matched
+exclusive decode pp128/tg256: **38.26 → 39.91 t/s (+4.3%)** with a
+bit-identical `output_sha256`. Grouped MoE GEMV stays scalar — its 1e-4
+contract cannot absorb the vec4 reorder (measured 2.19e-4). See
+[EXPERIMENTS.md](EXPERIMENTS.md).
