@@ -101,4 +101,15 @@ if (ENGINE_ENABLE_HIP)
   add_test(NAME gemma4.speculative COMMAND gemma4_speculative_test)
   set_tests_properties(gemma4.speculative PROPERTIES
     LABELS "gemma4;hip;gpu;gfx1151;external-model;slow" SKIP_RETURN_CODE 77)
+
+  # Vision tower device parity on the real mmproj: the ROCm encoder against the
+  # scalar oracle over a fixed 96x96 image (scale-relative bound). Skips (77)
+  # without GUFO_GEMMA4_MMPROJ_GGUF; needs the GPU.
+  add_executable(gemma4_vision_encoder_test EXCLUDE_FROM_ALL
+    vision_encoder_test.cpp)
+  target_link_libraries(gemma4_vision_encoder_test PRIVATE
+    gufo_gemma4_executor gufo_gemma4_reference gufo_core)
+  add_test(NAME gemma4.vision_encoder COMMAND gemma4_vision_encoder_test)
+  set_tests_properties(gemma4.vision_encoder PROPERTIES
+    LABELS "gemma4;hip;gpu;gfx1151;external-model;slow" SKIP_RETURN_CODE 77)
 endif()

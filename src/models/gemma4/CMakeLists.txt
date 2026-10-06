@@ -34,11 +34,12 @@ if (ENGINE_ENABLE_HIP)
     kernels/rocm/fused.hip.cpp
     kernels/rocm/gemv.hip.cpp
     kernels/rocm/gemm.hip.cpp
-    kernels/rocm/routed_f16.hip.cpp)
+    kernels/rocm/routed_f16.hip.cpp
+    vision/kernels.hip.cpp)
   set_source_files_properties(kernels/rocm/attention.hip.cpp
     kernels/rocm/fused.hip.cpp
     kernels/rocm/gemv.hip.cpp kernels/rocm/gemm.hip.cpp
-    kernels/rocm/routed_f16.hip.cpp
+    kernels/rocm/routed_f16.hip.cpp vision/kernels.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_gemma4_kernels PROPERTIES
     HIP_STANDARD 17
@@ -58,7 +59,8 @@ if (ENGINE_ENABLE_HIP)
   # engine and CLI consume it.
   add_library(gufo_gemma4_executor STATIC EXCLUDE_FROM_ALL
     kernels/rocm/device_model.cpp
-    kernels/rocm/executor.cpp)
+    kernels/rocm/executor.cpp
+    vision/encoder.cpp)
   set_target_properties(gufo_gemma4_executor PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
   target_include_directories(gufo_gemma4_executor PUBLIC ${PROJECT_SOURCE_DIR})
