@@ -23,7 +23,7 @@ end-to-end greedy token streams are the final gate.
 
 | Path | Contract |
 | --- | --- |
-| F32 fused ops (norms, rope, softmax) | ≤ 1e-5 abs vs oracle |
+| F32 fused ops (norms, rope, softmax) | ≤ 1e-5 abs vs oracle. RMSNorm (`RmsNormKernel`, `FusedAddRmsNormKernel`) uses a `dim % 4 == 0` `float4` fast path with a `float` per-thread partial (block reduce in `double`); measured worst-relative **1.55e-7** vs the `double` oracle and bit-identical end-to-end greedy tokens (`output_sha256` matches the scalar kernel). |
 | Q8_0 GEMV/GEMM (mmq, dense + routed) | logits ≤ 2e-3 abs. Dense and fused-qkv GEMVs use the vec4 kernel (4 int8 codes/lane), which reorders the dot accumulation but applies each block's scale exactly — measured 1.12e-3 and bit-identical end-to-end greedy tokens (`output_sha256` matches the scalar kernel). The grouped MoE GEMV stays on the order-pinned scalar kernel: its 1e-4 unit contract cannot absorb the vec4 reorder (measured 2.19e-4). |
 | WMMA MoE (routed_f16, F16 narrowing) | not bit-exact; guarded by forward test, logits ≤ 5e-3 abs |
 | Attention prefill scalar oracle (`AttentionPrefillScalar`) | ≤ 1e-3 abs vs oracle (measured 8e-6); F32-Q, kept as the numerical reference |

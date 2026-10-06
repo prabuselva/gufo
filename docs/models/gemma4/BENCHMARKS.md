@@ -60,16 +60,17 @@ attention down to ~13% of prefill; no large untapped lever remains
 
 | Config | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| Q8_K_XL, no MTP | 40.15 | 41.83 | −4.0% |
+| Q8_K_XL, no MTP | 42.02 | 41.83 | +0.5% |
 | Q8_K_XL, MTP n=1 | 36.60 | — | — |
 | Q8_K_XL, MTP n=2 | 46.93 | — | +12.2% |
 | Q8_K_XL, MTP n=4 | 59.99 | — | +43.4% |
 
-The no-MTP row is the current vec4-GEMV build (pp512 tg128 reps3); the vec4
-Q8_0 GEMV lifted it from 38.08 → 40.15 (+5.4%, bit-identical output — see
-[EXPERIMENTS.md](EXPERIMENTS.md)). The MTP rows predate vec4 and were measured
-on the scalar build; they run the same projections in the verify pass and would
-gain similarly, but are not re-measured here.
+The no-MTP row is the current vec4-GEMV + float4-RMSNorm build (pp512 tg128
+reps3). The vec4 Q8_0 GEMV lifted it from 38.08 → 40.15 (+5.4%) and the float4
+RMSNorm lifted it further to 42.02 (+4.6%); both are bit-identical end-to-end
+(see [EXPERIMENTS.md](EXPERIMENTS.md)). The MTP rows predate both and were
+measured on the scalar build; they run the same projections and norms in the
+verify pass and would gain similarly, but are not re-measured here.
 
 MTP is opt-in (`--speculative mtp --mtp-model <draft>`); `n` is
 `--draft-tokens`, capped at 4 by `kMaxVerifyRows=5`. n=4 is the best measured
