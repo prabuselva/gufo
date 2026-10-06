@@ -174,7 +174,9 @@ the scaled token embeddings during prefill; `Model::EncodeChatVision` +
 reaches it. `gemma4.vision_prompt` (CPU) pins the resize/normalization and the
 marker expansion. End-to-end OCR on the mtmd moon-landing page returns the
 exact headline "A Powdery Surface Is Closely Explored" (greedy, Q8_K_XL trunk +
-BF16 mmproj). HTTP `serve` image input is a follow-up.
+BF16 mmproj), both through `gufo prompt` and over HTTP `serve`
+(`/v1/chat/completions` with an `image_url` part). HTTP serve keys the prompt
+cache on the image bytes and reprocesses the whole prompt with the spliced rows.
 
 ### M10 — Quantizations (Q8_0, Q4_K_M)
 
@@ -331,6 +333,7 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
    (`SetVision`/`VisionImage`, contiguous D2D over the scaled token rows),
    `Model::EncodeChatVision` + `Session::Sync(prompt, slots)`, and
    `gufo prompt --mmproj --image`. `gemma4.vision_prompt` (CPU) pins resize,
-   normalization and marker expansion. End-to-end OCR on the mtmd moon-landing
-   page returns the exact headline (greedy, Q8_K_XL + BF16 mmproj). Remaining:
-   HTTP `serve` image input.
+normalization and marker expansion. End-to-end OCR on the mtmd moon-landing
+    page returns the exact headline (greedy, Q8_K_XL + BF16 mmproj) through both
+    `gufo prompt` and HTTP `serve` (`/v1/chat/completions` `image_url`, cache
+    keyed on image bytes).
