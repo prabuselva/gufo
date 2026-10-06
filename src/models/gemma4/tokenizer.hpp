@@ -40,10 +40,13 @@ public:
   [[nodiscard]] static std::unique_ptr<Tokenizer> FromGguf(
       const core::GgufReader& gguf, std::string* error_msg = nullptr);
 
-  /// Builds a tokenizer directly from token and merge lists (tests).
+  /// Builds a tokenizer directly from token and merge lists (tests). Tokens
+  /// named in `specials` are marked user-defined so `parse_special` splits them
+  /// out of the text before BPE.
   [[nodiscard]] static std::unique_ptr<Tokenizer> FromVocabulary(
       std::span<const std::string> tokens, std::span<const std::string> merges,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      std::span<const std::string> specials = {});
 
   /// Encodes UTF-8 text. `add_special` prepends BOS (Gemma-4 always adds it,
   /// matching the reference override); `parse_special` splits special-token

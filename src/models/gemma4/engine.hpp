@@ -12,16 +12,23 @@
 #include "src/core/sampling.hpp"
 #include "src/models/gemma4/chat_template.hpp"
 #include "src/models/gemma4/config.hpp"
+#include "src/models/gemma4/vision/prompt.hpp"
 
-namespace gufo::core {
+namespace gufo {
+namespace core {
 class GgufReader;
-}
+class Image;
+}  // namespace core
+}  // namespace gufo
 
 namespace gufo::models::gemma4 {
 
 struct ModelWeights;
 struct DraftWeights;
 class Tokenizer;
+namespace vision {
+class Encoder;
+}  // namespace vision
 namespace rocm {
 class DeviceModel;
 class DeviceDraft;
@@ -37,6 +44,9 @@ struct ModelOptions {
   // Optional MTP draft sidecar artifact. When set, the draft is loaded and
   // speculative decoding is available; sessions opt in with SetMtpEnabled.
   std::string draft_path;
+  // Optional `gemma4v` vision mmproj sidecar. When set, the tower is resident
+  // and image prompts are supported via EncodeChatVision and the vision Sync.
+  std::string vision_model_path;
 };
 
 class Session;
@@ -63,6 +73,14 @@ public:
   [[nodiscard]] std::vector<std::int32_t> EncodeChat(
       std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
       const ChatTemplateOptions& options) const;
+  /// Renders a conversation, encodes it, and expands every `<|image|>` marker
+  /// into its placeholder span, returning the tokens plus the per-image slots
+  /// (pixels + absolute offsets) the vision Sync fills. Requires a loaded
+  /// vision tower; returns an empty prompt and fills `error_msg` otherwise.
+  [[nodiscard]] vision::PreparedPrompt EncodeChatVision(
+      std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+      const ChatTemplateOptions& options,
+      const std::vector<core::Image>& images, std::string* error_msg) const;
   [[nodiscard]] std::string Decode(std::span<const std::int32_t> tokens) const;
   [[nodiscard]] std::string TokenText(std::int32_t token) const;
   [[nodiscard]] std::int32_t EosToken() const noexcept;
@@ -82,6 +100,10 @@ public:
   [[nodiscard]] bool HasMtp() const noexcept {
     return draft_device_ != nullptr;
   }
+  /// True when a `gemma4v` vision tower was loaded and image prompts work.
+  [[nodiscard]] bool HasVision() const noexcept {
+    return vision_ != nullptr;
+  }
   /// Worst-case private device state one session of `context` tokens owns.
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
 
@@ -99,6 +121,8 @@ private:
   std::shared_ptr<core::GgufReader> draft_reader_;
   std::unique_ptr<DraftWeights> draft_weights_;
   std::unique_ptr<rocm::DeviceDraft> draft_device_;
+  // Optional `gemma4v` vision tower: the mmproj sidecar resident on the device.
+  std::unique_ptr<vision::Encoder> vision_;
 
   friend class Session;
 };
@@ -115,6 +139,14 @@ public:
   /// Makes the session state equal to `prompt`: keeps the longest common
   /// prefix with the current tokens, reprocesses the rest through prefill.
   [[nodiscard]] bool Sync(std::span<const std::int32_t> prompt,
+                          std::string* error_msg = nullptr);
+  /// Vision-aware sync: runs the tower over each slot's pixels, uploads the
+  /// image embeddings, and splices them over the token embeddings at the slot
+  /// offsets during prefill. Always reprocesses the whole prompt (image rows
+  /// cannot be reused from a text-only prefix), so `prompt` must be the full
+  /// sequence produced by `EncodeChatVision`.
+  [[nodiscard]] bool Sync(std::span<const std::int32_t> prompt,
+                          const std::vector<vision::VisionSlot>& images,
                           std::string* error_msg = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
@@ -173,6 +205,10 @@ private:
   std::uint32_t draft_k_{4U};
   bool mtp_enabled_{false};
   bool valid_{true};
+  // Device staging buffer for the image embeddings of the last vision Sync,
+  // grown on demand and reused across turns. Owned by this session.
+  float* vision_dev_{nullptr};
+  std::size_t vision_dev_cap_{0};
 };
 
 }  // namespace gufo::models::gemma4

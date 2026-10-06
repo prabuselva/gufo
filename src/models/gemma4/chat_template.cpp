@@ -528,6 +528,13 @@ std::string Render(std::span<const ChatMessage> messages,
     } else {
       content = std::string(Trim(message.content));
     }
+    if (role != "model" && message.image_count > 0) {
+      std::string markers;
+      for (std::uint32_t i = 0; i < message.image_count; ++i) {
+        markers += "<|image|>";
+      }
+      content = markers + content;
+    }
     out += content;
     const bool has_content = !Trim(content).empty();
 

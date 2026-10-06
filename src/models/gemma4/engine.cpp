@@ -6,9 +6,11 @@
 #include <utility>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/image.hpp"
 #include "src/models/gemma4/kernels/rocm/device_model.hpp"
 #include "src/models/gemma4/kernels/rocm/executor.hpp"
 #include "src/models/gemma4/tokenizer.hpp"
+#include "src/models/gemma4/vision/encoder.hpp"
 #include "src/models/gemma4/weights.hpp"
 
 namespace gufo::models::gemma4 {
@@ -90,6 +92,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       return nullptr;
     }
   }
+  if (!options.vision_model_path.empty()) {
+    m->vision_ = vision::Encoder::Open(options.vision_model_path, error_msg);
+    if (!m->vision_) {
+      return nullptr;
+    }
+  }
   return m;
 }
 
@@ -117,6 +125,18 @@ std::vector<std::int32_t> Model::EncodeChat(
   const std::string rendered = RenderChat(messages, tools, options);
   return tokenizer_->Encode(rendered, /*add_special=*/false,
                             /*parse_special=*/true);
+}
+
+vision::PreparedPrompt Model::EncodeChatVision(
+    std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+    const ChatTemplateOptions& options, const std::vector<core::Image>& images,
+    std::string* error_msg) const {
+  if (vision_ == nullptr) {
+    AssignError(error_msg, "no vision tower loaded");
+    return {};
+  }
+  const std::string rendered = RenderChat(messages, tools, options);
+  return vision::BuildPrompt(*tokenizer_, rendered, images, {}, error_msg);
 }
 
 std::string Model::Decode(std::span<const std::int32_t> tokens) const {
@@ -168,7 +188,13 @@ Session::Session(std::shared_ptr<Model> model,
                       model_->VocabSize());
 }
 
-Session::~Session() = default;
+Session::~Session() {
+  if (vision_dev_ != nullptr) {
+    (void)hipFree(vision_dev_);
+    vision_dev_ = nullptr;
+    vision_dev_cap_ = 0;
+  }
+}
 
 std::uint32_t Session::Position() const noexcept {
   return session_->position();
@@ -246,6 +272,89 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
   for (std::size_t i = common; i < prompt.size(); ++i) {
     tokens_.push_back(prompt[i]);
   }
+  (void)hipMemcpy(logits_.data(), executor_->logits(),
+                  logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
+  valid_ = true;
+  return true;
+}
+
+bool Session::Sync(std::span<const std::int32_t> prompt,
+                   const std::vector<vision::VisionSlot>& images,
+                   std::string* error_msg) {
+  if (prompt.empty()) {
+    AssignError(error_msg, "prompt is empty");
+    return false;
+  }
+  if (prompt.size() > ContextSize()) {
+    AssignError(error_msg, "prompt exceeds the session context");
+    return false;
+  }
+  if (images.empty()) {
+    return Sync(prompt, error_msg);
+  }
+  vision::Encoder* encoder = model_->vision_.get();
+  if (encoder == nullptr) {
+    AssignError(error_msg, "no vision tower loaded");
+    return false;
+  }
+  const std::size_t hidden = encoder->config().projection_dim;
+
+  // Grow the session's device staging buffer to hold every image's rows.
+  std::size_t total_rows = 0;
+  for (const vision::VisionSlot& slot : images) {
+    total_rows += slot.count;
+  }
+  const std::size_t need_bytes = total_rows * hidden * sizeof(float);
+  if (need_bytes > vision_dev_cap_) {
+    if (vision_dev_ != nullptr) {
+      (void)hipFree(vision_dev_);
+      vision_dev_ = nullptr;
+      vision_dev_cap_ = 0;
+    }
+    if (hipMalloc(&vision_dev_, need_bytes) != hipSuccess) {
+      AssignError(error_msg, "failed to allocate vision staging buffer");
+      return false;
+    }
+    vision_dev_cap_ = need_bytes;
+  }
+
+  // Run the tower over each slot and upload its rows into a contiguous device
+  // region; the executor splices them over the token embeddings at the slot
+  // offsets during prefill.
+  std::vector<rocm::Executor::VisionImage> staged;
+  staged.reserve(images.size());
+  std::vector<float> rows;
+  std::size_t row_cursor = 0;
+  for (const vision::VisionSlot& slot : images) {
+    if (!encoder->Encode(slot.pixels.data(), slot.nx, slot.ny, rows,
+                         error_msg)) {
+      return false;
+    }
+    if (rows.size() != static_cast<std::size_t>(slot.count) * hidden) {
+      AssignError(error_msg, "vision encoder row count mismatch");
+      return false;
+    }
+    float* dst = vision_dev_ + row_cursor * hidden;
+    if (hipMemcpy(dst, rows.data(), rows.size() * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      AssignError(error_msg, "failed to upload image embeddings");
+      return false;
+    }
+    staged.push_back({dst, slot.offset, slot.count});
+    row_cursor += slot.count;
+  }
+
+  // Image rows cannot be reused from a text-only prefix, so reprocess the
+  // whole sequence with the staged embeddings spliced in.
+  Reset();
+  valid_ = false;
+  executor_->SetVision(std::move(staged));
+  if (!executor_->Prefill(*session_, prompt.data(),
+                          static_cast<std::uint32_t>(prompt.size()),
+                          error_msg)) {
+    return false;
+  }
+  tokens_.assign(prompt.begin(), prompt.end());
   (void)hipMemcpy(logits_.data(), executor_->logits(),
                   logits_.size() * sizeof(float), hipMemcpyDeviceToHost);
   valid_ = true;

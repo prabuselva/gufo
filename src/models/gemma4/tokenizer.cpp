@@ -172,7 +172,7 @@ bool Tokenizer::LoadFromGguf(const core::GgufReader& gguf,
 
 std::unique_ptr<Tokenizer> Tokenizer::FromVocabulary(
     std::span<const std::string> tokens, std::span<const std::string> merges,
-    std::string* error_msg) {
+    std::string* error_msg, std::span<const std::string> specials) {
   auto tokenizer = std::unique_ptr<Tokenizer>(new Tokenizer());
   if (tokens.empty()) {
     if (error_msg != nullptr) {
@@ -185,6 +185,13 @@ std::unique_ptr<Tokenizer> Tokenizer::FromVocabulary(
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     tokenizer->token_to_id_[tokenizer->id_to_token_[i]] =
         static_cast<TokenId>(i);
+  }
+  for (const std::string& special : specials) {
+    const auto it = tokenizer->token_to_id_.find(special);
+    if (it != tokenizer->token_to_id_.end()) {
+      tokenizer->id_type_[static_cast<std::size_t>(it->second)] =
+          kTypeUserDefined;
+    }
   }
   for (std::size_t i = 0; i < merges.size(); ++i) {
     const std::string& word = merges[i];

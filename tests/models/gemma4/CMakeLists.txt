@@ -8,6 +8,13 @@ add_test(NAME gemma4.config COMMAND gemma4_config_test)
 set_tests_properties(gemma4.config PROPERTIES LABELS "gemma4;cpu")
 add_dependencies(gemma4_tests gemma4_config_test)
 
+# Smart-resize policy and CHW normalization contract (CPU-only, no model file).
+add_executable(gemma4_vision_prompt_test vision_prompt_test.cpp)
+target_link_libraries(gemma4_vision_prompt_test PRIVATE gufo_gemma4)
+add_test(NAME gemma4.vision_prompt COMMAND gemma4_vision_prompt_test)
+set_tests_properties(gemma4.vision_prompt PROPERTIES LABELS "gemma4;cpu")
+add_dependencies(gemma4_tests gemma4_vision_prompt_test)
+
 # Binds the real artifacts (headers only) to prove every tensor name and shape
 # resolves. Skips (77) unless GUFO_GEMMA4_GGUF points at a Gemma-4 GGUF; the
 # draft checks additionally need GUFO_GEMMA4_MTP_GGUF.

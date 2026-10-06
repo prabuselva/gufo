@@ -96,6 +96,25 @@ public:
   bool Prefill(Session& session, const std::int32_t* tokens,
                std::uint32_t count, std::string* error_msg = nullptr);
 
+  /// One image's trunk-width embeddings, already projected by the vision
+  /// tower and left unscaled (Gemma replaces the sqrt(hidden)-scaled token
+  /// embedding at these positions, it does not scale the image rows). `rows`
+  /// is a device buffer of `row_count` rows of `hidden_size` floats; `offset`
+  /// is the absolute session position of the first image row.
+  struct VisionImage {
+    const float* rows{nullptr};
+    std::uint32_t offset{0};
+    std::uint32_t row_count{0};
+  };
+
+  /// Stages the image embeddings the next `Prefill` splices into the residual
+  /// stream. The rows stay on the device (uploaded by the caller); the
+  /// executor only records the pointers and their absolute positions. Cleared
+  /// at the end of the next `Prefill`, so it never leaks into `Step`/`Verify`.
+  void SetVision(std::vector<VisionImage> images) {
+    vision_ = std::move(images);
+  }
+
 [[nodiscard]] const float* logits() const noexcept { return logits_; }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
 
@@ -259,6 +278,10 @@ public:
   // post-output-norm hidden ([kMaxVerifyRows][hidden]).
   float* verify_logits_{nullptr};
   float* verify_hidden_{nullptr};
+
+  // Image embeddings staged for the next Prefill (see SetVision). Cleared at
+  // the end of Prefill so they never affect Step or Verify.
+  std::vector<VisionImage> vision_;
 
   std::vector<void*> allocations_;
 };

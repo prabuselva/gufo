@@ -3863,7 +3863,10 @@ const TextDiskCacheConfig& disk_cache_config,
       return false;
     }
     auto model = models::gemma4::Model::Load(
-        model_path, models::gemma4::ModelOptions{.max_context = max_context},
+        model_path,
+        models::gemma4::ModelOptions{.max_context = max_context,
+                                     .draft_path = "",
+                                     .vision_model_path = ""},
         &load_error);
     if (model == nullptr) {
       SetError(error, "Failed to create Gemma-4 model: " + load_error);

@@ -1426,9 +1426,10 @@ int RunGemma4Benchmark(
   std::string error;
   auto model = g4::Model::Load(
       options.model_path,
-      g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
-                           required_context),
-                       .draft_path = mtp ? options.mtp_model_path : ""},
+g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
+                            required_context),
+                        .draft_path = mtp ? options.mtp_model_path : "",
+                        .vision_model_path = ""},
       &error);
   if (model == nullptr) {
     std::cerr << "Error creating Gemma-4-26B-A4B model: " << error << '\n';
