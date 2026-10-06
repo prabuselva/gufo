@@ -35,6 +35,7 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/gemma4/engine.hpp"
+#include "src/models/gemma4/vision/prompt.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -3102,8 +3103,12 @@ std::vector<std::int32_t> Gemma4EngineTokens(
   return converted;
 }
 
+struct Gemma4ImageContext final : TextPromptContext {
+  std::vector<models::gemma4::vision::VisionSlot> slots;
+};
+
 class Gemma4TextRunnerState final : public TextRunnerState {
-public:
+ public:
   Gemma4TextRunnerState(const std::shared_ptr<Gemma4Model>& model,
                         std::uint32_t max_context) {
     std::string error;
@@ -3115,15 +3120,25 @@ public:
 
   void Invalidate() noexcept override {
     session_->Reset();
+    vision_context_.reset();
     position_ = 0;
   }
 
   [[nodiscard]] Gemma4Session& session() const { return *session_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
+  void set_vision_context(
+      std::shared_ptr<const Gemma4ImageContext> context) noexcept {
+    vision_context_ = std::move(context);
+  }
+  [[nodiscard]] const std::shared_ptr<const Gemma4ImageContext>& vision_context()
+      const noexcept {
+    return vision_context_;
+  }
 
-private:
+ private:
   std::unique_ptr<Gemma4Session> session_;
+  std::shared_ptr<const Gemma4ImageContext> vision_context_;
   std::size_t position_{0};
 };
 
@@ -3203,53 +3218,9 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    std::vector<models::gemma4::ChatMessage> messages;
-    messages.reserve(request.messages.size());
-    for (const auto& message : request.messages) {
-      models::gemma4::ChatMessage converted{
-          .role = std::string(ChatRoleName(message.role)),
-          .content = message.content,
-          .reasoning_content = message.thought,
-          .tool_calls = {},
-          .tool_call_id = message.tool_call_id,
-      };
-      converted.tool_calls.reserve(message.tool_calls.size());
-      for (const auto& call : message.tool_calls) {
-        models::gemma4::ChatMessage::ToolCall converted_call{
-            .name = call.name,
-            .arguments = {},
-            .id = call.id,
-        };
-        converted_call.arguments.reserve(call.arguments.size());
-        for (const auto& argument : call.arguments) {
-          converted_call.arguments.push_back({
-              .name = argument.name,
-              .value = argument.value,
-              .is_string = argument.is_string,
-          });
-        }
-        converted.tool_calls.push_back(std::move(converted_call));
-      }
-      messages.push_back(std::move(converted));
-    }
-
-    std::vector<models::gemma4::ChatTool> tools;
-    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
-      tools.reserve(request.tools.size());
-      for (const auto& tool : request.tools) {
-        tools.push_back({
-            .name = tool.name,
-            .description = tool.description,
-            .parameters_json = tool.parameters_json,
-            .definition_json =
-                tool.definition_json.empty()
-                    ? std::string{}
-                    : json::parse(tool.definition_json)["function"].dump(),
-        });
-      }
-    }
+    const auto inputs = ConvertInputs(request, nullptr);
     auto tokens = Gemma4RunnerTokens(model_->EncodeChat(
-        messages, tools,
+        inputs.messages, inputs.tools,
         models::gemma4::ChatTemplateOptions{
             .add_generation_prompt = true,
             .enable_thinking = request.reasoning.enabled.value_or(false),
@@ -3260,6 +3231,58 @@ public:
       return std::nullopt;
     }
     return tokens;
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    const bool has_images = std::ranges::any_of(
+        request.messages, [](const auto& m) { return !m.images.empty(); });
+    if (!has_images) {
+      auto tokens = RenderAndTokenize(request);
+      if (!tokens) {
+        return std::nullopt;
+      }
+      return TextPreparedPrompt{std::move(*tokens), {}};
+    }
+    if (!model_->HasVision()) {
+      throw std::invalid_argument(
+          "image input requires a matching --mmproj sidecar");
+    }
+    std::vector<core::Image> images;
+    const auto inputs = ConvertInputs(request, &images);
+    std::string error;
+    auto prepared = model_->EncodeChatVision(
+        inputs.messages, inputs.tools,
+        models::gemma4::ChatTemplateOptions{
+            .add_generation_prompt = true,
+            .enable_thinking = request.reasoning.enabled.value_or(false),
+            .preserve_thinking =
+                request.reasoning.preserve_thinking.value_or(false),
+        },
+        images, &error);
+    if (prepared.tokens.empty()) {
+      throw std::invalid_argument("Gemma-4 image prompt failed: " + error);
+    }
+    auto context = std::make_shared<Gemma4ImageContext>();
+    context->slots = std::move(prepared.images);
+    context->cache_identity = ImageCacheIdentity(request);
+    return TextPreparedPrompt{Gemma4RunnerTokens(prepared.tokens),
+                              std::move(context), 0};
+  }
+
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    auto& gemma = RequireGemma4State(state);
+    if (context == nullptr) {
+      gemma.set_vision_context(nullptr);
+      return;
+    }
+    if (dynamic_cast<const Gemma4ImageContext*>(context.get()) == nullptr) {
+      throw std::invalid_argument("invalid Gemma-4 prompt context");
+    }
+    gemma.set_vision_context(
+        std::static_pointer_cast<const Gemma4ImageContext>(std::move(context)));
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -3299,11 +3322,30 @@ public:
     if (offset >= prompt.size()) {
       throw std::logic_error("Gemma-4 prefill has no remaining input");
     }
+    std::string error;
+    if (const auto vision = gemma.vision_context(); vision != nullptr) {
+      if (offset != 0) {
+        throw std::logic_error(
+            "Gemma-4 image prefill cannot resume mid-prompt");
+      }
+      // Image rows cannot be reused from a text prefix, so the whole prompt is
+      // reprocessed with the staged embeddings spliced over the token rows; the
+      // executor chunks internally, so one call bounds peak memory.
+      if (!gemma.session().Sync(Gemma4EngineTokens(prompt), vision->slots,
+                                &error)) {
+        gemma.set_position(0);
+        throw std::runtime_error("Gemma-4 image prefill failed: " + error);
+      }
+      gemma.set_position(prompt.size());
+      return {
+          .consumed_tokens = prompt.size(),
+          .decode_ready = true,
+      };
+    }
     const std::size_t consumed =
         std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
     const std::size_t next_position = offset + consumed;
     const auto prefix = Gemma4EngineTokens(prompt.first(next_position));
-    std::string error;
     if (!gemma.session().Sync(prefix, &error)) {
       gemma.set_position(0);
       throw std::runtime_error("Gemma-4 prefill failed: " + error);
@@ -3360,6 +3402,105 @@ public:
   }
 
 private:
+  struct Inputs {
+    std::vector<models::gemma4::ChatMessage> messages;
+    std::vector<models::gemma4::ChatTool> tools;
+  };
+
+  /// Converts the serve request into Gemma-4 chat messages and tools. When
+  /// `images_out` is non-null, each message's image parts are decoded (in
+  /// order) and appended, and `image_count` is set so the template emits the
+  /// matching `<|image|>` markers.
+  [[nodiscard]] Inputs ConvertInputs(
+      const ChatRequest& request, std::vector<core::Image>* images_out) const {
+    Inputs inputs;
+    inputs.messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      models::gemma4::ChatMessage converted{
+          .role = std::string(ChatRoleName(message.role)),
+          .content = message.content,
+          .reasoning_content = message.thought,
+          .tool_calls = {},
+          .tool_call_id = message.tool_call_id,
+      };
+      converted.tool_calls.reserve(message.tool_calls.size());
+      for (const auto& call : message.tool_calls) {
+        models::gemma4::ChatMessage::ToolCall converted_call{
+            .name = call.name,
+            .arguments = {},
+            .id = call.id,
+        };
+        converted_call.arguments.reserve(call.arguments.size());
+        for (const auto& argument : call.arguments) {
+          converted_call.arguments.push_back({
+              .name = argument.name,
+              .value = argument.value,
+              .is_string = argument.is_string,
+          });
+        }
+        converted.tool_calls.push_back(std::move(converted_call));
+      }
+      converted.image_count = message.images.size();
+      if (images_out != nullptr) {
+        for (const auto& part : message.images) {
+          images_out->push_back(
+              core::DecodeImage(std::span<const std::uint8_t>(*part.bytes)));
+        }
+      }
+      inputs.messages.push_back(std::move(converted));
+    }
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      inputs.tools.reserve(request.tools.size());
+      for (const auto& tool : request.tools) {
+        inputs.tools.push_back({
+            .name = tool.name,
+            .description = tool.description,
+            .parameters_json = tool.parameters_json,
+            .definition_json =
+                tool.definition_json.empty()
+                    ? std::string{}
+                    : json::parse(tool.definition_json)["function"].dump(),
+        });
+      }
+    }
+    return inputs;
+  }
+
+  /// FNV-1a over every image's raw bytes so distinct image sets never share a
+  /// cached KV prefix; the count is folded in first to separate ordering.
+  [[nodiscard]] static std::vector<std::uint8_t> ImageCacheIdentity(
+      const ChatRequest& request) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](std::uint64_t value) {
+      for (int byte = 0; byte < 8; ++byte) {
+        hash = (hash ^ ((value >> (byte * 8)) & 0xFFULL)) * 1099511628211ULL;
+      }
+    };
+    std::size_t count = 0;
+    for (const auto& message : request.messages) {
+      count += message.images.size();
+    }
+    mix(count);
+    for (const auto& message : request.messages) {
+      for (const auto& part : message.images) {
+        if (part.bytes == nullptr) {
+          mix(0);
+          continue;
+        }
+        for (const std::uint8_t byte : *part.bytes) {
+          hash = (hash ^ byte) * 1099511628211ULL;
+        }
+        mix(part.bytes->size());
+      }
+    }
+    std::vector<std::uint8_t> identity;
+    identity.reserve(8);
+    for (int byte = 0; byte < 8; ++byte) {
+      identity.push_back(static_cast<std::uint8_t>((hash >> (byte * 8)) & 0xFF));
+    }
+    return identity;
+  }
+
   std::shared_ptr<Gemma4Model> model_;
   std::uint32_t max_context_;
 };
@@ -3620,10 +3761,6 @@ const TextDiskCacheConfig& disk_cache_config,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "gemma4") {
-    if (!vision_model_path.empty()) {
-      SetError(error, "Gemma-4 does not support --mmproj yet");
-      return false;
-    }
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
       SetError(error,
                "Gemma-4 HTTP models do not support speculative decoding yet");
@@ -3635,9 +3772,10 @@ const TextDiskCacheConfig& disk_cache_config,
     }
     auto model = models::gemma4::Model::Load(
         model_path,
-        models::gemma4::ModelOptions{.max_context = max_context,
-                                     .draft_path = "",
-                                     .vision_model_path = ""},
+        models::gemma4::ModelOptions{
+            .max_context = max_context,
+            .draft_path = "",
+            .vision_model_path = vision_model_path},
         &load_error);
     if (model == nullptr) {
       SetError(error, "Failed to create Gemma-4 model: " + load_error);
