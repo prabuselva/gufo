@@ -24,7 +24,7 @@ end-to-end greedy token streams are the final gate.
 | Path | Contract |
 | --- | --- |
 | F32 fused ops (norms, rope, softmax) | ≤ 1e-5 abs vs oracle |
-| Q8_0 GEMV/GEMM (mmq, dense + routed) | accumulation order pinned; logits ≤ 2e-3 abs |
+| Q8_0 GEMV/GEMM (mmq, dense + routed) | logits ≤ 2e-3 abs. Dense and fused-qkv GEMVs use the vec4 kernel (4 int8 codes/lane), which reorders the dot accumulation but applies each block's scale exactly — measured 1.12e-3 and bit-identical end-to-end greedy tokens (`output_sha256` matches the scalar kernel). The grouped MoE GEMV stays on the order-pinned scalar kernel: its 1e-4 unit contract cannot absorb the vec4 reorder (measured 2.19e-4). |
 | WMMA MoE (routed_f16, F16 narrowing) | not bit-exact; guarded by forward test, logits ≤ 5e-3 abs |
 | Attention prefill scalar oracle (`AttentionPrefillScalar`) | ≤ 1e-3 abs vs oracle (measured 8e-6); F32-Q, kept as the numerical reference |
 | Attention prefill WMMA (`AttentionPrefill`, F16 Q/K/V) | ≤ 3e-3 abs (measured 2.01e-3 full / 1.98e-3 SWA). gemma4 pins the attention scale to 1.0 (not 1/√head_dim), so the softmax is extremely peaked and a 1-ulp F16-Q perturbation flips a near-tie; the F32-Q oracle is 250× tighter and both head_dims (256/512) land at the same ~2e-3 floor, so this is the F16 encoding floor, not a kernel bug (the kernel math equals the validated microbench, whose smooth data reaches 4e-4). Production prefill path; guarded by `gemma4.rocm_forward` (argmax exact). |

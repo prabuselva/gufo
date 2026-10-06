@@ -181,3 +181,32 @@ int8×int8→int32 on WMMA; F16-WMMA dense rejected as not numerics-preserving).
 Quality: n/a (no change made).
 Verdict: rejected — 3000+ t/s is not physically reachable for a 4B-active MoE on
 gfx1151; M11 finalized at the WMMA-attention result.
+
+### 2026-10-06 — vec4 Q8_0 GEMV for decode (post-M11)
+Hypothesis: decode is GEMV-bound (a pp128/tg profile put Q8_0 GEMVs at ~75% of
+token time — dense projections + lm_head ~33%, grouped MoE ~28%, fused-qkv
+Multi4 ~14%) and not launch-bound (7.7% idle), so the scalar GEMV's 1-byte-per-
+lane weight loads under-utilize the memory bus; loading 4 int8 codes per lane
+(one uint32 at byte `4·lane` of a 128-byte group of four Q8_0 blocks) should
+raise achieved bandwidth.
+Change: `GemvQ8_0Vec4` and `GemvQ8_0Multi4Vec4` in
+`kernels/rocm/gemv.hip.cpp`. Lane `l` reads the uint32 at byte `4l` of a
+128-byte group covering four blocks (`blk = g·4 + lane/8`, `word = (4·lane)%32`),
+applies each block's own scale `d` to its four codes, and reorders the
+accumulation. `Gemv` dispatches vec4 for dense Q8_0 when `cols % 128 == 0`
+(all gemma4 projections qualify: 2816=22·128, 1408=11·128, 8192, 4096);
+`GemvMulti` dispatches `Multi4Vec4` when every fused projection has
+`nb % 4 == 0`. Grouped MoE GEMV stays scalar (see Quality).
+Measurement: standalone `tools/bench/gemma4_gemv_bench.hip` (warm) predicted
+large per-kernel wins (lm_head +44%, proj +33%, Multi4 +56%); the honest
+in-model number is smaller because decode is cold/DRAM-bound. Exclusive-GPU
+matched `gufo bench` pp128 tg256 reps3 (Q8_K_XL): **38.26 ± 0.05 → 39.91 ± 0.16
+t/s (+4.3%)**; pp128 unchanged (prefill uses WMMA/GEMM, not the decode GEMV).
+Quality: `gemma4.rocm_kernels` passes — dense vec4 worst-relative 1.12e-3 < the
+2e-3 Q8_0 GEMV contract (the dot reorder error is well inside tolerance; each
+block's scale `d` is still applied exactly). The generated-token `output_sha256`
+is **bit-identical** between vec4 and scalar on the decode A/B, so no argmax
+decision changed. Grouped MoE GEMV was **rejected for vec4**: its contract is
+1e-4 (tighter than the dense 2e-3) and the vec4 reorder measures 2.19e-4, which
+fails; its cold win was only +3.4% anyway, so it stays scalar.
+Verdict: retained as the default dense + fused-qkv decode path (no switch).
