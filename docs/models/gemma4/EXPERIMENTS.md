@@ -66,3 +66,20 @@ single-token decode, so it can flip a near-tie. Inherent to batched
 verification (llama.cpp MTP behaves the same); MTP stays opt-in so the default
 greedy path is unchanged.
 Verdict: retained (opt-in, n=4 default cap)
+### 2026-10-06 — Vision tower precision (M9)
+Hypothesis: the `gemma4v` tower can run its projections in BF16 (native mmproj
+type) like the trunk, halving vision weight bytes with no quality cost.
+Change: `vision/encoder.{hpp,cpp}` device driver + `vision/kernels.{hpp,hip.cpp}`
+(im2col, position add, 2D RoPE, geglu_quick, avg-pool 3×3, std-norm, flash-style
+non-causal attention), reusing `Gemm`/`RmsNormRows`/`Add`.
+Measurement: `gemma4.vision_encoder` vs the CPU oracle on a fixed 96×96 gradient.
+BF16 `GemmEx` path: oracle checksum −53.0989 vs device −64.2804, max abs diff
+5.45 (58% of ref max 9.35), mean 0.407 — BF16 activation narrowing compounds
+across 27 blocks well past any acceptable bound.
+F32 path (BF16 weights upcast on the host, SGEMM): checksums identical
+(−53.0989), max abs diff 2.9e-05, mean 4.5e-06 — pure F32 rounding.
+Quality: independent CPU `ReferenceEncoder` oracle; test tolerance tightened to
+1e-3 relative (was a 5% BF16-era bound).
+Verdict: F32 retained as the default. The tower is ~1.2 GB and a rounding pass
+next to the 26B trunk, so full precision costs nothing measurable and removes a
+real quality gap; BF16 rejected.
