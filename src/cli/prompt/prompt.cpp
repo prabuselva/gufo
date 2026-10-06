@@ -653,7 +653,8 @@ std::shared_ptr<models::gemma4::Model> LoadGemma4Model(
   auto model = models::gemma4::Model::Load(
       opt.model_path,
       models::gemma4::ModelOptions{.max_context = kDefaultContext,
-                                   .draft_path = mtp ? opt.mtp_model_path : ""},
+                                   .draft_path = mtp ? opt.mtp_model_path : "",
+                                   .vision_model_path = opt.vision_model_path},
       &error);
   if (model == nullptr) {
     std::cerr << "Error creating Gemma-4-26B-A4B model: " << error << '\n';
@@ -674,7 +675,9 @@ int GenerateGemma4Response(
     const PromptOptions& opt,
     const std::shared_ptr<models::gemma4::Model>& model,
     models::gemma4::Session& session,
-    std::span<const std::int32_t> prompt_tokens, std::string* reply = nullptr) {
+    std::span<const std::int32_t> prompt_tokens, std::string* reply = nullptr,
+    const std::vector<models::gemma4::vision::VisionSlot>* vision_slots =
+        nullptr) {
   std::string error;
   const auto emit = [&](std::int32_t token) {
     const auto piece = model->TokenText(token);
@@ -693,7 +696,11 @@ int GenerateGemma4Response(
     return 1;
   }
   session.Reset();
-  if (!session.Sync(prompt_tokens, &error)) {
+  const bool synced =
+      vision_slots != nullptr && !vision_slots->empty()
+          ? session.Sync(prompt_tokens, *vision_slots, &error)
+          : session.Sync(prompt_tokens, &error);
+  if (!synced) {
     std::cerr << "Gemma-4-26B-A4B prefill failed: " << error << '\n';
     return 1;
   }
@@ -783,17 +790,48 @@ int RunGemma4Prompt(const PromptOptions& opt, const core::GgufReader& reader,
     session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
   }
   std::vector<std::int32_t> prompt_tokens;
+  std::vector<models::gemma4::vision::VisionSlot> vision_slots;
   if (opt.use_chat_template) {
     std::vector<models::gemma4::ChatMessage> messages;
     if (!opt.system_prompt.empty()) {
       messages.push_back({.role = "system", .content = opt.system_prompt});
     }
-    messages.push_back({.role = "user", .content = opt.prompt_text});
-    prompt_tokens = model->EncodeChat(messages, {}, Gemma4ChatOptions(opt));
+    std::vector<core::Image> images;
+    for (const auto& path : opt.image_paths) {
+      images.push_back(core::DecodeImage(core::ReadImageFile(path)));
+    }
+    if (!images.empty()) {
+      if (!model->HasVision()) {
+        std::cerr << "Gemma-4 image input requires --mmproj\n";
+        return 1;
+      }
+      messages.push_back(
+          {.role = "user",
+           .content = opt.prompt_text,
+           .image_count = static_cast<std::uint32_t>(images.size())});
+      auto prepared = model->EncodeChatVision(messages, {},
+                                              Gemma4ChatOptions(opt), images,
+                                              &error);
+      if (prepared.tokens.empty()) {
+        std::cerr << "Gemma-4 vision prompt failed: " << error << '\n';
+        return 1;
+      }
+      prompt_tokens = std::move(prepared.tokens);
+      vision_slots = std::move(prepared.images);
+    } else {
+      messages.push_back({.role = "user", .content = opt.prompt_text});
+      prompt_tokens = model->EncodeChat(messages, {}, Gemma4ChatOptions(opt));
+    }
   } else {
+    if (!opt.image_paths.empty()) {
+      std::cerr << "Gemma-4 image input requires the chat template; drop "
+                   "--raw\n";
+      return 1;
+    }
     prompt_tokens = model->Tokenize(opt.prompt_text);
   }
-  return GenerateGemma4Response(opt, model, *session, prompt_tokens);
+  return GenerateGemma4Response(opt, model, *session, prompt_tokens, nullptr,
+                                vision_slots.empty() ? nullptr : &vision_slots);
 }
 
 int RunGemma4Chat(const PromptOptions& opt, const core::GgufReader& reader,
@@ -1324,10 +1362,6 @@ int RunPrompt(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsGemma4(*reader)) {
-    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
-      std::cerr << "Gemma-4 image input is not yet available\n";
-      return 2;
-    }
     return RunGemma4Prompt(opt, *reader, model_load_start);
   }
 #else

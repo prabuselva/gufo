@@ -7,6 +7,7 @@ add_library(gufo_gemma4 STATIC
   tokenizer.cpp
   weights.cpp
   vision/config.cpp
+  vision/prompt.cpp
   vision/weights.cpp)
 
 target_include_directories(gufo_gemma4 PUBLIC ${PROJECT_SOURCE_DIR})

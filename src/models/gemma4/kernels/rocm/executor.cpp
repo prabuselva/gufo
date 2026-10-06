@@ -469,6 +469,31 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
     }
     ScaleInPlace(pf_cur_, std::sqrt(static_cast<float>(hidden)),
                  static_cast<std::size_t>(T) * hidden, nullptr);
+    // Splice the image embeddings over the scaled token rows they replace.
+    // Both regions are contiguous [rows][hidden], so each overlap is one D2D
+    // copy. Gemma does not scale the image rows, so this runs after the
+    // sqrt(hidden) embedding scale.
+    for (const VisionImage& image : vision_) {
+      if (image.rows == nullptr || image.row_count == 0) {
+        continue;
+      }
+      const std::uint32_t image_end = image.offset + image.row_count;
+      const std::uint32_t begin = std::max(start, image.offset);
+      const std::uint32_t end = std::min(start + T, image_end);
+      if (begin >= end) {
+        continue;
+      }
+      const std::size_t n = static_cast<std::size_t>(end - begin) * hidden;
+      if (hipMemcpyAsync(pf_cur_ + static_cast<std::size_t>(begin - start) *
+                                          hidden,
+                         image.rows + static_cast<std::size_t>(begin -
+                                                               image.offset) *
+                                          hidden,
+                         n * sizeof(float), hipMemcpyDeviceToDevice) !=
+          hipSuccess) {
+        return Fail(error_msg, "image embedding splice failed");
+      }
+    }
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
       if (!PrefillLayer(session, il, session.position_ + start, T, error_msg)) {
         return false;
@@ -494,6 +519,7 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
       }
     }
   }
+  vision_.clear();
   session.position_ += count;
   return true;
 }

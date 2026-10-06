@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_GEMMA4_CHAT_TEMPLATE_HPP_
 #define GUFO_MODELS_GEMMA4_CHAT_TEMPLATE_HPP_
 
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,6 +30,11 @@ struct ChatMessage {
   std::vector<ToolCall> tool_calls;
   std::string tool_call_id;
   std::string name;
+  // Number of images attached to this turn. Each emits one `<|image|>` marker
+  // before the text content, which `vision::BuildPrompt` expands into the
+  // image placeholder span. Zero (the default) leaves the text-only render
+  // byte-identical.
+  std::uint32_t image_count{0};
 };
 
 struct ChatTool {
