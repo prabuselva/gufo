@@ -36,3 +36,16 @@ exclusive decode pp128/tg256: **38.26 → 39.91 t/s (+4.3%)** with a
 bit-identical `output_sha256`. Grouped MoE GEMV stays scalar — its 1e-4
 contract cannot absorb the vec4 reorder (measured 2.19e-4). See
 [EXPERIMENTS.md](EXPERIMENTS.md).
+
+### float4 RMSNorm (decode + prefill)
+
+`RmsNormKernel` and `FusedAddRmsNormKernel` take a `dim % 4 == 0` fast path:
+16-byte `float4` loads/stores and a `float` per-thread sum-of-squares (the
+block reduce stays in `double` over the ≤1024 partials). The scalar `double`
+path remains the fallback for `dim % 4 != 0`; every gemma4 norm dim (2816, 512,
+256) is a multiple of 4. Standalone kernel: decode shape (rows=1, dim=2816)
+**6.43 → 3.22 µs (−50%)**, prefill shape (rows=512) **48.9 → 19.6 µs (−60%)**.
+Matched exclusive decode pp128/tg256: **39.98 → 41.75 t/s (+4.4%)**, pp128
++1.0%. Worst-relative error vs the `double` oracle is **1.55e-7** (inside the
+1e-5 norm contract) and the greedy `output_sha256` is bit-identical to the
+baseline. See [EXPERIMENTS.md](EXPERIMENTS.md).

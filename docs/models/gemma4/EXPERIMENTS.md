@@ -210,3 +210,54 @@ decision changed. Grouped MoE GEMV was **rejected for vec4**: its contract is
 1e-4 (tighter than the dense 2e-3) and the vec4 reorder measures 2.19e-4, which
 fails; its cold win was only +3.4% anyway, so it stays scalar.
 Verdict: retained as the default dense + fused-qkv decode path (no switch).
+
+### 2026-10-06 — grouped prefetch + ffn_down vec4-tail (post-M11, rejected)
+
+Change: two further decode-GEMV levers probed on `tools/bench/gemma4_gemv_bench.hip`.
+(1) `GemvGroupedQ8_0Prefetch` — a bit-exact double-buffered variant of the
+grouped MoE GEMV (load block `b+1`'s `d`/`q`/`x` before the FMA for block `b`,
+identical accumulation order, so it stays inside the 1e-4 contract). (2)
+`GemvQ8_0Vec4Tail` — vec4 over the whole `cols/128` groups plus a scalar tail
+over the leftover blocks, to bring vec4 to `ffn_down` (`cols=2112`, a multiple
+of 32 but not 128, so the shipped `cols % 128 == 0` gate left it scalar).
+Measurement: (1) prefetch is **2× slower** warm (114 vs 221 GB/s gate_up, 147 vs
+343 down) — the `b+1 < nblocks` guard serializes the loop and the scalar kernel
+was not latency-bound as hypothesized. (2) `ffn_down` vec4-tail is +25% warm
+(411 → 514 GB/s) but the honest matched exclusive-GPU `gufo bench` pp128 tg256
+reps3 is **39.96 ± 0.04 → 40.05 ± 0.07 t/s (+0.23%, within run-to-run noise)**:
+`ffn_down` is only ~4% of decode and `cols=2112` is a small matrix, so the
+cold/DRAM-bound decode shrinks the coalescing win to nothing measurable.
+Quality: (1) bit-exact by construction (passes 1e-4) but slower, so moot.
+(2) the tail path measured 2.10e-3 on the bench's 1e-6 floor (inside the dense
+2e-3 contract, safer than the shipped lm_head vec4), but the win does not clear
+noise, so it was not worth an end-to-end `output_sha256` A/B.
+Verdict: both rejected — no production change. The grouped MoE GEMV stays on the
+order-pinned scalar kernel (vec4 fails 1e-4, prefetch is slower); `ffn_down`
+stays on the scalar `Gemv` path (vec4-tail is noise). Decode GEMV optimization is
+exhausted: the two large slices (dense vec4 27%, fused-qkv Multi4 12%) are
+already vec4 and DRAM-bound, and the grouped slice (27%) is contract-locked.
+
+### 2026-10-06 — float4 RMSNorm (post-M11)
+Hypothesis: after the GEMV levers were exhausted, the next decode slice is
+`RmsNormKernel` (~8% of token time, 31571 calls at ~8.9 µs each in the decode
+profile). The kernel ran a scalar `double` accumulation with 4-byte loads; for
+the decode shape (rows=1, dim=2816) it is latency/issue-bound, so 16-byte
+`float4` loads/stores with a `float` per-thread partial should cut it sharply.
+Change: a `dim % 4 == 0` fast path in both `RmsNormKernel` and
+`FusedAddRmsNormKernel` (`kernels/rocm/fused.hip.cpp`) — `float4` loads of `x`
+(and `gamma`), a `float` per-thread sum-of-squares, the block reduce kept in
+`double` over the ≤1024 partials, and `float4` stores of the scaled output. The
+scalar `double` path stays as the `else` fallback for `dim % 4 != 0`; every
+gemma4 norm dim (2816, 512, 256) is a multiple of 4, so the fast path always
+runs. No dispatch or launcher change, no switch.
+Measurement: standalone `tools/bench/gemma4_rmsnorm_bench.hip` — decode shape
+(rows=1, dim=2816) **6.43 → 3.22 µs (−50%)**, prefill shape (rows=512)
+**48.9 → 19.6 µs (−60%)**. Exclusive-GPU matched `gufo bench` pp128 tg256 reps3
+(Q8_K_XL): **tg256 39.98 ± 0.05 → 41.75 ± 0.15 t/s (+4.4%)**, pp128
+910.10 → 919.49 (+1.0%, prefill also touches RMSNorm).
+Quality: `gemma4.rocm_kernels` passes — `RmsNormRows` and `FusedAddRmsNorm`
+(dim=2816) worst-relative **1.55e-7** against the `double` oracle, well inside
+the 1e-5 kernel contract. The greedy generated-token `output_sha256` is
+**bit-identical** between the float4 and baseline binaries (count=86,
+sha256=244656b9…32b376), so no argmax decision changed.
+Verdict: retained as the default RMSNorm path (no switch).
