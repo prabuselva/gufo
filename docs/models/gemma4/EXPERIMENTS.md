@@ -261,3 +261,50 @@ the 1e-5 kernel contract. The greedy generated-token `output_sha256` is
 **bit-identical** between the float4 and baseline binaries (count=86,
 sha256=244656b9…32b376), so no argmax decision changed.
 Verdict: retained as the default RMSNorm path (no switch).
+
+### 2026-10-06 — grouped vec4 + double accumulate (post-M11, rejected)
+Hypothesis: the grouped MoE GEMV (27% of decode) is the one large slice still on
+the scalar 1-byte/lane path. vec4 (float) was rejected earlier because its
+reorder error (2.19e-4) exceeds the 1e-4 contract. The contract is checked
+against a `double` oracle, so a vec4 **load** with a **`double` accumulator**
+should converge to ~0 error (passing 1e-4) while widening the warp's weight
+transaction 4× (32 B → 128 B), the same lever that lifted dense GEMV.
+Change: `GemvGroupedQ8_0Vec4D` + `WarpReduceSumD` on
+`tools/bench/gemma4_gemv_bench.hip` — vec4 load pattern copied from the shipped
+`GemvGroupedQ8_0Vec4`, expert gather from the scalar `GemvGroupedQ8_0`, all four
+per-lane products and the warp reduce in `double`.
+Measurement: gate_up worst-relative **0.000e+00** vs the double oracle (bit-exact,
+as predicted) — but **53.5 GB/s vs scalar 222 GB/s (2.4× slower)**; down 51.2 vs
+350 GB/s. `double` FMA runs at the 1/64 rate on gfx1151, so the kernel flips from
+memory-bound to ALU-bound. Decisive control: vec4 barely moves grouped at all
+(scalar 222 → vec4-float 228 GB/s) while it lifts dense 444→582 and 478→648 GB/s.
+Grouped is therefore **not load-width-bound** — the 8-way expert gather (8 random
+base pointers per launch) dominates, and no load-widening variant can help it.
+Quality: bit-exact but moot.
+Verdict: rejected — no production change. The grouped MoE GEMV stays on the
+order-pinned scalar kernel. This closes the grouped slice from every angle:
+vec4-float fails the 1e-4 contract, vec4-double is 2.4× slower (FP64), prefetch
+is 2× slower, and vec4 does not speed up a gather-bound kernel regardless. Decode
+GEMV optimization is exhausted.
+
+### 2026-10-06 — vec4 BF16 dense GEMV (post-M11, rejected)
+Hypothesis: the last full-attention layer ships its q/o/k/v projections in BF16
+(the UD quant's only non-Q8_0 dense weights), and `GemvBf16` was still the scalar
+lane-stride-32 path (2-byte loads, ~119 GB/s in the decode profile, 3% of token
+time) — the same un-vectorized pattern the shipped `GemvQ8_0Vec4` fixed on the
+Q8_0 dense projections (444 → 580 GB/s). A flat-layout vec4 (four BF16 = 8 bytes
+per lane, `cols % 128 == 0`, 128 threads / 4 rows like `GemvQ8_0Vec4`) should
+widen the warp transaction 64 B → 256 B with no block/scale handling.
+Change: `GemvBf16Vec4` + a `cols % 128 == 0` dispatch gate in `Gemv`'s kBF16 case
+(`kernels/rocm/gemv.hip.cpp`), scalar kept as the `else` fallback.
+Measurement: `gemma4.rocm_kernels` `Gemv BF16` (cols=2816, double oracle, tol
+1e-4) passes and the greedy `output_sha256` is **bit-identical** to the baseline
+(count=86, sha256=244656b9…32b376). But the matched exclusive-GPU `gufo bench`
+pp512 tg128 (reps3 + two reps5 passes, base vs new binaries) is **tg128 41.86 →
+41.93 t/s (+0.17%, inside the ±0.1–0.2 run-to-run spread)** and pp512 unchanged
+(the single-row `Gemv` is not on the prefill path; the first reps3 run's +3% pp512
+did not reproduce). The BF16 layer is 1/30 of the model, so even a large kernel
+speedup on its ~3% slice lands below the noise floor — the same outcome as the
+`ffn_down` vec4-tail.
+Verdict: rejected — no production change, consistent with the `ffn_down` precedent
+of not carrying a path that does not clear noise. `GemvBf16` stays scalar.
