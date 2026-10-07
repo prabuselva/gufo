@@ -20,6 +20,10 @@ namespace {
 
 constexpr unsigned kThreads = 256;
 
+// Tile index of a map entry past the last tile: beyond every bucket, so the
+// routed GEMM's block for it returns without touching the weight or row maps.
+constexpr std::int32_t kDeadTile = 0x7FFF;
+
 // F16 WMMA fragments (wave32): sixteen halves per lane, eight F32
 // accumulators per lane.
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -190,6 +194,9 @@ __launch_bounds__(256) __global__
       reinterpret_cast<uint4*>(lds + kCodeBytes + kHighBytes + kScaleBytes);
 
   const std::int32_t tile = tiles[blockIdx.y];
+  if ((tile >> 16) == kDeadTile) {
+    return;
+  }
   const int expert = tile & 0xFFFF;
   const int t_local = (tile >> 16) * BN;
   const int bucket_begin = pad_bounds[expert];
@@ -685,6 +692,35 @@ inline unsigned Blocks(std::size_t count) {
   return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
 
+// One block: thread e counts expert e's `rows`-row tiles, an ordered scan
+// places them, and the remaining capacity entries become dead tiles.
+__global__ void __launch_bounds__(256) BuildRoutedTilesKernel(
+    const std::uint32_t* __restrict__ counts, std::uint32_t experts,
+    std::uint32_t rows, std::uint32_t capacity,
+    std::int32_t* __restrict__ tiles) {
+  __shared__ std::uint32_t scan[256];
+  const std::uint32_t e = threadIdx.x;
+  const std::uint32_t padded = e < experts ? (counts[e] + 15U) / 16U * 16U : 0;
+  const std::uint32_t n = (padded + rows - 1) / rows;
+  scan[e] = n;
+  __syncthreads();
+  // Inclusive Hillis-Steele scan; integer sums, so order-free.
+  for (std::uint32_t step = 1; step < 256; step <<= 1) {
+    const std::uint32_t add = e >= step ? scan[e - step] : 0;
+    __syncthreads();
+    scan[e] += add;
+    __syncthreads();
+  }
+  const std::uint32_t first = scan[e] - n;
+  for (std::uint32_t j = 0; j < n; ++j) {
+    tiles[first + j] = static_cast<std::int32_t>(e | (j << 16));
+  }
+  constexpr std::int32_t kDead = kDeadTile << 16;
+  for (std::uint32_t i = scan[255] + e; i < capacity; i += 256) {
+    tiles[i] = kDead;
+  }
+}
+
 }  // namespace
 
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
@@ -718,6 +754,13 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
   hipLaunchKernelGGL(RoutedScatterKernel, dim3(Blocks(slots)), dim3(kThreads),
                      0, stream, ids, pad_bounds, cursors, rows_token, rows_slot,
                      static_cast<std::uint32_t>(slots), k);
+}
+
+void BuildRoutedTiles(const std::uint32_t* counts, std::uint32_t experts,
+                      std::uint32_t rows, std::uint32_t capacity,
+                      std::int32_t* tiles, hipStream_t stream) {
+  BuildRoutedTilesKernel<<<1, 256, 0, stream>>>(counts, experts, rows, capacity,
+                                                tiles);
 }
 
 template<int BN>

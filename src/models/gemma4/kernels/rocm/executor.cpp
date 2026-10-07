@@ -196,7 +196,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->AllocBytes(compact_rows * sizeof(std::int32_t), error_msg));
   if (e->pf_rows_slot_ == nullptr)
     return nullptr;
-  const std::size_t max_tiles = slots / 64 + c.num_experts + 1;
+  const std::size_t max_tiles =
+      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 64);
   e->pf_tiles_dev_ = reinterpret_cast<std::int32_t*>(
       e->AllocBytes(max_tiles * sizeof(std::int32_t), error_msg));
   if (e->pf_tiles_dev_ == nullptr)
@@ -215,7 +216,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
 #undef GUFO_ALLOC
 
-  e->counts_host_.resize(c.num_experts);
   e->prefill_chunk_ = prefill_chunk;
   return e;
 }
@@ -648,26 +648,14 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
   NarrowActivations(x, pf_x_half_, false,
                     static_cast<std::size_t>(tokens) * c.hidden_size, nullptr);
   ExpertCounts(ids, pf_counts_, tokens, c.num_experts, used, nullptr);
-  if (hipMemcpy(counts_host_.data(), pf_counts_,
-                c.num_experts * sizeof(std::uint32_t),
-                hipMemcpyDeviceToHost) != hipSuccess) {
-    return Fail(error_msg, "expert histogram download failed");
-  }
-  tiles_host_.clear();
-  for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-    const std::uint32_t padded = (counts_host_[e] + 15U) / 16U * 16U;
-    for (std::uint32_t j = 0; j < (padded + 63U) / 64U; ++j) {
-      tiles_host_.push_back(static_cast<std::int32_t>(e | (j << 16)));
-    }
-  }
-  if (tiles_host_.empty()) {
-    return Fail(error_msg, "routed MoE produced no tiles");
-  }
-  if (hipMemcpyAsync(pf_tiles_dev_, tiles_host_.data(),
-                     tiles_host_.size() * sizeof(std::int32_t),
-                     hipMemcpyHostToDevice) != hipSuccess) {
-    return Fail(error_msg, "tile map upload failed");
-  }
+  // The routed tile map is built on the device from the per-expert counts, so
+  // the host never downloads the histogram or uploads a tile map: the GEMM
+  // launches the map's capacity and skips the dead entries. This removes a
+  // synchronous device-to-host round-trip from every MoE layer.
+  const std::uint32_t n_tiles =
+      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 64);
+  BuildRoutedTiles(pf_counts_, c.num_experts, 64, n_tiles, pf_tiles_dev_,
+                   nullptr);
   RoutedCompact(ids, pf_counts_, pf_pad_bounds_, pf_cursors_, pf_rows_token_,
                 pf_rows_slot_, tokens, used, c.num_experts, nullptr);
 
@@ -676,7 +664,6 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
   // on its own weight type (RoutedF16Gemm rejects an unsupported one below).
   const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
   const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
-  const std::uint32_t n_tiles = static_cast<std::uint32_t>(tiles_host_.size());
   if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, pf_tiles_dev_,
                      n_tiles, 64, pf_pad_bounds_, pf_rows_token_, pf_rows_slot_,
                      nullptr, pf_gu_half_, 2 * c.expert_ff, c.hidden_size,
