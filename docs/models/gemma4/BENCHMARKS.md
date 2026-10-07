@@ -117,7 +117,31 @@ helps decode bandwidth-bound tg most.
 
 This table predates the vec4 Q8_0 GEMV (see the Decode section); both columns
 were measured on the scalar build and both would gain from vec4, so the
-relative Q4-vs-Q8 comparison is unaffected.
+relative Q4-vs-Q8 comparison is unaffected. It also predates the M11 WMMA
+flash-attention prefill kernel, so its prefill rows are far below current-build
+throughput — see "Q4_K_M on the current build" below for the superseding
+figures.
+
+## Q4_K_M on the current build (prefill + MTP)
+
+`gufo bench --repetitions 1`, exclusive GPU, greedy, committed binary
+`73f9dc60` (the bench kernels are unchanged since the WMMA-prefill + dense-F16
+build; that commit only touched the serve path). Q4_K_M trunk + Q8_0 MTP draft.
+Prefill is unaffected by MTP; the two prefill columns agree within run-to-run
+noise.
+
+| Test | no MTP | MTP n=4 | gain |
+| --- | --- | --- | --- |
+| pp2048 | 2143.30 | 2117.80 | ~0% |
+| pp8192 | 1948.33 | 1956.52 | ~0% |
+| pp16384 | 1641.22 | 1647.51 | ~0% |
+| tg128 | 46.23 | 81.05 | +75.3% |
+
+These are the current-build Q4_K_M figures and supersede the pre-M11 scalar
+prefill rows in the Quantizations table above (pp8192 261 → 1948). The MTP
+tg128 gain (+75%, same-build) is larger than Q8_K_XL's same-build +57%
+(38.22 → 59.99, [DEVELOPMENT.md](DEVELOPMENT.md)): Q4_K_M decode is more
+bandwidth-bound, so accepted drafts move throughput more.
 
 ## Serve (t/s, streaming)
 
