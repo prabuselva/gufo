@@ -138,6 +138,78 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
   }
 }
 
+// Binary16-output RMSNorm. The sum-of-squares reduction and the float scale are
+// identical to RmsNormKernel (double accumulator over the row, float rsqrt);
+// only the store is F16. dim is a multiple of 4 for every gemma4 norm, so the
+// vectorized float4 load path covers it; the scalar path is kept for safety.
+__global__ void RmsNormKernelHalf(const float* x, const float* gamma,
+                                  __half* out, std::uint32_t dim, float eps) {
+  __shared__ double reduce[32];
+  const std::size_t row = blockIdx.x;
+  const float* xr = x + row * dim;
+  if ((dim & 3U) == 0U) {
+    const float4* x4 = reinterpret_cast<const float4*>(xr);
+    const std::uint32_t n4 = dim / 4U;
+    float ss = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float scale = 1.0F / sqrtf(static_cast<float>(
+                            BlockReduceSum(static_cast<double>(ss), reduce) /
+                            static_cast<double>(dim)) +
+                        eps);
+    __half* orow = out + row * dim;
+    // Materialize the product as a float before the F16 store: the compiler
+    // otherwise fuses mul.f32 -> cvt.f16.f32 (one rounding), while the float
+    // RmsNormKernel + narrow() round twice, diverging at half-ULP ties. The
+    // volatile temp forces the float round-trip; applies to all stores below.
+    if (gamma != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(gamma);
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 g = g4[i];
+        volatile float rx = v.x * scale * g.x;
+        volatile float ry = v.y * scale * g.y;
+        volatile float rz = v.z * scale * g.z;
+        volatile float rw = v.w * scale * g.w;
+        orow[4 * i] = __float2half(rx);
+        orow[4 * i + 1] = __float2half(ry);
+        orow[4 * i + 2] = __float2half(rz);
+        orow[4 * i + 3] = __float2half(rw);
+      }
+    } else {
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        volatile float rx = v.x * scale;
+        volatile float ry = v.y * scale;
+        volatile float rz = v.z * scale;
+        volatile float rw = v.w * scale;
+        orow[4 * i] = __float2half(rx);
+        orow[4 * i + 1] = __float2half(ry);
+        orow[4 * i + 2] = __float2half(rz);
+        orow[4 * i + 3] = __float2half(rw);
+      }
+    }
+    return;
+  }
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const double v = xr[i];
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(dim)) +
+                   eps);
+  __half* orow = out + row * dim;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float g = gamma != nullptr ? gamma[i] : 1.0F;
+    volatile float r = xr[i] * scale * g;
+    orow[i] = __float2half(r);
+  }
+}
+
 // Residual add fused with the following RMSNorm: x += addend, then
 // out = rmsnorm(x) * gamma. Bit-identical to AddKernel followed by
 // RmsNormKernel for a single row (grid == 1): the sum is formed as a float in
@@ -361,6 +433,22 @@ __global__ void GegluSeparateKernel(const float* gate, const float* up,
   }
 }
 
+// Binary16-output shared-FFN geglu: the same gelu_tanh(gate) * up in float,
+// stored as F16 so the down GEMM consumes the act row directly. The volatile
+// temp is the same float-materialization barrier as RmsNormKernelHalf: without
+// it the compiler fuses the final mul into the cvt and single-rounds, whereas
+// the FP32 path stores the float act and NarrowHalf rounds it again.
+__global__ void GegluSeparateHalfKernel(const float* gate, const float* up,
+                                        __half* act, std::size_t count) {
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += stride) {
+    volatile float r = DGelu(gate[i]) * up[i];
+    act[i] = __float2half(r);
+  }
+}
+
 }  // namespace
 
 void ScaleInPlace(float* x, float k, std::size_t count, hipStream_t stream) {
@@ -406,11 +494,29 @@ void GegluF32Separate(const float* gate, const float* up, float* act,
   GegluSeparateKernel<<<grid, block, 0, stream>>>(gate, up, act, count);
 }
 
+void GegluF16Separate(const float* gate, const float* up, __half* act,
+                      std::size_t count, hipStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  const std::size_t block = 256;
+  const std::size_t grid =
+      std::min<std::size_t>((count + block - 1) / block, 65535);
+  GegluSeparateHalfKernel<<<grid, block, 0, stream>>>(gate, up, act, count);
+}
+
 void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
                  hipStream_t stream) {
   const dim3 block(std::min<std::uint32_t>(dim, 256U));
   RmsNormKernel<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
+}
+
+void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
+                     std::uint32_t rows, std::uint32_t dim, float eps,
+                     hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  RmsNormKernelHalf<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
 }
 
 void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,

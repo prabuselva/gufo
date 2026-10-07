@@ -210,6 +210,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->AllocBytes(slots * expert_ff * sizeof(__half), error_msg));
   if (e->pf_act_half_ == nullptr)
     return nullptr;
+  e->pf_normed_half_ = reinterpret_cast<__half*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
+  if (e->pf_normed_half_ == nullptr)
+    return nullptr;
+  e->pf_act_ffn_half_ = reinterpret_cast<__half*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * ffn * sizeof(__half), error_msg));
+  if (e->pf_act_ffn_half_ == nullptr)
+    return nullptr;
 #undef GUFO_ALLOC
 
   e->prefill_chunk_ = prefill_chunk;
@@ -582,13 +590,43 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
       !GemvTypeOf(l.ffn_down.type, &ft)) {
     return Fail(error_msg, "unsupported shared FFN type");
   }
-  Gemm(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes, pf_normed_,
-       pf_up_, tokens, nullptr);
-  Gemm(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
-       pf_normed_, pf_gate_, tokens, nullptr);
-  GegluF32Separate(pf_gate_, pf_up_, pf_act_, rows * c.ffn_length, nullptr);
-  Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes, pf_act_,
-       pf_mlp_, tokens, nullptr);
+  // Wide-batch binary16 shared-FFN path: the ffn-norm writes F16 and the three
+  // dense F16 GEMMs consume the half rows directly, skipping the FP32->F16
+  // narrowing pass the FP32 Gemm wrapper inserts and halving the normed/act
+  // row traffic. Gated so all three projections take the F16 route together
+  // (up/gate shape [ffn x hidden], down shape [hidden x ffn]) and their K is a
+  // multiple of 32, which is exactly when GemmHalfIn cannot fall back; any
+  // other shape or batch keeps the bit-identical FP32 path.
+  const bool ffn_half = ft == GemvType::kQ8_0 && (hidden % 32U == 0U) &&
+                        (c.ffn_length % 32U == 0U) &&
+                        DenseF16Window(tokens, c.ffn_length, hidden) &&
+                        DenseF16Window(tokens, hidden, c.ffn_length);
+  if (ffn_half) {
+    RmsNormRowsHalf(pf_attn_out_, l.ffn_norm.f32(), pf_normed_half_, tokens,
+                    hidden, c.rms_eps, nullptr);
+    const bool ok =
+        GemmHalfIn(l.ffn_up.data, ft, c.ffn_length, hidden, pf_normed_half_,
+                   pf_up_, tokens, nullptr) &&
+        GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden, pf_normed_half_,
+                   pf_gate_, tokens, nullptr);
+    if (!ok) {
+      return Fail(error_msg, "shared FFN up/gate GEMM failed");
+    }
+    GegluF16Separate(pf_gate_, pf_up_, pf_act_ffn_half_, rows * c.ffn_length,
+                     nullptr);
+    if (!GemmHalfIn(l.ffn_down.data, ft, hidden, c.ffn_length,
+                    pf_act_ffn_half_, pf_mlp_, tokens, nullptr)) {
+      return Fail(error_msg, "shared FFN down GEMM failed");
+    }
+  } else {
+    Gemm(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes,
+         pf_normed_, pf_up_, tokens, nullptr);
+    Gemm(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
+         pf_normed_, pf_gate_, tokens, nullptr);
+    GegluF32Separate(pf_gate_, pf_up_, pf_act_, rows * c.ffn_length, nullptr);
+    Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes,
+         pf_act_, pf_mlp_, tokens, nullptr);
+  }
   RmsNormRows(pf_mlp_, l.post_ffw_norm_1.f32(), pf_mlp1_, tokens, hidden,
               c.rms_eps, nullptr);
 

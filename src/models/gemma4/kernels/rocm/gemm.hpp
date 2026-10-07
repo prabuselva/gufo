@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_GEMMA4_KERNELS_ROCM_GEMM_HPP_
 #define GUFO_MODELS_GEMMA4_KERNELS_ROCM_GEMM_HPP_
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -26,6 +27,23 @@ namespace gufo::models::gemma4::rocm {
 void Gemm(const void* base, GemvType type, std::uint32_t rows,
           std::uint32_t cols, std::size_t row_bytes, const float* x, float* out,
           std::uint32_t batch, hipStream_t stream);
+
+/// True when a Q8_0 projection of shape [rows x cols] at `batch` rows falls in
+/// the measured dense F16 WMMA winning window (the same bounds `Gemm` uses to
+/// pick that route). Lets a caller gate a binary16 activation pipeline so every
+/// GEMM in the pipeline takes the F16 route together, or none do.
+bool DenseF16Window(std::uint32_t batch, std::uint32_t rows,
+                    std::uint32_t cols);
+
+/// The binary16-activation sibling of `Gemm`: runs the dense F16 WMMA GEMM
+/// directly on pre-narrowed F16 activations `xh` ([batch x cols]), skipping the
+/// FP32->F16 narrowing pass `Gemm` inserts. `out` is [batch x rows] F32.
+/// Returns false (launching nothing) when `type` is not Q8_0 or the shape is
+/// outside `DenseF16Window`, so the caller falls back to the FP32 `Gemm` path.
+/// Asynchronous on `stream`.
+bool GemmHalfIn(const void* base, GemvType type, std::uint32_t rows,
+                std::uint32_t cols, const __half* xh, float* out,
+                std::uint32_t batch, hipStream_t stream);
 
 /// Grouped MoE projection. For each token t and slot s in [0, n_expert_used),
 /// with e = ids[t*n_expert_used + s]:

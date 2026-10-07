@@ -248,6 +248,11 @@ public:
   std::int32_t* pf_tiles_dev_{nullptr};
   __half* pf_x_half_{nullptr};
   __half* pf_act_half_{nullptr};
+  // Wide-batch binary16 shared-FFN activation rows: the ffn-norm output and the
+  // geglu act, consumed directly by the dense F16 up/gate/down GEMMs so the
+  // FP32->F16 narrowing pass is skipped. Only used on the F16 dense route.
+  __half* pf_normed_half_{nullptr};
+  __half* pf_act_ffn_half_{nullptr};
   float* pf_expert_out_{nullptr};
   /// Prefill residual ping-pong: pf_cur_ alternates with pf_next_.
   float* pf_cur_{nullptr};

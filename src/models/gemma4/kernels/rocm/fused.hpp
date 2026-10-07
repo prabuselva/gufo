@@ -20,6 +20,15 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
                  hipStream_t stream);
 
+/// Binary16-output RMSNorm: the same reduction and scale as `RmsNormRows` (the
+/// sum-of-squares stays in double, the scale in float) but the row is stored as
+/// F16. The wide-batch shared-FFN path uses it so the following dense F16 GEMMs
+/// consume the normed activations directly, skipping the FP32->F16 narrowing
+/// pass and halving the normed-row traffic. `gamma` may be null (scale 1).
+void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
+                     std::uint32_t rows, std::uint32_t dim, float eps,
+                     hipStream_t stream);
+
 /// Single-row residual add fused with the following RMSNorm: `x += addend`,
 /// then `out = rmsnorm(x) * gamma`. Bit-identical to Add then RmsNormRows with
 /// rows == 1. `out` may alias `x`; `gamma` may be null (scale 1).
@@ -76,6 +85,12 @@ void GegluF16(const __half* gu, __half* act, std::size_t count,
 /// act[i] = gelu_tanh(gate[i]) * up[i] over `count` elements laid out as
 /// [rows][ff] rows in all three buffers.
 void GegluF32Separate(const float* gate, const float* up, float* act,
+                      std::size_t count, hipStream_t stream);
+
+/// Binary16-output shared-FFN geglu: reads the FP32 gate/up rows, stores the
+/// act row as F16 so the following dense F16 down GEMM consumes it directly
+/// (skipping the FP32->F16 narrowing pass and halving the act-row traffic).
+void GegluF16Separate(const float* gate, const float* up, __half* act,
                       std::size_t count, hipStream_t stream);
 
 }  // namespace gufo::models::gemma4::rocm

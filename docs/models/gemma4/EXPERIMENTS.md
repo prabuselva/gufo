@@ -445,3 +445,83 @@ Verdict: **retained** — production default, no extra switch. Throughput is
 neutral, so unlike the `ffn_down`/BF16 vec4 rejections (complexity added for a
 sub-noise gain) this is kept because it *removes* a buffer and a kernel launch:
 less VRAM and less code, matching franzmoca's structure.
+
+### 2026-10-07 — Binary16 shared-FFN activations (half norm + half GeGLU)
+Hypothesis: on the wide route the `Gemm` wrapper already narrows FP32
+activations to F16 (`NarrowHalf`) before `DenseF16Gemm`, so the shared-FFN
+inputs are F16 anyway. Producing them as F16 directly — `RmsNormRowsHalf` for
+the normed residual and `GegluF16Separate` for the act — removes three
+`NarrowHalf` passes and halves the normed/act writes, and feeding them through
+a new `GemmHalfIn` (which calls `DenseF16Gemm` directly, skipping the wrapper's
+narrowing) should be bit-identical and slightly faster.
+Change: `RmsNormRowsHalf` + `GegluF16Separate` (`kernels/rocm/fused.{hpp,
+hip.cpp}`); `DenseF16Window` + `GemmHalfIn` (`kernels/rocm/gemm.{hpp,
+hip.cpp}`); `pf_normed_half_`/`pf_act_ffn_half_` buffers and a gated shared-FFN
+branch (`kernels/rocm/executor.{hpp,cpp}`). The branch fires only for Q8_0 with
+both shapes inside `DenseF16Window` and `k % 32 == 0`, else the original FP32
+path runs unchanged. gate/up stay FP32 (GEMM F32 out, GeGLU reads F32); only the
+down-GEMM input and the normed input are F16. The `__float2half` rounding moved
+into the norm/GeGLU kernels is identical to `NarrowHalf`, so the GEMM inputs —
+and the whole prefill — are bit-identical.
+Measurement (t/s, exclusive GPU, both binaries in one session, run in BOTH
+orders to cancel thermal drift): pp2048 binary16 1966.97/1960.41 vs baseline
+1951.69/1944.71 (**+0.80 %**, wins both orders); pp8192 1790.57/1788.98 vs
+1777.25/1778.64 (**+0.67 %**, wins both orders); pp16384 1540.48/1514.14 vs
+1532.04/1526.21 (−0.12 %, split across orders, σ up to 12.7 → neutral).
+Quality: bit-identical greedy `output_sha256 =
+2669d2fd9f3b02843fccb1576f71359abdbb3e0db18e5d954880575d552a1b04` (pp512 tg128,
+`--speculative off`) == baseline; `gemma4.rocm_kernels` Passed.
+Verdict: **retained** — production default, no extra switch. A real,
+order-independent ~+0.7 % at pp2048/pp8192 and neutral at pp16384, plus strictly
+less memory traffic (three narrowing passes removed, two buffers halved) and the
+binary16-activation infrastructure for the deferred gate/up→half and attention
+work.
+
+### 2026-10-07 — Half-activation bit-identity: compiler `mul→cvt` fusion (fix)
+Follow-up to the binary16 shared-FFN entry above. That entry claimed
+`RmsNormRowsHalf` is bit-identical to `narrow(RmsNormRows)` because its
+`__float2half` rounding "is identical to `NarrowHalf`". A direct elementwise
+diff disproved it: the half kernel differed from `narrow(RmsNormRows)` on
+79 / 1 441 792 elements (~5e-5, half-ULP ties). The greedy pp512 hash still
+matched only because none of those 79 ties sat on a token boundary for the test
+prompt, so the shared-FFN change was *output-equivalent*, not bit-identical.
+Root cause: on gfx1151/clang the compiler fuses `mul.f32`→`cvt.f16.f32`, so
+`v * scale * g` is rounded to F16 once, whereas the FP32 baseline stores the
+float product and `NarrowHalf` rounds it again — a double rounding that differs
+from the fused single rounding at ties. `__half(float)`, `__float2half` and
+`__float2half_rn` are all `static_cast<_Float16>` on device
+(`amd_hip_fp16.h:463-466`), so the rounding *mode* is not the issue; the fused
+instruction is. `asm volatile("+f")` does not compile on gfx1151 ("invalid
+output constraint '+f'").
+Change: a `volatile float` temp between the product and the store forces the
+float to be materialized before `__float2half`, in every F16 store of
+`RmsNormKernelHalf` (gamma, no-gamma, scalar) and in `GegluSeparateHalfKernel`
+(the act store, which has the identical fused `mul→cvt` and the same float-act +
+`NarrowHalf` baseline). The norm's elementwise diff drops to 0 and the act store
+is fixed by the same construction, so the shared-FFN change is now bit-identical
+by construction, not just output-equivalent.
+Measurement: re-ran the shared-FFN A/B (A = shared-FFN + barrier vs HEAD,
+alternating order, reps3): pp2048 mean **+1.09 %** (positive all three rounds),
+pp8192 +0.16 %, pp16384 −0.40 % — the barrier does not erase the shared-FFN
+gain. Quality: `output_sha256 =
+2669d2fd9f3b02843fccb1576f71359abdbb3e0db18e5d954880575d552a1b04` == HEAD.
+Verdict: **retained** — a correctness fix, not a perf change. Any half-output
+kernel that must match a float-store+narrow baseline needs the volatile barrier;
+without it the "bit-identical" claim is only as strong as the test prompt.
+
+### 2026-10-07 — MoE input written as F16 by the pre-MoE norm (REJECTED)
+Hypothesis: the routed-MoE path narrows the pre-MoE norm output to F16
+(`NarrowActivations`) before the gate/up GEMM, exactly like the shared FFN.
+Having `RmsNormRowsHalf` write F16 directly into `pf_x_half_` and dropping that
+narrowing pass — the same trick as the shared-FFN entry — should remove one pass
+and be bit-identical and slightly faster.
+Change: `MoeBatch` took `const __half* x_half`, `NarrowActivations` was removed,
+and the pre-MoE norm switched to `RmsNormRowsHalf(..., pf_x_half_, ...)`.
+Measurement: without the barrier the change broke bit-identity (hash `312d68b6`
+≠ `2669d2fd`, greedy text drifted "freezing"→"flashing") — the same `mul→cvt`
+fusion as the entry above. With the barrier it returned to `2669d2fd`, but the
+clean alternating-order A/B showed it added ~0 on top of shared-FFN (neutral to
+negative at pp8192/pp16384, no pp2048 gain beyond shared-FFN's own ~+1 %).
+Verdict: **rejected** — reverted. It needs the barrier, changes the `MoeBatch`
+signature and adds a half-input buffer for no measurable gain over the
+shared-FFN change that already ships, so the narrowing pass stays.
