@@ -241,13 +241,11 @@ public:
   std::int32_t* pf_ids_{nullptr};
   float* pf_weights_{nullptr};
   std::uint32_t* pf_counts_{nullptr};
-  std::vector<std::uint32_t> counts_host_;
   std::int32_t* pf_pad_bounds_{nullptr};
   std::int32_t* pf_cursors_{nullptr};
   std::int32_t* pf_rows_token_{nullptr};
   std::int32_t* pf_rows_slot_{nullptr};
   std::int32_t* pf_tiles_dev_{nullptr};
-  std::vector<std::int32_t> tiles_host_;
   __half* pf_x_half_{nullptr};
   __half* pf_gu_half_{nullptr};
   __half* pf_act_half_{nullptr};
