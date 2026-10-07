@@ -322,7 +322,10 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   (Q8_K_XL, exclusive GPU, greedy): no MTP 38.22, MTP n=1 36.60, n=2 46.93,
   n=4 59.99 t/s (+57%). MTP is opt-in; committed tokens are the trunk's, so
   output stays on-target but is not bit-identical to non-spec greedy at long
-  range (batched verify; see QUALITY.md). Serve path still loads no draft.
+  range (batched verify; see QUALITY.md). Serve path wires the same MTP path
+  (`--speculative mtp --mtp-model`, opt-in) and supports `--sessions N`:
+  compute serializes on the shared executor while each session owns a private
+  KV cache, with `-c` divided across sessions to bound the combined KV.
 - M9: vision (`gemma4v`) — CPU-oracle foundation done. `vision/config.{hpp,cpp}`
   parses `clip.vision.*` + the `gemma4v` projector and locks the geometry
   (hidden 1152, heads 16, head_dim 72, layers 27, eps 1e-6, rope θ=100, merge 3,

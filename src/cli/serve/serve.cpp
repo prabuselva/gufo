@@ -675,8 +675,9 @@ parser.AddOption(
                      "Path to DeepSeek V4 Flash DSpark support GGUF file",
                      "Speculative", &dspark_model_path);
     parser.AddOption("", "--mtp-model", "PATH",
-                     "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
-                     "mtp-...-shared-*.gguf sidecar)",
+                     "Path to the MTP draft GGUF sidecar for --speculative mtp "
+                     "(Qwen3.8-Flash-Next mtp-...-shared-*.gguf, or the "
+                     "Gemma-4 mtp-*.gguf draft)",
                      "Speculative", &mtp_model_path);
     parser.AddOption(
         "-d", "--draft-tokens", "N",

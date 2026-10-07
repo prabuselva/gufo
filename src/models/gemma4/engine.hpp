@@ -51,9 +51,10 @@ struct ModelOptions {
 
 class Session;
 
-/// Gufo-owned API over the ROCm runtime: one resident trunk and one session
-/// with independent context state. The Gemma-4-26B-A4B executor serializes
-/// compute on shared scratch, so the model supports exactly one session.
+/// Gufo-owned API over the ROCm runtime: one resident trunk and one or more
+/// sessions with independent context state. The Gemma-4-26B-A4B executor
+/// serializes compute on shared scratch, so sessions run one at a time; each
+/// session owns a private KV cache sized to its context.
 class Model final : public std::enable_shared_from_this<Model> {
 public:
   ~Model();

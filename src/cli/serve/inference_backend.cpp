@@ -3296,11 +3296,18 @@ struct Gemma4ImageContext final : TextPromptContext {
 class Gemma4TextRunnerState final : public TextRunnerState {
  public:
   Gemma4TextRunnerState(const std::shared_ptr<Gemma4Model>& model,
-                        std::uint32_t max_context) {
+                        std::uint32_t max_context, bool use_mtp,
+                        std::uint32_t min_drafts, std::uint32_t max_drafts) {
     std::string error;
     session_ = model->CreateSession(max_context, &error);
     if (session_ == nullptr) {
       throw std::runtime_error("Failed to create Gemma-4 session: " + error);
+    }
+    // Serve decodes with MTP speculative decoding, so the draft cache must be
+    // filled during prefill. Enable it before the first Sync.
+    if (use_mtp) {
+      session_->SetMtpEnabled(true);
+      session_->SetDraftLimits(min_drafts, max_drafts);
     }
   }
 
@@ -3348,12 +3355,18 @@ const Gemma4TextRunnerState& RequireGemma4State(
 /// Serial runner for Gemma-4-26B-A4B. The model owns one shared executor
 /// (weights and scratch) plus one private context state per session; the pool
 /// creates up to the configured session count, each with a divided context
-/// window. Decode is single-token (no speculative drafting).
+/// window. Decode is single-token unless MTP speculative decoding is enabled,
+/// in which case each step drafts and verifies a block in one pass.
 class Gemma4TextRunner final : public TextModelRunner {
 public:
   Gemma4TextRunner(std::shared_ptr<Gemma4Model> model,
-                   std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+                   std::uint32_t max_context, bool use_mtp,
+                   std::uint32_t min_drafts, std::uint32_t max_drafts)
+      : model_(std::move(model)),
+        max_context_(max_context),
+        use_mtp_(use_mtp),
+        min_drafts_(min_drafts),
+        max_drafts_(max_drafts) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -3367,7 +3380,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0u,
                 .prefix_reuse = true,
@@ -3484,7 +3497,9 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<Gemma4TextRunnerState>(model_, max_context_);
+    return std::make_unique<Gemma4TextRunnerState>(model_, max_context_,
+                                                   use_mtp_, min_drafts_,
+                                                   max_drafts_);
   }
 
   void PreparePrefixReuse(
@@ -3580,6 +3595,41 @@ public:
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (!use_mtp_ || max_tokens == 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "Gemma-4 MTP decode budget must be at least one token");
+    }
+    auto& gemma = RequireGemma4State(state);
+    if (gemma.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    Gemma4Session::DecodeResult decoded;
+    std::string error;
+    if (!gemma.session().DecodeStep(max_tokens, sampler, &decoded, &error)) {
+      throw std::runtime_error("Gemma-4 MTP decode failed: " + error);
+    }
+    TextDecodeStep step;
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
+    gemma.set_position(gemma.session().Position());
+    step.draft_tokens = decoded.drafted;
+    step.draft_accepted_tokens = decoded.accepted;
+    return step;
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
@@ -3689,6 +3739,9 @@ private:
 
   std::shared_ptr<Gemma4Model> model_;
   std::uint32_t max_context_;
+  bool use_mtp_;
+  std::uint32_t min_drafts_;
+  std::uint32_t max_drafts_;
 };
 #endif
 
@@ -3990,9 +4043,17 @@ const TextDiskCacheConfig& disk_cache_config,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "gemma4") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
-               "Gemma-4 HTTP models do not support speculative decoding yet");
+               "Gemma-4 HTTP models support only MTP speculative decoding "
+               "(--speculative mtp --mtp-model)");
+      return false;
+    }
+    const bool use_mtp =
+        speculative_config.backend == TextSpeculativeBackend::kMtp;
+    if (use_mtp && speculative_config.draft_model_path.empty()) {
+      SetError(error, "Gemma-4 MTP speculative decoding requires --mtp-model");
       return false;
     }
     if (!models::gemma4::ValidateGgufTemplate(*reader, &load_error)) {
@@ -4003,7 +4064,8 @@ const TextDiskCacheConfig& disk_cache_config,
         model_path,
         models::gemma4::ModelOptions{
             .max_context = max_context,
-            .draft_path = "",
+            .draft_path = use_mtp ? speculative_config.draft_model_path
+                                  : std::string{},
             .vision_model_path = vision_model_path},
         &load_error);
     if (model == nullptr) {
@@ -4460,19 +4522,29 @@ bool InferenceBackend::load(
     SetError(error, "Gemma-4 model must not be null");
     return false;
   }
-  if (session_count != 1) {
-    SetError(error,
-             "Gemma-4 HTTP models serialize compute on a shared executor and "
-             "support exactly one session (--sessions 1)");
-    return false;
-  }
   if (max_context == 0 || max_context > model->MaxContext()) {
     SetError(error,
              "HTTP context exceeds the loaded Gemma-4 model context");
     return false;
   }
-  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
-    SetError(error, "Gemma-4 HTTP models do not support speculative decoding");
+  // Compute is serialized on the shared executor; each session owns a private
+  // KV cache, so the configured context is divided across the concurrent
+  // sessions to bound their combined KV footprint. A single session keeps the
+  // full window.
+  const auto per_session_context = static_cast<std::uint32_t>(
+      std::max<std::size_t>(1, max_context / session_count));
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != TextSpeculativeBackend::kMtp) {
+    SetError(error,
+             "Gemma-4 HTTP models support only MTP speculative decoding "
+             "(--speculative mtp --mtp-model)");
+    return false;
+  }
+  const bool use_mtp =
+      speculative_config.backend == TextSpeculativeBackend::kMtp;
+  if (use_mtp && !model->HasMtp()) {
+    SetError(error,
+             "Gemma-4 MTP speculative decoding requires an --mtp-model draft");
     return false;
   }
   if (DiskCacheEnabled(disk_cache_config)) {
@@ -4481,8 +4553,10 @@ bool InferenceBackend::load(
   }
   try {
     auto new_state = std::make_shared<Impl::State>();
-    auto runner =
-        std::make_shared<Gemma4TextRunner>(std::move(model), max_context);
+    auto runner = std::make_shared<Gemma4TextRunner>(
+        std::move(model), per_session_context, use_mtp,
+        speculative_config.min_draft_tokens,
+        speculative_config.max_draft_tokens);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);
