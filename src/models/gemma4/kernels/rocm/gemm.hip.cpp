@@ -179,6 +179,21 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
   }
 }
 
+bool DenseF16Window(std::uint32_t batch, std::uint32_t rows,
+                    std::uint32_t cols) {
+  return batch >= kDenseF16MinBatch && rows >= kDenseF16MinRows &&
+         cols <= kDenseF16MaxCols;
+}
+
+bool GemmHalfIn(const void* base, GemvType type, std::uint32_t rows,
+                std::uint32_t cols, const __half* xh, float* out,
+                std::uint32_t batch, hipStream_t stream) {
+  if (type != GemvType::kQ8_0 || !DenseF16Window(batch, rows, cols)) {
+    return false;
+  }
+  return DenseF16Gemm(base, xh, out, batch, rows, cols, stream);
+}
+
 void GemmMoe(const void* base, GemvType type, std::uint32_t rows,
              std::uint32_t cols, std::size_t row_bytes, const float* x,
              const std::int32_t* ids, float* out, std::uint32_t n_tokens,
