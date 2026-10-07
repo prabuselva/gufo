@@ -33,10 +33,15 @@ binary16 WMMA GEMM at wide batch; see [EXPERIMENTS.md](EXPERIMENTS.md)) lifts
 prefill ~10–13% at short context and ~2–7% at long context over the prior int8
 `mul_mat_q` build. The binary16 shared-FFN activation path added in `efd90672`
 (RMSNorm/GeGLU outputs stored as binary16 so the WMMA GEMMs consume half inputs
-directly) is bit-identical and performance-neutral: its controlled A/B is within
-±1%, and this table sits ~1–2% under the earlier `--repetitions 1` numbers
-purely from session/methodology variance — the unaffected decode row drifts by
-the same amount.
+directly) is bit-identical (output hash `2669d2fd…`) and within ~1% of its
+parent on a controlled A/B. These reps3 numbers run ~3–4% under the old
+`--repetitions 1` table at short context, but that is a methodology correction,
+not a regression: re-measuring the *same* `cdbf18a3` build the old table was
+taken on drops the same amount at reps3 (reps1 single-samples were optimistic),
+while the current build is ~3–4% *faster* than `cdbf18a3` at reps3 (gelu-tanh
+fusion + shared-FFN cumulative), the unaffected decode row matching across
+sessions (41.75 vs 41.59 t/s). The two effects nearly cancel, so the honest
+reps3 figure lands near the old optimistic reps1 figure.
 
 | pp | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
