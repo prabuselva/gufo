@@ -14,47 +14,56 @@ under `/home/praburaja/projects/llm/models/gguf/Gemma4-26B-A4B-IT/`.
 
 ```sh
 # Gufo
-build/release/gufo bench --model "$GUFO_GEMMA4_GGUF" --n-prompt 16384 --n-gen 128
+build/release/gufo bench --model "$GUFO_GEMMA4_GGUF" \
+  --n-prompt 512,1024,2048,4096,8192,16384,32768,65536,102400 --n-gen 128 \
+  --speculative off --repetitions 3
 # llama.cpp fork reference
 llama-bench -m "$GUFO_GEMMA4_GGUF" -p 512,1024,2048,4096,8192,16384,32768,65536,102400 -n 128
 ```
 
 ## Prefill (t/s)
 
-Matched exclusive-GPU sweep, `--repetitions 1`, greedy, Q8_K_XL. Reference:
-llama.cpp fork HIP build (`/tmp/llama-hip`, gfx1151, `-ngl 99`, flash attention
-on by default), build 843d57505 (unchanged). Gufo column re-measured
-2026-10-07 on the model-private dense-F16 WMMA route (Q8_0 dense projections
-decode to binary16 activations at wide batch; see
-[EXPERIMENTS.md](EXPERIMENTS.md)), lifting prefill ~10–13% at short context and
-~2–7% at long context over the prior int8 `mul_mat_q` build.
+Matched exclusive-GPU sweep, `--repetitions 3` (mean of 3 timed runs after a
+warmup; run-to-run spread ≤ ~18 t/s at pp512 and ≤ ~7 t/s elsewhere), greedy,
+Q8_K_XL. Reference: llama.cpp fork HIP build (`/tmp/llama-hip`, gfx1151,
+`-ngl 99`, flash attention on by default), build 843d57505 (unchanged). Gufo
+column re-measured 2026-10-07 on the committed binary `efd90672`: the
+model-private dense-F16 WMMA route (Q8_0 dense projections run through a
+binary16 WMMA GEMM at wide batch; see [EXPERIMENTS.md](EXPERIMENTS.md)) lifts
+prefill ~10–13% at short context and ~2–7% at long context over the prior int8
+`mul_mat_q` build. The binary16 shared-FFN activation path added in `efd90672`
+(RMSNorm/GeGLU outputs stored as binary16 so the WMMA GEMMs consume half inputs
+directly) is bit-identical and performance-neutral: its controlled A/B is within
+±1%, and this table sits ~1–2% under the earlier `--repetitions 1` numbers
+purely from session/methodology variance — the unaffected decode row drifts by
+the same amount.
 
 | pp | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| 512 | 1910.46 | 1219.75 | +56.6% |
-| 1024 | 1961.95 | 1235.00 | +58.9% |
-| 2048 | 1943.56 | 1181.73 | +64.5% |
-| 4096 | 1892.48 | 1149.99 | +64.6% |
-| 8192 | 1776.77 | 1019.03 | +74.4% |
-| 16384 | 1522.48 | 881.18 | +72.8% |
-| 32768 | 1200.98 | — | — |
-| 65536 | 842.24 | — | — |
-| 102400 | 634.82 | — | — |
+| 512 | 1916.35 | 1219.75 | +57.1% |
+| 1024 | 1933.58 | 1235.00 | +56.6% |
+| 2048 | 1934.99 | 1181.73 | +63.7% |
+| 4096 | 1882.23 | 1149.99 | +63.7% |
+| 8192 | 1733.34 | 1019.03 | +70.1% |
+| 16384 | 1488.44 | 881.18 | +68.9% |
+| 32768 | 1191.03 | — | — |
+| 65536 | 845.11 | — | — |
+| 102400 | 636.26 | — | — |
 
 The M11 WMMA flash-attention prefill kernel (`AttentionPrefillWmmaKernel`)
 replaced the scalar per-query head_dim dot-product kernel
 (`AttentionPrefillTiledKernel`, kept as the `AttentionPrefillScalar` oracle).
 Gufo now leads llama.cpp at every measured depth and the previously quadratic
-gap is gone: throughput falls only gently with context (1944 → 635 t/s from
+gap is gone: throughput falls only gently with context (1935 → 636 t/s from
 2K → 100K) because 25 of 30 layers are sliding-window (window 1024) and only
 the 5 full-attention layers (head_dim 512) grow quadratically. Versus the
-pre-M11 scalar path the same build is 2.01× faster at 512 rising to 9.46× at
-16384 (951 → 1910 and 161 → 1522).
+pre-M11 scalar path the same build is 2.01× faster at 512 rising to 9.24× at
+16384 (951 → 1916 and 161 → 1488).
 
 At 4K this is at the practical ceiling for a 4B-active MoE on gfx1151: the
 fully-optimized sibling `qwen3.6-35B-A3B` (3B active) reaches 2373 t/s
 (reference llama 2425); scaled by active params (×3/4) that predicts
-~1780 t/s for gemma4, and the dense-F16 route lifts gemma4 just past it (1892)
+~1780 t/s for gemma4, and the dense-F16 route lifts gemma4 just past it (1882)
 because gemma4 is the denser of the two (4B active of 26B, ~15%, vs 3B of 35B,
 ~9%), so its wide prefill spends a larger share in the dense projections the
 route accelerates. A pp4096 profile shows the remaining time is two WMMA GEMMs
