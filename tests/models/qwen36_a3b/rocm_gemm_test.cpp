@@ -47,8 +47,10 @@ struct Q8Matrix {
 
   float At(std::uint32_t r, std::uint32_t k) const {
     const std::uint32_t nb = cols / 32;
-    const float d = __half2float(scales[static_cast<std::size_t>(r) * nb + k / 32]);
-    return d * static_cast<float>(codes[static_cast<std::size_t>(r) * cols + k]);
+    const float d =
+        __half2float(scales[static_cast<std::size_t>(r) * nb + k / 32]);
+    return d *
+           static_cast<float>(codes[static_cast<std::size_t>(r) * cols + k]);
   }
 };
 
@@ -97,8 +99,8 @@ float Bf16BitsToFloat(std::uint16_t bits) {
 
 bool DenseQ8(std::uint32_t rows, std::uint32_t cols, std::uint32_t batch) {
   const Q8Matrix w = MakeQ8(rows, cols, 0x1234ABCDU);
-  const auto x = t::MakeValues(static_cast<std::size_t>(batch) * cols,
-                               0x0F0F0F0FU, 1.0F);
+  const auto x =
+      t::MakeValues(static_cast<std::size_t>(batch) * cols, 0x0F0F0F0FU, 1.0F);
   t::HipBuffer<std::uint8_t> d_w(w.bytes.size());
   t::CheckHip(hipMemcpy(d_w.get(), w.bytes.data(), w.bytes.size(),
                         hipMemcpyHostToDevice),
@@ -106,8 +108,8 @@ bool DenseQ8(std::uint32_t rows, std::uint32_t cols, std::uint32_t batch) {
   t::HipBuffer<float> d_x(x.size());
   t::Upload(&d_x, x);
   t::HipBuffer<float> d_out(static_cast<std::size_t>(batch) * rows);
-  q::Gemm(d_w.get(), q::GemvType::kQ8_0, rows, cols, 34, d_x.get(),
-          d_out.get(), batch, nullptr);
+  q::Gemm(d_w.get(), q::GemvType::kQ8_0, rows, cols, 34, d_x.get(), d_out.get(),
+          batch, nullptr);
   t::CheckHip(hipDeviceSynchronize(), "GemmQ8_0 sync");
   const auto got = t::Download(&d_out, static_cast<std::size_t>(batch) * rows);
 
@@ -126,10 +128,10 @@ bool DenseQ8(std::uint32_t rows, std::uint32_t cols, std::uint32_t batch) {
 }
 
 bool DenseF32(std::uint32_t rows, std::uint32_t cols, std::uint32_t batch) {
-  const auto w = t::MakeValues(static_cast<std::size_t>(rows) * cols,
-                               0x55556666U, 1.0F);
-  const auto x = t::MakeValues(static_cast<std::size_t>(batch) * cols,
-                               0x77778888U, 1.0F);
+  const auto w =
+      t::MakeValues(static_cast<std::size_t>(rows) * cols, 0x55556666U, 1.0F);
+  const auto x =
+      t::MakeValues(static_cast<std::size_t>(batch) * cols, 0x77778888U, 1.0F);
   t::HipBuffer<float> d_w(w.size());
   t::Upload(&d_w, w);
   t::HipBuffer<float> d_x(x.size());
@@ -158,18 +160,19 @@ bool DenseBf16(std::uint32_t rows, std::uint32_t cols, std::uint32_t batch) {
   std::vector<std::uint16_t> w(static_cast<std::size_t>(rows) * cols);
   std::uint32_t seed = 0x9A8B7C6DU;
   for (auto& value : w) {
-    const float f = 1.0F *
-                    static_cast<float>(
-                        static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
-                        32768) /
-                    32768.0F;
+    const float f =
+        1.0F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
     value = FloatToBf16Bits(f);
   }
-  const auto x = t::MakeValues(static_cast<std::size_t>(batch) * cols,
-                               0x2468ACE1U, 1.0F);
+  const auto x =
+      t::MakeValues(static_cast<std::size_t>(batch) * cols, 0x2468ACE1U, 1.0F);
   t::HipBuffer<std::uint16_t> d_w(w.size());
-  t::CheckHip(hipMemcpy(d_w.get(), w.data(), d_w.bytes(), hipMemcpyHostToDevice),
-              "upload bf16");
+  t::CheckHip(
+      hipMemcpy(d_w.get(), w.data(), d_w.bytes(), hipMemcpyHostToDevice),
+      "upload bf16");
   t::HipBuffer<float> d_x(x.size());
   t::Upload(&d_x, x);
   t::HipBuffer<float> d_out(static_cast<std::size_t>(batch) * rows);
@@ -198,8 +201,8 @@ bool DenseBf16(std::uint32_t rows, std::uint32_t cols, std::uint32_t batch) {
 bool MoeQ8(std::uint32_t rows, std::uint32_t cols, std::uint32_t experts,
            std::uint32_t used, std::uint32_t tokens) {
   const Q8Matrix w = MakeQ8(experts * rows, cols, 0x31415926U);
-  const auto x = t::MakeValues(static_cast<std::size_t>(tokens) * cols,
-                               0x27182818U, 1.0F);
+  const auto x =
+      t::MakeValues(static_cast<std::size_t>(tokens) * cols, 0x27182818U, 1.0F);
   std::vector<std::int32_t> ids(static_cast<std::size_t>(tokens) * used);
   std::uint32_t seed = 0xABCDEF01U;
   for (auto& id : ids) {
@@ -212,9 +215,9 @@ bool MoeQ8(std::uint32_t rows, std::uint32_t cols, std::uint32_t experts,
   t::HipBuffer<float> d_x(x.size());
   t::Upload(&d_x, x);
   t::HipBuffer<std::int32_t> d_ids(ids.size());
-  t::CheckHip(hipMemcpy(d_ids.get(), ids.data(), d_ids.bytes(),
-                        hipMemcpyHostToDevice),
-              "upload ids");
+  t::CheckHip(
+      hipMemcpy(d_ids.get(), ids.data(), d_ids.bytes(), hipMemcpyHostToDevice),
+      "upload ids");
   const std::size_t pairs = static_cast<std::size_t>(tokens) * used;
   t::HipBuffer<float> d_out(pairs * rows);
   q::GemmMoe(d_w.get(), q::GemvType::kQ8_0, rows, cols, 34, d_x.get(),
@@ -233,7 +236,8 @@ bool MoeQ8(std::uint32_t rows, std::uint32_t cols, std::uint32_t experts,
           acc += static_cast<double>(w.At(e * rows + r, k)) *
                  x[static_cast<std::size_t>(tb) * cols + k];
         }
-        ref[static_cast<std::size_t>(pair) * rows + r] = static_cast<float>(acc);
+        ref[static_cast<std::size_t>(pair) * rows + r] =
+            static_cast<float>(acc);
       }
     }
   }
@@ -245,28 +249,29 @@ bool MoeBf16(std::uint32_t rows, std::uint32_t cols, std::uint32_t experts,
   std::vector<std::uint16_t> w(static_cast<std::size_t>(experts) * rows * cols);
   std::uint32_t seed = 0x13579BDFU;
   for (auto& value : w) {
-    const float f = 1.0F *
-                    static_cast<float>(
-                        static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
-                        32768) /
-                    32768.0F;
+    const float f =
+        1.0F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
     value = FloatToBf16Bits(f);
   }
-  const auto x = t::MakeValues(static_cast<std::size_t>(tokens) * cols,
-                               0x9E3779B9U, 1.0F);
+  const auto x =
+      t::MakeValues(static_cast<std::size_t>(tokens) * cols, 0x9E3779B9U, 1.0F);
   std::vector<std::int32_t> ids(static_cast<std::size_t>(tokens) * used);
   for (auto& id : ids) {
     id = static_cast<std::int32_t>(t::NextRandom(&seed) % experts);
   }
   t::HipBuffer<std::uint16_t> d_w(w.size());
-  t::CheckHip(hipMemcpy(d_w.get(), w.data(), d_w.bytes(), hipMemcpyHostToDevice),
-              "upload bf16 moe");
+  t::CheckHip(
+      hipMemcpy(d_w.get(), w.data(), d_w.bytes(), hipMemcpyHostToDevice),
+      "upload bf16 moe");
   t::HipBuffer<float> d_x(x.size());
   t::Upload(&d_x, x);
   t::HipBuffer<std::int32_t> d_ids(ids.size());
-  t::CheckHip(hipMemcpy(d_ids.get(), ids.data(), d_ids.bytes(),
-                        hipMemcpyHostToDevice),
-              "upload ids");
+  t::CheckHip(
+      hipMemcpy(d_ids.get(), ids.data(), d_ids.bytes(), hipMemcpyHostToDevice),
+      "upload ids");
   const std::size_t pairs = static_cast<std::size_t>(tokens) * used;
   t::HipBuffer<float> d_out(pairs * rows);
   q::GemmMoe(d_w.get(), q::GemvType::kBF16, rows, cols, 2, d_x.get(),
@@ -286,7 +291,8 @@ bool MoeBf16(std::uint32_t rows, std::uint32_t cols, std::uint32_t experts,
                      w[(static_cast<std::size_t>(e) * rows + r) * cols + k])) *
                  x[static_cast<std::size_t>(tb) * cols + k];
         }
-        ref[static_cast<std::size_t>(pair) * rows + r] = static_cast<float>(acc);
+        ref[static_cast<std::size_t>(pair) * rows + r] =
+            static_cast<float>(acc);
       }
     }
   }
@@ -522,6 +528,11 @@ int main() {
     }
     bool ok = true;
     ok = DenseQ8(64, 2048, 5) && ok;
+    // Wide prefill batch on the real q_proj shape (4096 x 2048) trips the dense
+    // F16 WMMA route (batch >= 96, rows >= 2048, cols <= 4096); it is checked
+    // against the same double oracle. F16 is more accurate than the int8 mmq
+    // path, so the 1.5e-2 tolerance holds.
+    ok = DenseQ8(4096, 2048, 128) && ok;
     ok = DenseF32(64, 2048, 5) && ok;
     ok = DenseBf16(64, 2048, 5) && ok;
     ok = MoeQ8(64, 2048, 8, 2, 4) && ok;

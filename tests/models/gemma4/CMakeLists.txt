@@ -77,6 +77,14 @@ if (ENGINE_ENABLE_HIP)
     LABELS "gemma4;hip;gpu;gfx1151")
   add_dependencies(gemma4_tests gemma4_rocm_kernels_test)
 
+  # Standalone prefill-GEMM microbenchmark: the production int8 MMQ path
+  # against the model-private binary16 WMMA path (gemma4 DenseF16Gemm) on the
+  # six dense projections the trunk runs at pp2048. Not a CTest case; run it
+  # under tools/bench/gpu_exclusive.sh. See docs/models/gemma4/OPTIMIZATION_DIFF.md.
+  add_executable(gemma4_dense_f16_bench EXCLUDE_FROM_ALL dense_f16_bench.cpp)
+  target_link_libraries(gemma4_dense_f16_bench PRIVATE
+    gufo_gemma4_kernels gufo_qwen38_flash_next_mmq gufo_core)
+
   # End-to-end forward parity on the real artifact: prefill and decode logits
   # against the scalar oracle (<= 5e-3 abs, identical argmax). Skips (77)
   # without GUFO_GEMMA4_GGUF; needs the full GPU and ~28 GiB of VRAM.

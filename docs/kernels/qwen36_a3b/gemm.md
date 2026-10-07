@@ -10,7 +10,8 @@ always stay in their native encoding.
 
 | Encoding | Path |
 | --- | --- |
-| Q8_0 | `qfn_mmq_q8_0_dense` / `qfn_mmq_q8_0_moe_raw` — the shared MMQ tensor-core path from `src/models/qwen38_flash_next/kernels/rocm/mmq/` (CMake target `gufo_qwen38_flash_next_mmq`, header dir exported; documented with that model) |
+| Q8_0 (wide prefill) | `DenseF16Gemm` — model-private binary16 WMMA GEMM (`kernels/rocm/dense_f16_gemm.hip.cpp`, a verbatim copy of the gemma4 generic kernel, not linked across models), taken when `batch >= 96 && rows >= 2048 && cols <= 4096` (k % 32 == 0); activations narrowed to F16 in a growable `HalfScratch`. 1.32–1.46× the int8 path and 10–16× more accurate on the gated shapes (attn_q/ssm_qkv 8192×2048, ssm_gate 4096×2048, attn_out/ssm_out 2048×4096, shexp_down 2048×512) |
+| Q8_0 (else) | `qfn_mmq_q8_0_dense` / `qfn_mmq_q8_0_moe_raw` — the shared MMQ tensor-core path from `src/models/qwen38_flash_next/kernels/rocm/mmq/` (CMake target `gufo_qwen38_flash_next_mmq`, header dir exported; documented with that model). Decode/short-prompt and narrow projections (attn_k/v, shared gate/up, router) stay here |
 | F32 | `hipblasSgemm` (W stored row-major → `OP_T · OP_N`) |
 | BF16 | `NarrowBf16` of the activations + `hipblasGemmEx` (BF16 in, F32 out, `COMPUTE_32F`) |
 | MoE, non-Q8_0 | `MoeVecFallback<T>` (correctness path, not perf) |

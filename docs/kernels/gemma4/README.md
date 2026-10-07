@@ -24,7 +24,7 @@ F16 GEMM had the source's SwiGLU epilogues stripped.
 | --- | --- | --- |
 | [fused-ops.md](fused-ops.md) | `fused.hip.cpp` (338 lines) | norms, residual add, router, expert histogram, MoE combine, geglu |
 | [gemv.md](gemv.md) | `gemv.hip.cpp` (675 lines) | decode linear projections: Q8_0/F32/BF16 GEMV, grouped expert GEMV, multi-projection fusion, embedding row dequant |
-| [gemm.md](gemm.md) | `gemm.hip.cpp` (155 lines) | prefill linear projections: mmq Q8_0 dense, hipBLAS F32/BF16, MoE fallback |
+| [gemm.md](gemm.md) | `gemm.hip.cpp` (155 lines) + `dense_f16_gemm.hip.cpp` | prefill linear projections: model-private binary16 WMMA dense route (wide batch), mmq Q8_0 dense, hipBLAS F32/BF16, MoE fallback |
 | [routed-f16-moe.md](routed-f16-moe.md) | `routed_f16.hip.cpp` (800 lines) | production prefill MoE: bucket compaction + F16 WMMA routed expert GEMM |
 
 Attention kernels (WMMA flash prefill/decode over the two head_dim classes,
@@ -51,7 +51,7 @@ Dispatch rules inside the launchers:
 | `GemvGrouped` | Q8_0 / Q4_K / Q5_K specialized; F32/BF16 → `GemvGroupedDense<T>` |
 | `GemvGroupedPair` | Q8_0 only; returns false otherwise (caller runs two `GemvGrouped`) |
 | `GemvMulti` | n in [1,4]; Q8_0 subset folded into one `GemvQ8_0Multi4`, the rest as plain `Gemv` |
-| `Gemm` / `GemmMoe` | Q8_0 → `qfn_mmq_q8_0_dense` / `qfn_mmq_q8_0_moe_raw` (shared mmq target from `qwen38_flash_next`); F32 → hipBLAS SGEMM; BF16 → narrow + hipBLAS GemmEx; MoE non-Q8_0 → `MoeVecFallback` |
+| `Gemm` / `GemmMoe` | Q8_0 → model-private `DenseF16Gemm` when `batch >= 96 && rows >= 2048 && cols <= 4096`, else `qfn_mmq_q8_0_dense` / `qfn_mmq_q8_0_moe_raw` (shared mmq target from `qwen38_flash_next`); F32 → hipBLAS SGEMM; BF16 → narrow + hipBLAS GemmEx; MoE non-Q8_0 → `MoeVecFallback` |
 | `RoutedF16Gemm` | Q4_K/Q5_1/Q8_0/Q5_K/BF16; `tile_rows ∈ {16, 48, 64}`; exactly one of `out`/`out_half`; returns false on unsupported shape |
 
 ## Oracle tests

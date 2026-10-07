@@ -42,6 +42,15 @@ if (ENGINE_ENABLE_HIP)
     add_dependencies(qwen36_a3b_tests qwen36_a3b_${name}_test)
   endforeach()
 
+  # Standalone prefill-GEMM microbenchmark: the production int8 MMQ path
+  # against the model-private binary16 WMMA path (qwen36_a3b DenseF16Gemm) on
+  # the dense projections the trunk runs at pp2048. Not a CTest case; run it
+  # under tools/bench/gpu_exclusive.sh. See docs/models/gemma4/EXPERIMENTS.md.
+  add_executable(qwen36_a3b_dense_f16_bench EXCLUDE_FROM_ALL
+    dense_f16_bench.cpp)
+  target_link_libraries(qwen36_a3b_dense_f16_bench PRIVATE
+    gufo_qwen36_a3b_kernels gufo_qwen38_flash_next_mmq gufo_core)
+
   # End-to-end forward pass: the GPU executor's trunk and MTP logits must agree
   # with the scalar oracle over the real artifact. Skips (77) without the GGUF.
   add_executable(qwen36_a3b_rocm_forward_test EXCLUDE_FROM_ALL

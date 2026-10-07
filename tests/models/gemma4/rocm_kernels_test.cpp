@@ -449,37 +449,50 @@ bool TestNormsAndAdd() {
          ok;
 }
 
-bool TestGemm() {
-  constexpr std::uint32_t kRows = 64;
-  constexpr std::uint32_t kBatch = 8;
-  const auto x = t::MakeValues(static_cast<std::size_t>(kBatch) * kHidden,
+bool TestGemmShape(std::uint32_t rows, std::uint32_t batch, const char* label,
+                   float tol) {
+  const auto x = t::MakeValues(static_cast<std::size_t>(batch) * kHidden,
                                0x6E6E6E6EU, 1.0F);
-  const auto w8 = MakeQ8(kRows, kHidden, 0x7F7F7F7FU);
+  const auto w8 = MakeQ8(rows, kHidden, 0x7F7F7F7FU);
   t::HipBuffer<std::uint8_t> d_w(w8.bytes.size());
   t::CheckHip(hipMemcpy(d_w.get(), w8.bytes.data(), w8.bytes.size(),
                         hipMemcpyHostToDevice),
               "upload q8_0 matrix");
   t::HipBuffer<float> d_x(x.size());
   t::Upload(&d_x, x);
-  t::HipBuffer<float> d_out(static_cast<std::size_t>(kBatch) * kRows);
-  q::Gemm(d_w.get(), q::GemvType::kQ8_0, kRows, kHidden, 34 * (kHidden / 32),
-          d_x.get(), d_out.get(), kBatch, nullptr);
+  t::HipBuffer<float> d_out(static_cast<std::size_t>(batch) * rows);
+  q::Gemm(d_w.get(), q::GemvType::kQ8_0, rows, kHidden, 34 * (kHidden / 32),
+          d_x.get(), d_out.get(), batch, nullptr);
   t::CheckHip(hipDeviceSynchronize(), "Gemm synchronization");
-  const auto got =
-      t::Download(&d_out, static_cast<std::size_t>(kBatch) * kRows);
-  std::vector<float> ref(static_cast<std::size_t>(kBatch) * kRows);
-  for (std::uint32_t tok = 0; tok < kBatch; ++tok) {
-    for (std::uint32_t r = 0; r < kRows; ++r) {
+  const auto got = t::Download(&d_out, static_cast<std::size_t>(batch) * rows);
+  std::vector<float> ref(static_cast<std::size_t>(batch) * rows);
+  for (std::uint32_t tok = 0; tok < batch; ++tok) {
+    for (std::uint32_t r = 0; r < rows; ++r) {
       double acc = 0.0;
       for (std::uint32_t i = 0; i < kHidden; ++i) {
         acc += static_cast<double>(
                    w8.values[static_cast<std::size_t>(r) * kHidden + i]) *
                x[static_cast<std::size_t>(tok) * kHidden + i];
       }
-      ref[static_cast<std::size_t>(tok) * kRows + r] = static_cast<float>(acc);
+      ref[static_cast<std::size_t>(tok) * rows + r] = static_cast<float>(acc);
     }
   }
-  return Check("Gemm Q8_0 batch8", t::WorstRelativeToScale(ref, got), 2e-2);
+  return Check(label, t::WorstRelativeToScale(ref, got), tol);
+}
+
+bool TestGemm() {
+  bool ok = true;
+  // Narrow batch: below the dense F16 route's batch floor, so this exercises
+  // the int8 mmq dense path.
+  ok = TestGemmShape(64, 8, "Gemm Q8_0 batch8 (int8)", 2e-2) && ok;
+  // Wide batch at an FFN projection geometry (rows 2112, cols 2816) trips the
+  // model-private dense F16 WMMA route (rows >= 2048, cols <= 4096, batch >=
+  // 96). The F16 activation narrowing is the only error the route adds over the
+  // exact Q8_0 dequant, and it is smaller than the int8 path's per-block
+  // requantize, so the same 2e-2 contract holds (docs/models/gemma4/
+  // EXPERIMENTS.md).
+  ok = TestGemmShape(2112, 128, "Gemm Q8_0 batch128 (F16 route)", 2e-2) && ok;
+  return ok;
 }
 
 // Full routed MoE prefill pipeline at the artifact geometry: fused gate/up
@@ -885,7 +898,8 @@ bool TestAttention() {
                   "prefill V upload");
       t::HipBuffer<float> d_out(q.size());
       q::AttentionPrefillScalar(d_q.get(), d_kc.get(), d_vc.get(), d_out.get(),
-                                start, tokens, kHeads, kvh, hd, window, nullptr);
+                                start, tokens, kHeads, kvh, hd, window,
+                                nullptr);
       t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
       const auto got = t::Download(&d_out, q.size());
       std::vector<float> ref(q.size());
@@ -928,15 +942,17 @@ bool TestAttention() {
                  t::WorstRelativeToScale(ref, got), 1e-3) &&
            ok;
 
-      // WMMA fast path against the same double reference. The F32-Q oracle above
-      // holds 1e-3; this F16-Q tensor-core path is bounded by Q quantization
-      // through the unscaled (scale 1.0) softmax, which is extremely peaked (see
-      // rocm_forward_test.cpp), so the floor on the uniform fixture is ~2e-3.
-      // The same kernel reaches ~4e-4 on smooth data. 3e-3 leaves margin.
+      // WMMA fast path against the same double reference. The F32-Q oracle
+      // above holds 1e-3; this F16-Q tensor-core path is bounded by Q
+      // quantization through the unscaled (scale 1.0) softmax, which is
+      // extremely peaked (see rocm_forward_test.cpp), so the floor on the
+      // uniform fixture is ~2e-3. The same kernel reaches ~4e-4 on smooth data.
+      // 3e-3 leaves margin.
       t::HipBuffer<float> d_out_wmma(q.size());
       q::AttentionPrefill(d_q.get(), d_kc.get(), d_vc.get(), d_out_wmma.get(),
                           start, tokens, kHeads, kvh, hd, window, nullptr);
-      t::CheckHip(hipDeviceSynchronize(), "AttentionPrefillWmma synchronization");
+      t::CheckHip(hipDeviceSynchronize(),
+                  "AttentionPrefillWmma synchronization");
       const auto got_wmma = t::Download(&d_out_wmma, q.size());
       ok = Check(("AttentionPrefillWmma " + tag).c_str(),
                  t::WorstRelativeToScale(ref, got_wmma), 3e-3) &&

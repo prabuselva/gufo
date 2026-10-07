@@ -308,3 +308,106 @@ speedup on its ~3% slice lands below the noise floor — the same outcome as the
 `ffn_down` vec4-tail.
 Verdict: rejected — no production change, consistent with the `ffn_down` precedent
 of not carrying a path that does not clear noise. `GemvBf16` stays scalar.
+
+### 2026-10-07 — Reopen F16-WMMA dense: faster AND more accurate than int8
+Hypothesis: the M11 close-out (2026-10-06) rejected F16-WMMA dense "as not
+numerics-preserving" by generalizing a BF16 experiment (KL 0.066, vision max-abs
+5.45) and the sibling qwen3.6 conclusion. That conflates BF16 (8-bit mantissa)
+with binary16 (10-bit mantissa, ~100× finer). franzmoca's KL table separates
+them: Q8_1 0.74, BF16 0.066, **binary16 3.7e-5** — i.e. F16 is *more* accurate
+than the production int8 path, not less. Test the two levers directly at the
+kernel level: is the F16 WMMA GEMM faster, and is it more accurate, than the
+int8 `qfn_mmq_q8_0_dense` path gemma4 runs today?
+Change: standalone `tests/models/gemma4/dense_f16_bench.cpp` (CMake target
+`gemma4_dense_f16_bench`, EXCLUDE_FROM_ALL). Both kernels consume the same
+synthetic `block_q8_0` bytes; the int8 path takes FP32 activations, the F16 path
+(`qwen38_flash_next::rocm::DenseF16Gemm`, already built but never called by the
+gemma4 executor) takes their binary16 copy. Six dense projections the trunk runs
+per layer at pp2048, batch 2048, 4 rotating weight copies (streamed set > 32 MiB
+MALL), median of 15 hipEvent-timed reps, exclusive GPU. Error is worst
+scale-relative vs a double reference (dequantized weights × FP32 activations).
+Measurement (µs, exclusive GPU):
+
+    shape             int8_us     f16_us  speedup     int8_err      f16_err
+    q_proj_swa         2131.8     1516.8    1.41x    4.147e-03    2.661e-04
+    q_proj_full        4085.0     2990.6    1.37x    4.183e-03    3.242e-04
+    attn_out_swa       2292.8     1540.1    1.49x    3.181e-03    2.536e-04
+    attn_out_full      4472.6     5035.8    0.89x    4.162e-03    3.365e-04
+    ffn_gate_up        1150.7      851.0    1.35x    4.183e-03    2.814e-04
+    ffn_down           1253.8      773.5    1.62x    4.062e-03    3.051e-04
+
+F16 is **13–16× more accurate** than int8 on every shape (2.5–3.4e-4 vs
+3.2–4.2e-3) — the numerics objection is refuted at the kernel level, matching
+franzmoca's binary16 KL. F16 is also **faster on 5/6 shapes (1.35–1.62×)**; the
+dense-GEMM slice sums to 15387 → 12708 µs (**1.21×**), or **1.42×** excluding the
+one regression. The regression is `attn_out_full` (m=2816, k=8192) at 0.89× — a
+tile-selection gap in `DenseF16Gemm` for the m=2816 / large-k shape, exactly the
+case franzmoca special-cases. The int8 path also pays an FP32→Q8_1 requantize and
+an FP32 row write that F16 avoids, so the end-to-end dense win is ≥ the measured
+kernel win.
+Quality: F16 error is strictly below the int8 path's on all six shapes; no
+regression to guard.
+Verdict: **validated at kernel level — the "not numerics-preserving" rejection is
+withdrawn.** Next: route gemma4's dense Q8_0 projections through `DenseF16Gemm`
+and add the m=2816 tile, then confirm end-to-end prefill (pp2048/pp16384) and the
+`gemma4.rocm_forward` logit bar before making it production.
+
+### 2026-10-07 — Model-private F16 dense GEMM: production routing + cross-model port
+Hypothesis: the kernel-level win above generalizes to a production route on
+gemma4 and transfers to qwen3.6-35B-A3B, provided the kernel is **model-private**
+(copied into each model, not linked across models) and gated to the shape window
+where F16 actually beats int8. The prior entry's "add the m=2816 tile" plan is
+superseded: instead of chasing the one regressing tile, gate it out.
+Change: `DenseF16Gemm` is a generic template `DenseF16GEMMKernel<BM,BN,BK,WM,WN,
+kRowGroup>` with only the plain transposed-store epilogue (qwen38's fused
+attention/hc-mix/ssm-conv epilogues stripped so nothing is shared). It is copied
+verbatim into each trunk as `src/models/<model>/kernels/rocm/dense_f16_gemm.
+{hpp,hip.cpp}` — gemma4 and qwen36_a3b each own a private copy; **no cross-model
+link** (the only shared dense dependency stays the `gufo_qwen38_flash_next_mmq`
+int8 target). The `Gemm` Q8_0 case now routes to `DenseF16Gemm` under the
+crossover gate `batch >= 96 && rows >= 2048 && cols <= 4096` (k % 32 == 0),
+activations narrowed to binary16 in a growable `HalfScratch`, else falls through
+to `qfn_mmq_q8_0_dense` unchanged.
+Crossover rule (why the gate): F16 WMMA wins where arithmetic intensity is low
+enough that the int8 path's FP32→Q8_1 requantize + FP32 row write dominate, and
+loses where the reduction is deep enough that int8×int8→I32 tensor-core
+throughput wins. `cols <= 4096` excludes gemma4's `attn_out_full` (k=8192, the
+0.89× tile gap); `rows >= 2048` excludes narrow projections (attn_k/v, shared-
+expert gate/up, router) where the int8 GEMV-shaped tile is already optimal;
+`batch >= 96` matches wide prefill tiles (decode and short prompts stay on the
+byte-identical int8 path). qwen36_a3b has no dense projection with cols=8192, so
+the cap never wrongly excludes there.
+Measurement (µs, exclusive GPU, batch 2048, median of 15, worst scale-relative
+vs a double reference):
+gemma4 (production route, gate active):
+
+    shape             int8_us     f16_us  speedup     int8_err      f16_err
+    q_proj_swa         2131.8     1516.8    1.39x    4.147e-03    2.661e-04
+    q_proj_full        4085.0     2990.6    1.40x    4.183e-03    3.242e-04
+    attn_out_swa       2292.8     1540.1    1.48x    3.181e-03    2.536e-04
+    ffn_gate_up        1150.7      851.0    1.32x    4.183e-03    2.814e-04
+    ffn_down           1253.8      773.5    1.59x    4.062e-03    3.051e-04
+    (attn_out_full k=8192 gated out → int8, the 0.89× case)
+
+qwen36_a3b (same kernel, its own gated shapes):
+
+    shape             int8_us     f16_us  speedup     int8_err      f16_err
+    attn_q             3191.3     2281.6    1.40x    4.445e-03    3.123e-04
+    ssm_qkv            3206.1     2249.8    1.43x    4.445e-03    3.123e-04
+    ssm_gate           1719.2     1176.1    1.46x    4.042e-03    2.405e-04
+    attn_out           1806.2     1300.6    1.39x    3.575e-03    2.706e-04
+    ssm_out            1770.7     1252.4    1.41x    3.575e-03    2.706e-04
+    shexp_down          263.7      199.3    1.32x    3.539e-03    3.283e-04
+
+Every gated shape wins 1.32–1.59× and F16 error is 10–16× below int8 on both
+trunks (2.4–3.4e-4 vs 3.5–4.4e-3), confirming the win is a property of the
+shape window, not of one model.
+Quality: `gemma4.rocm_kernels` and `qwen36_a3b.rocm_gemm` each carry a wide-batch
+F16 case (gemma4 rows=2112/batch=128; qwen36_a3b 4096×2048/batch=128) that trips
+the gate and checks against the scalar oracle. For batch < 96 the int8 path is
+byte-identical (only a gated branch was added), so the forward/inference tests
+are unaffected; those need the GGUF + exclusive GPU and are the model-level gate.
+Verdict: **retained on both trunks** — production default for wide-prefill dense
+Q8_0, no extra switch. The reusable pattern: copy the generic kernel into the
+model, gate on `batch>=96 && rows>=2048 && cols<=4096`, keep int8 for everything
+else.

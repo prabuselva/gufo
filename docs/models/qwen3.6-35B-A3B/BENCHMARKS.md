@@ -13,6 +13,14 @@ conv+RMSNorm kernel (`feat/support_qwen36_35b_a3b`, `build/release/gufo`);
 GiB) on the native Q4_K/Q5_K routed-expert path; the reference cannot load it, so
 that section compares Q4 against the Q8 `gufo` column.
 
+The **gufo** prefill column was re-measured 2026-10-07 on the model-private
+dense-F16 WMMA route (Q8_0 dense projections decode to binary16 activations at
+wide batch, `batch >= 96`; see [EXPERIMENTS.md](EXPERIMENTS.md)), which lifts
+prefill ~5–10% over the `082a8432`-plus-fused-GDN build and closes most of the
+short-context gap to the reference (96 %→100 % at 512, 88 %→95 % at 16 K). The
+**reference** column is unchanged from the October 3 session (the reference tree
+does not carry the route). Decode is unaffected (batch 1 never trips the route).
+
 `gufo bench` is greedy argmax with no chat template (thinking off), 3
 repetitions, identical flags for both binaries. The `±` is the stddev over the
 timed repetitions. Measuring the reference on this machine rather than quoting
@@ -23,19 +31,19 @@ machine, so the same-machine ratios are lower than its self-reported ones.
 
 | Prefill prompt (tokens) | gufo (t/s) | reference (t/s) | ratio |
 | ---: | ---: | ---: | ---: |
-| 512 | 1585.5 ± 7.8 | 1648.1 ± 10.0 | 96 % |
-| 1024 | 2009.6 ± 4.4 | 2201.6 ± 6.1 | 91 % |
-| 2048 | 2203.1 ± 3.8 | 2403.3 ± 4.1 | 92 % |
-| 4096 | 2194.7 ± 3.8 | 2425.1 ± 2.2 | 90 % |
-| 8192 | 2077.8 ± 2.4 | 2341.1 ± 4.2 | 89 % |
-| 16384 | 1952.7 ± 1.7 | 2217.8 ± 1.7 | 88 % |
-| 32768 | 1703.3 ± 11.8 | 1941.7 ± 15.1 | 88 % |
-| 65536 | 1358.4 ± 6.7 | 1592.3 ± 1.1 | 85 % |
-| 102400 | 1114.7 ± 7.9 | 1331.4 ± 2.3 | 84 % |
+| 512 | 1656.6 ± 4.1 | 1648.1 ± 10.0 | 100 % |
+| 1024 | 2183.1 ± 5.3 | 2201.6 ± 6.1 | 99 % |
+| 2048 | 2377.1 ± 5.2 | 2403.3 ± 4.1 | 99 % |
+| 4096 | 2372.8 ± 6.3 | 2425.1 ± 2.2 | 98 % |
+| 8192 | 2254.0 ± 7.0 | 2341.1 ± 4.2 | 96 % |
+| 16384 | 2110.8 ± 1.8 | 2217.8 ± 1.7 | 95 % |
+| 32768 | 1866.3 ± 3.3 | 1941.7 ± 15.1 | 96 % |
+| 65536 | 1467.2 ± 27.3 | 1592.3 ± 1.1 | 92 % |
+| 102400 | 1186.2 ± 5.2 | 1331.4 ± 2.3 | 89 % |
 
 | Workload | gufo (t/s) | reference (t/s) | ratio |
 | --- | ---: | ---: | ---: |
-| tg128 (greedy, no MTP) | 44.87 ± 0.04 | 50.80 ± 0.04 | 88 % |
+| tg128 (greedy, no MTP) | 44.99 ± 0.08 | 50.80 ± 0.04 | 89 % |
 
 ## Qwen3.6-35B-A3B, UD-Q4_K_XL
 
@@ -47,6 +55,15 @@ load. The reference build cannot load this artifact, so there is **no reference
 column**; the comparison is Q4 against the Q8_K_XL `gufo` column above. Measured
 October 4, 2026 with `build/release/gufo`, 3 repetitions, same exclusive-GPU
 session and flags as the Q8 sweep.
+
+> **Not re-measured (2026-10-07).** The `Q4_K_XL` artifact is no longer on disk,
+> so this section stays as the October 4 historical comparison. The `Q8_K_XL
+> gufo` column shown here is the **pre-dense-F16-route** build (the same tree the
+> Q4 numbers were taken on, so the Q4/Q8 ratios below are internally consistent);
+> the current Q8 column in the table above is ~5–10 % higher on the F16 route.
+> The route accelerates the dense Q8_0 projections, which are the same tier in
+> the Q4 artifact, so re-measuring Q4 would lift it by a similar amount and the
+> Q4/Q8 ratios are approximately preserved.
 
 | Prefill prompt (tokens) | Q4_K_XL (t/s) | Q8_K_XL gufo (t/s) | Q4 / Q8 |
 | ---: | ---: | ---: | ---: |
@@ -94,11 +111,11 @@ exceeds the ~60 t/s target and the reference's measured bench MTP n=2 (63.41).
 ## Reading the numbers
 
 The production serving path (MTP, adaptive draft) meets the throughput target.
-On a strict like-for-like `gufo bench` basis measured on this machine, the
-reference is faster on every point; the gaps are kernel-efficiency differences,
-not methodology:
+On a strict like-for-like `gufo bench` basis measured on this machine, gufo is at
+parity at 512 and the reference stays ahead at depth; the residual gaps are
+kernel-efficiency differences, not methodology:
 
-- **Long-context prefill (96 % at 512 → 88 % at 16–32 K → 84 % at 100 K).** The
+- **Long-context prefill (100 % at 512 → 95 % at 16 K → 89 % at 100 K).** The
   earlier monotonic collapse (91 % → 68 %) is fixed. The dominant cause was not
   the attention kernel itself: every plain (non-speculative) prefill was still
   running the MTP draft layer through the scalar oracle attention
@@ -107,20 +124,20 @@ not methodology:
   off the WMMA path. The fix skips the draft entirely unless MTP is enabled
   (matching the reference, which gates the draft on the speculative session
   mode) and gives the draft an f16 mirror so that when MTP *is* enabled it uses
-  the same WMMA kernel as the trunk. That lifted pp16384 from 1515 to 1883 t/s
-  and flattened the curve; the fused GDN prefill conv+RMSNorm front-end
-  ([EXPERIMENTS.md](EXPERIMENTS.md)) adds ~1 % more, to a peak 2203 (pp2048)
-  and 1953 at 16 K (the table's gufo column). Hoisting the GDN decay/beta/q·k
-  out of the serial recurrence (prep kernels, [EXPERIMENTS.md](EXPERIMENTS.md))
-  adds a further ~2 % bit-exact, and prefetching the recurrence's critical-path
-  scalars one token ahead adds ~0.5 % more, so the current tree is ~2-3 % above
-  the table at every depth (prep measured pp2048 +3.4 %, pp16384 +2.8 %,
-pp102400 +1.6 %; prefetch +0.4-0.8 % on top). A separate routed-MoE lever
-   fuses the gate and up projections into one `RoutedF16GEMMKernel` launch over a
-   paired tile map (reads `x` once, drops the gate's F32 round trip), bit-exact and
-   worth a further +0.8 % (pp2048) to +1.7 % (pp102400) on top — see
-   [EXPERIMENTS.md](EXPERIMENTS.md) "Routed MoE fused gate+up". The
-   residual 88 % at 16384 is the remaining kernel-efficiency gap in the attention
+the same WMMA kernel as the trunk. That lifted pp16384 from 1515 to 1883 t/s
+   and flattened the curve; the fused GDN prefill conv+RMSNorm front-end
+   ([EXPERIMENTS.md](EXPERIMENTS.md)) adds ~1 % more. Hoisting the GDN
+   decay/beta/q·k out of the serial recurrence (prep kernels,
+   [EXPERIMENTS.md](EXPERIMENTS.md)) adds a further ~2 % bit-exact, prefetching
+   the recurrence's critical-path scalars one token ahead ~0.5 % more, and a
+   routed-MoE lever fuses the gate and up projections into one
+   `RoutedF16GEMMKernel` launch over a paired tile map (reads `x` once, drops the
+   gate's F32 round trip), bit-exact, worth +0.8 % (pp2048) to +1.7 % (pp102400)
+   — see [EXPERIMENTS.md](EXPERIMENTS.md) "Routed MoE fused gate+up". The latest
+   lever is the model-private **dense-F16 WMMA route** for the Q8_0 projections
+   (binary16 activations at `batch >= 96`), worth ~5–10 % prefill; the table's
+   gufo column now includes all of these (peak 2377 at pp2048, 2111 at 16 K). The
+   residual 95 % at 16384 is the remaining kernel-efficiency gap in the attention
    core. The reference's
   **head-major packed KV fast path** (`attention_wmma.hip`, gated to
   `batch_size >= 1024`) repacks each KV head into a contiguous `[context]
@@ -138,10 +155,10 @@ pp102400 +1.6 %; prefetch +0.4-0.8 % on top). A separate routed-MoE lever
   ablation of the production packed tile at 100 K confirms the attention core is
   now **WMMA-compute-bound** (S + PV matmuls ≈ 55 % of the kernel, global KV load
   only ≈ 5 %), so neither the repack nor a full-KV-group re-read cut can close
-  the gap; the residual widening past 16 K (88 % at 32 K → 85 % at 64 K → 84 % at
-  100 K) is matmul efficiency, not data movement. See [EXPERIMENTS.md](EXPERIMENTS.md)
-  and [OPTIMIZATIONS.md](OPTIMIZATIONS.md) "Prefill attention WMMA + row-split GDN".
-- **Greedy decode (88 %).** At 44.87 t/s the step moves ~3.07 GB of active
+the gap; the residual widening past 16 K (96 % at 32 K → 92 % at 64 K → 89 % at
+   100 K) is matmul efficiency, not data movement. See [EXPERIMENTS.md](EXPERIMENTS.md)
+   and [OPTIMIZATIONS.md](OPTIMIZATIONS.md) "Prefill attention WMMA + row-split GDN".
+ - **Greedy decode (89 %).** At 44.99 t/s the step moves ~3.07 GB of active
   weights/token, i.e. ~136 GB/s effective against the ~240 GB/s streaming peak
   (roofline ~78 t/s, [OPTIMIZATIONS.md](OPTIMIZATIONS.md)). The Q8_0 `lm_head`
   GEMV is at the DRAM ceiling (231 GB/s), but the grouped MoE and `lin_gemm_in`

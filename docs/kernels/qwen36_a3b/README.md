@@ -15,7 +15,7 @@ also Q4_K / Q5_K / Q5_1 through the F16 WMMA tier).
 | --- | --- | --- |
 | [fused-ops.md](fused-ops.md) | `kernels.hip.cpp` (1319 lines) | norms, RoPE, elementwise, router, MoE epilogue, GDN decode + prefill, attention decode + prefill |
 | [gemv.md](gemv.md) | `gemv.hip.cpp` (271 lines) | decode linear projections: Q8_0/F32/BF16 GEMV, grouped expert GEMV, embedding row dequant |
-| [gemm.md](gemm.md) | `gemm.hip.cpp` (151 lines) | prefill linear projections: mmq Q8_0 dense, hipBLAS F32/BF16, MoE fallback |
+| [gemm.md](gemm.md) | `gemm.hip.cpp` (151 lines) + `dense_f16_gemm.hip.cpp` | prefill linear projections: model-private binary16 WMMA dense route (wide batch), mmq Q8_0 dense, hipBLAS F32/BF16, MoE fallback |
 | [routed-f16-moe.md](routed-f16-moe.md) | `routed_f16.hip.cpp` (903 lines) | production prefill MoE: bucket compaction + F16 WMMA routed expert GEMM |
 
 ## Tier selection
@@ -39,7 +39,7 @@ Dispatch rules inside the launchers:
 | `AttentionDecode` | `head_dim == 256 && n_kv > 0` → split + combine (`splits = ceil(n_kv/64)`, cap 32); else 3-pass `AttentionDecodeKernel` |
 | `AttentionPrefill` | `head_dim <= 256` → `AttentionPrefillTiled`; else `AttentionPrefillNaive` |
 | `GdnDeltaLoop` | `kRows = 8`, template `kCols = head_dim / warpSize` (switch 1–8) |
-| `Gemm` / `GemmMoe` | Q8_0 → `qfn_mmq_*` (shared mmq target from `qwen38_flash_next`); F32 → hipBLAS SGEMM; BF16 → narrow + hipBLAS GemmEx; MoE non-Q8_0 → `MoeVecFallback` |
+| `Gemm` / `GemmMoe` | Q8_0 → model-private `DenseF16Gemm` when `batch >= 96 && rows >= 2048 && cols <= 4096`, else `qfn_mmq_*` (shared mmq target from `qwen38_flash_next`); F32 → hipBLAS SGEMM; BF16 → narrow + hipBLAS GemmEx; MoE non-Q8_0 → `MoeVecFallback` |
 | `RoutedF16Gemm` | Q4_K/Q5_K only at `tile_rows <= 48`; `tile_rows ∈ {16, 48, 64}`; returns false on unsupported shape (executor falls back to `GemmMoe`) |
 
 ## Decode stage profile (34.2 tps, 32 steps)
