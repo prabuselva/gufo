@@ -206,10 +206,10 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
       const double v = src[i];
       ss += v * v;
     }
-    const float scale = 1.0F / sqrtf(static_cast<float>(
-                                       BlockReduceSum(ss, reduce) /
-                                       static_cast<double>(head_dim)) +
-                                   eps);
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                        static_cast<double>(head_dim)) +
+                     eps);
     for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
       normed[i] = src[i] * scale * (q_norm != nullptr ? q_norm[i] : 1.0F);
       gate_out[static_cast<std::size_t>(b) * head_dim + i] = gate_src[i];
@@ -220,7 +220,7 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
       const std::uint32_t i = threadIdx.x;
       const float p = qwen::vision::RopePosition(rope, pos, i);
       const float freq = powf(theta, -2.0F * static_cast<float>(i) /
-                                        static_cast<float>(rotary_dim));
+                                         static_cast<float>(rotary_dim));
       const float angle = p * freq;
       const float c = cosf(angle);
       const float s = sinf(angle);
@@ -242,25 +242,25 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
       const double v = src[i];
       ss += v * v;
     }
-    const float scale = 1.0F / sqrtf(static_cast<float>(
-                                       BlockReduceSum(ss, reduce) /
-                                       static_cast<double>(head_dim)) +
-                                   eps);
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                        static_cast<double>(head_dim)) +
+                     eps);
     for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
       normed[i] = src[i] * scale * (k_norm != nullptr ? k_norm[i] : 1.0F);
     }
     __syncthreads();
     float* dst = k_out + static_cast<std::size_t>(hk) * head_dim;
     float* kc = k_cache + cache_base + static_cast<std::size_t>(hk) * head_dim;
-    __half* kc16 = k_cache_f16 != nullptr
-                       ? k_cache_f16 + cache_base +
-                             static_cast<std::size_t>(hk) * head_dim
-                       : nullptr;
+    __half* kc16 =
+        k_cache_f16 != nullptr
+            ? k_cache_f16 + cache_base + static_cast<std::size_t>(hk) * head_dim
+            : nullptr;
     if (threadIdx.x < half) {
       const std::uint32_t i = threadIdx.x;
       const float p = qwen::vision::RopePosition(rope, pos, i);
       const float freq = powf(theta, -2.0F * static_cast<float>(i) /
-                                        static_cast<float>(rotary_dim));
+                                         static_cast<float>(rotary_dim));
       const float angle = p * freq;
       const float c = cosf(angle);
       const float s = sinf(angle);
@@ -291,10 +291,10 @@ __global__ void FusedQKNormRoPEKvWriteKernel(
     const std::uint32_t hv = b - heads - kv_heads;
     const float* src = v_in + static_cast<std::size_t>(hv) * head_dim;
     float* vc = v_cache + cache_base + static_cast<std::size_t>(hv) * head_dim;
-    __half* vc16 = v_cache_f16 != nullptr
-                       ? v_cache_f16 + cache_base +
-                             static_cast<std::size_t>(hv) * head_dim
-                       : nullptr;
+    __half* vc16 =
+        v_cache_f16 != nullptr
+            ? v_cache_f16 + cache_base + static_cast<std::size_t>(hv) * head_dim
+            : nullptr;
     for (std::uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
       const float val = src[i];
       vc[i] = val;
@@ -489,20 +489,19 @@ __global__ void GdnNormQkKernel(const float* convolved, float* qn, float* kn,
   }
 }
 
-// Fused decode GDN front-end: the depthwise causal conv and the per-head RMSNorm
-// of the q and k groups in one launch. Each block owns one head (q, k or v) and
-// each thread owns one channel of that head, so the conv is the same per-channel
-// dot over the kernel taps plus the in-place history shift as GdnConvKernel. The
-// q and k blocks then reduce the head's convolved values with the identical
-// BlockReduceSum and blockDim (head_dim) as GdnNormQkKernel, so qn/kn are
-// bit-identical to the unfused conv + norm chain while the convolved q/k never
-// round-trips through global memory. The v block writes the convolved value the
-// delta recurrence consumes.
+// Fused decode GDN front-end: the depthwise causal conv and the per-head
+// RMSNorm of the q and k groups in one launch. Each block owns one head (q, k
+// or v) and each thread owns one channel of that head, so the conv is the same
+// per-channel dot over the kernel taps plus the in-place history shift as
+// GdnConvKernel. The q and k blocks then reduce the head's convolved values
+// with the identical BlockReduceSum and blockDim (head_dim) as GdnNormQkKernel,
+// so qn/kn are bit-identical to the unfused conv + norm chain while the
+// convolved q/k never round-trips through global memory. The v block writes the
+// convolved value the delta recurrence consumes.
 __global__ void GdnConvNormQkKernel(const float* qkv, const float* conv_w,
                                     float* history, float* convolved, float* qn,
                                     float* kn, std::uint32_t channels,
-                                    std::uint32_t kernel,
-                                    std::uint32_t k_heads,
+                                    std::uint32_t kernel, std::uint32_t k_heads,
                                     std::uint32_t head_dim, float eps) {
   __shared__ double reduce[32];
   const std::uint32_t head = blockIdx.x;
@@ -522,7 +521,8 @@ __global__ void GdnConvNormQkKernel(const float* qkv, const float* conv_w,
   if (head < 2U * k_heads) {
     const bool is_key = head >= k_heads;
     const std::uint32_t local = is_key ? head - k_heads : head;
-    float* dst = (is_key ? kn : qn) + static_cast<std::size_t>(local) * head_dim;
+    float* dst =
+        (is_key ? kn : qn) + static_cast<std::size_t>(local) * head_dim;
     const double ss = static_cast<double>(c) * c;
     const float scale =
         1.0f / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce)) + eps);

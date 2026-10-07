@@ -104,7 +104,7 @@ private:
 /// are built from the draft's own `rope_freqs`, which the KV-share contract
 /// keeps consistent with the trunk layer whose cache each draft layer reads.
 class DeviceDraft {
- public:
+public:
   ~DeviceDraft();
   DeviceDraft(const DeviceDraft&) = delete;
   DeviceDraft& operator=(const DeviceDraft&) = delete;
@@ -135,7 +135,7 @@ class DeviceDraft {
   }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
 
- private:
+private:
   DeviceDraft() = default;
 
   Config config_;

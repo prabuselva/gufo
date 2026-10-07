@@ -2,8 +2,6 @@
 // 96x96 gradient and checks they agree to full-precision tolerance. The device
 // path upcasts the BF16 mmproj weights to F32, so both paths compute in F32 and
 // agree to rounding. Skips (77) without GUFO_GEMMA4_MMPROJ_GGUF; needs the GPU.
-#include "src/models/gemma4/vision/encoder.hpp"
-
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/gemma4/vision/encoder.hpp"
 #include "src/models/gemma4/vision/reference.hpp"
 #include "src/models/gemma4/vision/weights.hpp"
 

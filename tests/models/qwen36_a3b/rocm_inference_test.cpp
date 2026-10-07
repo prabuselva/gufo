@@ -47,7 +47,7 @@ std::uint32_t ArgMax(const std::vector<float>& v) {
 
 // Greedy-decodes `steps` tokens from a starting logits vector, feeding each
 // sampled token back through `advance`. Returns the sampled token ids.
-template <typename Advance>
+template<typename Advance>
 std::vector<std::int32_t> Greedy(std::vector<float> logits, int steps,
                                  Advance&& advance) {
   std::vector<std::int32_t> tokens;
@@ -84,8 +84,7 @@ int main(int argc, char** argv) {
     std::cerr << "trunk bind failed: " << error << "\n";
     return 1;
   }
-  const auto tokenizer =
-      tok::QwenTokenizer::CreateFromGguf(*reader, &error);
+  const auto tokenizer = tok::QwenTokenizer::CreateFromGguf(*reader, &error);
   if (!tokenizer) {
     std::cerr << "tokenizer failed: " << error << "\n";
     return 1;
@@ -103,11 +102,11 @@ int main(int argc, char** argv) {
     std::cout << "  " << t << " " << tokenizer->DecodeTokenCopy(t) << "\n";
   }
 
-  const std::uint32_t max_context =
-      static_cast<std::uint32_t>(prompt.size()) + static_cast<std::uint32_t>(steps) + 8;
+  const std::uint32_t max_context = static_cast<std::uint32_t>(prompt.size()) +
+                                    static_cast<std::uint32_t>(steps) + 8;
 
-  // --- CPU oracle + GPU executor, interleaved prefill with per-step compare ---
-  // The forward test proves a 3-token prefill matches; this pinpoints which
+  // --- CPU oracle + GPU executor, interleaved prefill with per-step compare
+  // --- The forward test proves a 3-token prefill matches; this pinpoints which
   // prefill step (if any) diverges on the real prompt, and whether the bug is
   // in prefill or only in the decode loop.
   q36::ReferenceModel reference(*weights, max_context);
@@ -143,15 +142,15 @@ int main(int argc, char** argv) {
       std::cerr << "GPU prefill step " << i << " failed: " << error << "\n";
       return 1;
     }
-    test::CheckHip(hipMemcpy(gpu_logits.data(), executor->logits(),
-                             c.vocab_size * sizeof(float),
-                             hipMemcpyDeviceToHost),
-                   "download prefill logits");
+    test::CheckHip(
+        hipMemcpy(gpu_logits.data(), executor->logits(),
+                  c.vocab_size * sizeof(float), hipMemcpyDeviceToHost),
+        "download prefill logits");
     const std::uint32_t cpu_arg = ArgMax(ref_logits);
     const std::uint32_t gpu_arg = ArgMax(gpu_logits);
     const double worst = test::WorstRelative(ref_logits, gpu_logits, 1e-3);
-    std::cout << "prefill step " << i << " (token " << token << "): cpu_arg="
-              << cpu_arg << " gpu_arg=" << gpu_arg
+    std::cout << "prefill step " << i << " (token " << token
+              << "): cpu_arg=" << cpu_arg << " gpu_arg=" << gpu_arg
               << (cpu_arg == gpu_arg ? "  OK" : "  *** DIVERGED ***")
               << "  worst_rel=" << worst << "\n";
   }
@@ -166,10 +165,10 @@ int main(int argc, char** argv) {
         if (!executor->Step(*session, token, &error)) {
           return false;
         }
-        test::CheckHip(hipMemcpy(logits.data(), executor->logits(),
-                                 c.vocab_size * sizeof(float),
-                                 hipMemcpyDeviceToHost),
-                       "download gen logits");
+        test::CheckHip(
+            hipMemcpy(logits.data(), executor->logits(),
+                      c.vocab_size * sizeof(float), hipMemcpyDeviceToHost),
+            "download gen logits");
         return true;
       });
 
@@ -201,13 +200,12 @@ int main(int argc, char** argv) {
     const std::uint32_t cpu_arg = ArgMax(ref_logits);
     const std::uint32_t pf_arg = ArgMax(pf_logits);
     const double worst = test::WorstRelative(ref_logits, pf_logits, 1e-3);
-    std::cout << "\nbatched prefill: cpu_arg=" << cpu_arg << " pf_arg="
-              << pf_arg
+    std::cout << "\nbatched prefill: cpu_arg=" << cpu_arg
+              << " pf_arg=" << pf_arg
               << (cpu_arg == pf_arg ? "  OK" : "  *** DIVERGED ***")
               << "  worst_rel=" << worst << "\n";
     Expect(cpu_arg == pf_arg, "batched prefill argmax matches oracle");
-    Expect(pf_session->position() ==
-           static_cast<std::uint32_t>(prompt.size()),
+    Expect(pf_session->position() == static_cast<std::uint32_t>(prompt.size()),
            "batched prefill advanced position");
     // Decisive cross-check: compare the batched prefill directly against the
     // per-token GPU path (the original working path), not just the oracle. If
@@ -225,14 +223,16 @@ int main(int argc, char** argv) {
         if (!pf_executor->Step(*pf_session, token, &error)) {
           return false;
         }
-        test::CheckHip(hipMemcpy(logits.data(), pf_executor->logits(),
-                                 c.vocab_size * sizeof(float),
-                                 hipMemcpyDeviceToHost),
-                       "download batched-prefill gen logits");
+        test::CheckHip(
+            hipMemcpy(logits.data(), pf_executor->logits(),
+                      c.vocab_size * sizeof(float), hipMemcpyDeviceToHost),
+            "download batched-prefill gen logits");
         return true;
       });
-  std::cout << "prefill text: " << tokenizer->Decode(
-      std::vector<tok::TokenId>(pf_tokens.begin(), pf_tokens.end())) << "\n";
+  std::cout << "prefill text: "
+            << tokenizer->Decode(std::vector<tok::TokenId>(pf_tokens.begin(),
+                                                           pf_tokens.end()))
+            << "\n";
   Expect(pf_tokens.size() == cpu_tokens.size(),
          "batched-prefill token count matches oracle");
   for (std::size_t i = 0; i < std::min(pf_tokens.size(), cpu_tokens.size());
@@ -250,19 +250,21 @@ int main(int argc, char** argv) {
   std::cout << "\nGPU tokens: ";
   for (const std::int32_t t : gpu_tokens)
     std::cout << t << " ";
-  std::cout << "\n\nCPU text: " << tokenizer->Decode(
-      std::vector<tok::TokenId>(cpu_tokens.begin(), cpu_tokens.end()))
-            << "\nGPU text: " << tokenizer->Decode(
-      std::vector<tok::TokenId>(gpu_tokens.begin(), gpu_tokens.end()))
+  std::cout << "\n\nCPU text: "
+            << tokenizer->Decode(std::vector<tok::TokenId>(cpu_tokens.begin(),
+                                                           cpu_tokens.end()))
+            << "\nGPU text: "
+            << tokenizer->Decode(std::vector<tok::TokenId>(gpu_tokens.begin(),
+                                                           gpu_tokens.end()))
             << "\n";
 
   Expect(cpu_tokens.size() == gpu_tokens.size(), "token count matches");
   const std::size_t n = std::min(cpu_tokens.size(), gpu_tokens.size());
   for (std::size_t i = 0; i < n; ++i) {
     Expect(cpu_tokens[i] == gpu_tokens[i],
-           "token " + std::to_string(i) + " matches (cpu=" +
-               std::to_string(cpu_tokens[i]) + " gpu=" +
-               std::to_string(gpu_tokens[i]) + ")");
+           "token " + std::to_string(i) +
+               " matches (cpu=" + std::to_string(cpu_tokens[i]) +
+               " gpu=" + std::to_string(gpu_tokens[i]) + ")");
   }
 
   if (failures != 0) {

@@ -17,19 +17,19 @@ namespace gufo::models::gemma4::vision {
 /// head_dim (72); V is normalized weightlessly. `attn_post_norm` and
 /// `ffn_post_norm` normalize the branch output before the residual add.
 struct BlockWeights {
-  TensorRef ln1;            ///< [1152] pre-attention RMSNorm.
-  TensorRef attn_q;         ///< [1152 -> 1152].
-  TensorRef attn_k;         ///< [1152 -> 1152].
-  TensorRef attn_v;         ///< [1152 -> 1152].
-  TensorRef q_norm;         ///< [72] per-head RMSNorm.
-  TensorRef k_norm;         ///< [72] per-head RMSNorm.
-  TensorRef attn_out;       ///< [1152 -> 1152].
-  TensorRef attn_post_norm; ///< [1152].
-  TensorRef ln2;            ///< [1152] pre-FFN RMSNorm.
-  TensorRef ffn_gate;       ///< [1152 -> 4304].
-  TensorRef ffn_up;         ///< [1152 -> 4304].
-  TensorRef ffn_down;       ///< [4304 -> 1152].
-  TensorRef ffn_post_norm;  ///< [1152].
+  TensorRef ln1;             ///< [1152] pre-attention RMSNorm.
+  TensorRef attn_q;          ///< [1152 -> 1152].
+  TensorRef attn_k;          ///< [1152 -> 1152].
+  TensorRef attn_v;          ///< [1152 -> 1152].
+  TensorRef q_norm;          ///< [72] per-head RMSNorm.
+  TensorRef k_norm;          ///< [72] per-head RMSNorm.
+  TensorRef attn_out;        ///< [1152 -> 1152].
+  TensorRef attn_post_norm;  ///< [1152].
+  TensorRef ln2;             ///< [1152] pre-FFN RMSNorm.
+  TensorRef ffn_gate;        ///< [1152 -> 4304].
+  TensorRef ffn_up;          ///< [1152 -> 4304].
+  TensorRef ffn_down;        ///< [4304 -> 1152].
+  TensorRef ffn_post_norm;   ///< [1152].
 };
 
 /// The `gemma4v` vision tower bound from the mmproj sidecar. `patch_embed` is

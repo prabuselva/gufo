@@ -102,10 +102,11 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
       const float4 v = x4[i];
       ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
-    const float scale = 1.0F / sqrtf(static_cast<float>(
-                            BlockReduceSum(static_cast<double>(ss), reduce) /
-                            static_cast<double>(dim)) +
-                        eps);
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
     float4* orow = reinterpret_cast<float4*>(out + row * dim);
     if (gamma != nullptr) {
       const float4* g4 = reinterpret_cast<const float4*>(gamma);
@@ -155,10 +156,11 @@ __global__ void RmsNormKernelHalf(const float* x, const float* gamma,
       const float4 v = x4[i];
       ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
-    const float scale = 1.0F / sqrtf(static_cast<float>(
-                            BlockReduceSum(static_cast<double>(ss), reduce) /
-                            static_cast<double>(dim)) +
-                        eps);
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
     __half* orow = out + row * dim;
     // Materialize the product as a float before the F16 store: the compiler
     // otherwise fuses mul.f32 -> cvt.f16.f32 (one rounding), while the float
@@ -230,10 +232,11 @@ __global__ void FusedAddRmsNormKernel(float* x, const float* addend,
       x4[i] = sum;
       ss += sum.x * sum.x + sum.y * sum.y + sum.z * sum.z + sum.w * sum.w;
     }
-    const float scale = 1.0F / sqrtf(static_cast<float>(
-                            BlockReduceSum(static_cast<double>(ss), reduce) /
-                            static_cast<double>(dim)) +
-                        eps);
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
     float4* orow = reinterpret_cast<float4*>(out);
     if (gamma != nullptr) {
       const float4* g4 = reinterpret_cast<const float4*>(gamma);

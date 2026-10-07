@@ -372,8 +372,8 @@ __global__ void GemvQ8_0Vec4(const Q8_0Block* __restrict__ w,
     __builtin_memcpy(&packed, &row[blk].qs[word], 4);
     const float d = __half2float(row[blk].d);
     const std::uint32_t k = blk * 32U + word;
-    acc += d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) *
-           x[k];
+    acc +=
+        d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) * x[k];
     acc += d *
            static_cast<float>(static_cast<std::int8_t>((packed >> 8) & 0xFF)) *
            x[k + 1];
@@ -413,8 +413,8 @@ __global__ void GemvQ8_0Multi4Vec4(Multi4Args a, const float* __restrict__ x) {
     __builtin_memcpy(&packed, &row[blk].qs[word], 4);
     const float d = __half2float(row[blk].d);
     const std::uint32_t k = blk * 32U + word;
-    acc += d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) *
-           x[k];
+    acc +=
+        d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) * x[k];
     acc += d *
            static_cast<float>(static_cast<std::int8_t>((packed >> 8) & 0xFF)) *
            x[k + 1];

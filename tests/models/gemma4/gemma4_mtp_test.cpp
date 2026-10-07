@@ -90,7 +90,8 @@ void CheckDraftLogits(const std::vector<float>& oracle,
   for (std::size_t i = 0; i < oracle.size(); ++i) {
     const double d = std::fabs(oracle[i] - gpu[i]);
     worst_abs = std::max(worst_abs, d);
-    max_oracle = std::max(max_oracle, std::fabs(static_cast<double>(oracle[i])));
+    max_oracle =
+        std::max(max_oracle, std::fabs(static_cast<double>(oracle[i])));
   }
   std::vector<std::uint32_t> order(oracle.size());
   for (std::size_t i = 0; i < order.size(); ++i) {
@@ -156,13 +157,13 @@ int main() {
   std::cout << "uploaded trunk " << model->resident_bytes() / (1024U * 1024U)
             << " MiB\n";
 
-  const auto draft_reader = gufo::core::GgufReader::OpenFile(draft_path, &error);
+  const auto draft_reader =
+      gufo::core::GgufReader::OpenFile(draft_path, &error);
   if (draft_reader == nullptr) {
     std::cerr << "cannot open " << draft_path << ": " << error << "\n";
     return 1;
   }
-  const auto draft_weights =
-      g4::DraftWeights::Bind(*draft_reader, c, &error);
+  const auto draft_weights = g4::DraftWeights::Bind(*draft_reader, c, &error);
   if (!draft_weights.has_value()) {
     std::cerr << "draft bind failed: " << error << "\n";
     return 1;
@@ -190,8 +191,8 @@ int main() {
 
   // Prefill the trunk so the draft has a KV cache to read, then take the GPU
   // post-norm hidden as the shared draft input.
-  const std::vector<std::int32_t> prompt = {100, 200, 300, 400, 500, 600, 700,
-                                            800};
+  const std::vector<std::int32_t> prompt = {100, 200, 300, 400,
+                                            500, 600, 700, 800};
   const auto session = executor->CreateSession(max_context, &error);
   if (session == nullptr) {
     std::cerr << "session create failed: " << error << "\n";
@@ -237,14 +238,14 @@ int main() {
     std::cerr << "gpu draft step failed: " << error << "\n";
     return 1;
   }
-  t::CheckHip(hipMemcpy(gpu_draft_logits.data(), executor->draft_logits(),
-                        gpu_draft_logits.size() * sizeof(float),
-                        hipMemcpyDeviceToHost),
-              "draft logit download");
-  t::CheckHip(hipMemcpy(gpu_h_next.data(), executor->draft_h_next(),
-                        gpu_h_next.size() * sizeof(float),
-                        hipMemcpyDeviceToHost),
-              "draft hidden download");
+  t::CheckHip(
+      hipMemcpy(gpu_draft_logits.data(), executor->draft_logits(),
+                gpu_draft_logits.size() * sizeof(float), hipMemcpyDeviceToHost),
+      "draft logit download");
+  t::CheckHip(
+      hipMemcpy(gpu_h_next.data(), executor->draft_h_next(),
+                gpu_h_next.size() * sizeof(float), hipMemcpyDeviceToHost),
+      "draft hidden download");
   if (!oracle.DraftStep(*draft_weights, draft_token, gpu_hidden,
                         ref_draft_logits, ref_h_next, &error)) {
     std::cerr << "oracle draft step failed: " << error << "\n";
@@ -272,19 +273,19 @@ int main() {
   // session position is unchanged (the draft never writes KV), so the oracle
   // and GPU still read the same trunk cache.
   std::vector<float> gpu_hidden_chain = gpu_h_next;
-  if (!executor->DraftStep(*session, draft_token + 1,
-                           executor->draft_h_next(), &error)) {
+  if (!executor->DraftStep(*session, draft_token + 1, executor->draft_h_next(),
+                           &error)) {
     std::cerr << "gpu chained draft step failed: " << error << "\n";
     return 1;
   }
-  t::CheckHip(hipMemcpy(gpu_draft_logits.data(), executor->draft_logits(),
-                        gpu_draft_logits.size() * sizeof(float),
-                        hipMemcpyDeviceToHost),
-              "chained draft logit download");
-  t::CheckHip(hipMemcpy(gpu_h_next.data(), executor->draft_h_next(),
-                        gpu_h_next.size() * sizeof(float),
-                        hipMemcpyDeviceToHost),
-              "chained draft hidden download");
+  t::CheckHip(
+      hipMemcpy(gpu_draft_logits.data(), executor->draft_logits(),
+                gpu_draft_logits.size() * sizeof(float), hipMemcpyDeviceToHost),
+      "chained draft logit download");
+  t::CheckHip(
+      hipMemcpy(gpu_h_next.data(), executor->draft_h_next(),
+                gpu_h_next.size() * sizeof(float), hipMemcpyDeviceToHost),
+      "chained draft hidden download");
   if (!oracle.DraftStep(*draft_weights, draft_token + 1, gpu_hidden_chain,
                         ref_draft_logits, ref_h_next, &error)) {
     std::cerr << "oracle chained draft step failed: " << error << "\n";

@@ -645,7 +645,8 @@ std::shared_ptr<models::gemma4::Model> LoadGemma4Model(
   }
   std::string template_error;
   if (!models::gemma4::ValidateGgufTemplate(reader, &template_error)) {
-    std::cerr << "Unsupported Gemma-4 chat template: " << template_error << '\n';
+    std::cerr << "Unsupported Gemma-4 chat template: " << template_error
+              << '\n';
     PrintModelLoadTime(load_start, false);
     return nullptr;
   }
@@ -696,10 +697,9 @@ int GenerateGemma4Response(
     return 1;
   }
   session.Reset();
-  const bool synced =
-      vision_slots != nullptr && !vision_slots->empty()
-          ? session.Sync(prompt_tokens, *vision_slots, &error)
-          : session.Sync(prompt_tokens, &error);
+  const bool synced = vision_slots != nullptr && !vision_slots->empty()
+                          ? session.Sync(prompt_tokens, *vision_slots, &error)
+                          : session.Sync(prompt_tokens, &error);
   if (!synced) {
     std::cerr << "Gemma-4-26B-A4B prefill failed: " << error << '\n';
     return 1;
@@ -809,9 +809,8 @@ int RunGemma4Prompt(const PromptOptions& opt, const core::GgufReader& reader,
           {.role = "user",
            .content = opt.prompt_text,
            .image_count = static_cast<std::uint32_t>(images.size())});
-      auto prepared = model->EncodeChatVision(messages, {},
-                                              Gemma4ChatOptions(opt), images,
-                                              &error);
+      auto prepared = model->EncodeChatVision(
+          messages, {}, Gemma4ChatOptions(opt), images, &error);
       if (prepared.tokens.empty()) {
         std::cerr << "Gemma-4 vision prompt failed: " << error << '\n';
         return 1;
@@ -1035,9 +1034,8 @@ int GenerateQwen36A3BResponse(const PromptOptions& opt,
                               std::string* reply = nullptr) {
   if (prompt.empty() || prompt.size() >= session.ContextSize() ||
       opt.max_tokens > session.ContextSize() - prompt.size()) {
-    std::cerr
-        << "Qwen3.6-35B-A3B prompt and output exceed the 4096-token CLI "
-           "context\n";
+    std::cerr << "Qwen3.6-35B-A3B prompt and output exceed the 4096-token CLI "
+                 "context\n";
     return 1;
   }
   const std::vector<std::int32_t> input(prompt.begin(), prompt.end());

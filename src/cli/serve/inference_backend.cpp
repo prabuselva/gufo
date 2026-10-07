@@ -2771,8 +2771,7 @@ private:
 using Qwen36A3BModel = models::qwen36_a3b::Model;
 using Qwen36A3BSession = models::qwen36_a3b::Session;
 
-constexpr std::string_view kQwen36A3BStateAbi =
-    "qwen36-a3b-rocm-session-v1";
+constexpr std::string_view kQwen36A3BStateAbi = "qwen36-a3b-rocm-session-v1";
 
 std::vector<std::int32_t> Qwen36A3BEngineTokens(
     std::span<const TextRunnerToken> tokens) {
@@ -2792,8 +2791,7 @@ std::vector<std::int32_t> Qwen36A3BEngineTokens(
 class Qwen36A3BTextRunnerState final : public TextRunnerState {
 public:
   Qwen36A3BTextRunnerState(const std::shared_ptr<Qwen36A3BModel>& model,
-                           std::uint32_t max_context,
-                           std::uint32_t min_drafts,
+                           std::uint32_t max_context, std::uint32_t min_drafts,
                            std::uint32_t max_drafts) {
     std::string error;
     session_ = model->CreateSession(max_context, &error);
@@ -2874,25 +2872,25 @@ public:
     };
   }
 
-[[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-  std::size_t free_bytes = 0;
-  std::size_t total_bytes = 0;
-  std::optional<std::size_t> capacity;
-  if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-    const auto deferred = model_->DeferredScratchBytes();
-    capacity = free_bytes > deferred ? free_bytes - deferred : 0;
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      const auto deferred = model_->DeferredScratchBytes();
+      capacity = free_bytes > deferred ? free_bytes - deferred : 0;
+    }
+    // Each session owns its KV/recurrent/snapshot state; the executor scratch
+    // is shared and already allocated at model load, so reserve it once.
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = model_->SessionBytes(max_context_),
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = 0,
+        .requires_device_runtime_lock = true,
+    };
   }
-  // Each session owns its KV/recurrent/snapshot state; the executor scratch
-  // is shared and already allocated at model load, so reserve it once.
-  return {
-      .resident_weights_bytes = model_->ResidentBytes(),
-      .state_capacity_bytes = capacity,
-      .per_request_state_bytes = model_->SessionBytes(max_context_),
-      .temporary_scratch_bytes = 0,
-      .retained_snapshot_capacity_bytes = 0,
-      .requires_device_runtime_lock = true,
-  };
-}
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
     return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
@@ -2939,8 +2937,7 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     return std::make_unique<Qwen36A3BTextRunnerState>(model_, max_context_,
-                                                      min_drafts_,
-                                                      max_drafts_);
+                                                      min_drafts_, max_drafts_);
   }
 
   void PreparePrefixReuse(
@@ -2962,8 +2959,7 @@ public:
           "Qwen3.6-35B-A3B prefill offset does not match retained state");
     }
     if (offset >= prompt.size()) {
-      throw std::logic_error(
-          "Qwen3.6-35B-A3B prefill has no remaining input");
+      throw std::logic_error("Qwen3.6-35B-A3B prefill has no remaining input");
     }
     const std::size_t consumed =
         std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
@@ -2989,8 +2985,7 @@ public:
     }
     const auto logits = q36.session().Logits();
     if (logits.empty()) {
-      throw std::runtime_error(
-          "Qwen3.6-35B-A3B token selection has no logits");
+      throw std::runtime_error("Qwen3.6-35B-A3B token selection has no logits");
     }
     const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
     if (model_->IsStopToken(token)) {
@@ -3095,8 +3090,7 @@ std::vector<std::int32_t> Gemma4EngineTokens(
   for (const TextRunnerToken token : tokens) {
     if (token > static_cast<TextRunnerToken>(
                     std::numeric_limits<std::int32_t>::max())) {
-      throw std::invalid_argument(
-          "Gemma-4 token ID exceeds engine range");
+      throw std::invalid_argument("Gemma-4 token ID exceeds engine range");
     }
     converted.push_back(static_cast<std::int32_t>(token));
   }
@@ -3108,7 +3102,7 @@ struct Gemma4ImageContext final : TextPromptContext {
 };
 
 class Gemma4TextRunnerState final : public TextRunnerState {
- public:
+public:
   Gemma4TextRunnerState(const std::shared_ptr<Gemma4Model>& model,
                         std::uint32_t max_context, bool use_mtp,
                         std::uint32_t min_drafts, std::uint32_t max_drafts) {
@@ -3138,12 +3132,12 @@ class Gemma4TextRunnerState final : public TextRunnerState {
       std::shared_ptr<const Gemma4ImageContext> context) noexcept {
     vision_context_ = std::move(context);
   }
-  [[nodiscard]] const std::shared_ptr<const Gemma4ImageContext>& vision_context()
-      const noexcept {
+  [[nodiscard]] const std::shared_ptr<const Gemma4ImageContext>&
+  vision_context() const noexcept {
     return vision_context_;
   }
 
- private:
+private:
   std::unique_ptr<Gemma4Session> session_;
   std::shared_ptr<const Gemma4ImageContext> vision_context_;
   std::size_t position_{0};
@@ -3157,8 +3151,7 @@ Gemma4TextRunnerState& RequireGemma4State(TextRunnerState& state) {
   return *gemma;
 }
 
-const Gemma4TextRunnerState& RequireGemma4State(
-    const TextRunnerState& state) {
+const Gemma4TextRunnerState& RequireGemma4State(const TextRunnerState& state) {
   const auto* gemma = dynamic_cast<const Gemma4TextRunnerState*>(&state);
   if (gemma == nullptr) {
     throw std::logic_error("text runner state is not Gemma-4");
@@ -3311,9 +3304,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<Gemma4TextRunnerState>(model_, max_context_,
-                                                   use_mtp_, min_drafts_,
-                                                   max_drafts_);
+    return std::make_unique<Gemma4TextRunnerState>(
+        model_, max_context_, use_mtp_, min_drafts_, max_drafts_);
   }
 
   void PreparePrefixReuse(
@@ -3321,8 +3313,7 @@ public:
       std::span<const TextRunnerToken> prefix) const override {
     const auto& gemma = RequireGemma4State(state);
     if (gemma.position() != prefix.size()) {
-      throw std::logic_error(
-          "Gemma-4 reused prefix does not match checkpoint");
+      throw std::logic_error("Gemma-4 reused prefix does not match checkpoint");
     }
   }
 
@@ -3546,7 +3537,8 @@ private:
     std::vector<std::uint8_t> identity;
     identity.reserve(8);
     for (int byte = 0; byte < 8; ++byte) {
-      identity.push_back(static_cast<std::uint8_t>((hash >> (byte * 8)) & 0xFF));
+      identity.push_back(
+          static_cast<std::uint8_t>((hash >> (byte * 8)) & 0xFF));
     }
     return identity;
   }
@@ -3645,10 +3637,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
-const TextDiskCacheConfig& disk_cache_config,
-                             const std::string& vision_model_path,
-                             std::uint32_t attn_window,
-                             std::uint32_t attn_sink) {
+                            const TextDiskCacheConfig& disk_cache_config,
+                            const std::string& vision_model_path,
+                            std::uint32_t attn_window,
+                            std::uint32_t attn_sink) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3835,8 +3827,8 @@ const TextDiskCacheConfig& disk_cache_config,
         model_path,
         models::gemma4::ModelOptions{
             .max_context = max_context,
-            .draft_path = use_mtp ? speculative_config.draft_model_path
-                                  : std::string{},
+            .draft_path =
+                use_mtp ? speculative_config.draft_model_path : std::string{},
             .vision_model_path = vision_model_path},
         &load_error);
     if (model == nullptr) {
@@ -4180,12 +4172,13 @@ bool InferenceBackend::load(
   }
 }
 
-bool InferenceBackend::load(
-    std::shared_ptr<models::qwen36_a3b::Model> model, std::string* error,
-    std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
-    TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+bool InferenceBackend::load(std::shared_ptr<models::qwen36_a3b::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.6-35B-A3B model must not be null");
     return false;
@@ -4253,19 +4246,19 @@ bool InferenceBackend::load(
   }
 }
 
-bool InferenceBackend::load(
-    std::shared_ptr<models::gemma4::Model> model, std::string* error,
-    std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
-    TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config) {
   if (model == nullptr) {
     SetError(error, "Gemma-4 model must not be null");
     return false;
   }
   if (max_context == 0 || max_context > model->MaxContext()) {
-    SetError(error,
-             "HTTP context exceeds the loaded Gemma-4 model context");
+    SetError(error, "HTTP context exceeds the loaded Gemma-4 model context");
     return false;
   }
   // Compute is serialized on the shared executor; each session owns a private

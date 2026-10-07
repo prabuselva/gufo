@@ -118,11 +118,12 @@ void GdnNormQk(const float* convolved, float* qn, float* kn,
 
 /// Fused decode front-end: `GdnConv` followed by `GdnNormQk` in one launch. The
 /// conv reads `qkv`/`conv_w` and advances `history` in place exactly as
-/// `GdnConv`; the q and k groups are RMS-normalized into `qn`/`kn` bit-identical
-/// to `GdnNormQk` (same `BlockReduceSum`, `blockDim == head_dim`), and the value
-/// group is written to `convolved` for the delta recurrence. The convolved q/k
-/// halves are consumed in-kernel and never materialized. Requires
-/// `channels == (2 * k_heads + v_heads) * head_dim` and `head_dim <= 1024`.
+/// `GdnConv`; the q and k groups are RMS-normalized into `qn`/`kn`
+/// bit-identical to `GdnNormQk` (same `BlockReduceSum`, `blockDim ==
+/// head_dim`), and the value group is written to `convolved` for the delta
+/// recurrence. The convolved q/k halves are consumed in-kernel and never
+/// materialized. Requires `channels == (2 * k_heads + v_heads) * head_dim` and
+/// `head_dim <= 1024`.
 void GdnConvNormQk(const float* qkv, const float* conv_w, float* history,
                    float* convolved, float* qn, float* kn,
                    std::uint32_t channels, std::uint32_t kernel,

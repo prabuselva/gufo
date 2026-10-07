@@ -488,13 +488,11 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
         continue;
       }
       const std::size_t n = static_cast<std::size_t>(end - begin) * hidden;
-      if (hipMemcpyAsync(pf_cur_ + static_cast<std::size_t>(begin - start) *
-                                          hidden,
-                         image.rows + static_cast<std::size_t>(begin -
-                                                               image.offset) *
-                                          hidden,
-                         n * sizeof(float), hipMemcpyDeviceToDevice) !=
-          hipSuccess) {
+      if (hipMemcpyAsync(
+              pf_cur_ + static_cast<std::size_t>(begin - start) * hidden,
+              image.rows +
+                  static_cast<std::size_t>(begin - image.offset) * hidden,
+              n * sizeof(float), hipMemcpyDeviceToDevice) != hipSuccess) {
         return Fail(error_msg, "image embedding splice failed");
       }
     }
@@ -604,18 +602,17 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   if (ffn_half) {
     RmsNormRowsHalf(pf_attn_out_, l.ffn_norm.f32(), pf_normed_half_, tokens,
                     hidden, c.rms_eps, nullptr);
-    const bool ok =
-        GemmHalfIn(l.ffn_up.data, ft, c.ffn_length, hidden, pf_normed_half_,
-                   pf_up_, tokens, nullptr) &&
-        GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden, pf_normed_half_,
-                   pf_gate_, tokens, nullptr);
+    const bool ok = GemmHalfIn(l.ffn_up.data, ft, c.ffn_length, hidden,
+                               pf_normed_half_, pf_up_, tokens, nullptr) &&
+                    GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden,
+                               pf_normed_half_, pf_gate_, tokens, nullptr);
     if (!ok) {
       return Fail(error_msg, "shared FFN up/gate GEMM failed");
     }
     GegluF16Separate(pf_gate_, pf_up_, pf_act_ffn_half_, rows * c.ffn_length,
                      nullptr);
-    if (!GemmHalfIn(l.ffn_down.data, ft, hidden, c.ffn_length,
-                    pf_act_ffn_half_, pf_mlp_, tokens, nullptr)) {
+    if (!GemmHalfIn(l.ffn_down.data, ft, hidden, c.ffn_length, pf_act_ffn_half_,
+                    pf_mlp_, tokens, nullptr)) {
       return Fail(error_msg, "shared FFN down GEMM failed");
     }
   } else {
@@ -735,7 +732,8 @@ bool Executor::AttachDraft(const DeviceDraft& draft, std::string* error_msg) {
   if (!GemvTypeOf(draft.pre_projection().type, &pt) ||
       !GemvTypeOf(draft.post_projection().type, &pt) ||
       !GemvTypeOf(draft.token_embd().type, &pt)) {
-    return Fail(error_msg, "draft projection type unsupported by the GEMV tier");
+    return Fail(error_msg,
+                "draft projection type unsupported by the GEMV tier");
   }
   const std::uint32_t hidden_out = c_.hidden_size;
   const std::uint32_t hidden = dc.hidden_size;
@@ -796,8 +794,8 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
   if (!GemvTypeOf(model_.token_embd().type, &emb_type)) {
     return Fail(error_msg, "unsupported token embedding type");
   }
-  EmbedRow(model_.token_embd().data, emb_type, static_cast<std::uint32_t>(token),
-           hidden_out, d_xh_, nullptr);
+  EmbedRow(model_.token_embd().data, emb_type,
+           static_cast<std::uint32_t>(token), hidden_out, d_xh_, nullptr);
   ScaleInPlace(d_xh_, std::sqrt(static_cast<float>(hidden_out)), hidden_out,
                nullptr);
   if (hipMemcpyAsync(d_xh_ + hidden_out, h, hidden_out * sizeof(float),
@@ -961,10 +959,9 @@ bool Executor::Verify(Session& session, std::int32_t t0,
                    static_cast<std::size_t>(rows) * c.vocab_size, nullptr);
   }
   // A full accept continues from row k, so leave h_out() at that hidden.
-  if (hipMemcpyAsync(h_out_,
-                     verify_hidden_ + static_cast<std::size_t>(k) * hidden,
-                     hidden * sizeof(float), hipMemcpyDeviceToDevice) !=
-      hipSuccess) {
+  if (hipMemcpyAsync(
+          h_out_, verify_hidden_ + static_cast<std::size_t>(k) * hidden,
+          hidden * sizeof(float), hipMemcpyDeviceToDevice) != hipSuccess) {
     return Fail(error_msg, "hidden state copy failed");
   }
   session.position_ += rows;

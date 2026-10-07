@@ -16,7 +16,7 @@ namespace gufo::models::gemma4::vision {
 /// pixels in [0,1] with nx/ny multiples of patch*merge, output row-major
 /// [n_tokens x projection_dim].
 class Encoder {
- public:
+public:
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
@@ -34,7 +34,7 @@ class Encoder {
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] std::size_t resident_bytes() const noexcept;
 
- private:
+private:
   struct Impl;
   explicit Encoder(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;

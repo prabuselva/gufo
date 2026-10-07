@@ -38,7 +38,8 @@ __global__ void Im2ColKernel(const float* __restrict__ pixels,
   patchmat[idx] = raw * 2.0F - 1.0F;
 }
 
-__global__ void PosAddKernel(float* __restrict__ h, const float* __restrict__ px,
+__global__ void PosAddKernel(float* __restrict__ h,
+                             const float* __restrict__ px,
                              const float* __restrict__ py, std::uint32_t n_px,
                              std::uint32_t emb, std::size_t total) {
   const std::size_t idx =
@@ -95,7 +96,8 @@ __global__ void GegluQuickKernel(const float* __restrict__ gate,
   act[idx] = GeluQuick(gate[idx]) * up[idx];
 }
 
-__global__ void StdNormKernel(float* __restrict__ x, const float* __restrict__ bias,
+__global__ void StdNormKernel(float* __restrict__ x,
+                              const float* __restrict__ bias,
                               const float* __restrict__ scale,
                               std::uint32_t emb, std::size_t total) {
   const std::size_t idx =

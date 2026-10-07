@@ -257,12 +257,10 @@ bool TestMulti() {
     return false;
   }
   t::CheckHip(hipDeviceSynchronize(), "GemvQ8_0Multi4 synchronization");
-  const bool ok = t::Download(&d_ref_a, kRowsA) ==
-                      t::Download(&d_out_a, kRowsA) &&
-                  t::Download(&d_ref_b, kRowsB) ==
-                      t::Download(&d_out_b, kRowsB) &&
-                  t::Download(&d_ref_c, kRowsC) ==
-                      t::Download(&d_out_c, kRowsC);
+  const bool ok =
+      t::Download(&d_ref_a, kRowsA) == t::Download(&d_out_a, kRowsA) &&
+      t::Download(&d_ref_b, kRowsB) == t::Download(&d_out_b, kRowsB) &&
+      t::Download(&d_ref_c, kRowsC) == t::Download(&d_out_c, kRowsC);
   std::cout << "GemvQ8_0Multi4 bit-exact: " << (ok ? "yes" : "no") << '\n';
   // n=2 (the gate/up pair shape) and a non-Q8_0 rejection.
   t::HipBuffer<float> d_pair_a(kRowsA);
@@ -271,11 +269,10 @@ bool TestMulti() {
       {d_wa.get(), q::GemvType::kQ8_0, kRowsA, kCols, d_pair_a.get()},
       {d_wb.get(), q::GemvType::kQ8_0, kRowsB, kCols, d_pair_b.get()},
   };
-  const bool pair_ok = q::GemvMulti(pair, 2U, d_x.get(), nullptr) &&
-                       t::Download(&d_ref_a, kRowsA) ==
-                           t::Download(&d_pair_a, kRowsA) &&
-                       t::Download(&d_ref_b, kRowsB) ==
-                           t::Download(&d_pair_b, kRowsB);
+  const bool pair_ok =
+      q::GemvMulti(pair, 2U, d_x.get(), nullptr) &&
+      t::Download(&d_ref_a, kRowsA) == t::Download(&d_pair_a, kRowsA) &&
+      t::Download(&d_ref_b, kRowsB) == t::Download(&d_pair_b, kRowsB);
   std::cout << "GemvMulti n=2: " << (pair_ok ? "yes" : "no") << '\n';
   // Mixed Q8_0 + F32 group (the ssm quartet shape): the F32 side vector
   // runs as a plain Gemv and must still match bit-for-bit.
@@ -292,13 +289,11 @@ bool TestMulti() {
       {d_wf.get(), q::GemvType::kF32, kRowsF, kCols, d_out_f.get()},
       {d_wb.get(), q::GemvType::kQ8_0, kRowsB, kCols, d_pair_b.get()},
   };
-  const bool mixed_ok = q::GemvMulti(mixed, 3U, d_x.get(), nullptr) &&
-                        t::Download(&d_ref_a, kRowsA) ==
-                            t::Download(&d_pair_a, kRowsA) &&
-                        t::Download(&d_ref_f, kRowsF) ==
-                            t::Download(&d_out_f, kRowsF) &&
-                        t::Download(&d_ref_b, kRowsB) ==
-                            t::Download(&d_pair_b, kRowsB);
+  const bool mixed_ok =
+      q::GemvMulti(mixed, 3U, d_x.get(), nullptr) &&
+      t::Download(&d_ref_a, kRowsA) == t::Download(&d_pair_a, kRowsA) &&
+      t::Download(&d_ref_f, kRowsF) == t::Download(&d_out_f, kRowsF) &&
+      t::Download(&d_ref_b, kRowsB) == t::Download(&d_pair_b, kRowsB);
   const bool rejects = !q::GemvMulti(pair, 0U, d_x.get(), nullptr) &&
                        !q::GemvMulti(pair, 5U, d_x.get(), nullptr);
   std::cout << "GemvMulti mixed Q8_0+F32 and rejection: "
@@ -337,9 +332,9 @@ bool TestGroupedPair() {
   t::HipBuffer<float> d_out_a(kUsed * kRows);
   t::HipBuffer<float> d_out_b(kUsed * kRows);
   if (!q::GemvGroupedPair(d_wa.get(), d_wb.get(), q::GemvType::kQ8_0,
-                         expert_bytes, d_ids.get(), kUsed, kRows, kCols,
-                         d_x.get(), 0U, d_out_a.get(), d_out_b.get(),
-                         nullptr)) {
+                          expert_bytes, d_ids.get(), kUsed, kRows, kCols,
+                          d_x.get(), 0U, d_out_a.get(), d_out_b.get(),
+                          nullptr)) {
     std::cerr << "GemvGroupedPair unexpectedly returned false for Q8_0\n";
     return false;
   }
@@ -421,8 +416,8 @@ bool TestMultiRow() {
     for (std::uint32_t rows = 2U; rows <= 5U; ++rows) {
       std::vector<float> x(static_cast<std::size_t>(rows) * kCols);
       for (std::uint32_t o = 0; o < rows; ++o) {
-        const auto xo = t::MakeValues(kCols, 0x11223344U + o * 0x01010101U,
-                                      1.0F);
+        const auto xo =
+            t::MakeValues(kCols, 0x11223344U + o * 0x01010101U, 1.0F);
         std::copy(xo.begin(), xo.end(), x.begin() + o * kCols);
       }
       t::HipBuffer<std::uint8_t> d_w(w.size());
@@ -451,8 +446,8 @@ bool TestMultiRow() {
     }
   };
 
-  run("GemvRowsQ8_0", q::GemvType::kQ8_0,
-      EncodeQ8_0(kRows, kCols, 0x66778899U), 34);
+  run("GemvRowsQ8_0", q::GemvType::kQ8_0, EncodeQ8_0(kRows, kCols, 0x66778899U),
+      34);
 
   const auto w_f32 =
       t::MakeValues(static_cast<std::size_t>(kRows) * kCols, 0x55556666U, 1.0F);
@@ -463,11 +458,11 @@ bool TestMultiRow() {
   std::vector<std::uint16_t> w_bf16(static_cast<std::size_t>(kRows) * kCols);
   std::uint32_t seed = 0x9A8B7C6DU;
   for (auto& value : w_bf16) {
-    const float f = 1.0F *
-                    static_cast<float>(
-                        static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
-                        32768) /
-                    32768.0F;
+    const float f =
+        1.0F *
+        static_cast<float>(static_cast<int>(t::NextRandom(&seed) & 0xFFFFU) -
+                           32768) /
+        32768.0F;
     value = FloatToBf16Bits(f);
   }
   std::vector<std::uint8_t> w_bf16_bytes(w_bf16.size() * sizeof(std::uint16_t));

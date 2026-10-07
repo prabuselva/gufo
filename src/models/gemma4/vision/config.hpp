@@ -18,16 +18,16 @@ namespace gufo::models::gemma4::vision {
 /// value is read from the mmproj file; `FromGguf` locks the geometry this
 /// runtime was written and tested for.
 struct Config {
-  std::uint32_t projection_dim{0};   ///< Output width to the trunk, 2816.
-  std::uint32_t image_size{0};       ///< Reference square side, 224.
-  std::uint32_t patch_size{0};       ///< 16.
-  std::uint32_t embedding_length{0};  ///< Vision hidden, 1152.
+  std::uint32_t projection_dim{0};       ///< Output width to the trunk, 2816.
+  std::uint32_t image_size{0};           ///< Reference square side, 224.
+  std::uint32_t patch_size{0};           ///< 16.
+  std::uint32_t embedding_length{0};     ///< Vision hidden, 1152.
   std::uint32_t feed_forward_length{0};  ///< 4304.
-  std::uint32_t block_count{0};      ///< 27.
-  std::uint32_t head_count{0};       ///< 16.
+  std::uint32_t block_count{0};          ///< 27.
+  std::uint32_t head_count{0};           ///< 16.
   float layer_norm_epsilon{1e-6F};
-  std::vector<float> image_mean;     ///< 3 entries, all 0.
-  std::vector<float> image_std;      ///< 3 entries, all 1.
+  std::vector<float> image_mean;  ///< 3 entries, all 0.
+  std::vector<float> image_std;   ///< 3 entries, all 1.
 
   /// Fixed by the `gemma4v` projector, not stored in the file.
   static constexpr std::uint32_t kMergeSize = 3;

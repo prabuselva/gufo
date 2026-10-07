@@ -1153,9 +1153,9 @@ int RunServe(std::span<const char* const> args) {
                            .directory = cache_disk_directory,
                            .capacity_bytes = cache_disk_bytes,
                            .staging_capacity_bytes = cache_disk_staging_bytes,
-.model_artifact_fingerprint = {},
-                        },
-                        vision_model_path, attn_window, attn_sink)) {
+                           .model_artifact_fingerprint = {},
+                       },
+                       vision_model_path, attn_window, attn_sink)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
