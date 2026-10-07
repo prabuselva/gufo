@@ -411,3 +411,37 @@ Verdict: **retained on both trunks** — production default for wide-prefill den
 Q8_0, no extra switch. The reusable pattern: copy the generic kernel into the
 model, gate on `batch>=96 && rows>=2048 && cols<=4096`, keep int8 for everything
 else.
+
+### 2026-10-07 — Fuse gelu-tanh into the routed gate/up GEMM epilogue
+Hypothesis: franzmoca (`feat/gemma`) fuses Gemma-4's gelu-tanh activation into
+the routed gate/up WMMA epilogue and writes the `expert_ff`-wide act directly,
+so there is no wide `gu` buffer and no separate `GegluF16` pass. Porting that
+fusion should reach architectural parity with franzmoca, drop the
+`slots × 2 × expert_ff` half buffer, and be throughput-neutral-or-better (the
+activation math is tiny next to the GEMM).
+Change: `RoutedF16GEMMKernel` gains a `kGeGlu` template param. The BN>=48
+scratch transpose already stages the gate wave in scratch rows `[0, BM/2)` and
+the matching up wave in `[BM/2, BM)`; the fused epilogue reads both as `float2`
+and writes a `half2` act via `GeGluHalf` (rounds gate/up to `__half` first, then
+gelu-tanh, so it matches `GegluF16` reading a half `gu` bit-for-bit). Weight-row
+fetch remaps the block row-slot: gate slots `[0, BM/2)` → `r_block + rr`, up
+slots → `half_m + r_block + (rr - BM/2)`; `grid.x` is unchanged because
+`(m + kBM - 1)/kBM == half_m/(BM/2)`. `RoutedF16Gemm` gains a `geglu` flag
+(rejects it for the BN=16 narrow tile or odd `m`); the executor's gate/up is now
+a single fused call and the `pf_gu_half_` buffer is gone. Gemma-4's gate/up is
+always a 64-row tile over an even `2 × expert_ff` stack, so the fused path always
+accepts and no fallback is kept. `GegluF16` stays as the tested standalone kernel.
+Measurement (t/s, exclusive GPU, interleaved reps5 A/B with both binaries in one
+session so thermal state is shared): pp8192 mean HEAD 1745.4 vs fused 1734.7
+(−0.6 %); pp16384 mean HEAD 1499.1 vs fused 1498.3 (−0.05 %). Within run-to-run
+noise → **neutral**. (A first cross-session pass showed +0.6–0.9 %, which the
+interleaved A/B exposed as thermal drift, not a real gain.)
+Quality: bit-identical greedy `output_sha256 =
+2669d2fd9f3b02843fccb1576f71359abdbb3e0db18e5d954880575d552a1b04` (pp512 tg128,
+`--speculative off`) == HEAD, before and after the buffer removal. The
+`rocm_kernels` routed-GEMM case still exercises the non-fused `gu`+`GegluF16`
+path; the fused path is validated by the model-level hash.
+Verdict: **retained** — production default, no extra switch. Throughput is
+neutral, so unlike the `ffn_down`/BF16 vec4 rejections (complexity added for a
+sub-noise gain) this is kept because it *removes* a buffer and a kernel launch:
+less VRAM and less code, matching franzmoca's structure.

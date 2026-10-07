@@ -247,7 +247,6 @@ public:
   std::int32_t* pf_rows_slot_{nullptr};
   std::int32_t* pf_tiles_dev_{nullptr};
   __half* pf_x_half_{nullptr};
-  __half* pf_gu_half_{nullptr};
   __half* pf_act_half_{nullptr};
   float* pf_expert_out_{nullptr};
   /// Prefill residual ping-pong: pf_cur_ alternates with pf_next_.

@@ -206,10 +206,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
   if (e->pf_x_half_ == nullptr)
     return nullptr;
-  e->pf_gu_half_ = reinterpret_cast<__half*>(
-      e->AllocBytes(slots * 2 * expert_ff * sizeof(__half), error_msg));
-  if (e->pf_gu_half_ == nullptr)
-    return nullptr;
   e->pf_act_half_ = reinterpret_cast<__half*>(
       e->AllocBytes(slots * expert_ff * sizeof(__half), error_msg));
   if (e->pf_act_half_ == nullptr)
@@ -662,16 +658,18 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
   // gate/up and down are independent WMMA calls; a *_K_M artifact stores the
   // gate/up stack as Q4_K and the down stack as Q8_0, so each GEMM dispatches
   // on its own weight type (RoutedF16Gemm rejects an unsupported one below).
+  // The gate/up GEMM fuses Gemma-4's gelu-tanh activation into its epilogue and
+  // writes the expert_ff-wide act directly, so no wide gu buffer or separate
+  // GegluF16 pass is needed. Gemma-4's gate_up is always a 64-row tile over an
+  // even 2*expert_ff stack, which the fused epilogue always accepts.
   const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
   const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
   if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, pf_tiles_dev_,
                      n_tiles, 64, pf_pad_bounds_, pf_rows_token_, pf_rows_slot_,
-                     nullptr, pf_gu_half_, 2 * c.expert_ff, c.hidden_size,
-                     nullptr)) {
+                     nullptr, pf_act_half_, 2 * c.expert_ff, c.hidden_size,
+                     nullptr, /*geglu=*/true)) {
     return Fail(error_msg, "RoutedF16Gemm gate_up unsupported");
   }
-  GegluF16(pf_gu_half_, pf_act_half_, slots * c.expert_ff, c.expert_ff,
-           nullptr);
   if (!RoutedF16Gemm(l.ffn_down_exps.data, wt_down, pf_act_half_, pf_tiles_dev_,
                      n_tiles, 64, pf_pad_bounds_, pf_rows_slot_, pf_rows_slot_,
                      pf_expert_out_, nullptr, c.hidden_size, c.expert_ff,

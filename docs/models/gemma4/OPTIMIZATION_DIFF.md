@@ -105,8 +105,8 @@ pp2048). Two differences remain:
 |---|---|---|
 | Tile map build | **device→host→device**: `hipMemcpy` counts to host, build `tiles_host_` on CPU, upload back (`executor.cpp:651-668`) | `BuildRoutedTiles` — device-built tile maps, **no host sync** (`moe.hip.cpp:754/797`, called `executor.cpp:1019`) |
 | Routing | `RouterTopK` + `ExpertCounts` + `RoutedCompact` (multiple launches) | `MoeRoute` — one-launch routing (`moe.hip.cpp:810`, `executor.cpp:953/970`); experts on a 2nd stream |
-| gate/up GEMM | `RoutedF16Gemm` (FP16 act) (`routed_f16.hpp:58`) | `LaunchRoutedHalfGemm` with **fused GeGLU epilogue** |
-| GeGLU | **separate kernel** `GegluF16`/`GegluF32` between gate_up and down (`fused.hpp:70-78`) | fused into gate/up epilogue — `gu` intermediate never stored |
+| gate/up GEMM | `RoutedF16Gemm` (FP16 act) with **fused GeGLU epilogue** (`geglu=true`, `routed_f16.hpp`) | `LaunchRoutedHalfGemm` with **fused GeGLU epilogue** |
+| GeGLU | **fused** into the gate/up epilogue — `gu` intermediate dropped (parity; `GegluF16`/`GegluF32` kept as standalone kernels, `fused.hpp:70-78`) | fused into gate/up epilogue — `gu` intermediate never stored |
 | Mixture | `MoeEpilogue` separate | `MoeFinish` — fused mixture + norms |
 
 **Effect.** The host round-trip in `MoeBatch` (`executor.cpp:651-668`) is a
@@ -140,7 +140,7 @@ the binary16 GEMM directly.
 |---|---|---|
 | Post-attention norm | separate residual-add + RMSNorm | `PostAttentionNorm`: fused residual-add + dual RMSNorm + optional Q8_1 quantize + optional binary16 side-copies; **null `h` skips the FP32 row** (`kernels.hpp:129-137`) |
 | Post-FFN norm | separate | `PostFeedForwardNorm` fused, optional Q8_1 (`kernels.hpp:142`) |
-| GeGLU | `GegluF16` / `GegluF32` separate (`fused.hpp:70-78`) | `GeGluQuantize` / `GeGluPackedHalf` fused with quantize / binary16 (`kernels.hpp:153/165`) |
+| GeGLU | fused into the routed gate/up epilogue (half act, no `gu` round-trip); `GegluF16`/`GegluF32` kept standalone (`fused.hpp:70-78`) | `GeGluQuantize` / `GeGluPackedHalf` fused with quantize / binary16 (`kernels.hpp:153/165`) |
 
 **Effect.** Each fused producer that writes binary16 and skips the FP32 row
 removes a full-width read+write from the prefill memory budget. Across 30 layers
@@ -170,14 +170,14 @@ with fusion, not that any single one is a silver bullet.
 
 | Kernel (gufo gemma4 pp2048) | % of kernel time | franzmoca's difference |
 |---|---|---|
-| `RoutedF16GEMM` (MoE experts) | **34.2%** | already F16 WMMA here; franzmoca fuses GeGLU into the gate/up epilogue (removes the separate `Geglu*` pass + `gu_half` round-trip) |
+| `RoutedF16GEMM` (MoE experts) | **34.2%** | already F16 WMMA here; **GeGLU now fused into the gate/up epilogue** (parity — the separate `Geglu*` pass + `gu_half` round-trip are gone) |
 | `DenseF16GEMM` (Q8_0 projections) | 18.8% | already F16 WMMA here; franzmoca adds `HalfPlan` staged tiles |
 | `Cijk…BSS…` `hipblasSgemm` (F32 projections) | 6.6% | **franzmoca runs these as W8A8 int8 on tensor cores**, not FP32 SGEMM |
 | `AttentionPrefillWmma` | ~10% | 2 blocks/WGP + prefetch + `out_half` |
 | `MoeEpilogue` | 5.7% | fused into the down-GEMM epilogue |
 | `QknormRope`+`KvNormRope`+`RmsNorm` | ~10% | fused into adjacent kernels / GEMM epilogues |
 | `NarrowHalf`/`NarrowKernel`/`NarrowBf16` | ~2% | avoided by an end-to-end binary16 pipeline |
-| `GegluKernel`+`GegluSeparate` | ~1.2% | fused into the routed gate/up epilogue |
+| `GegluKernel`+`GegluSeparate` | ~1.2% → **0** | now fused into the routed gate/up epilogue here too (folded into the 34.2% above; net-neutral wall time — see EXPERIMENTS) |
 
 **Correction to the earlier draft:** the "MoE host round-trip" was listed as the
 *largest* lever. It has now been ported (device-side `BuildRoutedTiles`,
@@ -212,10 +212,14 @@ tracks the levers in §4.
    PASS). **Measured throughput-neutral** — kept for the cleaner architecture
    (no per-layer D2H sync) and as the prerequisite for one-launch routing, not
    for speed. The earlier "largest lever" claim was wrong; see §4.
-3. **Fuse GeGLU into the routed gate/up epilogue** (targets the 34% MoE GEMM +
-   the ~1.2% separate GeGLU + the `gu_half` write/read round-trip). Port
-   franzmoca's `LaunchRoutedHalfGemm` fused epilogue. Highest remaining ROI but a
-   large kernel port; validate quality independently.
+3. ~~**Fuse GeGLU into the routed gate/up epilogue.**~~ **DONE**: `RoutedF16Gemm`
+   now fuses gelu-tanh into the gate/up epilogue and writes the half act
+   directly, dropping the `gu_half` buffer and the separate `GegluF16` pass
+   (parity with franzmoca's `LaunchRoutedHalfGemm` fused epilogue).
+   **Measured throughput-neutral** (pp8192/pp16384 within noise) and
+   **bit-identical** output; kept for the cleaner architecture and the VRAM
+   saving, not for speed — see EXPERIMENTS (2026-10-07). franzmoca's remaining
+   edge here is folding the Q8_1 quantize into the same epilogue (item 5).
 4. **W8A8 int8 for the F32-weight projections** (targets the 6.6% `hipblasSgemm`
    FP32 path). franzmoca runs these on int8 tensor cores via
    `LaunchBatchedQuantGEMMPreQuantized`. Changes rounding — needs a quality gate.

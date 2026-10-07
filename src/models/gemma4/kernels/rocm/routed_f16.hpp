@@ -68,15 +68,18 @@ void BuildRoutedTiles(const std::uint32_t* counts, std::uint32_t experts,
 /// index in the high 16. `pad_bounds` [n_experts + 1] gives the bucket starts.
 /// Each compacted output row `rows_out[c]` receives the result as F32 `out`
 /// (m-wide) or narrowed to F16 `out_half`. Exactly one of `out` / `out_half`
-/// is non-null. Gemma-4's gelu-tanh activation is applied separately by
-/// GegluF16/GegluF32 between the gate_up and down GEMMs. `tile_rows` is 16,
-/// 48 or 64. Returns false for an unsupported shape.
+/// is non-null. With `geglu` the m rows are read as a gate/up stack (gate rows
+/// [0, m/2), up rows [m/2, m)) and the epilogue writes gelu_tanh(gate) * up to
+/// an m/2-wide `out_half`, fusing Gemma-4's activation into the gate_up GEMM;
+/// it needs `tile_rows` of 48 or 64 and even m. Otherwise the activation is
+/// applied separately by GegluF16/GegluF32 between the gate_up and down GEMMs.
+/// `tile_rows` is 16, 48 or 64. Returns false for an unsupported shape.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,
                    const std::int32_t* rows_in, const std::int32_t* rows_out,
                    float* out, __half* out_half, std::size_t m, std::size_t k,
-                   hipStream_t stream);
+                   hipStream_t stream, bool geglu = false);
 
 }  // namespace gufo::models::gemma4::rocm
 
