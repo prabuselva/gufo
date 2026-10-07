@@ -169,11 +169,11 @@ __launch_bounds__(256) __global__
                              float* __restrict__ out,
                              __half* __restrict__ out_half, std::size_t m,
                              std::size_t k) {
-   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
-   static_assert(BN % 16 == 0 && BN / 16 <= 8);
-   static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
-   static_assert(!kGeGlu || (BN >= 48 && BM % 2 == 0),
-                 "the fused gate/up epilogue uses the wide-tile store");
+  static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
+  static_assert(BN % 16 == 0 && BN / 16 <= 8);
+  static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
+  static_assert(!kGeGlu || (BN >= 48 && BM % 2 == 0),
+                "the fused gate/up epilogue uses the wide-tile store");
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
@@ -235,8 +235,7 @@ __launch_bounds__(256) __global__
   const int half_id = lane_id >> 4;
   // A fused block spans BM/2 gate rows and the matching BM/2 up rows, so its
   // grid.x is half_m / (BM/2) == m / BM (the launcher grid is unchanged).
-  const int r_block =
-      static_cast<int>(blockIdx.x) * (kGeGlu ? BM / 2 : BM);
+  const int r_block = static_cast<int>(blockIdx.x) * (kGeGlu ? BM / 2 : BM);
 
   // Weight fetch: unit u of a thread is (row = tid / 2 + 128 u, chunk c =
   // tid % 2). Q4_K: the two 16-byte halves of one 32-byte nibble group (two
@@ -751,10 +750,11 @@ inline unsigned Blocks(std::size_t count) {
 
 // One block: thread e counts expert e's `rows`-row tiles, an ordered scan
 // places them, and the remaining capacity entries become dead tiles.
-__global__ void __launch_bounds__(256) BuildRoutedTilesKernel(
-    const std::uint32_t* __restrict__ counts, std::uint32_t experts,
-    std::uint32_t rows, std::uint32_t capacity,
-    std::int32_t* __restrict__ tiles) {
+__global__ void __launch_bounds__(256)
+    BuildRoutedTilesKernel(const std::uint32_t* __restrict__ counts,
+                           std::uint32_t experts, std::uint32_t rows,
+                           std::uint32_t capacity,
+                           std::int32_t* __restrict__ tiles) {
   __shared__ std::uint32_t scan[256];
   const std::uint32_t e = threadIdx.x;
   const std::uint32_t padded = e < experts ? (counts[e] + 15U) / 16U * 16U : 0;

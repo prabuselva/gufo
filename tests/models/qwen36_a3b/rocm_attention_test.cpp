@@ -113,9 +113,9 @@ std::vector<float> Reference(const std::vector<float>& query,
     const std::uint32_t n_kv = start + token + 1;
     for (std::uint32_t h = 0; h < kHeads; ++h) {
       const std::uint32_t kvh = h / kGroup;
-      const float* qh = query.data() +
-                        (static_cast<std::size_t>(token) * kHeads + h) *
-                            kHeadDim;
+      const float* qh =
+          query.data() +
+          (static_cast<std::size_t>(token) * kHeads + h) * kHeadDim;
       std::vector<double> scores(n_kv);
       double max_score = -INFINITY;
       for (std::uint32_t j = 0; j < n_kv; ++j) {
@@ -180,17 +180,17 @@ bool RunPrefillCase(std::uint32_t start, std::uint32_t tokens) {
   t::Upload(&d_v, v_cache);
   const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
   q::AttentionPrefill(d_q.get(), d_k.get(), d_v.get(), nullptr, nullptr,
-                      d_gate.get(), d_out.get(), start, tokens, kHeads, kKvHeads,
-                      kHeadDim, scale, nullptr);
+                      d_gate.get(), d_out.get(), start, tokens, kHeads,
+                      kKvHeads, kHeadDim, scale, nullptr);
   t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
   const auto got = t::Download(&d_out, q_count);
 
-  return Check("AttentionPrefill start=" + std::to_string(start) +
-                   " tokens=" + std::to_string(tokens),
-               t::WorstRelative(Reference(query, gate, k_cache, v_cache, start,
-                                          tokens),
-                                got),
-               1e-4);
+  return Check(
+      "AttentionPrefill start=" + std::to_string(start) +
+          " tokens=" + std::to_string(tokens),
+      t::WorstRelative(Reference(query, gate, k_cache, v_cache, start, tokens),
+                       got),
+      1e-4);
 }
 
 // The matrix-core prefill path (FP16 KV mirror) must reproduce the scalar
@@ -228,12 +228,12 @@ bool RunWmmaCase(std::uint32_t start, std::uint32_t tokens) {
   t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill WMMA synchronization");
   const auto got = t::Download(&d_out, q_count);
 
-  return Check("AttentionPrefillWmma start=" + std::to_string(start) +
-                   " tokens=" + std::to_string(tokens),
-               t::WorstRelativeToScale(Reference(query, gate, k_cache, v_cache,
-                                                start, tokens),
-                                       got),
-               2e-3);
+  return Check(
+      "AttentionPrefillWmma start=" + std::to_string(start) +
+          " tokens=" + std::to_string(tokens),
+      t::WorstRelativeToScale(
+          Reference(query, gate, k_cache, v_cache, start, tokens), got),
+      2e-3);
 }
 
 // Sparse causal reference: token at absolute position p attends the causal
@@ -253,9 +253,9 @@ std::vector<float> ReferenceSparse(const std::vector<float>& query,
     const std::uint32_t n_kv = p + 1;
     for (std::uint32_t h = 0; h < kHeads; ++h) {
       const std::uint32_t kvh = h / kGroup;
-      const float* qh = query.data() +
-                        (static_cast<std::size_t>(token) * kHeads + h) *
-                            kHeadDim;
+      const float* qh =
+          query.data() +
+          (static_cast<std::size_t>(token) * kHeads + h) * kHeadDim;
       std::vector<double> scores(n_kv, -INFINITY);
       double max_score = -INFINITY;
       for (std::uint32_t j = 0; j < n_kv; ++j) {
@@ -333,15 +333,14 @@ bool RunWmmaSparseCase(std::uint32_t start, std::uint32_t tokens,
   t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill WMMA sparse sync");
   const auto got = t::Download(&d_out, q_count);
 
-  return Check("AttentionPrefillWmmaSparse start=" + std::to_string(start) +
-                   " tokens=" + std::to_string(tokens) +
-                   " window=" + std::to_string(window) +
-                   " sink=" + std::to_string(sink),
-               t::WorstRelativeToScale(
-                   ReferenceSparse(query, gate, k_cache, v_cache, start, tokens,
-                                   window, sink),
-                   got),
-               2e-3);
+  return Check(
+      "AttentionPrefillWmmaSparse start=" + std::to_string(start) +
+          " tokens=" + std::to_string(tokens) +
+          " window=" + std::to_string(window) + " sink=" + std::to_string(sink),
+      t::WorstRelativeToScale(ReferenceSparse(query, gate, k_cache, v_cache,
+                                              start, tokens, window, sink),
+                              got),
+      2e-3);
 }
 
 // The multi-row verify kernel must reproduce the same causal rows as the
@@ -375,12 +374,12 @@ bool RunDecodeRowsCase(std::uint32_t start, std::uint32_t tokens) {
   t::CheckHip(hipDeviceSynchronize(), "AttentionDecodeRows synchronization");
   const auto got = t::Download(&d_out, q_count);
 
-  return Check("AttentionDecodeRows start=" + std::to_string(start) +
-                   " tokens=" + std::to_string(tokens),
-               t::WorstRelative(Reference(query, gate, k_cache, v_cache, start,
-                                          tokens),
-                                got),
-               1e-4);
+  return Check(
+      "AttentionDecodeRows start=" + std::to_string(start) +
+          " tokens=" + std::to_string(tokens),
+      t::WorstRelative(Reference(query, gate, k_cache, v_cache, start, tokens),
+                       got),
+      1e-4);
 }
 
 // The fused decode front-end (deinterleave + per-head RMSNorm + partial RoPE +
@@ -399,8 +398,7 @@ bool TestFusedQKNormRoPEKvWrite() {
 
   const auto qg = t::MakeValues(static_cast<std::size_t>(kHeads) * 2 * kHeadDim,
                                 0x13579BDFU, 1.0F);
-  const auto k_in =
-      t::MakeValues(kv_row, 0x2468ACE0U, 1.0F);
+  const auto k_in = t::MakeValues(kv_row, 0x2468ACE0U, 1.0F);
   const auto v_in = t::MakeValues(kv_row, 0x0FEDCBA9U, 1.0F);
   const auto q_norm = t::MakeValues(kHeadDim, 0x5A5A5A5AU, 0.5F, 1.0F);
   const auto k_norm = t::MakeValues(kHeadDim, 0x6B6B6B6BU, 0.5F, 1.0F);
@@ -416,8 +414,9 @@ bool TestFusedQKNormRoPEKvWrite() {
   t::Upload(&d_qnorm, q_norm);
   t::Upload(&d_knorm, k_norm);
   t::HipBuffer<std::uint32_t> d_pos(1);
-  t::CheckHip(hipMemcpy(d_pos.get(), &kPos, sizeof(kPos), hipMemcpyHostToDevice),
-              "upload pos");
+  t::CheckHip(
+      hipMemcpy(d_pos.get(), &kPos, sizeof(kPos), hipMemcpyHostToDevice),
+      "upload pos");
 
   // Reference: the unfused chain the executor falls back to.
   t::HipBuffer<float> r_q(q_count);
@@ -444,14 +443,14 @@ bool TestFusedQKNormRoPEKvWrite() {
           nullptr);
   q::Rope(r_k.get(), d_pos.get(), 1, kKvHeads, kHeadDim, kRotary, kTheta,
           nullptr);
-  t::CheckHip(hipMemcpy(r_kc.get() + static_cast<std::size_t>(kPos) * kv_row,
-                        r_k.get(), kv_row * sizeof(float),
-                        hipMemcpyDeviceToDevice),
-              "ref k cache write");
-  t::CheckHip(hipMemcpy(r_vc.get() + static_cast<std::size_t>(kPos) * kv_row,
-                        d_vin.get(), kv_row * sizeof(float),
-                        hipMemcpyDeviceToDevice),
-              "ref v cache write");
+  t::CheckHip(
+      hipMemcpy(r_kc.get() + static_cast<std::size_t>(kPos) * kv_row, r_k.get(),
+                kv_row * sizeof(float), hipMemcpyDeviceToDevice),
+      "ref k cache write");
+  t::CheckHip(
+      hipMemcpy(r_vc.get() + static_cast<std::size_t>(kPos) * kv_row,
+                d_vin.get(), kv_row * sizeof(float), hipMemcpyDeviceToDevice),
+      "ref v cache write");
   q::KvCacheWriteF16(r_kc.get(), r_vc.get(), r_kc16.get(), r_vc16.get(),
                      static_cast<std::size_t>(kPos) * kv_row, kv_row, nullptr);
 
@@ -479,17 +478,17 @@ bool TestFusedQKNormRoPEKvWrite() {
 
   const auto dl16 = [](t::HipBuffer<std::uint16_t>* b) {
     std::vector<std::uint16_t> v(b->bytes() / sizeof(std::uint16_t));
-    t::CheckHip(hipMemcpy(v.data(), b->get(), b->bytes(),
-                          hipMemcpyDeviceToHost),
-                "download f16");
+    t::CheckHip(
+        hipMemcpy(v.data(), b->get(), b->bytes(), hipMemcpyDeviceToHost),
+        "download f16");
     return v;
   };
   bool ok = true;
   const auto cmp = [&](const char* name, const std::vector<float>& a,
                        const std::vector<float>& b) {
     const bool eq = a == b;
-    std::cout << "FusedQKNormRoPEKvWrite " << name << " bit-exact: "
-              << (eq ? "yes" : "no") << '\n';
+    std::cout << "FusedQKNormRoPEKvWrite " << name
+              << " bit-exact: " << (eq ? "yes" : "no") << '\n';
     ok = ok && eq;
   };
   cmp("q", t::Download(&r_q, q_count), t::Download(&f_q, q_count));
@@ -559,25 +558,37 @@ int main() {
     for (std::uint32_t n_kv : {1U, 5U, 33U, 128U, 1000U, 2400U}) {
       ok = RunCase(n_kv) && ok;
     }
-    // Chunk starts and lengths that straddle the kernel's 128-wide softmax tile.
+    // Chunk starts and lengths that straddle the kernel's 128-wide softmax
+    // tile.
     for (const auto& cs : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
              {0U, 1U}, {0U, 8U}, {5U, 7U}, {100U, 40U}, {200U, 64U}}) {
       ok = RunPrefillCase(cs.first, cs.second) && ok;
     }
     // Matrix-core (WMMA) prefill over the FP16 KV mirror, straddling the
     // 32-row query tile and the 16-key inner tile at several depths.
-    for (const auto& cs : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
-             {0U, 1U}, {0U, 32U}, {0U, 33U}, {5U, 7U}, {100U, 40U},
-             {200U, 64U}, {0U, 128U}, {1024U, 96U}}) {
+    for (const auto& cs :
+         std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0U, 1U},
+                                                              {0U, 32U},
+                                                              {0U, 33U},
+                                                              {5U, 7U},
+                                                              {100U, 40U},
+                                                              {200U, 64U},
+                                                              {0U, 128U},
+                                                              {1024U, 96U}}) {
       ok = RunWmmaCase(cs.first, cs.second) && ok;
     }
     // Sparse (sliding-window + sink) WMMA prefill: windows/sinks that straddle
     // the 16-key tile and leave a non-empty dropped middle range.
-    for (const auto& c : std::vector<std::tuple<std::uint32_t, std::uint32_t,
-                                                std::uint32_t, std::uint32_t>>{
-             {0U, 128U, 32U, 0U}, {0U, 128U, 32U, 4U}, {0U, 128U, 16U, 16U},
-             {100U, 40U, 32U, 4U}, {200U, 64U, 48U, 8U}, {1024U, 96U, 64U, 16U},
-             {0U, 33U, 8U, 0U}, {5U, 7U, 4U, 2U}}) {
+    for (const auto& c :
+         std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t,
+                                std::uint32_t>>{{0U, 128U, 32U, 0U},
+                                                {0U, 128U, 32U, 4U},
+                                                {0U, 128U, 16U, 16U},
+                                                {100U, 40U, 32U, 4U},
+                                                {200U, 64U, 48U, 8U},
+                                                {1024U, 96U, 64U, 16U},
+                                                {0U, 33U, 8U, 0U},
+                                                {5U, 7U, 4U, 2U}}) {
       ok = RunWmmaSparseCase(std::get<0>(c), std::get<1>(c), std::get<2>(c),
                              std::get<3>(c)) &&
            ok;

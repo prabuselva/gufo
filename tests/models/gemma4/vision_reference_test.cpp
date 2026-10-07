@@ -3,14 +3,14 @@
 // tensor resolves with the expected shape and that the tower produces a finite
 // [n_tokens x 2816] embedding. This is the CPU oracle the vision kernels are
 // later validated against; it skips (77) without GUFO_GEMMA4_MMPROJ_GGUF.
-#include "src/models/gemma4/vision/reference.hpp"
-
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include "src/models/gemma4/vision/reference.hpp"
 
 namespace g4v = gufo::models::gemma4::vision;
 namespace {
@@ -98,8 +98,9 @@ int main() {
     std::cerr << "vision encode failed: " << error << "\n";
     return 1;
   }
-  const std::uint32_t n_tokens = (nx / (c.patch_size * g4v::Config::kMergeSize)) *
-                                 (ny / (c.patch_size * g4v::Config::kMergeSize));
+  const std::uint32_t n_tokens =
+      (nx / (c.patch_size * g4v::Config::kMergeSize)) *
+      (ny / (c.patch_size * g4v::Config::kMergeSize));
   Expect(n_tokens == 4, "token count for a 96x96 image");
   Expect(out.size() == static_cast<std::size_t>(n_tokens) * c.projection_dim,
          "output size is n_tokens x projection_dim");

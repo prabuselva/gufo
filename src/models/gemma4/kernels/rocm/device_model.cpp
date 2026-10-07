@@ -89,10 +89,9 @@ struct Uploader {
     // tier decodes it) and Q4_K/Q5_K on dense tensors (only the routed tier
     // does). A *_K_M artifact stores the dense attention/FFN projections as
     // Q4_K, so those upcast while the routed experts stay native.
-    const bool upcast =
-        t.type == core::GgmlType::kQ6_K ||
-        (!expert && (t.type == core::GgmlType::kQ4_K ||
-                     t.type == core::GgmlType::kQ5_K));
+    const bool upcast = t.type == core::GgmlType::kQ6_K ||
+                        (!expert && (t.type == core::GgmlType::kQ4_K ||
+                                     t.type == core::GgmlType::kQ5_K));
     if (upcast) {
       return CopyUpcast(t);
     }
@@ -119,7 +118,7 @@ struct Uploader {
     return d;
   }
 
-// The GEMV and WMMA tiers decode Q8_0/Q4_K/Q5_K but not Q6_K, and the dense
+  // The GEMV and WMMA tiers decode Q8_0/Q4_K/Q5_K but not Q6_K, and the dense
   // GEMM tier decodes neither Q4_K nor Q5_K, so the k-quant tensors a *_K_XL or
   // *_K_M artifact stores in a tier that cannot decode them are requantized to
   // Q8_0 on the host during upload (see RequantKQuantRowToQ8_0). The rows are
@@ -319,7 +318,8 @@ std::unique_ptr<DeviceDraft> DeviceDraft::Upload(const DraftWeights& w,
     inv_full[i] = factors != nullptr ? static_cast<float>(base / factors[i])
                                      : static_cast<float>(base);
   }
-  m->inv_freq_swa_ = up.CopyF32(inv_swa.data(), inv_swa.size(), "draft_inv_swa");
+  m->inv_freq_swa_ =
+      up.CopyF32(inv_swa.data(), inv_swa.size(), "draft_inv_swa");
   m->inv_freq_full_ =
       up.CopyF32(inv_full.data(), inv_full.size(), "draft_inv_full");
 

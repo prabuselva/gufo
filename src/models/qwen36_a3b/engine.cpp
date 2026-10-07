@@ -413,7 +413,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
   for (std::size_t i = 0; i < accepted; ++i) {
     committed.push_back(static_cast<sampling::TokenId>(drafts[i]));
   }
-if (accepted == k) {
+  if (accepted == k) {
     if (!executor_->MtpAdvance(
             *session_, drafts[k - 1],
             executor_->verify_hidden() + (k - 1) * model_->config().hidden_size,
@@ -426,7 +426,7 @@ if (accepted == k) {
     }
   } else {
     executor_->RollbackVerify(*session_,
-                            static_cast<std::uint32_t>(accepted + 1U));
+                              static_cast<std::uint32_t>(accepted + 1U));
     if (accepted == 0) {
       draft_k_ = std::max(draft_min_, draft_k_ - 1U);
     }

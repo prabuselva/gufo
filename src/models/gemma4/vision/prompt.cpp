@@ -95,8 +95,8 @@ Size CalcSizePreservedRatio(std::uint32_t width, std::uint32_t height,
   std::uint32_t h_bar = std::max(limits.align_size, round_by(h));
   if (limits.max_pixels > 0 &&
       static_cast<double>(h_bar) * w_bar > limits.max_pixels) {
-    const double beta = std::sqrt(static_cast<double>(height) * width /
-                                  limits.max_pixels);
+    const double beta =
+        std::sqrt(static_cast<double>(height) * width / limits.max_pixels);
     h_bar = std::max(limits.align_size, floor_by(static_cast<float>(h / beta)));
     w_bar = std::max(limits.align_size, floor_by(static_cast<float>(w / beta)));
   } else if (limits.min_pixels > 0 &&
@@ -112,8 +112,7 @@ Size CalcSizePreservedRatio(std::uint32_t width, std::uint32_t height,
 PreparedImage PrepareImage(const core::Image& image,
                            const ResizeLimits& limits) {
   PreparedImage out;
-  const Size target =
-      CalcSizePreservedRatio(image.width, image.height, limits);
+  const Size target = CalcSizePreservedRatio(image.width, image.height, limits);
   if (target.width == 0 || target.height == 0 || image.pixels.empty()) {
     return out;
   }
@@ -126,15 +125,16 @@ PreparedImage PrepareImage(const core::Image& image,
   // Horizontal pass: source [sh][sw][3] -> [sh][tw][3] float.
   std::vector<float> hres(static_cast<std::size_t>(sh) * tw * 3, 0.0F);
   for (int y = 0; y < sh; ++y) {
-    const std::uint8_t* src_row = image.pixels.data() +
-                                  static_cast<std::size_t>(y) * sw * 3;
+    const std::uint8_t* src_row =
+        image.pixels.data() + static_cast<std::size_t>(y) * sw * 3;
     float* dst_row = hres.data() + static_cast<std::size_t>(y) * tw * 3;
     for (int x = 0; x < tw; ++x) {
       const std::size_t base = static_cast<std::size_t>(x) * 3;
       float acc[3] = {0.0F, 0.0F, 0.0F};
       for (std::size_t t = x_taps.offset[x]; t < x_taps.offset[x + 1]; ++t) {
         const float wgt = x_taps.weight[t];
-        const std::uint8_t* s = src_row + static_cast<std::size_t>(x_taps.index[t]) * 3;
+        const std::uint8_t* s =
+            src_row + static_cast<std::size_t>(x_taps.index[t]) * 3;
         acc[0] += wgt * s[0];
         acc[1] += wgt * s[1];
         acc[2] += wgt * s[2];
@@ -167,16 +167,15 @@ PreparedImage PrepareImage(const core::Image& image,
   }
   out.nx = target.width;
   out.ny = target.height;
-  out.tokens = (target.width / limits.align_size) *
-               (target.height / limits.align_size);
+  out.tokens =
+      (target.width / limits.align_size) * (target.height / limits.align_size);
   return out;
 }
 
 PreparedPrompt BuildPrompt(const Tokenizer& tokenizer,
                            std::string_view rendered,
                            const std::vector<core::Image>& images,
-                           const ResizeLimits& limits,
-                           std::string* error_msg) {
+                           const ResizeLimits& limits, std::string* error_msg) {
   const Tokenizer::TokenId begin = tokenizer.TokenToId("<|image>");
   const Tokenizer::TokenId marker = tokenizer.TokenToId("<|image|>");
   const Tokenizer::TokenId end = tokenizer.TokenToId("<image|>");

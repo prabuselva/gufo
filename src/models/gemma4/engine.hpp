@@ -102,9 +102,7 @@ public:
     return draft_device_ != nullptr;
   }
   /// True when a `gemma4v` vision tower was loaded and image prompts work.
-  [[nodiscard]] bool HasVision() const noexcept {
-    return vision_ != nullptr;
-  }
+  [[nodiscard]] bool HasVision() const noexcept { return vision_ != nullptr; }
   /// Worst-case private device state one session of `context` tokens owns.
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
 

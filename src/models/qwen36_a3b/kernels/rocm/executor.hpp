@@ -27,7 +27,7 @@ class Executor;
 /// snapshots of the recurrent state and conv history so a rejected draft can
 /// rewind to any committed prefix.
 class Session {
- public:
+public:
   ~Session();
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
@@ -57,7 +57,7 @@ class Session {
     return allocated_bytes_ + vision_input_.Bytes();
   }
 
- private:
+private:
   friend class Executor;
   Session(const Config& c, bool has_mtp) : c_(c), has_mtp_(has_mtp) {}
 
@@ -121,7 +121,7 @@ class Session {
 /// its recurrent state and caches. `Create` allocates the shared scratch;
 /// `CreateSession` allocates one session's state at its own context length.
 class Executor {
- public:
+public:
   ~Executor();
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -205,11 +205,11 @@ class Executor {
   }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
 
- private:
+private:
   Executor(const Config& c, const DeviceModel& model) : c_(c), model_(model) {}
 
-  void LinearAttention(Session& session, const DeviceLayer& l,
-                       std::uint32_t il, const float* x, float* out);
+  void LinearAttention(Session& session, const DeviceLayer& l, std::uint32_t il,
+                       const float* x, float* out);
   void Attention(const DeviceLayer& l, const float* x, std::uint32_t pos,
                  float* out, float* k_cache, float* v_cache, void* k_cache_f16,
                  void* v_cache_f16, const std::uint32_t* pos_dev,

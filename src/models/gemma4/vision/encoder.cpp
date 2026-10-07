@@ -145,9 +145,7 @@ struct Uploader {
     return d;
   }
 
-  float* Norm(const TensorRef& t) {
-    return Raw(t);
-  }
+  float* Norm(const TensorRef& t) { return Raw(t); }
 };
 
 }  // namespace
@@ -200,9 +198,9 @@ std::unique_ptr<Encoder> Encoder::Open(const std::string& mmproj_path,
   const std::uint32_t quarter = hd / 4;
   std::vector<float> inv(quarter);
   for (std::uint32_t i = 0; i < quarter; ++i) {
-    inv[i] = static_cast<float>(std::pow(
-        static_cast<double>(Config::kRopeTheta),
-        -2.0 * static_cast<double>(i) / static_cast<double>(hd)));
+    inv[i] = static_cast<float>(
+        std::pow(static_cast<double>(Config::kRopeTheta),
+                 -2.0 * static_cast<double>(i) / static_cast<double>(hd)));
   }
   if (hipMalloc(&impl->inv_freq, quarter * sizeof(float)) != hipSuccess) {
     if (error_msg != nullptr) {
@@ -299,8 +297,8 @@ bool Encoder::Encode(const float* pixels, std::uint32_t nx, std::uint32_t ny,
   }
 
   hipStream_t s = nullptr;
-  if (hipMemcpyAsync(pix_dev, pixels, static_cast<std::size_t>(3) * ny * nx *
-                                          sizeof(float),
+  if (hipMemcpyAsync(pix_dev, pixels,
+                     static_cast<std::size_t>(3) * ny * nx * sizeof(float),
                      hipMemcpyHostToDevice, s) != hipSuccess) {
     release();
     if (error_msg != nullptr) {
@@ -322,12 +320,12 @@ bool Encoder::Encode(const float* pixels, std::uint32_t nx, std::uint32_t ny,
               n_patches, s);
     g4r::Gemm(b.attn_v.data, b.attn_v.type, emb, emb, b.attn_v.row_bytes, xn, v,
               n_patches, s);
-    g4r::RmsNormRows(q, b.q_norm, qn, static_cast<std::size_t>(n_patches) * heads,
-                     hd, eps, s);
-    g4r::RmsNormRows(k, b.k_norm, kn, static_cast<std::size_t>(n_patches) * heads,
-                     hd, eps, s);
-    g4r::RmsNormRows(v, nullptr, vn, static_cast<std::size_t>(n_patches) * heads,
-                     hd, eps, s);
+    g4r::RmsNormRows(q, b.q_norm, qn,
+                     static_cast<std::size_t>(n_patches) * heads, hd, eps, s);
+    g4r::RmsNormRows(k, b.k_norm, kn,
+                     static_cast<std::size_t>(n_patches) * heads, hd, eps, s);
+    g4r::RmsNormRows(v, nullptr, vn,
+                     static_cast<std::size_t>(n_patches) * heads, hd, eps, s);
     Rope2d(qn, m.inv_freq, n_px, n_patches, heads, hd, s);
     Rope2d(kn, m.inv_freq, n_px, n_patches, heads, hd, s);
     VisionAttention(qn, kn, vn, attn, n_patches, heads, hd, s);
@@ -365,9 +363,8 @@ bool Encoder::Encode(const float* pixels, std::uint32_t nx, std::uint32_t ny,
   const std::size_t out_floats =
       static_cast<std::size_t>(n_tokens) * c.projection_dim;
   out.assign(out_floats, 0.0F);
-  const hipError_t copy = hipMemcpy(out.data(), out_dev,
-                                    out_floats * sizeof(float),
-                                    hipMemcpyDeviceToHost);
+  const hipError_t copy = hipMemcpy(
+      out.data(), out_dev, out_floats * sizeof(float), hipMemcpyDeviceToHost);
   release();
   if (copy != hipSuccess) {
     if (error_msg != nullptr) {
@@ -378,7 +375,11 @@ bool Encoder::Encode(const float* pixels, std::uint32_t nx, std::uint32_t ny,
   return true;
 }
 
-const Config& Encoder::config() const noexcept { return impl_->config; }
-std::size_t Encoder::resident_bytes() const noexcept { return impl_->bytes; }
+const Config& Encoder::config() const noexcept {
+  return impl_->config;
+}
+std::size_t Encoder::resident_bytes() const noexcept {
+  return impl_->bytes;
+}
 
 }  // namespace gufo::models::gemma4::vision

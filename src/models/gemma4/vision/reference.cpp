@@ -25,8 +25,8 @@ void Rope2d(float* head, std::uint32_t head_dim, std::uint32_t half,
     const std::uint32_t base = pass * half;
     const float pos = static_cast<float>(pass == 0 ? pos_x : pos_y);
     for (std::uint32_t i = 0; i < quarter; ++i) {
-      const float inv = std::pow(theta, -2.0F * static_cast<float>(i) /
-                                                 static_cast<float>(head_dim));
+      const float inv = std::pow(
+          theta, -2.0F * static_cast<float>(i) / static_cast<float>(head_dim));
       const float angle = pos * inv;
       const float c = std::cos(angle);
       const float s = std::sin(angle);
@@ -40,7 +40,8 @@ void Rope2d(float* head, std::uint32_t head_dim, std::uint32_t half,
 
 }  // namespace
 
-ReferenceEncoder::ReferenceEncoder(const VisionWeights& weights) : w_(weights) {}
+ReferenceEncoder::ReferenceEncoder(const VisionWeights& weights)
+    : w_(weights) {}
 
 bool ReferenceEncoder::Encode(const float* pixels, std::uint32_t nx,
                               std::uint32_t ny, std::vector<float>& out,
@@ -147,7 +148,8 @@ bool ReferenceEncoder::Encode(const float* pixels, std::uint32_t nx,
       for (std::uint32_t hh = 0; hh < heads; ++hh) {
         const std::size_t off = static_cast<std::size_t>(hh) * hd;
         for (std::uint32_t i = 0; i < n_patches; ++i) {
-          const float* ki = k_all.data() + static_cast<std::size_t>(i) * emb + off;
+          const float* ki =
+              k_all.data() + static_cast<std::size_t>(i) * emb + off;
           const float* qi = qp + off;
           float dot = 0.0F;
           for (std::uint32_t d = 0; d < hd; ++d) {
@@ -161,7 +163,8 @@ bool ReferenceEncoder::Encode(const float* pixels, std::uint32_t nx,
           oh[d] = 0.0F;
         }
         for (std::uint32_t i = 0; i < n_patches; ++i) {
-          const float* vi = v_all.data() + static_cast<std::size_t>(i) * emb + off;
+          const float* vi =
+              v_all.data() + static_cast<std::size_t>(i) * emb + off;
           const float w = scores[i];
           for (std::uint32_t d = 0; d < hd; ++d) {
             oh[d] += w * vi[d];
@@ -191,8 +194,8 @@ bool ReferenceEncoder::Encode(const float* pixels, std::uint32_t nx,
       for (std::uint32_t f = 0; f < c.feed_forward_length; ++f) {
         cur[f] = GeluQuick(g[f]) * cur[f];
       }
-      cpu::MatVec(b.ffn_down, 0, std::span<const float>(cur.data(),
-                                                        c.feed_forward_length),
+      cpu::MatVec(b.ffn_down, 0,
+                  std::span<const float>(cur.data(), c.feed_forward_length),
                   std::span<float>(tmp.data(), emb));
       cpu::RmsNorm(std::span<float>(tmp.data(), emb),
                    static_cast<const float*>(b.ffn_post_norm.data), eps);
@@ -231,9 +234,9 @@ bool ReferenceEncoder::Encode(const float* pixels, std::uint32_t nx,
     }
     cpu::RmsNorm(std::span<float>(xn.data(), emb), nullptr, eps);
     cpu::MatVec(w_.projection, 0, std::span<const float>(xn.data(), emb),
-                std::span<float>(out.data() + static_cast<std::size_t>(t) *
-                                                        c.projection_dim,
-                                 c.projection_dim));
+                std::span<float>(
+                    out.data() + static_cast<std::size_t>(t) * c.projection_dim,
+                    c.projection_dim));
   }
   return true;
 }

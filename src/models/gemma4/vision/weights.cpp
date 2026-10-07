@@ -37,7 +37,8 @@ struct Binder {
   /// formats, folding the dimensions into a `TensorRef` (ne[0] -> cols,
   /// ne[1] -> rows, ne[2] -> experts; ne[3] must be 1). The payload stays
   /// mapped and untouched.
-  TensorRef Get(const std::string& name, std::initializer_list<std::uint64_t> dims,
+  TensorRef Get(const std::string& name,
+                std::initializer_list<std::uint64_t> dims,
                 std::initializer_list<GgmlType> types) {
     TensorRef t;
     const auto* info = reader.FindTensor(name);
@@ -136,16 +137,16 @@ std::optional<VisionWeights> VisionWeights::Bind(const core::GgufReader& reader,
   // patch_embd is stored [kx=16, ky=16, cin=3, cout=1152]; fold the three
   // contiguous kernel axes into cols (kx fastest, then ky, then cin) so a
   // single row is one output channel's full 768-element kernel.
-  TensorRef patch = b.Get("v.patch_embd.weight", {16, 16, 3, 1152},
-                          {GgmlType::kF32});
+  TensorRef patch =
+      b.Get("v.patch_embd.weight", {16, 16, 3, 1152}, {GgmlType::kF32});
   patch.cols = 16 * 16 * 3;
   patch.rows = 1152;
   patch.experts = 1;
   w.patch_embed = patch;
 
   // position_embd is [1152, 10240, 2]: two stacked [1152][10240] tables.
-  TensorRef pos = b.Get("v.position_embd.weight", {1152, 10240, 2},
-                        {GgmlType::kF32});
+  TensorRef pos =
+      b.Get("v.position_embd.weight", {1152, 10240, 2}, {GgmlType::kF32});
   pos.cols = 1152;
   pos.rows = 10240;
   pos.experts = 2;

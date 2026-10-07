@@ -156,7 +156,7 @@ private:
   void TrimHistory();
   void RebuildPenaltyCounts();
   [[nodiscard]] double AdjustedLogit(TokenId token, float logit) const noexcept;
-[[nodiscard]] TokenId SampleConstrainedGreedy(
+  [[nodiscard]] TokenId SampleConstrainedGreedy(
       std::span<const float> logits) const;
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;

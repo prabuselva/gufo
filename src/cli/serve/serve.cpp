@@ -579,7 +579,7 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "llm") {
     std::string model;
     std::string served_model_name;
-std::uint32_t max_context = 0;
+    std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     std::uint32_t attn_window = 0;
     std::uint32_t attn_sink = 0;
@@ -626,7 +626,7 @@ std::uint32_t max_context = 0;
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API", "Model",
                      &served_model_name);
-parser.AddOption(
+    parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
@@ -1127,7 +1127,7 @@ int RunServe(std::span<const char* const> args) {
     // Default to LLM server
     std::string model;
     std::string served_model_name;
-std::uint32_t max_context = 0;
+    std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     std::uint32_t attn_window = 0;
     std::uint32_t attn_sink = 0;
@@ -1174,7 +1174,7 @@ std::uint32_t max_context = 0;
     llm_parser.AddOption("", "--served-model-name", "ID",
                          "Model identifier exposed by the OpenAI API", "Model",
                          &served_model_name);
-llm_parser.AddOption(
+    llm_parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
@@ -1420,7 +1420,7 @@ llm_parser.AddOption(
                            .directory = cache_disk_directory,
                            .capacity_bytes = cache_disk_bytes,
                            .staging_capacity_bytes = cache_disk_staging_bytes,
-.model_artifact_fingerprint = {},
+                           .model_artifact_fingerprint = {},
                        },
                        vision_model_path,
                        server::TextRunnerRamCacheOptions{

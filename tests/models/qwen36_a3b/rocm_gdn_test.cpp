@@ -213,8 +213,7 @@ bool RunPrefillCase(std::uint32_t tokens) {
   const std::size_t conv_state =
       static_cast<std::size_t>(kKernel - 1) * kChannels;
   const std::size_t qkv_count = static_cast<std::size_t>(tokens) * kChannels;
-  const std::size_t attn_count =
-      static_cast<std::size_t>(tokens) * kValueDim;
+  const std::size_t attn_count = static_cast<std::size_t>(tokens) * kValueDim;
 
   const auto qkv = t::MakeValues(qkv_count, 0x1234ABCDU, 1.0F);
   const auto conv_w = t::MakeValues(
@@ -304,12 +303,13 @@ bool RunPrefillCase(std::uint32_t tokens) {
                 d_beta.get() + static_cast<std::size_t>(tk) * kVHeads,
                 d_a.get(), d_dt.get(), r_state.get(), r_attn.get(), kKHeads,
                 kVHeads, kDim, nullptr);
-    q::GdnOutNorm(r_attn.get(), d_z.get() + static_cast<std::size_t>(tk) * kValueDim,
+    q::GdnOutNorm(r_attn.get(),
+                  d_z.get() + static_cast<std::size_t>(tk) * kValueDim,
                   d_norm_w.get(), kVHeads, kDim, kEps, nullptr);
-    (void)hipMemcpyAsync(r_attn_all.get() +
-                             static_cast<std::size_t>(tk) * kValueDim,
-                         r_attn.get(), kValueDim * sizeof(float),
-                         hipMemcpyDeviceToDevice, nullptr);
+    (void)hipMemcpyAsync(
+        r_attn_all.get() + static_cast<std::size_t>(tk) * kValueDim,
+        r_attn.get(), kValueDim * sizeof(float), hipMemcpyDeviceToDevice,
+        nullptr);
     dc_states.push_back(t::Download(&r_state, state_count));
   }
   t::CheckHip(hipDeviceSynchronize(), "GDN decode reference synchronization");
@@ -341,8 +341,8 @@ bool RunPrefillCase(std::uint32_t tokens) {
                     d_attn.get(), tokens, kKHeads, kVHeads, kDim, kChannels,
                     d_snap.get(), tokens - 1, nullptr);
     t::CheckHip(hipDeviceSynchronize(), "GDN snapshot synchronization");
-    const auto snap =
-        t::Download(&d_snap, static_cast<std::size_t>(tokens - 1) * state_count);
+    const auto snap = t::Download(
+        &d_snap, static_cast<std::size_t>(tokens - 1) * state_count);
     double worst = 0.0;
     for (std::uint32_t tk = 0; tk + 1 < tokens; ++tk) {
       const std::vector<float> slot(
@@ -358,8 +358,8 @@ bool RunPrefillCase(std::uint32_t tokens) {
 }
 
 // The fused decode front-end (conv + q/k RMSNorm in one launch) must be
-// bit-identical to the unfused GdnConv + GdnNormQk chain: same qn, kn, the value
-// half of convolved that the delta recurrence consumes, and the advanced
+// bit-identical to the unfused GdnConv + GdnNormQk chain: same qn, kn, the
+// value half of convolved that the delta recurrence consumes, and the advanced
 // convolution history.
 bool TestFusedConvNormQk() {
   const std::size_t conv_state =
@@ -401,14 +401,14 @@ bool TestFusedConvNormQk() {
   const auto conv_v_ref = t::Download(&u_conv, kChannels);
   const auto conv_v_fused = t::Download(&f_conv, kChannels);
   const std::vector<float> ref_v(conv_v_ref.begin() + 2 * kKeyDim,
-                                  conv_v_ref.end());
+                                 conv_v_ref.end());
   const std::vector<float> fused_v(conv_v_fused.begin() + 2 * kKeyDim,
-                                    conv_v_fused.end());
+                                   conv_v_fused.end());
 
   bool ok = true;
   const auto report = [&](const char* name, bool eq) {
-    std::cout << "GdnConvNormQk " << name << " bit-exact: " << (eq ? "yes" : "no")
-              << '\n';
+    std::cout << "GdnConvNormQk " << name
+              << " bit-exact: " << (eq ? "yes" : "no") << '\n';
     ok = ok && eq;
   };
   report("qn", t::Download(&u_qn, kKeyDim) == t::Download(&f_qn, kKeyDim));

@@ -386,8 +386,8 @@ __global__ void AttentionPrefillTiledKernel(
 // the whole key loop. K and the transposed V share one staging buffer.
 //
 // The head dimension is a template parameter so the same tiling covers the full
-// layers (512) and the SWA layers (256); the waves split the head dimension into
-// `kWaves / kSTiles` halves summed through LDS, and each wave owns
+// layers (512) and the SWA layers (256); the waves split the head dimension
+// into `kWaves / kSTiles` halves summed through LDS, and each wave owns
 // `kDimTilesPerWave = (kHeadDim/16)/kWaves` output dim tiles. The attention
 // scale is 1.0 (pinned by the oracle), so Q is converted to F16 unscaled.
 // ---------------------------------------------------------------------------
@@ -415,11 +415,14 @@ constexpr std::uint32_t kWmmaHeads = 2;  // query heads per block, divides GQA
 
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
          std::uint32_t kHeadDim>
-__launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
-    const float* __restrict__ q, const __half* __restrict__ k_cache,
-    const __half* __restrict__ v_cache, float* __restrict__ out,
-    std::uint32_t start, std::uint32_t tokens, std::uint32_t heads,
-    std::uint32_t kv_heads, std::uint32_t window) {
+__launch_bounds__(kWaves * 32, 1) __global__
+    void AttentionPrefillWmmaKernel(const float* __restrict__ q,
+                                    const __half* __restrict__ k_cache,
+                                    const __half* __restrict__ v_cache,
+                                    float* __restrict__ out,
+                                    std::uint32_t start, std::uint32_t tokens,
+                                    std::uint32_t heads, std::uint32_t kv_heads,
+                                    std::uint32_t window) {
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kThreads = kWaves * 32;
@@ -465,7 +468,7 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
 
   constexpr std::uint32_t kKvLdsHalves =
       (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? (kKeys * kWmmaKStride)
-                                                     : (kHeadDim * kVtStride);
+                                                    : (kHeadDim * kVtStride);
   __shared__ __half kv_lds[kKvLdsHalves];
   __shared__ float s_lds[2][kSTiles][16][16];
   __shared__ __half p_lds[kRows][kKeys];
@@ -480,10 +483,12 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
 
   v16h q_frag[kKStepsPerWave];
   {
-    const std::uint32_t local_query = query_start + row_block_offset(s_rb) + sub;
+    const std::uint32_t local_query =
+        query_start + row_block_offset(s_rb) + sub;
     const bool live = local_query < tokens;
-    const float* q_row = q + (static_cast<std::size_t>(local_query) * attn_width) +
-                         (static_cast<std::size_t>(row_block_head(s_rb)) * kHeadDim);
+    const float* q_row =
+        q + (static_cast<std::size_t>(local_query) * attn_width) +
+        (static_cast<std::size_t>(row_block_head(s_rb)) * kHeadDim);
 #pragma unroll
     for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
       const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
@@ -524,8 +529,9 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
       const std::uint32_t v_key = lane % kKeys;
       const std::uint32_t v_slice = ((tid / kKeys) * (kVRegs * 8));
       const std::uint32_t key_position = key_start + v_key;
-      const auto* src = v_cache + (static_cast<std::size_t>(key_position) * kv_width) +
-                        (static_cast<std::size_t>(kv_head) * kHeadDim) + v_slice;
+      const auto* src =
+          v_cache + (static_cast<std::size_t>(key_position) * kv_width) +
+          (static_cast<std::size_t>(kv_head) * kHeadDim) + v_slice;
       const bool live = key_position < context_end;
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j) {
@@ -535,15 +541,18 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
     }
 
     __syncthreads();
-    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8); idx += kThreads) {
+    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8);
+         idx += kThreads) {
       const std::uint32_t key_row = idx / (kHeadDim / 8);
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
       const std::uint32_t key_position = key_start + key_row;
       __half packed[8] = {};
       if (key_position < context_end) {
-        const auto* src = k_cache + (static_cast<std::size_t>(key_position) * kv_width) +
+        const auto* src = k_cache +
+                          (static_cast<std::size_t>(key_position) * kv_width) +
                           (static_cast<std::size_t>(kv_head) * kHeadDim) + d8;
-        *reinterpret_cast<uint4*>(packed) = *reinterpret_cast<const uint4*>(src);
+        *reinterpret_cast<uint4*>(packed) =
+            *reinterpret_cast<const uint4*>(src);
       }
       *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
           *reinterpret_cast<const uint4*>(packed);
@@ -574,7 +583,8 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
       constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
       const std::uint32_t rb = rg / 16;
       const std::uint32_t row = rg % 16;
-      const std::uint32_t local_query = query_start + row_block_offset(rb) + row;
+      const std::uint32_t local_query =
+          query_start + row_block_offset(rb) + row;
       const std::uint32_t absolute_query = start + local_query;
       float part_max = -INFINITY;
       float vals[kPerLane];
@@ -658,8 +668,8 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
       v16h v_frag[kKeyBlocks];
 #pragma unroll
       for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
-        v_frag[kb] =
-            LoadFrag(&kv_lds[(((dim_tile * 16) + sub) * kVtStride) + (kb * 16)]);
+        v_frag[kb] = LoadFrag(
+            &kv_lds[(((dim_tile * 16) + sub) * kVtStride) + (kb * 16)]);
       }
 #pragma unroll
       for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
@@ -693,7 +703,8 @@ __launch_bounds__(kWaves * 32, 1) __global__ void AttentionPrefillWmmaKernel(
             (static_cast<std::size_t>(local_query) * attn_width) +
             (static_cast<std::size_t>(query_head) * kHeadDim) +
             (dim_tile * 16) + sub;
-        out[offset] = (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
+        out[offset] =
+            (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
       }
     }
   }

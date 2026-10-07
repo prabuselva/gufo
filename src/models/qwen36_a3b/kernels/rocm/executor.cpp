@@ -240,8 +240,8 @@ void Session::Reset() {
                          nullptr);
     (void)hipMemsetAsync(mtp_v_cache_f16_, 0, kv_elems * sizeof(__half),
                          nullptr);
-(void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
-                          nullptr);
+    (void)hipMemsetAsync(mtp_prev_hidden_, 0, c_.hidden_size * sizeof(float),
+                         nullptr);
   }
 }
 
@@ -253,8 +253,8 @@ void Session::ConfigureVision(
   vision_input_.Configure(std::move(prompt), std::move(encoder), stream);
 }
 
-std::unique_ptr<Session> Executor::CreateSession(
-    std::uint32_t max_context, std::string* error_msg) const {
+std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
+                                                 std::string* error_msg) const {
   if (max_context == 0) {
     if (error_msg != nullptr) {
       *error_msg = "max_context must be positive";
@@ -331,9 +331,9 @@ std::size_t Executor::SessionBytes(std::uint32_t max_context) const noexcept {
     return 0;
   }
   const Config& c = model_.config();
-  const std::size_t state_bytes =
-      static_cast<std::size_t>(c.ssm_num_v_heads) * c.ssm_head_dim *
-      c.ssm_head_dim * sizeof(float);
+  const std::size_t state_bytes = static_cast<std::size_t>(c.ssm_num_v_heads) *
+                                  c.ssm_head_dim * c.ssm_head_dim *
+                                  sizeof(float);
   const std::size_t history_bytes =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels() *
       sizeof(float);
@@ -679,11 +679,11 @@ void Executor::Attention(const DeviceLayer& l, const float* x,
     Rope(gqa_k_, pos_dev, 1, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr,
          rope);
     (void)hipMemcpyAsync(k_cache + static_cast<std::size_t>(pos) * kv_row,
-                         gqa_k_, kv_row * sizeof(float), hipMemcpyDeviceToDevice,
-                         nullptr);
+                         gqa_k_, kv_row * sizeof(float),
+                         hipMemcpyDeviceToDevice, nullptr);
     (void)hipMemcpyAsync(v_cache + static_cast<std::size_t>(pos) * kv_row,
-                         gqa_v_, kv_row * sizeof(float), hipMemcpyDeviceToDevice,
-                         nullptr);
+                         gqa_v_, kv_row * sizeof(float),
+                         hipMemcpyDeviceToDevice, nullptr);
     KvCacheWriteF16(k_cache, v_cache, k_cache_f16, v_cache_f16, pos * kv_row,
                     kv_row, nullptr);
   }
@@ -734,8 +734,8 @@ void Executor::Moe(const DeviceLayer& l, const float* x, float* out) {
                   l.ffn_gate_exps.cols, x, 0U, moe_gate_, nullptr);
       GemvGrouped(l.ffn_up_exps.data, ToGemvType(l.ffn_up_exps.type),
                   l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_,
-                  c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols, x,
-                  0U, moe_up_, nullptr);
+                  c_.num_experts_used, l.ffn_up_exps.rows, l.ffn_up_exps.cols,
+                  x, 0U, moe_up_, nullptr);
     }
     Swiglu(moe_gate_, moe_up_, c_.num_experts_used * c_.expert_ff, nullptr);
   }
@@ -1132,9 +1132,9 @@ void Executor::AttentionBatch(const DeviceLayer& l, const float* x,
   RmsNormRows(pf_k_, l.attn_k_norm.f32(), pf_k_, tokens * nkv, hd, c_.rms_eps,
               nullptr);
   Rope(pf_q_, pos_dev, tokens, nh, hd, c_.rotary_dim, c_.rope_theta, nullptr,
-      rope);
+       rope);
   Rope(pf_k_, pos_dev, tokens, nkv, hd, c_.rotary_dim, c_.rope_theta, nullptr,
-      rope);
+       rope);
 
   // Publish the chunk's rotated keys/values at their absolute positions, then
   // read the whole prefix back causally.

@@ -67,9 +67,9 @@ bool GemvGroupedPair(const void* wa, const void* wb, GemvType type,
 /// without a fused kernel (the caller falls back to the pair + Swiglu path).
 bool GemvGroupedSwiglu(const void* wa, const void* wb, GemvType type,
                        std::size_t expert_stride, const std::int32_t* ids,
-                       std::uint32_t used, std::uint32_t rows, std::uint32_t cols,
-                       const float* x, std::uint32_t x_stride, float* out,
-                       hipStream_t stream);
+                       std::uint32_t used, std::uint32_t rows,
+                       std::uint32_t cols, const float* x,
+                       std::uint32_t x_stride, float* out, hipStream_t stream);
 
 /// One projection of a fused multi launch (see GemvMulti).
 struct GemvMultiProj {

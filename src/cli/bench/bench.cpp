@@ -1193,8 +1193,8 @@ int RunQwen36A3BBenchmark(
   std::string error;
   auto model = q36::Model::Load(
       options.model_path,
-      q36::ModelOptions{
-          .max_context = static_cast<std::uint32_t>(required_context)},
+      q36::ModelOptions{.max_context =
+                            static_cast<std::uint32_t>(required_context)},
       &error);
   if (model == nullptr) {
     std::cerr << "Error creating Qwen3.6-35B-A3B model: " << error << '\n';
@@ -1261,9 +1261,8 @@ int RunQwen36A3BBenchmark(
       std::vector<double> runs;
       for (std::size_t repetition = 0; repetition <= options.repetitions;
            ++repetition) {
-        auto session =
-            model->CreateSession(static_cast<std::uint32_t>(required_context),
-                                 &error);
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
         if (!session) {
           std::cerr << "Error preparing depth: " << error << '\n';
           return 1;
@@ -1303,9 +1302,8 @@ int RunQwen36A3BBenchmark(
       std::vector<double> runs;
       for (std::size_t repetition = 0; repetition < options.repetitions;
            ++repetition) {
-        auto session =
-            model->CreateSession(static_cast<std::uint32_t>(required_context),
-                                 &error);
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
         if (!session) {
           std::cerr << "Error preparing generation: " << error << '\n';
           return 1;
@@ -1377,10 +1375,9 @@ bool IsGemma4(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "gemma4";
 }
 
-int RunGemma4Benchmark(
-    const BenchOptions& options,
-    const std::shared_ptr<const core::GgufReader>& reader,
-    std::chrono::steady_clock::time_point model_load_start) {
+int RunGemma4Benchmark(const BenchOptions& options,
+                       const std::shared_ptr<const core::GgufReader>& reader,
+                       std::chrono::steady_clock::time_point model_load_start) {
   namespace g4 = models::gemma4;
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
@@ -1426,10 +1423,10 @@ int RunGemma4Benchmark(
   std::string error;
   auto model = g4::Model::Load(
       options.model_path,
-g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
-                            required_context),
-                        .draft_path = mtp ? options.mtp_model_path : "",
-                        .vision_model_path = ""},
+      g4::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(required_context),
+          .draft_path = mtp ? options.mtp_model_path : "",
+          .vision_model_path = ""},
       &error);
   if (model == nullptr) {
     std::cerr << "Error creating Gemma-4-26B-A4B model: " << error << '\n';
@@ -1495,9 +1492,8 @@ g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
       std::vector<double> runs;
       for (std::size_t repetition = 0; repetition <= options.repetitions;
            ++repetition) {
-        auto session =
-            model->CreateSession(static_cast<std::uint32_t>(required_context),
-                                 &error);
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
         if (!session) {
           std::cerr << "Error preparing depth: " << error << '\n';
           return 1;
@@ -1534,9 +1530,8 @@ g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
       std::vector<double> runs;
       for (std::size_t repetition = 0; repetition < options.repetitions;
            ++repetition) {
-        auto session =
-            model->CreateSession(static_cast<std::uint32_t>(required_context),
-                                 &error);
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
         if (!session) {
           std::cerr << "Error preparing generation: " << error << '\n';
           return 1;
@@ -1556,9 +1551,8 @@ g4::ModelOptions{.max_context = static_cast<std::uint32_t>(
         std::vector<std::int32_t> generated;
         std::size_t drafted = 0;
         std::size_t accepted = 0;
-        const std::vector<sampling::TokenId> history(tokens.begin(),
-                                                     tokens.begin() +
-                                                         prefix_length);
+        const std::vector<sampling::TokenId> history(
+            tokens.begin(), tokens.begin() + prefix_length);
         sampling::SamplerState sampler(options.sampling, history);
         const auto start = std::chrono::steady_clock::now();
         while (generated.size() < generation_length) {

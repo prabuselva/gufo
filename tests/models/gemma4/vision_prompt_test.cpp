@@ -30,12 +30,10 @@ void Expect(bool condition, const std::string& message) {
 void CheckSize(std::uint32_t w, std::uint32_t h, std::uint32_t exp_w,
                std::uint32_t exp_h, const std::string& tag) {
   const v::Size got = v::CalcSizePreservedRatio(w, h, {});
-  const std::string label = tag + " (" + std::to_string(w) + "x" +
-                            std::to_string(h) + " -> " +
-                            std::to_string(got.width) + "x" +
-                            std::to_string(got.height) + ", want " +
-                            std::to_string(exp_w) + "x" + std::to_string(exp_h) +
-                            ")";
+  const std::string label =
+      tag + " (" + std::to_string(w) + "x" + std::to_string(h) + " -> " +
+      std::to_string(got.width) + "x" + std::to_string(got.height) + ", want " +
+      std::to_string(exp_w) + "x" + std::to_string(exp_h) + ")";
   Expect(got.width == exp_w && got.height == exp_h, label);
 }
 
@@ -56,8 +54,8 @@ gufo::core::Image Solid(std::uint32_t w, std::uint32_t h, std::uint8_t r,
 // A tiny vocabulary with the three image markers marked special so
 // `parse_special` splits them out; `a`/`b` are single-char normal tokens.
 std::unique_ptr<gufo::models::gemma4::Tokenizer> MarkerTokenizer() {
-  const std::vector<std::string> tokens = {"<unk>", "<|image>", "<|image|>",
-                                           "<image|>", "a", "b"};
+  const std::vector<std::string> tokens = {"<unk>",    "<|image>", "<|image|>",
+                                           "<image|>", "a",        "b"};
   const std::vector<std::string> specials = {"<|image>", "<|image|>",
                                              "<image|>"};
   return gufo::models::gemma4::Tokenizer::FromVocabulary(tokens, {}, nullptr,
@@ -97,15 +95,15 @@ void CheckBuildPrompt() {
 
   // One marker between two text tokens expands to begin + N fillers + end.
   const std::vector<gufo::core::Image> one = {Solid(224, 224, 10, 20, 30)};
-  const std::size_t base1 =
-      tok->Encode("a<|image|>b", false, true).size();
+  const std::size_t base1 = tok->Encode("a<|image|>b", false, true).size();
   const v::PreparedPrompt p1 =
       v::BuildPrompt(*tok, "a<|image|>b", one, {}, nullptr);
   Expect(p1.images.size() == 1, "one image slot");
   if (p1.images.size() == 1) {
     const v::VisionSlot& s = p1.images[0];
     Expect(s.count == 49, "one image filler count 49");
-    // One marker (1 token) becomes begin + count + end (count + 2): net +count+1.
+    // One marker (1 token) becomes begin + count + end (count + 2): net
+    // +count+1.
     Expect(p1.tokens.size() == base1 + s.count + 1, "one image total length");
     check_slot(p1, s, "one");
   }

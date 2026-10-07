@@ -314,8 +314,9 @@ __global__ void GemvGroupedQ8_0Pair(
 __global__ void GemvGroupedQ8_0Swiglu(
     const Q8_0Block* __restrict__ wa, const Q8_0Block* __restrict__ wb,
     const std::int32_t* __restrict__ ids, std::size_t expert_stride_blocks,
-    const float* __restrict__ x, std::uint32_t x_stride, float* __restrict__ out,
-    std::uint32_t used, std::uint32_t rows, std::uint32_t cols) {
+    const float* __restrict__ x, std::uint32_t x_stride,
+    float* __restrict__ out, std::uint32_t used, std::uint32_t rows,
+    std::uint32_t cols) {
   const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
   if (pair >= used * rows) {
     return;

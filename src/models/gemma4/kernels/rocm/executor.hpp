@@ -115,7 +115,7 @@ public:
     vision_ = std::move(images);
   }
 
-[[nodiscard]] const float* logits() const noexcept { return logits_; }
+  [[nodiscard]] const float* logits() const noexcept { return logits_; }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
 
   /// Attaches the MTP draft and allocates its forward scratch. The draft reads
@@ -168,7 +168,7 @@ public:
     return verify_hidden_;
   }
 
- private:
+private:
   Executor(const Config& c, const DeviceModel& model) : c_(c), model_(model) {}
 
   /// One decode layer; swaps cur_/other_ so cur_ holds the new residual.
