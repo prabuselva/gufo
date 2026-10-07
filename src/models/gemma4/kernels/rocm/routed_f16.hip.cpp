@@ -24,6 +24,21 @@ constexpr unsigned kThreads = 256;
 // routed GEMM's block for it returns without touching the weight or row maps.
 constexpr std::int32_t kDeadTile = 0x7FFF;
 
+// gelu_tanh(gate) * up, matching fused.hip.cpp's DGelu/GegluPair so the fused
+// gate/up epilogue rounds identically to the separate GegluF16 pass it
+// replaces (the gate and up accumulators are narrowed to binary16 first, as
+// GegluF16 reads them from the binary16 gu buffer).
+__device__ __forceinline__ float DGelu(float x) {
+  constexpr float kAlpha = 0.7978845608028654F;  // sqrt(2/pi)
+  const float inner = kAlpha * (x + 0.044715F * x * x * x);
+  return 0.5F * x * (1.0F + tanhf(inner));
+}
+
+__device__ __forceinline__ __half GeGluHalf(float gate, float up) {
+  return __float2half(DGelu(__half2float(__float2half(gate))) *
+                      __half2float(__float2half(up)));
+}
+
 // F16 WMMA fragments (wave32): sixteen halves per lane, eight F32
 // accumulators per lane.
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -143,7 +158,7 @@ __device__ __forceinline__ __half2 Bf16x2ToF16x2(std::uint32_t w) {
   return __floats2half2_rn(lo, hi);
 }
 
-template<WeightType kType, int BM, int BN, int BK>
+template<WeightType kType, int BM, int BN, int BK, bool kGeGlu = false>
 __launch_bounds__(256) __global__
     void RoutedF16GEMMKernel(const void* __restrict__ w,
                              const __half* __restrict__ x,
@@ -154,9 +169,11 @@ __launch_bounds__(256) __global__
                              float* __restrict__ out,
                              __half* __restrict__ out_half, std::size_t m,
                              std::size_t k) {
-  static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
-  static_assert(BN % 16 == 0 && BN / 16 <= 8);
-  static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
+   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
+   static_assert(BN % 16 == 0 && BN / 16 <= 8);
+   static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
+   static_assert(!kGeGlu || (BN >= 48 && BM % 2 == 0),
+                 "the fused gate/up epilogue uses the wide-tile store");
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
@@ -205,6 +222,8 @@ __launch_bounds__(256) __global__
       std::min(kTokTiles, (bucket_rows - t_local + 15) / 16);
   const int num_kb = static_cast<int>(k / 32);
   const int m_i = static_cast<int>(m);
+  const int half_m = m_i / 2;  // fused gate/up: gate rows [0, half_m), up rows
+                               // [half_m, m); a block covers BM/2 of each.
   const std::size_t row_bytes = RoutedF16RowBytes<kType>(k);
   const auto* w_expert = static_cast<const std::uint8_t*>(w) +
                          static_cast<std::size_t>(expert) * m * row_bytes;
@@ -214,7 +233,10 @@ __launch_bounds__(256) __global__
   const int lane_id = tid & 31;
   const int sub_lane = lane_id & 15;
   const int half_id = lane_id >> 4;
-  const int r_block = static_cast<int>(blockIdx.x) * BM;
+  // A fused block spans BM/2 gate rows and the matching BM/2 up rows, so its
+  // grid.x is half_m / (BM/2) == m / BM (the launcher grid is unchanged).
+  const int r_block =
+      static_cast<int>(blockIdx.x) * (kGeGlu ? BM / 2 : BM);
 
   // Weight fetch: unit u of a thread is (row = tid / 2 + 128 u, chunk c =
   // tid % 2). Q4_K: the two 16-byte halves of one 32-byte nibble group (two
@@ -225,10 +247,16 @@ __launch_bounds__(256) __global__
   uint4 f_header[kWaveRowTiles];
 #pragma unroll
   for (int u = 0; u < kWaveRowTiles; ++u) {
-    const int r = r_block + (tid >> 1) + (u * 128);
-    f_live[u] = r < m_i;
-    f_ptr[u] = w_expert +
-               static_cast<std::size_t>(f_live[u] ? r : (m_i - 1)) * row_bytes;
+    const int rr = (tid >> 1) + (u * 128);  // block row-slot [0, BM)
+    // Fused: the first BM/2 slots read gate rows, the rest read the matching
+    // up rows (offset by half_m). Non-fused: slot == matrix row.
+    int mrow = r_block + rr;
+    if (kGeGlu && rr >= BM / 2)
+      mrow = half_m + r_block + (rr - BM / 2);
+    f_live[u] = mrow < m_i;
+    const std::size_t f_row =
+        static_cast<std::size_t>(f_live[u] ? mrow : (m_i - 1));
+    f_ptr[u] = w_expert + f_row * row_bytes;
     f_header[u] = make_uint4(0u, 0u, 0u, 0u);
   }
   // The next stage's weights and activations, fetched one stage ahead. The
@@ -570,24 +598,53 @@ __launch_bounds__(256) __global__
                     half_id] = acc[u][j][l];
         }
         __syncthreads();
+        if constexpr (kGeGlu) {
+          // Fused gate/up: scratch rows [0, BM/2) hold the gate projection and
+          // rows [BM/2, BM) the matching up projection. act = gelu_tanh(gate) *
+          // up is written to a half_m-wide row, replacing the gu buffer and the
+          // separate GegluF16 pass. rr is always even, so the float2 reads and
+          // the half2 store stay aligned.
 #pragma unroll
-        for (int round = 0; round < 16 * BM / (256 * 2); ++round) {
-          const unsigned flat = (round * 256 + tid) * 2;
-          const unsigned tr = flat / BM, row = flat % BM;
-          const unsigned t = t_local + j * 16 + tr, r = r_block + row;
-          if (t < unsigned(bucket_rows) && r < m) {
-            const int dst = rows_out[bucket_begin + t];
-            if (dst >= 0) {
-              float2 v =
-                  *reinterpret_cast<const float2*>(scratch + tr * stride + row);
-              const size_t o = size_t(dst) * m + r;
-              if (m % 2 == 0 && r + 1 < m)
-                *reinterpret_cast<__half2*>(out_half + o) =
-                    __floats2half2_rn(v.x, v.y);
-              else {
-                out_half[o] = __float2half(v.x);
-                if (r + 1 < m)
-                  out_half[o + 1] = __float2half(v.y);
+          for (int round = 0; round < 16 * (BM / 2) / (256 * 2); ++round) {
+            const unsigned flat = (round * 256 + tid) * 2;
+            const unsigned tr = flat / (BM / 2), rr = flat % (BM / 2);
+            const unsigned t = t_local + j * 16 + tr, r = r_block + rr;
+            if (t < unsigned(bucket_rows) && r < unsigned(half_m)) {
+              const int dst = rows_out[bucket_begin + t];
+              if (dst >= 0) {
+                const float2 g = *reinterpret_cast<const float2*>(
+                    scratch + tr * stride + rr);
+                const float2 u = *reinterpret_cast<const float2*>(
+                    scratch + tr * stride + rr + BM / 2);
+                const size_t o = size_t(dst) * half_m + r;
+                if (r + 1 < unsigned(half_m))
+                  *reinterpret_cast<__half2*>(out_half + o) = __floats2half2_rn(
+                      GeGluHalf(g.x, u.x), GeGluHalf(g.y, u.y));
+                else
+                  out_half[o] = GeGluHalf(g.x, u.x);
+              }
+            }
+          }
+        } else {
+#pragma unroll
+          for (int round = 0; round < 16 * BM / (256 * 2); ++round) {
+            const unsigned flat = (round * 256 + tid) * 2;
+            const unsigned tr = flat / BM, row = flat % BM;
+            const unsigned t = t_local + j * 16 + tr, r = r_block + row;
+            if (t < unsigned(bucket_rows) && r < m) {
+              const int dst = rows_out[bucket_begin + t];
+              if (dst >= 0) {
+                const float* srow = scratch + tr * stride + row;
+                float2 v = *reinterpret_cast<const float2*>(srow);
+                const size_t o = size_t(dst) * m + r;
+                if (m % 2 == 0 && r + 1 < m)
+                  *reinterpret_cast<__half2*>(out_half + o) =
+                      __floats2half2_rn(v.x, v.y);
+                else {
+                  out_half[o] = __float2half(v.x);
+                  if (r + 1 < m)
+                    out_half[o + 1] = __float2half(v.y);
+                }
               }
             }
           }
@@ -763,7 +820,7 @@ void BuildRoutedTiles(const std::uint32_t* counts, std::uint32_t experts,
                                                 tiles);
 }
 
-template<int BN>
+template<int BN, bool kGeGlu>
 bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                      const std::int32_t* tiles, std::uint32_t n_tiles,
                      const std::int32_t* pad_bounds,
@@ -772,32 +829,39 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                      hipStream_t stream) {
   constexpr int kBM = 128;
   constexpr int kBK = 2;
+  // grid.x spans m / BM blocks; a fused block covers BM/2 gate and BM/2 up
+  // rows, so half_m / (BM/2) == m / BM leaves the grid unchanged.
   const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
   switch (type) {
     case WeightType::kQ4_K:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, out, out_half, m, k);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK, kGeGlu>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          out, out_half, m, k);
       return true;
     case WeightType::kQ5_1:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_1, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, out, out_half, m, k);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ5_1, kBM, BN, kBK, kGeGlu>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          out, out_half, m, k);
       return true;
     case WeightType::kQ8_0:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ8_0, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, out, out_half, m, k);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ8_0, kBM, BN, kBK, kGeGlu>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          out, out_half, m, k);
       return true;
     case WeightType::kBF16:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kBF16, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, out, out_half, m, k);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kBF16, kBM, BN, kBK, kGeGlu>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          out, out_half, m, k);
       return true;
     case WeightType::kQ5_K:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, out, out_half, m, k);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK, kGeGlu>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          out, out_half, m, k);
       return true;
     default:
       return false;
@@ -809,7 +873,7 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,
                    const std::int32_t* rows_in, const std::int32_t* rows_out,
                    float* out, __half* out_half, std::size_t m, std::size_t k,
-                   hipStream_t stream) {
+                   hipStream_t stream, bool geglu) {
   const std::size_t block_elems =
       (type == WeightType::kQ4_K || type == WeightType::kQ5_K)
           ? 256
@@ -818,19 +882,29 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       (out_half == nullptr) == (out == nullptr)) {
     return false;
   }
+  // The fused gate/up epilogue lives in the wide-tile store only.
+  if (geglu && (tile_rows == 16 || m % 2 != 0)) {
+    return false;
+  }
   switch (tile_rows) {
     case 16:
-      return LaunchRoutedF16<16>(w, type, x, tiles, n_tiles, pad_bounds,
-                                 rows_in, rows_out, out, out_half, m, k,
-                                 stream);
+      return LaunchRoutedF16<16, false>(w, type, x, tiles, n_tiles, pad_bounds,
+                                        rows_in, rows_out, out, out_half, m, k,
+                                        stream);
     case 48:
-      return LaunchRoutedF16<48>(w, type, x, tiles, n_tiles, pad_bounds,
-                                 rows_in, rows_out, out, out_half, m, k,
-                                 stream);
+      return geglu ? LaunchRoutedF16<48, true>(w, type, x, tiles, n_tiles,
+                                               pad_bounds, rows_in, rows_out,
+                                               out, out_half, m, k, stream)
+                   : LaunchRoutedF16<48, false>(w, type, x, tiles, n_tiles,
+                                                pad_bounds, rows_in, rows_out,
+                                                out, out_half, m, k, stream);
     case 64:
-      return LaunchRoutedF16<64>(w, type, x, tiles, n_tiles, pad_bounds,
-                                 rows_in, rows_out, out, out_half, m, k,
-                                 stream);
+      return geglu ? LaunchRoutedF16<64, true>(w, type, x, tiles, n_tiles,
+                                               pad_bounds, rows_in, rows_out,
+                                               out, out_half, m, k, stream)
+                   : LaunchRoutedF16<64, false>(w, type, x, tiles, n_tiles,
+                                                pad_bounds, rows_in, rows_out,
+                                                out, out_half, m, k, stream);
     default:
       return false;
   }
