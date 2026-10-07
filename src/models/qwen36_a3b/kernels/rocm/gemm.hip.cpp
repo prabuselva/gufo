@@ -1,6 +1,7 @@
 #include "src/models/qwen36_a3b/kernels/rocm/gemm.hpp"
 
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
@@ -8,9 +9,21 @@
 #include <cstdint>
 
 #include "qfn_mmq.h"
+#include "src/models/qwen36_a3b/kernels/rocm/dense_f16_gemm.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {
 namespace {
+
+// Dense F16 GEMM route bounds (gfx1151; see docs/models/gemma4/EXPERIMENTS.md).
+// rows >= 2048 keeps the router (256 rows) and the narrow KV and shared-expert
+// gate/up projections (512 rows) off the F16 path; cols <= 4096 is the measured
+// winning ceiling (the widest dense projection here is 4096, so it never
+// excludes a real shape but keeps the rule consistent with the other trunk).
+// batch >= 96 matches the wide prefill tiles the kernel was tuned and measured
+// on.
+constexpr std::uint32_t kDenseF16MinBatch = 96;
+constexpr std::uint32_t kDenseF16MinRows = 2048;
+constexpr std::uint32_t kDenseF16MaxCols = 4096;
 
 // Process-wide hipBLAS handle. The executor drives a single stream, so one
 // handle reused across calls is safe; the stream is rebound on every call.
@@ -45,6 +58,31 @@ __global__ void NarrowBf16(const float* __restrict__ x,
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) {
     out[i] = hip_bfloat16(x[i]);
+  }
+}
+
+// Lazily grown device scratch holding the F16 narrowing of the activations,
+// mirroring Bf16Scratch. Only the dense F16 GEMM route touches it and only one
+// stream is live, so a single growable buffer is race-free. Sized in elements.
+__half* HalfScratch(std::size_t elems) {
+  static __half* buf = nullptr;
+  static std::size_t cap = 0;
+  if (elems > cap) {
+    if (buf != nullptr) {
+      (void)hipFree(buf);
+    }
+    cap = elems < (1u << 16) ? (1u << 16) : elems;
+    (void)hipMalloc(&buf, cap * sizeof(__half));
+  }
+  return buf;
+}
+
+__global__ void NarrowHalf(const float* __restrict__ x,
+                           __half* __restrict__ out, std::size_t n) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = __float2half_rn(x[i]);
   }
 }
 
@@ -84,6 +122,24 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
   (void)row_bytes;
   switch (type) {
     case GemvType::kQ8_0:
+      // Wide prefill batches take the F16 WMMA dense GEMM wherever its lower
+      // arithmetic intensity makes halved activation traffic and no
+      // FP32->Q8_1 requantize outweigh int8's 2x tensor throughput (1.32-1.59x
+      // measured on the sibling trunk, docs/models/gemma4/EXPERIMENTS.md). The
+      // weights stay Q8_0 and are dequantized to F16 in LDS; only the
+      // activations are narrowed. Any shape outside the measured winning
+      // window, or one the kernel rejects, falls through to the int8 mmq path.
+      if (batch >= kDenseF16MinBatch && rows >= kDenseF16MinRows &&
+          cols <= kDenseF16MaxCols) {
+        const std::size_t n = static_cast<std::size_t>(batch) * cols;
+        __half* xh = HalfScratch(n);
+        const std::size_t block = 256;
+        const std::size_t grid = (n + block - 1) / block;
+        NarrowHalf<<<grid, block, 0, stream>>>(x, xh, n);
+        if (DenseF16Gemm(base, xh, out, batch, rows, cols, stream)) {
+          break;
+        }
+      }
       (void)qfn_mmq_q8_0_dense(base, x, out, static_cast<int>(rows),
                                static_cast<int>(batch), static_cast<int>(cols),
                                stream);

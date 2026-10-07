@@ -29,9 +29,11 @@ if (ENGINE_ENABLE_HIP)
     kernels/rocm/kernels.hip.cpp
     kernels/rocm/gemv.hip.cpp
     kernels/rocm/gemm.hip.cpp
+    kernels/rocm/dense_f16_gemm.hip.cpp
     kernels/rocm/routed_f16.hip.cpp)
   set_source_files_properties(kernels/rocm/kernels.hip.cpp
     kernels/rocm/gemv.hip.cpp kernels/rocm/gemm.hip.cpp
+    kernels/rocm/dense_f16_gemm.hip.cpp
     kernels/rocm/routed_f16.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_qwen36_a3b_kernels PROPERTIES

@@ -15,7 +15,8 @@ always stay in their native encoding.
 
 | Type | Path |
 | --- | --- |
-| Q8_0 | `qfn_mmq_q8_0_dense` / `qfn_mmq_q8_0_moe_raw` — the shared mmq tensor-core target from `qwen38_flash_next` (the only cross-model dependency of this file; see `docs/kernels/qwen36_a3b/gemm.md` for the mmq internals) |
+| Q8_0 (wide prefill) | `DenseF16Gemm` — model-private binary16 WMMA GEMM (`dense_f16_gemm.hip.cpp`), taken when `batch >= 96 && rows >= 2048 && cols <= 4096` (k % 32 == 0); activations narrowed to F16 in a growable `HalfScratch`. 1.32–1.59× the int8 path and 10–16× more accurate on the gated shapes |
+| Q8_0 (else) | `qfn_mmq_q8_0_dense` / `qfn_mmq_q8_0_moe_raw` — the shared mmq tensor-core target from `qwen38_flash_next` (the only cross-model dependency of this file; see `docs/kernels/qwen36_a3b/gemm.md` for the mmq internals). Decode/short-prompt and the k=8192 `attn_out_full` stay here |
 | F32 | hipBLAS SGEMM (row-major via `OP_T`/`OP_N`), process-wide handle rebound to the executor stream per call |
 | BF16 | `NarrowBf16` narrows the activations into a lazily grown scratch, then hipBLAS GemmEx BF16-in / F32-out |
 | Q4_K / Q5_K | never here: `ValidateTypes` restricts dense tensors to Q8_0/F32/BF16 and routed K-quant experts go through `RoutedF16Gemm` |
@@ -35,4 +36,7 @@ Measured (`gemma4.rocm_kernels`): Gemm Q8_0 batch-8 worst error 3.58e-3
 against the scalar oracle, scale-relative tolerance 2e-2. The mmq path
 accumulates int8 products in I32 with per-32-block rescale, so its error is
 inherently larger than the GEMV float path; the routed pipeline test pins
-the end-to-end effect (see routed-f16-moe.md).
+the end-to-end effect (see routed-f16-moe.md). The wide-batch F16 route
+(rows=2112, batch=128) measures ~2.5–3.4e-4 scale-relative — an order of
+magnitude below the int8 path — so it strictly improves accuracy where it
+is taken.
