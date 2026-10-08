@@ -12,9 +12,9 @@ the Status log at the bottom as phases land.
 ```sh
 export PATH=/opt/rocm/bin:$PATH ROCM_PATH=/opt/rocm
 export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
-export GUFO_GEMMA4_GGUF=/home/praburaja/projects/llm/models/gguf/Gemma4-26B-A4B-IT/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf
-export GUFO_GEMMA4_MTP_GGUF=/home/praburaja/projects/llm/models/gguf/Gemma4-26B-A4B-IT/mtp-gemma-4-26B-A4B-it-Q8_0.gguf
-export GUFO_GEMMA4_MMPROJ_GGUF=/home/praburaja/projects/llm/models/gguf/Gemma4-26B-A4B-IT/mmproj-BF16.gguf
+export GUFO_GEMMA4_GGUF=$MODELS_DIR/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf
+export GUFO_GEMMA4_MTP_GGUF=$MODELS_DIR/mtp-gemma-4-26B-A4B-it-Q8_0.gguf
+export GUFO_GEMMA4_MMPROJ_GGUF=$MODELS_DIR/mmproj-BF16.gguf
 
 cmake --preset gpu-test -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++
 cmake --build --preset gpu-test --target <target> --parallel 4
@@ -23,7 +23,7 @@ ctest --preset gpu-full -R '^gemma4\.' --output-on-failure
 
 GPU benchmarks run exclusively through `tools/bench/gpu_exclusive.sh` (see
 AGENTS.md); iterate levers at ≤16K context first. The benchmark reference
-column is the local llama.cpp fork (`/home/praburaja/projects/llm/llama.cpp/
+column is the local llama.cpp fork (`$LLAMA_CPP/
 llama.cpp`, ROCm build) which carries the ground-truth graphs
 `src/models/gemma4.cpp`, `gemma4-assistant.cpp` and
 `tools/mtmd/models/gemma4v.cpp`.

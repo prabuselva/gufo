@@ -18,7 +18,7 @@ GEMM library.
 | `mtp-gemma-4-26B-A4B-it-Q8_0.gguf` (461 MB) | MTP draft, arch `gemma4-assistant`, no K/V projections |
 | `mmproj-BF16.gguf` (1.19 GB) | vision encoder + projector, `clip.vision.projector_type=gemma4v` |
 
-Located under `/home/praburaja/projects/llm/models/gguf/Gemma4-26B-A4B-IT/`.
+Located under `$MODELS_DIR/`.
 Future targets: Q8_0 and Q4_K_M quantizations of the trunk (M10).
 
 ## Architecture contract

@@ -41,7 +41,7 @@ flash-next.
 export PATH=/opt/rocm/bin:$PATH
 export ROCM_PATH=/opt/rocm
 export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH   # else libamdhip64.so.7 not found
-export GUFO_QWEN36_A3B_GGUF=/home/praburaja/projects/llm/models/gguf/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf
+export GUFO_QWEN36_A3B_GGUF=$MODELS_DIR/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf
 ```
 
 Configure (preset alone fails with "Failed to find HIP root"):

@@ -3,12 +3,12 @@
 All numbers on Strix Halo gfx1151, exclusive GPU
 (`tools/bench/gpu_exclusive.sh`), greedy sampling, `--n-gen 128`.
 Reference column: the local llama.cpp fork
-(`/home/praburaja/projects/llm/llama.cpp/llama.cpp`, ROCm build, same
+(`$LLAMA_CPP/llama.cpp`, ROCm build, same
 GGUFs). Preserve compiler/dependency versions when comparing.
 
 Artifacts: `gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf` (trunk),
 `mtp-gemma-4-26B-A4B-it-Q8_0.gguf` (draft), `mmproj-BF16.gguf` (vision)
-under `/home/praburaja/projects/llm/models/gguf/Gemma4-26B-A4B-IT/`.
+under `$MODELS_DIR/`.
 
 ## Reproduce
 
