@@ -17,6 +17,7 @@
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/gguf_reader.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
@@ -551,6 +552,44 @@ private:
 };
 
 }  // namespace
+
+std::shared_ptr<Model> LoadServeModel(
+    const std::string& model_path, const core::GgufReader& reader,
+    std::uint32_t max_context, const std::string& vision_model_path,
+    const server::TextSpeculativeConfig& speculative_config,
+    std::string* error) {
+  if (speculative_config.backend != server::TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != server::TextSpeculativeBackend::kMtp) {
+    SetError(error,
+             "Gemma-4 HTTP models support only MTP speculative decoding "
+             "(--speculative mtp --mtp-model)");
+    return nullptr;
+  }
+  const bool use_mtp =
+      speculative_config.backend == server::TextSpeculativeBackend::kMtp;
+  if (use_mtp && speculative_config.draft_model_path.empty()) {
+    SetError(error, "Gemma-4 MTP speculative decoding requires --mtp-model");
+    return nullptr;
+  }
+  std::string template_error;
+  if (!ValidateGgufTemplate(reader, &template_error)) {
+    SetError(error, "Unsupported Gemma-4 chat template: " + template_error);
+    return nullptr;
+  }
+  std::string load_error;
+  auto model = Model::Load(
+      model_path,
+      ModelOptions{.max_context = max_context,
+                   .draft_path = use_mtp ? speculative_config.draft_model_path
+                                         : std::string{},
+                   .vision_model_path = vision_model_path},
+      &load_error);
+  if (model == nullptr) {
+    SetError(error, "Failed to create Gemma-4 model: " + load_error);
+    return nullptr;
+  }
+  return model;
+}
 
 std::shared_ptr<TextModelRunner> CreateTextRunner(
     std::shared_ptr<Model> model, std::uint32_t max_context,

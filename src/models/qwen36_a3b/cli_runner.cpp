@@ -22,6 +22,8 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/prompt.hpp"
 
 namespace gufo::models::qwen36_a3b {
 namespace {
@@ -386,6 +388,59 @@ int GenerateQwen36A3BResponse(const cli::PromptOptions& opt, const Model& model,
     PrintTokenTrace(generated);
   }
   return 0;
+}
+
+int RunQwen36A3BPrompt(const cli::PromptOptions& opt,
+                       const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start,
+                       const std::string& rendered_prompt,
+                       std::vector<tokenization::ChatMessage>& messages,
+                       AttachImagesFn attach_images,
+                       PrepareVisionFn prepare_vision) {
+  auto model = LoadQwen36A3BModel(opt, reader, load_start);
+  if (!model)
+    return 1;
+  std::string err;
+  auto session = model->CreateSession(kDefaultContext, &err);
+  if (!session) {
+    std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
+    return 1;
+  }
+  try {
+    if (!opt.image_paths.empty()) {
+      attach_images(opt, messages.back());
+      auto vision = prepare_vision(opt, model->tokenizer(), messages,
+                                   model->VisionEncoder());
+      session->ConfigureVision(vision);
+      return GenerateQwen36A3BResponse(opt, *model, *session, vision->tokens);
+    }
+    const auto ids = model->Tokenize(rendered_prompt);
+    const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
+    return GenerateQwen36A3BResponse(opt, *model, *session, prompt);
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << '\n';
+    return 1;
+  }
+}
+
+bool LoadQwen36A3BChat(const cli::PromptOptions& opt,
+                       const core::GgufReader& reader,
+                       std::chrono::steady_clock::time_point load_start,
+                       std::shared_ptr<Model>* model,
+                       std::unique_ptr<Session>* session) {
+  *model = LoadQwen36A3BModel(opt, reader, load_start);
+  if (*model == nullptr)
+    return false;
+  std::string err;
+  *session = (*model)->CreateSession(kDefaultContext, &err);
+  if (*session == nullptr) {
+    std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
+    return false;
+  }
+  // Interactive chat decodes with MTP speculative decoding, so the draft
+  // cache must be filled during prefill.
+  (*session)->SetMtpEnabled(true);
+  return true;
 }
 
 }  // namespace gufo::models::qwen36_a3b

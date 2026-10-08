@@ -1065,33 +1065,10 @@ int RunPrompt(std::span<const char* const> args) {
   };
 
 #if defined(ENGINE_ENABLE_HIP)
-  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    auto model =
-        models::qwen36_a3b::LoadQwen36A3BModel(opt, *reader, model_load_start);
-    if (!model)
-      return 1;
-    auto session = model->CreateSession(kDefaultContext, &err);
-    if (!session) {
-      std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
-      return 1;
-    }
-    try {
-      if (!opt.image_paths.empty()) {
-        AttachImages(opt, messages.back());
-        auto vision = PrepareVision(opt, model->tokenizer(), messages,
-                                    model->VisionEncoder());
-        session->ConfigureVision(vision);
-        return models::qwen36_a3b::GenerateQwen36A3BResponse(
-            opt, *model, *session, vision->tokens);
-      }
-      const auto ids = model->Tokenize(rendered_prompt);
-      const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
-      return models::qwen36_a3b::GenerateQwen36A3BResponse(opt, *model,
-                                                           *session, prompt);
-    } catch (const std::exception& e) {
-      std::cerr << e.what() << '\n';
-      return 1;
-    }
+  if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
+    return models::qwen36_a3b::RunQwen36A3BPrompt(
+        opt, *reader, model_load_start, rendered_prompt, messages, AttachImages,
+        PrepareVision);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
@@ -1311,19 +1288,10 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
   std::shared_ptr<models::qwen36_a3b::Model> qwen36_model;
   std::unique_ptr<models::qwen36_a3b::Session> qwen36_session;
-  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    qwen36_model =
-        models::qwen36_a3b::LoadQwen36A3BModel(opt, *reader, model_load_start);
-    if (!qwen36_model)
+  if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
+    if (!models::qwen36_a3b::LoadQwen36A3BChat(opt, *reader, model_load_start,
+                                               &qwen36_model, &qwen36_session))
       return 1;
-    qwen36_session = qwen36_model->CreateSession(kDefaultContext, &err);
-    if (!qwen36_session) {
-      std::cerr << "Qwen3.6-35B-A3B session failed: " << err << '\n';
-      return 1;
-    }
-    // Interactive chat decodes with MTP speculative decoding, so the draft
-    // cache must be filled during prefill.
-    qwen36_session->SetMtpEnabled(true);
     tokenizer = &qwen36_model->tokenizer();
     architecture = "qwen35moe";
     vision_encoder = qwen36_model->VisionEncoder();

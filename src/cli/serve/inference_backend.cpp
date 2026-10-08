@@ -2955,7 +2955,6 @@ private:
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
-
 #endif
 
 }  // namespace
@@ -3226,29 +3225,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        speculative_config.backend != TextSpeculativeBackend::kMtp) {
-      SetError(error,
-               "Qwen3.6-35B-A3B HTTP models support only MTP speculative "
-               "decoding (--speculative mtp)");
-      return false;
-    }
-    if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
-                                                              &load_error)) {
-      SetError(error,
-               "Unsupported Qwen3.6-35B-A3B chat template: " + load_error);
-      return false;
-    }
-    auto model = models::qwen36_a3b::Model::Load(
-        model_path,
-        models::qwen36_a3b::ModelOptions{
-            .max_context = max_context,
-            .attn_window = attn_window,
-            .attn_sink = attn_sink,
-            .vision_model_path = vision_model_path},
-        &load_error);
+    auto model = models::qwen36_a3b::LoadServeModel(
+        model_path, *reader, max_context, attn_window, attn_sink,
+        vision_model_path, speculative_config, &load_error);
     if (model == nullptr) {
-      SetError(error, "Failed to create Qwen3.6-35B-A3B model: " + load_error);
+      SetError(error, load_error);
       return false;
     }
     return load(std::move(model), error, max_context, session_count,
@@ -3256,33 +3237,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "gemma4") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        speculative_config.backend != TextSpeculativeBackend::kMtp) {
-      SetError(error,
-               "Gemma-4 HTTP models support only MTP speculative decoding "
-               "(--speculative mtp --mtp-model)");
-      return false;
-    }
-    const bool use_mtp =
-        speculative_config.backend == TextSpeculativeBackend::kMtp;
-    if (use_mtp && speculative_config.draft_model_path.empty()) {
-      SetError(error, "Gemma-4 MTP speculative decoding requires --mtp-model");
-      return false;
-    }
-    if (!models::gemma4::ValidateGgufTemplate(*reader, &load_error)) {
-      SetError(error, "Unsupported Gemma-4 chat template: " + load_error);
-      return false;
-    }
-    auto model = models::gemma4::Model::Load(
-        model_path,
-        models::gemma4::ModelOptions{
-            .max_context = max_context,
-            .draft_path =
-                use_mtp ? speculative_config.draft_model_path : std::string{},
-            .vision_model_path = vision_model_path},
+    auto model = models::gemma4::LoadServeModel(
+        model_path, *reader, max_context, vision_model_path, speculative_config,
         &load_error);
     if (model == nullptr) {
-      SetError(error, "Failed to create Gemma-4 model: " + load_error);
+      SetError(error, load_error);
       return false;
     }
     return load(std::move(model), error, max_context, session_count,

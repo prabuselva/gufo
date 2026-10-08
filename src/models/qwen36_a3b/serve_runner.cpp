@@ -17,6 +17,7 @@
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -396,6 +397,40 @@ private:
 };
 
 }  // namespace
+
+std::shared_ptr<Model> LoadServeModel(
+    const std::string& model_path, const core::GgufReader& reader,
+    std::uint32_t max_context, std::uint32_t attn_window,
+    std::uint32_t attn_sink, const std::string& vision_model_path,
+    const server::TextSpeculativeConfig& speculative_config,
+    std::string* error) {
+  if (speculative_config.backend != server::TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != server::TextSpeculativeBackend::kMtp) {
+    SetError(error,
+             "Qwen3.6-35B-A3B HTTP models support only MTP speculative "
+             "decoding (--speculative mtp)");
+    return nullptr;
+  }
+  std::string template_error;
+  if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(reader,
+                                                            &template_error)) {
+    SetError(error,
+             "Unsupported Qwen3.6-35B-A3B chat template: " + template_error);
+    return nullptr;
+  }
+  std::string load_error;
+  auto model = Model::Load(model_path,
+                           ModelOptions{.max_context = max_context,
+                                        .attn_window = attn_window,
+                                        .attn_sink = attn_sink,
+                                        .vision_model_path = vision_model_path},
+                           &load_error);
+  if (model == nullptr) {
+    SetError(error, "Failed to create Qwen3.6-35B-A3B model: " + load_error);
+    return nullptr;
+  }
+  return model;
+}
 
 std::shared_ptr<TextModelRunner> CreateTextRunner(
     std::shared_ptr<Model> model, std::uint32_t max_context,
