@@ -29,6 +29,9 @@ void RequantKQuantRowToQ8_0(const void* src, core::GgmlType type,
     case core::GgmlType::kQ4_K:
       gufo::quant::DequantizeQ4_K(src, scratch, cols);
       break;
+    case core::GgmlType::kQ4_0:
+      gufo::quant::DequantizeQ4_0(src, scratch, cols);
+      break;
     case core::GgmlType::kQ5_K:
       gufo::quant::DequantizeQ5_K(src, scratch, cols);
       break;
@@ -86,12 +89,15 @@ struct Uploader {
     // The dense GEMM tier decodes only Q8_0/F32/BF16 and the routed WMMA tier
     // decodes Q8_0/Q4_K/Q5_K/BF16. Any k-quant the target tier cannot decode is
     // requantized to Q8_0 on the host during upload: Q6_K everywhere (neither
-    // tier decodes it) and Q4_K/Q5_K on dense tensors (only the routed tier
-    // does). A *_K_M artifact stores the dense attention/FFN projections as
-    // Q4_K, so those upcast while the routed experts stay native.
-    const bool upcast = t.type == core::GgmlType::kQ6_K ||
-                        (!expert && (t.type == core::GgmlType::kQ4_K ||
-                                     t.type == core::GgmlType::kQ5_K));
+    // tier decodes it), Q4_0 everywhere (a QAT artifact stores every matmul as
+    // Q4_0 and neither tier decodes it) and Q4_K/Q5_K on dense tensors (only
+    // the routed tier does). A *_K_M artifact stores the dense
+    // attention/FFN projections as Q4_K, so those upcast while the routed
+    // experts stay native.
+    const bool upcast =
+        t.type == core::GgmlType::kQ6_K || t.type == core::GgmlType::kQ4_0 ||
+        (!expert &&
+         (t.type == core::GgmlType::kQ4_K || t.type == core::GgmlType::kQ5_K));
     if (upcast) {
       return CopyUpcast(t);
     }

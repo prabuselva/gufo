@@ -25,6 +25,8 @@ struct Format {
       return {1, 2};
     case GgmlType::kQ8_0:
       return {32, 34};
+    case GgmlType::kQ4_0:
+      return {32, 18};
     case GgmlType::kQ5_1:
       return {32, 24};
     case GgmlType::kQ4_K:
@@ -122,8 +124,8 @@ struct Binder {
     // Projections keep the artifact precision; the UD quant stores the last
     // full-attention layer in BF16 while the rest is Q8_0.
     const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kQ5_K,
-                        GgmlType::kQ4_K, GgmlType::kBF16, GgmlType::kF16,
-                        GgmlType::kF32};
+                        GgmlType::kQ4_K, GgmlType::kQ4_0, GgmlType::kBF16,
+                        GgmlType::kF16,  GgmlType::kF32};
     const auto norm = {GgmlType::kF32};
 
     l.attn_norm = Get(p + "attn_norm.weight", hidden, 1, 1, norm);
@@ -188,8 +190,8 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   w.config = *config;
   const Config& c = w.config;
   const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kQ5_K,
-                      GgmlType::kQ4_K, GgmlType::kBF16, GgmlType::kF16,
-                      GgmlType::kF32};
+                      GgmlType::kQ4_K, GgmlType::kQ4_0, GgmlType::kBF16,
+                      GgmlType::kF16,  GgmlType::kF32};
 
   w.token_embd =
       b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, dense);
@@ -228,8 +230,8 @@ std::optional<DraftWeights> DraftWeights::Bind(const core::GgufReader& reader,
   d.config = *config;
   const Config& c = d.config;
   const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kQ5_K,
-                      GgmlType::kQ4_K, GgmlType::kBF16, GgmlType::kF16,
-                      GgmlType::kF32};
+                      GgmlType::kQ4_K, GgmlType::kQ4_0, GgmlType::kBF16,
+                      GgmlType::kF16,  GgmlType::kF32};
 
   d.pre_projection = b.Get("nextn.pre_projection.weight",
                            2 * static_cast<std::uint64_t>(c.hidden_size_out),
