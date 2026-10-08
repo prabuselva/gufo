@@ -1423,8 +1423,8 @@ int RunServe(std::span<const char* const> args) {
                            .model_artifact_fingerprint = {},
                        },
                        vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes},
+                       server::TextRunnerRamCacheOptions{.capacity_bytes =
+                                                             cache_ram_bytes},
                        attn_window, attn_sink)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
