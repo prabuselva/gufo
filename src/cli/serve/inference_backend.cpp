@@ -3094,7 +3094,7 @@ public:
         request.tool_choice == ChatRequest::ToolChoice::kNone
             ? std::span<const tokenization::ChatTool>{}
             : std::span<const tokenization::ChatTool>{request.tools},
-        QwenChatOptions(request));
+        QwenChatOptions(request, max_context_));
   }
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
@@ -3111,7 +3111,7 @@ public:
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return QwenChatOptions(request).enable_thinking
+    return QwenChatOptions(request, max_context_).enable_thinking
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
   }
