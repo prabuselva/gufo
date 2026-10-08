@@ -1140,10 +1140,6 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
-#endif
-
-}  // namespace
-
 bool IsQwen36A3B(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "qwen35moe";
 }
@@ -1596,6 +1592,10 @@ int RunGemma4Benchmark(const BenchOptions& options,
   std::cout << '\n';
   return 0;
 }
+
+#endif  // defined(ENGINE_ENABLE_HIP)
+
+}  // namespace
 
 void PrintBenchHelp(std::string_view program_name) {
   BenchOptions opt;
