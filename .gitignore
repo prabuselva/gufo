@@ -120,3 +120,8 @@ tests/quality/compsec.json
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Local build directories and editor state
+build_*
+.opencode*
+AGENTS_MINE.md

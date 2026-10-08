@@ -42,6 +42,10 @@ struct PromptOptions {
   std::string dspark_model_path;
   std::uint32_t draft_tokens = 7;
   std::uint32_t min_draft_tokens = 1;
+  // Qwen3.6-35B-A3B prefill attention sparsity: sliding-window tokens plus the
+  // always-attended initial sink. 0 disables sparsity (dense).
+  std::uint32_t attn_window = 0;
+  std::uint32_t attn_sink = 0;
 };
 
 /// Prints help for `gufo prompt`.

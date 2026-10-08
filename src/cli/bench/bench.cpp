@@ -32,9 +32,11 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/gemma4/cli_runner.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen36_a3b/cli_runner.hpp"
 #endif
 
 namespace gufo::cli {
@@ -1138,7 +1140,7 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
-#endif
+#endif  // defined(ENGINE_ENABLE_HIP)
 
 }  // namespace
 
@@ -1266,6 +1268,13 @@ int RunBench(std::span<const char* const> args) {
   }
   if (IsQwen38FlashNext(*reader)) {
     return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
+  }
+  if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
+    return models::qwen36_a3b::RunQwen36A3BBenchmark(opt, reader,
+                                                     model_load_start);
+  }
+  if (models::gemma4::IsGemma4(*reader)) {
+    return models::gemma4::RunGemma4Benchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

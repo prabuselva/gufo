@@ -581,6 +581,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string served_model_name;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
+    std::uint32_t attn_window = 0;
+    std::uint32_t attn_sink = 0;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
@@ -628,6 +630,14 @@ void PrintServeHelp(std::string_view program_name,
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddOption("", "--attn-window", "N",
+                     "Qwen3.6-35B-A3B prefill attention: sliding-window tokens "
+                     "(0 = dense, default)",
+                     "Model", &attn_window);
+    parser.AddOption("", "--attn-sink", "N",
+                     "Qwen3.6-35B-A3B prefill attention: always-attended "
+                     "initial tokens when --attn-window is set (default 0)",
+                     "Model", &attn_sink);
 
     // Sampling Defaults
     parser.AddOption(
@@ -665,8 +675,9 @@ void PrintServeHelp(std::string_view program_name,
                      "Path to DeepSeek V4 Flash DSpark support GGUF file",
                      "Speculative", &dspark_model_path);
     parser.AddOption("", "--mtp-model", "PATH",
-                     "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
-                     "mtp-...-shared-*.gguf sidecar)",
+                     "Path to the MTP draft GGUF sidecar for --speculative mtp "
+                     "(Qwen3.8-Flash-Next mtp-...-shared-*.gguf, or the "
+                     "Gemma-4 mtp-*.gguf draft)",
                      "Speculative", &mtp_model_path);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
@@ -1118,6 +1129,8 @@ int RunServe(std::span<const char* const> args) {
     std::string served_model_name;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
+    std::uint32_t attn_window = 0;
+    std::uint32_t attn_sink = 0;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
@@ -1165,6 +1178,14 @@ int RunServe(std::span<const char* const> args) {
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddOption("", "--attn-window", "N",
+                         "Qwen3.6-35B-A3B prefill attention: sliding-window "
+                         "tokens (0 = dense, default)",
+                         "Model", &attn_window);
+    llm_parser.AddOption("", "--attn-sink", "N",
+                         "Qwen3.6-35B-A3B prefill attention: always-attended "
+                         "initial tokens when --attn-window is set (default 0)",
+                         "Model", &attn_sink);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1402,8 +1423,9 @@ int RunServe(std::span<const char* const> args) {
                            .model_artifact_fingerprint = {},
                        },
                        vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+                       server::TextRunnerRamCacheOptions{.capacity_bytes =
+                                                             cache_ram_bytes},
+                       attn_window, attn_sink)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

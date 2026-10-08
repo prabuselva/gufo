@@ -37,9 +37,14 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/gemma4/engine.hpp"
+#include "src/models/gemma4/serve_runner.hpp"
+#include "src/models/gemma4/vision/prompt.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen36_a3b/engine.hpp"
+#include "src/models/qwen36_a3b/serve_runner.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
@@ -3068,7 +3073,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            std::uint32_t attn_window,
+                            std::uint32_t attn_sink) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3216,6 +3223,30 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
+  }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    auto model = models::qwen36_a3b::LoadServeModel(
+        model_path, *reader, max_context, attn_window, attn_sink,
+        vision_model_path, speculative_config, &load_error);
+    if (model == nullptr) {
+      SetError(error, load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
+  }
+  if (reader->GetMetadataString("general.architecture") == "gemma4") {
+    auto model = models::gemma4::LoadServeModel(
+        model_path, *reader, max_context, vision_model_path, speculative_config,
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3567,6 +3598,76 @@ bool InferenceBackend::load(
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::qwen36_a3b::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Qwen3.6-35B-A3B model must not be null");
+    return false;
+  }
+  try {
+    auto runner = models::qwen36_a3b::CreateTextRunner(
+        std::move(model), max_context, session_count, speculative_config,
+        disk_cache_config, error);
+    if (runner == nullptr) {
+      return false;
+    }
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Gemma-4 model must not be null");
+    return false;
+  }
+  try {
+    auto runner = models::gemma4::CreateTextRunner(
+        std::move(model), max_context, session_count, speculative_config,
+        disk_cache_config, error);
+    if (runner == nullptr) {
+      return false;
+    }
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

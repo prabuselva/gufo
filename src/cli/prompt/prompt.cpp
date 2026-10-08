@@ -20,6 +20,8 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/gemma4/cli_runner.hpp"
+#include "src/models/gemma4/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -31,6 +33,8 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen36_a3b/cli_runner.hpp"
+#include "src/models/qwen36_a3b/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
@@ -88,6 +92,14 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
+  parser.AddOption("", "--attn-window", "N",
+                   "Qwen3.6-35B-A3B prefill attention: sliding-window tokens "
+                   "(0 = dense, default)",
+                   "Model", &opt.attn_window);
+  parser.AddOption("", "--attn-sink", "N",
+                   "Qwen3.6-35B-A3B prefill attention: always-attended initial "
+                   "tokens when --attn-window is set (default 0)",
+                   "Model", &opt.attn_sink);
   RegisterImageOptions(parser, opt);
 
   // Prompt & Formatting
@@ -1011,6 +1023,18 @@ int RunPrompt(std::span<const char* const> args) {
   }
 #endif
 
+#if defined(ENGINE_ENABLE_HIP)
+  if (models::gemma4::IsGemma4(*reader)) {
+    return models::gemma4::RunGemma4Prompt(opt, *reader, model_load_start);
+  }
+#else
+  if (models::gemma4::IsGemma4(*reader)) {
+    std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+#endif
+
   std::string rendered_prompt = opt.prompt_text;
   std::vector<tokenization::ContentSpan> content_spans;
   std::vector<tokenization::ChatMessage> messages;
@@ -1041,6 +1065,11 @@ int RunPrompt(std::span<const char* const> args) {
   };
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
+    return models::qwen36_a3b::RunQwen36A3BPrompt(
+        opt, *reader, model_load_start, rendered_prompt, messages, AttachImages,
+        PrepareVision);
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)
@@ -1233,6 +1262,21 @@ int RunChat(std::span<const char* const> args) {
   }
 #endif
 
+#if defined(ENGINE_ENABLE_HIP)
+  if (models::gemma4::IsGemma4(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Gemma-4 image input is not yet available\n";
+      return 2;
+    }
+    return models::gemma4::RunGemma4Chat(opt, *reader, model_load_start);
+  }
+#else
+  if (models::gemma4::IsGemma4(*reader)) {
+    std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
+    return 1;
+  }
+#endif
+
   const tokenization::QwenTokenizer* tokenizer = nullptr;
   std::string architecture;
   std::unique_ptr<models::QwenGenerator> generator;
@@ -1242,6 +1286,16 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
   std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
+  std::shared_ptr<models::qwen36_a3b::Model> qwen36_model;
+  std::unique_ptr<models::qwen36_a3b::Session> qwen36_session;
+  if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
+    if (!models::qwen36_a3b::LoadQwen36A3BChat(opt, *reader, model_load_start,
+                                               &qwen36_model, &qwen36_session))
+      return 1;
+    tokenizer = &qwen36_model->tokenizer();
+    architecture = "qwen35moe";
+    vision_encoder = qwen36_model->VisionEncoder();
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!flash_model)
@@ -1358,10 +1412,17 @@ int RunChat(std::span<const char* const> args) {
         prompt_tokens = vision->tokens;
         if (flash_session)
           flash_session->ConfigureVision(vision);
+        if (qwen36_session)
+          qwen36_session->ConfigureVision(vision);
         if (gpu_executor)
           gpu_executor->ConfigureVision(vision, vision_encoder);
       }
-      if (flash_model) {
+      if (qwen36_model) {
+        if (models::qwen36_a3b::GenerateQwen36A3BResponse(
+                opt, *qwen36_model, *qwen36_session, prompt_tokens,
+                &assistant_reply) != 0)
+          return 1;
+      } else if (flash_model) {
         if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
                                       prompt_tokens, &assistant_reply) != 0)
           return 1;
