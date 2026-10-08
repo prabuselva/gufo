@@ -187,7 +187,9 @@ endif()
 
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
-  src/cli/prompt/prompt.cpp)
+  src/cli/prompt/prompt.cpp
+  src/models/gemma4/cli_runner.cpp
+  src/models/qwen36_a3b/cli_runner.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
@@ -234,6 +236,8 @@ add_executable(gufo
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
+  src/models/gemma4/serve_runner.cpp
+  src/models/qwen36_a3b/serve_runner.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
 target_compile_definitions(gufo PRIVATE

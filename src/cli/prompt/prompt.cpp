@@ -20,6 +20,7 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/gemma4/cli_runner.hpp"
 #include "src/models/gemma4/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -32,6 +33,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen36_a3b/cli_runner.hpp"
 #include "src/models/qwen36_a3b/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -627,276 +629,6 @@ int RunDeepSeekChat(const PromptOptions& opt, const core::GgufReader& reader,
   return 0;
 }
 
-bool IsGemma4(const core::GgufReader& reader) {
-  return reader.GetMetadataString("general.architecture") == "gemma4";
-}
-
-std::shared_ptr<models::gemma4::Model> LoadGemma4Model(
-    const PromptOptions& opt, const core::GgufReader& reader,
-    std::chrono::steady_clock::time_point load_start) {
-  if (opt.force_cpu) {
-    std::cerr << "Gemma-4-26B-A4B is supported only by the ROCm backend\n";
-    PrintModelLoadTime(load_start, false);
-    return nullptr;
-  }
-  const bool mtp = opt.speculative_backend == "mtp";
-  if (!opt.speculative_backend.empty() && !mtp) {
-    std::cerr << "Gemma-4-26B-A4B supports only --speculative mtp or off\n";
-    PrintModelLoadTime(load_start, false);
-    return nullptr;
-  }
-  if (mtp && opt.mtp_model_path.empty()) {
-    std::cerr << "--speculative mtp requires --mtp-model\n";
-    PrintModelLoadTime(load_start, false);
-    return nullptr;
-  }
-  std::string template_error;
-  if (!models::gemma4::ValidateGgufTemplate(reader, &template_error)) {
-    std::cerr << "Unsupported Gemma-4 chat template: " << template_error
-              << '\n';
-    PrintModelLoadTime(load_start, false);
-    return nullptr;
-  }
-  std::string error;
-  auto model = models::gemma4::Model::Load(
-      opt.model_path,
-      models::gemma4::ModelOptions{.max_context = kDefaultContext,
-                                   .draft_path = mtp ? opt.mtp_model_path : "",
-                                   .vision_model_path = opt.vision_model_path},
-      &error);
-  if (model == nullptr) {
-    std::cerr << "Error creating Gemma-4-26B-A4B model: " << error << '\n';
-    PrintModelLoadTime(load_start, false);
-    return nullptr;
-  }
-  if (mtp && !model->HasMtp()) {
-    std::cerr << "--speculative mtp requested but the draft sidecar failed to "
-                 "load\n";
-    PrintModelLoadTime(load_start, false);
-    return nullptr;
-  }
-  PrintModelLoadTime(load_start);
-  return model;
-}
-
-int GenerateGemma4Response(
-    const PromptOptions& opt,
-    const std::shared_ptr<models::gemma4::Model>& model,
-    models::gemma4::Session& session,
-    std::span<const std::int32_t> prompt_tokens, std::string* reply = nullptr,
-    const std::vector<models::gemma4::vision::VisionSlot>* vision_slots =
-        nullptr) {
-  std::string error;
-  const auto emit = [&](std::int32_t token) {
-    const auto piece = model->TokenText(token);
-    if (reply != nullptr)
-      reply->append(piece);
-    std::cout << piece << std::flush;
-  };
-  if (prompt_tokens.empty()) {
-    std::cerr << "Gemma-4-26B-A4B prompt produced no tokens\n";
-    return 1;
-  }
-  if (prompt_tokens.size() >= kDefaultContext ||
-      opt.max_tokens >= kDefaultContext - prompt_tokens.size()) {
-    std::cerr << "Gemma-4-26B-A4B prompt and output exceed the 4096-token "
-                 "CLI context\n";
-    return 1;
-  }
-  session.Reset();
-  const bool synced = vision_slots != nullptr && !vision_slots->empty()
-                          ? session.Sync(prompt_tokens, *vision_slots, &error)
-                          : session.Sync(prompt_tokens, &error);
-  if (!synced) {
-    std::cerr << "Gemma-4-26B-A4B prefill failed: " << error << '\n';
-    return 1;
-  }
-  if (opt.verbose) {
-    std::cout << "[Engine]: Gemma-4-26B-A4B ROCm (gfx1151)\n"
-              << "Model: " << model->ModelName() << '\n'
-              << "Prompt tokens: " << prompt_tokens.size() << '\n'
-              << "Max tokens: " << opt.max_tokens << '\n'
-              << "--- Generation Output ---\n";
-  }
-  std::vector<sampling::TokenId> sampling_history;
-  sampling_history.reserve(prompt_tokens.size());
-  for (const std::int32_t token : prompt_tokens) {
-    sampling_history.push_back(static_cast<sampling::TokenId>(token));
-  }
-  sampling::SamplerState sampler(opt.sampling, sampling_history);
-
-  const auto generation_start = std::chrono::steady_clock::now();
-  const bool mtp = opt.speculative_backend == "mtp";
-  std::size_t generated = 0;
-  std::vector<tokenization::TokenId> generated_ids;
-  while (generated < opt.max_tokens) {
-    // A one-token budget keeps the autoregressive path; a larger one lets the
-    // session chain drafts through the MTP block and verify them in one pass.
-    const std::size_t budget = mtp ? opt.max_tokens - generated : 1;
-    models::gemma4::Session::DecodeResult decoded;
-    if (!session.DecodeStep(budget, sampler, &decoded, &error, true)) {
-      std::cerr << "\nGemma-4-26B-A4B decode failed: " << error << '\n';
-      return 1;
-    }
-    if (decoded.tokens.empty()) {
-      break;
-    }
-    for (const std::int32_t token : decoded.tokens) {
-      if (model->IsStopToken(token)) {
-        decoded.stop = true;
-        break;
-      }
-      emit(token);
-      if (opt.verbose)
-        generated_ids.push_back(token);
-      if (++generated >= opt.max_tokens) {
-        break;
-      }
-    }
-    if (decoded.stop) {
-      break;
-    }
-  }
-  std::cout << '\n';
-  if (opt.verbose && generated > 0) {
-    const double seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      generation_start)
-            .count();
-    std::cout << "Generated " << generated << " tokens on ROCm in " << seconds
-              << "s (" << static_cast<double>(generated) / seconds
-              << " tok/s)\n";
-    PrintTokenTrace(generated_ids);
-  }
-  return 0;
-}
-
-models::gemma4::ChatTemplateOptions Gemma4ChatOptions(
-    const PromptOptions& opt) {
-  const auto reasoning = PromptReasoningOptions(opt);
-  return models::gemma4::ChatTemplateOptions{
-      .add_generation_prompt = true,
-      .enable_thinking = reasoning.enabled.value_or(false),
-      .preserve_thinking = reasoning.preserve_thinking.value_or(false),
-  };
-}
-
-int RunGemma4Prompt(const PromptOptions& opt, const core::GgufReader& reader,
-                    std::chrono::steady_clock::time_point load_start) {
-  auto model = LoadGemma4Model(opt, reader, load_start);
-  if (!model)
-    return 1;
-  std::string error;
-  auto session = model->CreateSession(kDefaultContext, &error);
-  if (!session) {
-    std::cerr << "Gemma-4 session creation failed: " << error << '\n';
-    return 1;
-  }
-  if (opt.speculative_backend == "mtp") {
-    session->SetMtpEnabled(true);
-    session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
-  }
-  std::vector<std::int32_t> prompt_tokens;
-  std::vector<models::gemma4::vision::VisionSlot> vision_slots;
-  if (opt.use_chat_template) {
-    std::vector<models::gemma4::ChatMessage> messages;
-    if (!opt.system_prompt.empty()) {
-      messages.push_back({.role = "system", .content = opt.system_prompt});
-    }
-    std::vector<core::Image> images;
-    for (const auto& path : opt.image_paths) {
-      images.push_back(core::DecodeImage(core::ReadImageFile(path)));
-    }
-    if (!images.empty()) {
-      if (!model->HasVision()) {
-        std::cerr << "Gemma-4 image input requires --mmproj\n";
-        return 1;
-      }
-      messages.push_back(
-          {.role = "user",
-           .content = opt.prompt_text,
-           .image_count = static_cast<std::uint32_t>(images.size())});
-      auto prepared = model->EncodeChatVision(
-          messages, {}, Gemma4ChatOptions(opt), images, &error);
-      if (prepared.tokens.empty()) {
-        std::cerr << "Gemma-4 vision prompt failed: " << error << '\n';
-        return 1;
-      }
-      prompt_tokens = std::move(prepared.tokens);
-      vision_slots = std::move(prepared.images);
-    } else {
-      messages.push_back({.role = "user", .content = opt.prompt_text});
-      prompt_tokens = model->EncodeChat(messages, {}, Gemma4ChatOptions(opt));
-    }
-  } else {
-    if (!opt.image_paths.empty()) {
-      std::cerr << "Gemma-4 image input requires the chat template; drop "
-                   "--raw\n";
-      return 1;
-    }
-    prompt_tokens = model->Tokenize(opt.prompt_text);
-  }
-  return GenerateGemma4Response(opt, model, *session, prompt_tokens, nullptr,
-                                vision_slots.empty() ? nullptr : &vision_slots);
-}
-
-int RunGemma4Chat(const PromptOptions& opt, const core::GgufReader& reader,
-                  std::chrono::steady_clock::time_point load_start) {
-  if (!opt.use_chat_template) {
-    std::cerr << "Gemma-4 interactive chat requires chat framing; use prompt "
-                 "--raw for raw text\n";
-    return 1;
-  }
-  auto model = LoadGemma4Model(opt, reader, load_start);
-  if (!model)
-    return 1;
-  std::string error;
-  auto session = model->CreateSession(kDefaultContext, &error);
-  if (!session) {
-    std::cerr << "Gemma-4 session creation failed: " << error << '\n';
-    return 1;
-  }
-  if (opt.speculative_backend == "mtp") {
-    session->SetMtpEnabled(true);
-    session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
-  }
-  std::vector<models::gemma4::ChatMessage> history;
-  if (!opt.system_prompt.empty()) {
-    history.push_back({.role = "system", .content = opt.system_prompt});
-  }
-  const auto chat_options = Gemma4ChatOptions(opt);
-  std::cout << "=== Gufo Interactive Chat (Gemma-4-26B-A4B) ===\n"
-            << "Type 'exit' or Ctrl+D to quit.\n\n";
-  for (std::string input;;) {
-    std::cout << ">>> User: " << std::flush;
-    if (!std::getline(std::cin, input) || input == "exit" || input == "quit")
-      break;
-    if (input.empty())
-      continue;
-    history.push_back({.role = "user", .content = input});
-    const auto tokens = model->EncodeChat(history, {}, chat_options);
-    std::cout << "<<< Assistant: ";
-    std::string reply;
-    if (GenerateGemma4Response(opt, model, *session, tokens, &reply) != 0)
-      return 1;
-    models::gemma4::ChatMessage response;
-    response.role = "assistant";
-    if (chat_options.enable_thinking) {
-      constexpr std::string_view end = "<channel|>";
-      const auto boundary = reply.find(end);
-      response.reasoning_content = reply.substr(0, boundary);
-      if (boundary != std::string::npos) {
-        response.content = reply.substr(boundary + end.size());
-      }
-    } else {
-      response.content = std::move(reply);
-    }
-    history.push_back(std::move(response));
-    std::cout << '\n';
-  }
-  return 0;
-}
-
 std::shared_ptr<models::qwen::vision::Encoder> LoadQwenVision(
     const PromptOptions& opt, const core::GgufReader& reader) {
   if (opt.image_paths.empty() && opt.vision_model_path.empty())
@@ -983,82 +715,6 @@ int GenerateFlashNextResponse(const PromptOptions& opt,
     if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
                             &decoded, &error)) {
       std::cerr << "Flash-Next decode failed: " << error << '\n';
-      return 1;
-    }
-    for (const auto token : decoded.tokens) {
-      const auto piece = model.TokenText(token);
-      std::cout << piece << std::flush;
-      if (reply)
-        reply->append(piece);
-      generated.push_back(static_cast<tokenization::TokenId>(token));
-    }
-    if (decoded.stop)
-      break;
-  }
-  std::cout << '\n';
-  if (opt.verbose) {
-    const double seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-            .count();
-    std::cerr << "Generated " << generated.size() << " tokens ("
-              << generated.size() / seconds << " tok/s)\n";
-    PrintTokenTrace(generated);
-  }
-  return 0;
-}
-
-std::shared_ptr<models::qwen36_a3b::Model> LoadQwen36A3BModel(
-    const PromptOptions& opt, const core::GgufReader& reader,
-    std::chrono::steady_clock::time_point load_start) {
-  std::string error;
-  if (opt.force_cpu || !opt.speculative_backend.empty()) {
-    std::cerr << "Qwen3.6-35B-A3B requires ROCm and does not support "
-                 "speculative decoding\n";
-    return nullptr;
-  }
-  if (opt.use_chat_template &&
-      !tokenization::QwenChatTemplate::ValidateGgufTemplate(reader, &error)) {
-    std::cerr << "Unsupported Qwen3.6-35B-A3B chat template: " << error << '\n';
-    return nullptr;
-  }
-  auto model = models::qwen36_a3b::Model::Load(
-      opt.model_path,
-      {.max_context = kDefaultContext,
-       .attn_window = opt.attn_window,
-       .attn_sink = opt.attn_sink,
-       .vision_model_path = opt.vision_model_path},
-      &error);
-  PrintModelLoadTime(load_start, model != nullptr);
-  if (!model)
-    std::cerr << "Qwen3.6-35B-A3B load failed: " << error << '\n';
-  return model;
-}
-
-int GenerateQwen36A3BResponse(const PromptOptions& opt,
-                              const models::qwen36_a3b::Model& model,
-                              models::qwen36_a3b::Session& session,
-                              std::span<const tokenization::TokenId> prompt,
-                              std::string* reply = nullptr) {
-  if (prompt.empty() || prompt.size() >= session.ContextSize() ||
-      opt.max_tokens > session.ContextSize() - prompt.size()) {
-    std::cerr << "Qwen3.6-35B-A3B prompt and output exceed the 4096-token CLI "
-                 "context\n";
-    return 1;
-  }
-  const std::vector<std::int32_t> input(prompt.begin(), prompt.end());
-  std::string error;
-  if (!session.Sync(input, &error)) {
-    std::cerr << "Qwen3.6-35B-A3B prefill failed: " << error << '\n';
-    return 1;
-  }
-  sampling::SamplerState sampler(opt.sampling, prompt);
-  std::vector<tokenization::TokenId> generated;
-  const auto start = std::chrono::steady_clock::now();
-  while (generated.size() < opt.max_tokens) {
-    models::qwen36_a3b::Session::DecodeResult decoded;
-    if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
-                            &decoded, &error)) {
-      std::cerr << "Qwen3.6-35B-A3B decode failed: " << error << '\n';
       return 1;
     }
     for (const auto token : decoded.tokens) {
@@ -1368,11 +1024,11 @@ int RunPrompt(std::span<const char* const> args) {
 #endif
 
 #if defined(ENGINE_ENABLE_HIP)
-  if (IsGemma4(*reader)) {
-    return RunGemma4Prompt(opt, *reader, model_load_start);
+  if (models::gemma4::IsGemma4(*reader)) {
+    return models::gemma4::RunGemma4Prompt(opt, *reader, model_load_start);
   }
 #else
-  if (IsGemma4(*reader)) {
+  if (models::gemma4::IsGemma4(*reader)) {
     std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
@@ -1410,7 +1066,8 @@ int RunPrompt(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    auto model = LoadQwen36A3BModel(opt, *reader, model_load_start);
+    auto model =
+        models::qwen36_a3b::LoadQwen36A3BModel(opt, *reader, model_load_start);
     if (!model)
       return 1;
     auto session = model->CreateSession(kDefaultContext, &err);
@@ -1424,11 +1081,13 @@ int RunPrompt(std::span<const char* const> args) {
         auto vision = PrepareVision(opt, model->tokenizer(), messages,
                                     model->VisionEncoder());
         session->ConfigureVision(vision);
-        return GenerateQwen36A3BResponse(opt, *model, *session, vision->tokens);
+        return models::qwen36_a3b::GenerateQwen36A3BResponse(
+            opt, *model, *session, vision->tokens);
       }
       const auto ids = model->Tokenize(rendered_prompt);
       const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
-      return GenerateQwen36A3BResponse(opt, *model, *session, prompt);
+      return models::qwen36_a3b::GenerateQwen36A3BResponse(opt, *model,
+                                                           *session, prompt);
     } catch (const std::exception& e) {
       std::cerr << e.what() << '\n';
       return 1;
@@ -1627,15 +1286,15 @@ int RunChat(std::span<const char* const> args) {
 #endif
 
 #if defined(ENGINE_ENABLE_HIP)
-  if (IsGemma4(*reader)) {
+  if (models::gemma4::IsGemma4(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
       std::cerr << "Gemma-4 image input is not yet available\n";
       return 2;
     }
-    return RunGemma4Chat(opt, *reader, model_load_start);
+    return models::gemma4::RunGemma4Chat(opt, *reader, model_load_start);
   }
 #else
-  if (IsGemma4(*reader)) {
+  if (models::gemma4::IsGemma4(*reader)) {
     std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
     return 1;
   }
@@ -1653,7 +1312,8 @@ int RunChat(std::span<const char* const> args) {
   std::shared_ptr<models::qwen36_a3b::Model> qwen36_model;
   std::unique_ptr<models::qwen36_a3b::Session> qwen36_session;
   if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
-    qwen36_model = LoadQwen36A3BModel(opt, *reader, model_load_start);
+    qwen36_model =
+        models::qwen36_a3b::LoadQwen36A3BModel(opt, *reader, model_load_start);
     if (!qwen36_model)
       return 1;
     qwen36_session = qwen36_model->CreateSession(kDefaultContext, &err);
@@ -1790,8 +1450,9 @@ int RunChat(std::span<const char* const> args) {
           gpu_executor->ConfigureVision(vision, vision_encoder);
       }
       if (qwen36_model) {
-        if (GenerateQwen36A3BResponse(opt, *qwen36_model, *qwen36_session,
-                                      prompt_tokens, &assistant_reply) != 0)
+        if (models::qwen36_a3b::GenerateQwen36A3BResponse(
+                opt, *qwen36_model, *qwen36_session, prompt_tokens,
+                &assistant_reply) != 0)
           return 1;
       } else if (flash_model) {
         if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
