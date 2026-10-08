@@ -140,7 +140,7 @@ Verdict: retained.
 Hypothesis: the scalar prefill kernel (`AttentionPrefillTiledKernel`) computes
 each query·key score as a serial head_dim dot product in one thread with no
 tensor cores, so prefill is quadratic and ~16× slower than llama.cpp's WMMA
-flash-attention; a WMMA kernel (adapted from `tools/bench/attn_causal_bench.hip`,
+flash-attention; a WMMA kernel (adapted from `tools/bench/attn_causal_bench_v2.hip`,
 best variant `WmmaCausalAttention<32,16,8>`) closes the gap.
 Change: `AttentionPrefillWmmaKernel<kQueryRows,kKeys,kWaves,kHeadDim>` in
 `kernels/rocm/attention.hip.cpp` (unscaled-Q, scale 1.0, no gate/lse; sliding

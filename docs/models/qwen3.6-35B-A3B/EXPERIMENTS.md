@@ -8,7 +8,7 @@ tests. Every row is a matched same-session comparison through
 ## Prefill attention — WMMA kernel data movement
 
 Shape for microbenchmarks: 16 q-heads / 2 kv-heads, head_dim 256, b=2048,
-start_pos=98304 (the 100K last chunk). Microbench `tools/bench/attn_causal_bench.hip`.
+start_pos=98304 (the 100K last chunk). Microbench `tools/bench/attn_causal_bench_v2.hip`.
 
 | change | scope | result | decision |
 | --- | --- | --- | --- |
@@ -26,7 +26,7 @@ on the **unpacked** kernel, where the global K/V load really is ~49 % of time
 (`ablate: no K/V global loads` 1.707 ms vs unpacked 3.345 ms). Once packed-V +
 swizzle + prefetch shipped, the bottleneck moved: a fresh phase ablation of the
 **production packed tile** at the 100 K chunk (16 q / 2 kv, head_dim 256,
-b=2048, start_pos=98304, `attn_causal_bench -DKQUERY_HEADS=16 -DKKV_HEADS=2`)
+b=2048, start_pos=98304, `attn_causal_bench_v2 -DKQUERY_HEADS=16 -DKKV_HEADS=2`)
 shows the kernel is **WMMA-compute-bound**, not KV-bound:
 
 | ablation (packed `pipe: all three` = 1.811 ms) | ms | % of kernel |
@@ -99,7 +99,7 @@ bounded because only the 1-in-4 full-attention layers benefit and each still
 keeps a 2048-token window. It is lossy: quality must be validated per workload
 before enabling, and a missing-model skip is not a quality pass.
 
-The kernel-level effect can be isolated with `tools/bench/attn_causal_bench.hip`
+The kernel-level effect can be isolated with `tools/bench/attn_causal_bench_v2.hip`
 (`-w <window> -n <sink>`), which adds a `pipe: sparse w/sink` variant beside a
 `pipe: dense full (key0)` baseline over the same key range; run it through
 `tools/bench/gpu_exclusive.sh` for exclusive access. The sparse variant is

@@ -80,7 +80,7 @@ Landed on top of `fc428317`. Targets the WMMA kernel's V transpose into LDS.
    16-half pad every 8 dims spreads the transpose writes and the PV fragment
    reads over all 32 LDS banks (without it the four lane groups collide 4-way).
 
-A standalone microbenchmark (`tools/bench/attn_causal_bench.hip`, 16q/2kv,
+A standalone microbenchmark (`tools/bench/attn_causal_bench_v2.hip`, 16q/2kv,
 b=2048 s=98304) put the pipelined kernel at 1.69 ms vs 1.94 ms for the shipped
 prefetch-only mapping — a 1.15× kernel gain that implied ~10 % at 100K. It did
 **not** survive the full path: a matched same-session interleaved A/B

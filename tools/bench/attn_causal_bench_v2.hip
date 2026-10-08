@@ -35,10 +35,30 @@
     }                                                                   \
   } while (0)
 
-constexpr std::uint32_t kHeadDim = 256;
-constexpr std::uint32_t kQueryHeads = 24;
-constexpr std::uint32_t kKvHeads = 4;
+// Shape is overridable at compile time so the same harness can reproduce other
+// models' full-attention layers. Defaults are Qwen3.8-27B (24q/4kv, GQA 6);
+// Qwen3.6-35B-A3B uses -DKQUERY_HEADS=16 -DKKV_HEADS=2 (GQA 8); Gemma4 full
+// attention uses -DKHEAD_DIM=512 -DKQUERY_HEADS=16 -DKKV_HEADS=2
+// -DATTENTION_SCALE=1.0F (GQA 8, scale 1.0), SWA uses -DKKV_HEADS=8 (GQA 2)
+// with -w 1024.
+#ifndef KHEAD_DIM
+#define KHEAD_DIM 256
+#endif
+constexpr std::uint32_t kHeadDim = KHEAD_DIM;
+#ifndef KQUERY_HEADS
+#define KQUERY_HEADS 24
+#endif
+#ifndef KKV_HEADS
+#define KKV_HEADS 4
+#endif
+constexpr std::uint32_t kQueryHeads = KQUERY_HEADS;
+constexpr std::uint32_t kKvHeads = KKV_HEADS;
 constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
+// Score scale folded into Q before the FP16 conversion. Qwen uses
+// 1/sqrt(head_dim) = 1/16; Gemma4's oracle pins its attention scale to 1.0.
+#ifndef ATTENTION_SCALE
+#define ATTENTION_SCALE (1.0F / 16.0F)
+#endif
 constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
 constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
 
@@ -48,9 +68,12 @@ constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
 // the policy header.
 // ---------------------------------------------------------------------------
 
-constexpr std::uint32_t kTileQueryRows = 16;
+constexpr std::uint32_t kTileQueryRows = (kHeadDim <= 256) ? 16u : 8u;
 constexpr std::uint32_t kTileHeadsPerBlock = 2;
 constexpr std::uint32_t kTileColumns = kTileQueryRows * kTileHeadsPerBlock;
+// The scalar control hard-codes a 64-row key tile (lane and lane+32 in the
+// score phase, two 32-row value groups), so kTileKeyRows stays 64; the head_dim
+// 512 LDS fit comes from halving kTileQueryRows (q_tile) instead.
 constexpr std::uint32_t kTileKeyRows = 64;
 constexpr std::uint32_t kTileHalf2Dim = kHeadDim / 2;
 constexpr std::uint32_t kTileKeyHalf2Dim = kTileHalf2Dim / 2;
@@ -97,7 +120,7 @@ __launch_bounds__(256, 3) __global__
   const std::uint32_t first_query_head =
       (kv_head * kGqa) + (pair_in_group * kTileHeadsPerBlock);
   constexpr std::size_t kv_half2_stride = kKvWidth / 2;
-  constexpr float attention_scale = 1.0F / 16.0F;
+  constexpr float attention_scale = ATTENTION_SCALE;
 
   __shared__ __half2 q_tile[kTileColumns][kTileHalf2Dim];
   __shared__ __half2 kv_tile[kTileKeyRows * kTileKeyRowStride];
@@ -448,7 +471,7 @@ __launch_bounds__(kWaves * 32, 1) __global__
   const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
       (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
-  constexpr float attention_scale = 1.0F / 16.0F;
+  constexpr float attention_scale = ATTENTION_SCALE;
 
   // Row block -> (query head, 16-query sub-block of this block's rows).
   const auto row_block_head = [&](std::uint32_t rb) {
@@ -779,13 +802,14 @@ __device__ __forceinline__ constexpr std::uint32_t VtRow(std::uint32_t d) {
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
          std::uint32_t kVtSwizzle, bool kPipeline, bool kPackedV = true,
          std::uint32_t kVtPad = 8, int kAblate = 0,
-         std::uint32_t kDepth = 1>
+         std::uint32_t kDepth = 1, bool kSparse = false>
 __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache_f16,
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
     std::uint32_t start_pos, std::size_t batch_size,
-    float* __restrict__ lse_out, std::uint32_t key_begin) {
+    float* __restrict__ lse_out, std::uint32_t key_begin,
+    std::uint32_t window, std::uint32_t sink) {
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kThreads = kWaves * 32;
@@ -815,7 +839,7 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
   const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
       (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
-  constexpr float attention_scale = 1.0F / 16.0F;
+  constexpr float attention_scale = ATTENTION_SCALE;
 
   const auto row_block_head = [&](std::uint32_t rb) {
     return first_query_head + (rb % kWmmaHeads);
@@ -873,6 +897,36 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
       start_pos + static_cast<std::uint32_t>(batch_size);
   const std::uint32_t max_visible =
       min(context_end, start_pos + query_start + kQueryRows);
+
+  // Opt-in sliding-window + sink sparsity (mirrors the production kernel). The
+  // ring prefetch assumes contiguous tiles, so sparse runs at prefetch depth 1
+  // (the double-buffer the shipped kernel uses).
+  static_assert(!kSparse || kDepth == 1, "sparse skip needs prefetch depth 1");
+  std::uint32_t sink_end = 0;
+  std::uint32_t win_lo = 0;
+  if constexpr (kSparse) {
+    win_lo = (start_pos + query_start + 1u > window)
+                 ? ((start_pos + query_start + 1u - window) / kKeys) * kKeys
+                 : 0u;
+    if (win_lo > max_visible) {
+      win_lo = max_visible;
+    }
+    sink_end = ((sink + kKeys - 1u) / kKeys) * kKeys;
+    if (sink_end > win_lo) {
+      sink_end = win_lo;
+    }
+  }
+  const std::uint32_t first_key_start =
+      kSparse ? ((sink_end == 0u) ? win_lo : 0u) : key_begin;
+  const auto advance = [&](std::uint32_t ks) {
+    std::uint32_t nx = ks + kKeys;
+    if constexpr (kSparse) {
+      if (nx >= sink_end && nx < win_lo) {
+        nx = win_lo;
+      }
+    }
+    return nx;
+  };
 
   // V: lane L holds dims [wave*32 + (L%4)*8, +8) of keys 2*(L/4) and 2*(L/4)+1.
   const std::uint32_t v_pair = lane >> 2u;
@@ -937,17 +991,29 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
   constexpr std::uint32_t kVBuf = kPackedV ? 2 : kVRegs;
   uint4 k_buf[kDepth + 1][kKRegs];
   uint4 v_buf[kDepth + 1][kVBuf];
+  if constexpr (kSparse) {
+    load_k(first_key_start, k_buf[0]);
+    load_v(first_key_start, v_buf[0]);
+    const std::uint32_t nx = advance(first_key_start);
+    if (nx < max_visible) {
+      load_k(nx, k_buf[1]);
+      load_v(nx, v_buf[1]);
+    }
+  } else {
 #pragma unroll
-  for (std::uint32_t d = 0; d <= kDepth; ++d) {
-    const std::uint32_t start = key_begin + (d * kKeys);
-    if (d == 0 || start < max_visible) {
-      load_k(start, k_buf[d]);
-      load_v(start, v_buf[d]);
+    for (std::uint32_t d = 0; d <= kDepth; ++d) {
+      const std::uint32_t start = key_begin + (d * kKeys);
+      if (d == 0 || start < max_visible) {
+        load_k(start, k_buf[d]);
+        load_v(start, v_buf[d]);
+      }
     }
   }
 
-  for (std::uint32_t key_start = key_begin; key_start < max_visible;
-       key_start += kKeys) {
+  for (std::uint32_t key_start = first_key_start; key_start < max_visible;) {
+    const std::uint32_t next_start = advance(key_start);
+    const std::uint32_t prefetch_start =
+        kSparse ? next_start : (key_start + (kDepth * kKeys));
     // --- stage K from the registers the previous iteration prefetched
     __syncthreads();
 #pragma unroll
@@ -961,10 +1027,9 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
     __syncthreads();
 
     // --- prefetch kDepth tiles ahead. Everything below covers the latency.
-    const std::uint32_t next_start = key_start + (kDepth * kKeys);
-    if (kPipeline && next_start < max_visible) {
-      load_k(next_start, k_buf[kDepth]);
-      load_v(next_start, v_buf[kDepth]);
+    if (kPipeline && prefetch_start < max_visible) {
+      load_k(prefetch_start, k_buf[kDepth]);
+      load_v(prefetch_start, v_buf[kDepth]);
     }
 
     // --- S = Q K^T ---
@@ -1002,9 +1067,13 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
       for (std::uint32_t m = 0; m < kPerLane; ++m) {
         const std::uint32_t col = (seg * kPerLane) + m;
         const std::uint32_t key_position = key_start + col;
-        const bool valid = local_query < batch_size &&
-                           key_position <= absolute_query &&
-                           key_position < context_end;
+        bool valid = local_query < batch_size &&
+                     key_position <= absolute_query &&
+                     key_position < context_end;
+        if constexpr (kSparse) {
+          valid = valid && (key_position < sink ||
+                            absolute_query - key_position < window);
+        }
         const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
         vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
                            s_lds[1][tile][row][col % 16])
@@ -1117,9 +1186,10 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
         }
       }
     } else {
-      load_k(key_start + kKeys, k_buf[0]);
-      load_v(key_start + kKeys, v_buf[0]);
+      load_k(next_start, k_buf[0]);
+      load_v(next_start, v_buf[0]);
     }
+    key_start = next_start;
   }
   __syncthreads();
 
@@ -1205,7 +1275,7 @@ void ReferenceAttention(const std::vector<float>& q,
                         std::uint32_t batch, std::uint32_t key_begin,
                         std::vector<float>& out) {
   const std::uint32_t context_end = start_pos + batch;
-  const double scale = 1.0 / 16.0;
+  const double scale = ATTENTION_SCALE;
   for (std::uint32_t t = 0; t < batch; ++t) {
     const std::uint32_t absolute = start_pos + t;
     for (std::uint32_t h = 0; h < kQueryHeads; ++h) {
@@ -1256,6 +1326,8 @@ int main(int argc, char** argv) {
   int iters = 3;
   bool check = false;
   bool whole_range = false;
+  std::uint32_t window = 0;
+  std::uint32_t sink = 0;
   // At depth 16384 a full sweep is long enough to thermally throttle the APU,
   // which penalizes whichever variant runs last by up to 45%. `-v` runs one
   // variant so a caller can interleave candidates with cooldowns between them.
@@ -1277,6 +1349,10 @@ int main(int argc, char** argv) {
       // Cover the prefix and the diagonal in one kernel instead of masking only
       // the N x N diagonal, which is what replacing the split path would mean.
       whole_range = true;
+    } else if (arg == "-w" && i + 1 < argc) {
+      window = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (arg == "-n" && i + 1 < argc) {
+      sink = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
     }
   }
 
@@ -1444,18 +1520,25 @@ int main(int argc, char** argv) {
       [&] {                                                                 \
         WmmaCausalAttentionPipe<32, 16, 8, SWIZZLE, PIPELINE, PACKED, PAD>  \
             <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,       \
-                                   start_pos, batch, d_lse_new, key_begin); \
+                                   start_pos, batch, d_lse_new, key_begin,  \
+                                   0u, 0u);                                 \
       },                                                                    \
       d_out_new, &ref)
+  #if KHEAD_DIM == 256
   PIPE(0, false, true, 8, "pipe: packed V only");
   PIPE(16, false, true, 8, "pipe: packed+swizzle");
+#endif
   PIPE(0, true, false, 8, "pipe: prefetch only");
+#if KHEAD_DIM == 256
   PIPE(0, true, true, 8, "pipe: packed+prefetch");
   PIPE(16, true, true, 8, "pipe: all three");
+#endif
   // kVtPad 0 drops the V^T row padding, so LDS falls under a third of the 64 KB
   // and three blocks fit per CU instead of two. The swizzle keeps the packed
   // writes conflict-free without it.
+  #if KHEAD_DIM == 256
   PIPE(16, true, true, 0, "pipe: all three, 3 blk/CU");
+#endif
   PIPE(16, true, false, 0, "pipe: prefetch, 3 blk/CU");
   PIPE(0, true, false, 0, "pipe: prefetch, pad0");
 #undef PIPE
@@ -1469,12 +1552,42 @@ int main(int argc, char** argv) {
         WmmaCausalAttentionPipe<32, 16, 8, 0, true, false, 8, 0, D>       \
             <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,     \
                                    start_pos, batch, d_lse_new,          \
-                                   key_begin);                           \
+                                   key_begin, 0u, 0u);                   \
       },                                                                 \
       d_out_new, &ref)
   DEPTH(2, "pipe: prefetch depth 2");
   DEPTH(3, "pipe: prefetch depth 3");
 #undef DEPTH
+
+  // Opt-in sliding-window + sink sparsity, priced against the dense full-range
+  // kernel over the same key range (key_begin = 0 so the sink is reachable).
+  // Correctness is covered by the unit test, so these report time only; the
+  // TFLOPS column is dense-equivalent and the ms column is the real signal.
+  // The packed-V mapping is head_dim-256 only, so this path is compiled for the
+  // Qwen/SWA shapes; Gemma4 full attention (head_dim 512) is dense (window 0).
+#if KHEAD_DIM == 256
+  if (window > 0) {
+    std::printf("sparse: window=%u sink=%u (key_begin forced to 0)\n", window,
+                sink);
+    bench(
+        "pipe: dense full (key0)",
+        [&] {
+          WmmaCausalAttentionPipe<32, 16, 8, 16, true, true, 8, 0, 1, false>
+              <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,
+                                     start_pos, batch, d_lse_new, 0u, 0u, 0u);
+        },
+        d_out_new, nullptr);
+    bench(
+        "pipe: sparse w/sink",
+        [&] {
+          WmmaCausalAttentionPipe<32, 16, 8, 16, true, true, 8, 0, 1, true>
+              <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,
+                                     start_pos, batch, d_lse_new, 0u, window,
+                                     sink);
+        },
+        d_out_new, nullptr);
+  }
+#endif
 
   // A 32-key tile halves the number of dependency-chain traversals per unit of
   // work. The eight-wave split cannot hold it, so this is 16 waves / 512
@@ -1484,7 +1597,7 @@ int main(int argc, char** argv) {
       [&] {
         WmmaCausalAttentionPipe<32, 32, 16, 0, true, false, 8>
             <<<wmma_grid32, 512>>>(d_q, nullptr, d_k, d_v, d_out_new, start_pos,
-                                   batch, d_lse_new, key_begin);
+                                   batch, d_lse_new, key_begin, 0u, 0u);
       },
       d_out_new, &ref);
 
@@ -1496,7 +1609,8 @@ int main(int argc, char** argv) {
       [&] {                                                                 \
         WmmaCausalAttentionPipe<32, 16, 8, 0, true, false, 8, N>            \
             <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,       \
-                                   start_pos, batch, d_lse_new, key_begin); \
+                                   start_pos, batch, d_lse_new, key_begin,  \
+                                   0u, 0u);                                 \
       },                                                                    \
       d_out_new, nullptr)
   PABLATE(1, "  pipe ablate: no V transpose");
