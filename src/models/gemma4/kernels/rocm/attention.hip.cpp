@@ -387,7 +387,7 @@ __global__ void AttentionPrefillTiledKernel(
 //
 // The head dimension is a template parameter so the same tiling covers the full
 // layers (512) and the SWA layers (256); the waves split the head dimension
-// into `kWaves / kSTiles` halves summed through LDS, and each wave owns
+// into `kWaves / kSTiles` partials summed through LDS, and each wave owns
 // `kDimTilesPerWave = (kHeadDim/16)/kWaves` output dim tiles. The attention
 // scale is 1.0 (pinned by the oracle), so Q is converted to F16 unscaled.
 // ---------------------------------------------------------------------------
@@ -428,14 +428,16 @@ __launch_bounds__(kWaves * 32, 1) __global__
   constexpr std::uint32_t kThreads = kWaves * 32;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
   constexpr std::uint32_t kWmmaKSteps = kHeadDim / 16;
-  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (kWaves / kSTiles);
+  constexpr std::uint32_t kKSplit = kWaves / kSTiles;
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / kKSplit;
   constexpr std::uint32_t kRows = kRowBlocks * 16;
   constexpr std::uint32_t kDimTilesPerWave = kWmmaKSteps / kWaves;
   constexpr std::uint32_t kSoftmaxLanes = kThreads / kRows;
   constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
   constexpr std::uint32_t kVtStride = kKeys + 8;
-  static_assert(kSTiles * 2 == kWaves,
-                "the waves cover the S tiles in two head-dimension halves");
+  static_assert(kSTiles * kKSplit == kWaves,
+                "the waves cover the S tiles in kKSplit head-dimension "
+                "partials");
   static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
   static_assert(kKStepsPerWave * (kWaves / kSTiles) == kWmmaKSteps, "k split");
   static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
@@ -470,7 +472,7 @@ __launch_bounds__(kWaves * 32, 1) __global__
       (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? (kKeys * kWmmaKStride)
                                                     : (kHeadDim * kVtStride);
   __shared__ __half kv_lds[kKvLdsHalves];
-  __shared__ float s_lds[2][kSTiles][16][16];
+  __shared__ float s_lds[kKSplit][kSTiles][16][16];
   __shared__ __half p_lds[kRows][kKeys];
   __shared__ float row_max[kRows];
   __shared__ float row_sum[kRows];
@@ -598,9 +600,12 @@ __launch_bounds__(kWaves * 32, 1) __global__
           valid = valid && (absolute_query - key_position < window);
         }
         const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
-        vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
-                           s_lds[1][tile][row][col % 16])
-                        : -INFINITY;
+        float s = 0.0F;
+#pragma unroll
+        for (std::uint32_t kh = 0; kh < kKSplit; ++kh) {
+          s += s_lds[kh][tile][row][col % 16];
+        }
+        vals[m] = valid ? s : -INFINITY;
         part_max = fmaxf(part_max, vals[m]);
       }
 #pragma unroll
@@ -791,15 +796,22 @@ void AttentionPrefill(const float* q, const __half* k_cache,
                            kv_heads, head_dim, window, stream);
     return;
   }
-  constexpr std::uint32_t kQueryRows = 32;
   constexpr std::uint32_t kKeys = 16;
   constexpr std::uint32_t kWaves = 8;
-  const dim3 grid((tokens + kQueryRows - 1U) / kQueryRows, heads / kWmmaHeads);
   if (head_dim == 512U) {
+    // 512-wide heads split S over four head-dimension partials per tile:
+    // 32 query rows would need 128 VGPRs of Q fragments plus 128 of O
+    // accumulators and spills to scratch, so the block covers 16 rows.
+    constexpr std::uint32_t kQueryRows = 16;
+    const dim3 grid((tokens + kQueryRows - 1U) / kQueryRows,
+                    heads / kWmmaHeads);
     AttentionPrefillWmmaKernel<kQueryRows, kKeys, kWaves, 512>
         <<<grid, kWaves * 32, 0, stream>>>(q, k_cache, v_cache, out, start,
                                            tokens, heads, kv_heads, window);
   } else {
+    constexpr std::uint32_t kQueryRows = 32;
+    const dim3 grid((tokens + kQueryRows - 1U) / kQueryRows,
+                    heads / kWmmaHeads);
     AttentionPrefillWmmaKernel<kQueryRows, kKeys, kWaves, 256>
         <<<grid, kWaves * 32, 0, stream>>>(q, k_cache, v_cache, out, start,
                                            tokens, heads, kv_heads, window);

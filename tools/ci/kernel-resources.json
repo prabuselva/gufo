@@ -1,6 +1,6 @@
 {
  "schema": "gufo.kernel-resources.v1",
- "note": "Made from the release binary of gufo-runtime:latest (b722a61, Nix, ROCm 7.2.3, AMD clang 22). The kernels in this file use scratch by design. Make the file again only after you decide that a new allowance is correct: python3 tools/ci/check-kernel-resources.py result/bin/gufo --write-baseline tools/ci/kernel-resources.json --note TEXT",
+ "note": "Made from the release binary of gufo-runtime:latest (b722a61, Nix, ROCm 7.2.3, AMD clang 22). The kernels in this file use scratch by design. Make the file again only after you decide that a new allowance is correct: python3 tools/ci/check-kernel-resources.py result/bin/gufo --write-baseline tools/ci/kernel-resources.json --note TEXT qwen36_a3b/gemma4 allowances added for the model landing: RoutedF16GEMMKernel/RmsNormKernelHalf/GegluSeparateHalfKernel/AttentionPrefillWmma<256> use scratch with zero spills; AttentionPrefillTiledKernel is the never-launched scalar oracle.",
  "default_max_scratch": 0,
  "allow": {
   "_ZL18quantize_mmq_nvfp4PKfPKiPvlllllll": {
@@ -743,6 +743,105 @@
   },
   "_ZN7rocprimROCPRIM_NS6detail17trampoline_kernelINS1_34wrapped_radix_sort_onesweep_configINS0_14default_configEfjEELNS1_11target_archE4294967295EZZNS1_29radix_sort_onesweep_iterationIS4_Lb1EPKfPfPKjPjmNS0_19identity_decomposerENS1_16block_id_wrapperIjLb1EEEEE10hipError_tT1_PNSt15iterator_traitsISI_E10value_typeET2_T3_PNSJ_ISO_E10value_typeET4_T5_PST_SU_PNS1_23onesweep_lookback_stateEbbT6_jjT7_P12ihipStream_tbENKUlT_T0_SI_SN_E_clISA_SA_SD_SD_EEDaS11_S12_SI_SN_EUlS11_E_NS1_40radix_sort_onesweep_sort_config_selectorEEEvSI_": {
    "max_scratch": 80
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi16ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi16ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi48ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi48ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE13ELi128ELi48ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE12ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE13ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi64ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi64ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi128ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models10qwen36_a3b4rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi128ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PKfPfPS8_mmS7_": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi16ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi16ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi48ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi48ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE13ELi128ELi48ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi48ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi48ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE13ELi128ELi48ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE12ELi128ELi64ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi64ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi64ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE13ELi128ELi64ELi2ELb1EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE12ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE8ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 48
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE30ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 80
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_119RoutedF16GEMMKernelILNS2_10WeightTypeE13ELi128ELi64ELi2ELb0EEEvPKvPK6__halfPKiSC_SC_SC_PfPS8_mm": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_127AttentionPrefillTiledKernelEPKfPK6__halfS8_Pfjjjjjj": {
+   "max_scratch": 1052
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_126AttentionPrefillWmmaKernelILj32ELj16ELj8ELj256EEEvPKfPK6__halfS9_Pfjjjjj": {
+   "max_scratch": 32
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_117RmsNormKernelHalfEPKfS5_P6__halfjf": {
+   "max_scratch": 20
+  },
+  "_ZN4gufo6models6gemma44rocm12_GLOBAL__N_123GegluSeparateHalfKernelEPKfS5_P6__halfm": {
+   "max_scratch": 8
   }
  }
 }

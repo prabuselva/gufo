@@ -2474,47 +2474,52 @@ void GdnDeltaLoop(const float* qn, const float* kn, const float* convolved,
         k_heads, v_heads, head_dim, channels);
     return;
   }
-  constexpr std::uint32_t kRows = 8;
+  // Keep the per-lane state at <= 32 floats: wide heads (kCols > 4) halve the
+  // rows per warp so the recurrence stays register-resident on every
+  // supported compiler. Rows are independent, so the arithmetic per row is
+  // unchanged.
+  const std::uint32_t kCols = head_dim / warp;
+  const std::uint32_t kRows = kCols > 4U ? 4U : 8U;
   const dim3 grid(head_dim / kRows, v_heads);
   const dim3 block(warp);
-  switch (head_dim / warp) {
+  switch (kCols) {
     case 8:
-      GdnDeltaLoopKernel<kRows, 8><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<4, 8><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 7:
-      GdnDeltaLoopKernel<kRows, 7><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<4, 7><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 6:
-      GdnDeltaLoopKernel<kRows, 6><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<4, 6><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 5:
-      GdnDeltaLoopKernel<kRows, 5><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<4, 5><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 4:
-      GdnDeltaLoopKernel<kRows, 4><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<8, 4><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 3:
-      GdnDeltaLoopKernel<kRows, 3><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<8, 3><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     case 2:
-      GdnDeltaLoopKernel<kRows, 2><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<8, 2><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;
     default:
-      GdnDeltaLoopKernel<kRows, 1><<<grid, block, 0, stream>>>(
+      GdnDeltaLoopKernel<8, 1><<<grid, block, 0, stream>>>(
           qn, kn, convolved, alpha, beta, a, dt, state, attn, tokens, k_heads,
           v_heads, head_dim, channels, snap, snap_rows);
       break;

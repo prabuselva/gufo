@@ -43,32 +43,45 @@ fusion + shared-FFN cumulative), the unaffected decode row matching across
 sessions (41.75 vs 41.59 t/s). The two effects nearly cancel, so the honest
 reps3 figure lands near the old optimistic reps1 figure.
 
+Gufo column re-measured 2026-10-08 on `967f2370` plus the attention spill fix:
+`AttentionPrefillWmmaKernel` now derives `kKSplit = kWaves / kSTiles` softmax
+partials (generalizing the hardcoded 2-way K split) and the head_dim-512 launch
+uses `kQueryRows = 16` (q_frag + o_acc = 64 + 64 VGPRs), so `<16, 16, 8, 512>`
+fits the 256-VGPR `launch_bounds(256, 1)` budget with zero scratch on clang 23,
+where the old `<32, …, 512>` shape spilled. A matched same-toolchain A/B (HEAD
+vs fix, same exclusive session) gives +0.7–1.4% at 2K–16K, +0.9% at 65K and
++3.1% at 100K (−0.7% at 32K, inside session spread); the 2× K/V re-read of the
+4-way split does not cost at depth. The head_dim-256 (sliding-window) launch is
+unchanged (`kQueryRows = 32`, `kKSplit = 2`, bit-identical); the 512 path's
+4-partial accumulation stays inside the 3e-3 kernel-test tolerance (worst error
+2.0e-3 vs the double reference).
+
 | pp | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| 512 | 1916.35 | 1219.75 | +57.1% |
-| 1024 | 1933.58 | 1235.00 | +56.6% |
-| 2048 | 1934.99 | 1181.73 | +63.7% |
-| 4096 | 1882.23 | 1149.99 | +63.7% |
-| 8192 | 1733.34 | 1019.03 | +70.1% |
-| 16384 | 1488.44 | 881.18 | +68.9% |
-| 32768 | 1191.03 | — | — |
-| 65536 | 845.11 | — | — |
-| 102400 | 636.26 | — | — |
+| 512 | 1946.26 | 1219.75 | +59.6% |
+| 1024 | 1976.77 | 1235.00 | +60.1% |
+| 2048 | 1965.19 | 1181.73 | +66.3% |
+| 4096 | 1931.24 | 1149.99 | +67.9% |
+| 8192 | 1782.49 | 1019.03 | +74.9% |
+| 16384 | 1564.36 | 881.18 | +77.5% |
+| 32768 | 1232.47 | — | — |
+| 65536 | 869.80 | — | — |
+| 102400 | 659.38 | — | — |
 
 The M11 WMMA flash-attention prefill kernel (`AttentionPrefillWmmaKernel`)
 replaced the scalar per-query head_dim dot-product kernel
 (`AttentionPrefillTiledKernel`, kept as the `AttentionPrefillScalar` oracle).
 Gufo now leads llama.cpp at every measured depth and the previously quadratic
-gap is gone: throughput falls only gently with context (1935 → 636 t/s from
+gap is gone: throughput falls only gently with context (1965 → 659 t/s from
 2K → 100K) because 25 of 30 layers are sliding-window (window 1024) and only
 the 5 full-attention layers (head_dim 512) grow quadratically. Versus the
-pre-M11 scalar path the same build is 2.01× faster at 512 rising to 9.24× at
-16384 (951 → 1916 and 161 → 1488).
+pre-M11 scalar path the same build is 2.05× faster at 512 rising to 9.71× at
+16384 (951 → 1946 and 161 → 1564).
 
 At 4K this is at the practical ceiling for a 4B-active MoE on gfx1151: the
 fully-optimized sibling `qwen3.6-35B-A3B` (3B active) reaches 2373 t/s
 (reference llama 2425); scaled by active params (×3/4) that predicts
-~1780 t/s for gemma4, and the dense-F16 route lifts gemma4 just past it (1882)
+~1780 t/s for gemma4, and the dense-F16 route lifts gemma4 just past it (1931)
 because gemma4 is the denser of the two (4B active of 26B, ~15%, vs 3B of 35B,
 ~9%), so its wide prefill spends a larger share in the dense projections the
 route accelerates. A pp4096 profile shows the remaining time is two WMMA GEMMs
@@ -80,13 +93,15 @@ attention down to ~13% of prefill ([EXPERIMENTS.md](EXPERIMENTS.md)).
 
 | Config | Gufo | llama.cpp | gain |
 | --- | --- | --- | --- |
-| Q8_K_XL, no MTP | 42.02 | 41.83 | +0.5% |
+| Q8_K_XL, no MTP | 41.82 | 41.83 | ~0% |
 | Q8_K_XL, MTP n=1 | 36.60 | — | — |
 | Q8_K_XL, MTP n=2 | 46.93 | — | +12.2% |
 | Q8_K_XL, MTP n=4 | 59.99 | — | +43.4% |
 
 The no-MTP row is the current vec4-GEMV + float4-RMSNorm build (pp512 tg128
-reps3). The vec4 Q8_0 GEMV lifted it from 38.08 → 40.15 (+5.4%) and the float4
+reps3; re-measured 41.82 on 2026-10-08 with the attention spill fix — the
+decode path is unchanged, −0.5% is session spread). The vec4 Q8_0 GEMV lifted
+it from 38.08 → 40.15 (+5.4%) and the float4
 RMSNorm lifted it further to 42.02 (+4.6%); both are bit-identical end-to-end
 (see [EXPERIMENTS.md](EXPERIMENTS.md)). The MTP rows predate both and were
 measured on the scalar build; they run the same projections and norms in the
