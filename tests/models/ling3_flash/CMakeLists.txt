@@ -98,4 +98,18 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(ling3_flash.rocm_quality PROPERTIES
     LABELS "ling3_flash;hip;gpu;gfx1151;external-model;slow"
     SKIP_RETURN_CODE 77)
+
+  # MTP draft semantics over real text: the draft block must predict the
+  # trunk's next greedy token at a healthy rate, which only alignment of the
+  # draft cache, positions and hidden chain with the trunk achieves. Skips
+  # (77) without the GGUF.
+  add_executable(ling3_flash_rocm_mtp_accept_test EXCLUDE_FROM_ALL
+    rocm_mtp_accept_test.cpp)
+  target_link_libraries(ling3_flash_rocm_mtp_accept_test PRIVATE
+    gufo_ling3_flash_engine)
+  add_test(NAME ling3_flash.rocm_mtp_accept COMMAND
+    ling3_flash_rocm_mtp_accept_test)
+  set_tests_properties(ling3_flash.rocm_mtp_accept PROPERTIES
+    LABELS "ling3_flash;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
 endif()
