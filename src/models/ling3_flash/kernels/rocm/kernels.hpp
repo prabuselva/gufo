@@ -63,6 +63,60 @@ void KdaDelta(const float* q, const float* k, const float* v, const float* f,
               const float* g, float* state, float* out, std::uint32_t heads,
               std::uint32_t d, float eps, float gate_lb, hipStream_t stream);
 
+/// --- Prefill tier: the same recurrence over a token chunk, sequential over
+/// tokens but fully on-device. `q`, `k`, `v`, `f`, `beta` and `g` are chunked
+/// as [tokens][heads*d] (the per-stream projected rows as consumed by the
+/// decode chain); conv `history` is [kern-1][inner] oldest-first raw rows.
+
+/// Batched causal depthwise conv + SiLU over a chunk for one stream; reads the
+/// leading taps from `history`, leaves `history` untouched.
+void KdaConvSiluPrefill(const float* conv_w, const float* proj,
+                        const float* history, float* out, std::uint32_t tokens,
+                        std::uint32_t inner, std::uint32_t kern,
+                        hipStream_t stream);
+
+/// Writes into `out` the [kern-1][inner] raw projected rows ending at the
+/// chunk's last token (the next history), reading in-chunk `proj` rows and
+/// falling back to `history` when the chunk is shorter than kern-1.
+void KdaHistoryUpdate(const float* proj, const float* history, float* out,
+                      std::uint32_t tokens, std::uint32_t inner,
+                      std::uint32_t kern, hipStream_t stream);
+
+/// Per-head L2 norm (q *= q_scale) of the convolved [tokens][heads*d] q and k,
+/// in place; bit-identical to KdaNormHeads applied per token.
+void KdaNormHeadsPrefill(float* q, float* k, std::uint32_t tokens,
+                         std::uint32_t heads, std::uint32_t d, float eps,
+                         float q_scale, hipStream_t stream);
+
+/// Hoists the recurrence's transcendental inputs out of the serial token loop:
+/// decay_pre[t*heads*d + h*d + i] = exp(gate_lb * sigmoid(a[h] * f[...])) (the
+/// key-axis decay vector, same expression as KdaDelta), beta_pre[t*heads+h] =
+/// sigmoid(beta[...]), and kq_pre[t*heads+h] = dot(kn, qn) over each head row
+/// (qn is expected to already carry q_scale).
+void KdaPrep(const float* f, const float* a, const float* beta, const float* qn,
+             const float* kn, float gate_lb, float* decay_pre, float* beta_pre,
+             float* kq_pre, std::uint32_t tokens, std::uint32_t heads,
+             std::uint32_t d, hipStream_t stream);
+
+/// KDA delta-rule recurrence over the whole chunk using the precomputed
+/// decay/beta/kq; `v` is the convolved v stream, `state` [heads][d][d] is
+/// updated in place, and raw (pre-out-norm) `attn` is [tokens][heads*d].
+/// When `snap` is non-null, the state after each token (up to `snap_rows`) is
+/// written to `snap[t][heads][d][d]`; the snapshot-free fast path requires
+/// head_dim == 128.
+void KdaDeltaLoop(const float* qn, const float* kn, const float* v,
+                  const float* decay_pre, const float* beta_pre,
+                  const float* kq_pre, float* state, float* attn,
+                  std::uint32_t tokens, std::uint32_t heads,
+                  std::uint32_t head_dim, float* snap, std::uint32_t snap_rows,
+                  hipStream_t stream);
+
+/// Gated output norm over the chunked raw attn rows, in place; same formula
+/// and reduction as the decode KdaDelta tail.
+void KdaOutNormPrefill(float* attn, const float* g, const float* norm_w,
+                       std::uint32_t tokens, std::uint32_t heads,
+                       std::uint32_t d, float eps, hipStream_t stream);
+
 /// Sigmoid router with bias, group-limited top-k (ties to the smaller index,
 /// matching ggml argsort_top_k): selection = sigmoid(logits) + bias, keep the
 /// `groups_used` groups with the highest sum of their two best scores, take
