@@ -50,6 +50,17 @@ if (ENGINE_ENABLE_HIP)
     LABELS "ling3_flash;hip;gpu;gfx1151")
   add_dependencies(ling3_flash_tests ling3_flash_rocm_ops_test)
 
+  # Batched routed projection checks: synthetic Q4_K/Q5_K/Q6_K/Q8_0 expert
+  # matrices through the F16 WMMA tier against a canonical double reference,
+  # plus the SwiGLU epilogue widths/clamps and the fused gate+up launch.
+  add_executable(ling3_flash_rocm_gemm_test rocm_gemm_test.cpp)
+  target_link_libraries(ling3_flash_rocm_gemm_test PRIVATE
+    gufo_ling3_flash_kernels gufo_core)
+  add_test(NAME ling3_flash.rocm_gemm COMMAND ling3_flash_rocm_gemm_test)
+  set_tests_properties(ling3_flash.rocm_gemm PROPERTIES
+    LABELS "ling3_flash;hip;gpu;gfx1151")
+  add_dependencies(ling3_flash_tests ling3_flash_rocm_gemm_test)
+
   # Absorbed-MLA decode checks: synthetic latent caches through the split-KV
   # partial+combine kernels against a host double reference.
   add_executable(ling3_flash_rocm_attention_test rocm_attention_test.cpp)
