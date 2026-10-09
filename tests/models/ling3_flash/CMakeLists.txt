@@ -61,6 +61,18 @@ if (ENGINE_ENABLE_HIP)
     LABELS "ling3_flash;hip;gpu;gfx1151")
   add_dependencies(ling3_flash_tests ling3_flash_rocm_gemm_test)
 
+  # Chunked-prefill checks: the batched KDA tier (conv, history advance, head
+  # norms, prep, both delta loops, output norm) against the decode chain run
+  # token by token over the same chunk. No model artifact required.
+  add_executable(ling3_flash_rocm_kda_prefill_test rocm_kda_prefill_test.cpp)
+  target_link_libraries(ling3_flash_rocm_kda_prefill_test PRIVATE
+    gufo_ling3_flash_kernels)
+  add_test(NAME ling3_flash.rocm_kda_prefill COMMAND
+    ling3_flash_rocm_kda_prefill_test)
+  set_tests_properties(ling3_flash.rocm_kda_prefill PROPERTIES
+    LABELS "ling3_flash;hip;gpu;gfx1151")
+  add_dependencies(ling3_flash_tests ling3_flash_rocm_kda_prefill_test)
+
   # Absorbed-MLA decode checks: synthetic latent caches through the split-KV
   # partial+combine kernels against a host double reference.
   add_executable(ling3_flash_rocm_attention_test rocm_attention_test.cpp)
