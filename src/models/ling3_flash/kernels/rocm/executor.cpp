@@ -255,8 +255,51 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->mtp_h_ = e->AllocFloats(hid, err);
     e->mtp_cat_ = e->AllocFloats(2 * hid, err);
     e->mtp_x_ = e->AllocFloats(hid, err);
+    e->mtp_chain_ = e->AllocFloats(hid, err);
+    const std::size_t k = Executor::kMaxVerifyRows;
+    e->pf_x_ = e->AllocFloats(k * hid, err);
+    e->pf_normed_ = e->AllocFloats(k * hid, err);
+    e->pf_attn_ = e->AllocFloats(k * hid, err);
+    e->pf_ffn_ = e->AllocFloats(k * hid, err);
+    e->pf_h_ = e->AllocFloats(k * hid, err);
+    e->pf_logits_ = e->AllocFloats(k * c.vocab_size, err);
+    e->pf_kda_q_ = e->AllocFloats(k * inner, err);
+    e->pf_kda_k_ = e->AllocFloats(k * inner, err);
+    e->pf_kda_v_ = e->AllocFloats(k * inner, err);
+    e->pf_kda_f_ = e->AllocFloats(k * inner, err);
+    e->pf_kda_g_ = e->AllocFloats(k * inner, err);
+    e->pf_kda_beta_ = e->AllocFloats(k * heads, err);
+    e->pf_mla_q_ = e->AllocFloats(k * heads * c.mla_head_dim, err);
+    e->pf_mla_a_ = e->AllocFloats(k * c.MlaKeyDim(), err);
+    e->pf_mla_abs_ = e->AllocFloats(k * heads * c.MlaKeyDim(), err);
+    e->pf_mla_head_ = e->AllocFloats(k * heads * c.mla_value_dim, err);
+    e->pf_moe_ids_ = e->AllocInts(k * used, err);
+    e->pf_moe_weights_ = e->AllocFloats(k * used, err);
+    e->pf_moe_log_ = e->AllocFloats(k * c.num_experts, err);
+    e->pf_moe_gate_ = e->AllocFloats(k * used * ff, err);
+    e->pf_moe_up_ = e->AllocFloats(k * used * ff, err);
+    e->pf_moe_inter_ = e->AllocFloats(k * used * ff, err);
+    e->pf_moe_down_ = e->AllocFloats(k * used * hid, err);
+    e->pf_sh_gate_ = e->AllocFloats(k * c.shared_expert_ff, err);
+    e->pf_sh_up_ = e->AllocFloats(k * c.shared_expert_ff, err);
+    e->pf_sh_inter_ = e->AllocFloats(k * c.shared_expert_ff, err);
+    e->pf_sh_down_ = e->AllocFloats(k * hid, err);
     if (e->mtp_e_ == nullptr || e->mtp_h_ == nullptr ||
-        e->mtp_cat_ == nullptr || e->mtp_x_ == nullptr) {
+        e->mtp_cat_ == nullptr || e->mtp_x_ == nullptr ||
+        e->mtp_chain_ == nullptr || e->pf_x_ == nullptr ||
+        e->pf_normed_ == nullptr || e->pf_attn_ == nullptr ||
+        e->pf_ffn_ == nullptr || e->pf_h_ == nullptr ||
+        e->pf_logits_ == nullptr || e->pf_kda_q_ == nullptr ||
+        e->pf_kda_k_ == nullptr || e->pf_kda_v_ == nullptr ||
+        e->pf_kda_f_ == nullptr || e->pf_kda_g_ == nullptr ||
+        e->pf_kda_beta_ == nullptr || e->pf_mla_q_ == nullptr ||
+        e->pf_mla_a_ == nullptr || e->pf_mla_abs_ == nullptr ||
+        e->pf_mla_head_ == nullptr || e->pf_moe_ids_ == nullptr ||
+        e->pf_moe_weights_ == nullptr || e->pf_moe_log_ == nullptr ||
+        e->pf_moe_gate_ == nullptr || e->pf_moe_up_ == nullptr ||
+        e->pf_moe_inter_ == nullptr || e->pf_moe_down_ == nullptr ||
+        e->pf_sh_gate_ == nullptr || e->pf_sh_up_ == nullptr ||
+        e->pf_sh_inter_ == nullptr || e->pf_sh_down_ == nullptr) {
       return nullptr;
     }
   }
@@ -279,6 +322,16 @@ std::size_t Executor::SessionBytes(std::uint32_t max_context) const noexcept {
   if (model_.has_mtp()) {
     bytes +=
         static_cast<std::size_t>(max_context) * c_.MlaKeyDim() * sizeof(float);
+    const std::size_t slots = kMaxVerifyRows - 1U;
+    for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+      if (!c_.IsMlaLayer(il)) {
+        bytes += slots *
+                 (3U * (c_.ssm_conv_kernel - 1U) * c_.SsmInnerSize() +
+                  static_cast<std::size_t>(c_.num_heads) * c_.ssm_head_dim *
+                      c_.ssm_head_dim) *
+                 sizeof(float);
+      }
+    }
   }
   return bytes;
 }
@@ -322,6 +375,19 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
         s->AllocFloats(static_cast<std::size_t>(max_context) * c_.kv_lora_rank);
     s->mtp_kpe_ =
         s->AllocFloats(static_cast<std::size_t>(max_context) * c_.rotary_dim);
+    s->kda_conv_snap_.assign(c_.num_layers, nullptr);
+    s->kda_state_snap_.assign(c_.num_layers, nullptr);
+    const std::size_t slots = kMaxVerifyRows - 1U;
+    for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+      if (c_.IsMlaLayer(il)) {
+        continue;
+      }
+      s->kda_conv_snap_[il] = s->AllocFloats(
+          slots * 3U * (c_.ssm_conv_kernel - 1U) * c_.SsmInnerSize());
+      s->kda_state_snap_[il] =
+          s->AllocFloats(slots * static_cast<std::size_t>(c_.num_heads) *
+                         c_.ssm_head_dim * c_.ssm_head_dim);
+    }
     if (s->alloc_failed_) {
       if (error_msg != nullptr) {
         *error_msg = "session allocation failed";
@@ -477,17 +543,17 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
   (void)GemvTypeOf(l.ffn_gate_exps.type, &type);
   GemvGrouped(l.ffn_gate_exps.data, type,
               l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_, used,
-              ff, c_.hidden_size, x, 0U, moe_gate_, nullptr);
+              used, ff, c_.hidden_size, x, 0U, moe_gate_, nullptr);
   (void)GemvTypeOf(l.ffn_up_exps.type, &type);
   GemvGrouped(l.ffn_up_exps.data, type,
-              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_, used, ff,
-              c_.hidden_size, x, 0U, moe_up_, nullptr);
+              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_, used,
+              used, ff, c_.hidden_size, x, 0U, moe_up_, nullptr);
   SwigluClamped(moe_gate_, moe_up_, moe_inter_, used * ff,
                 c_.swiglu_clamp_exp[il], nullptr);
   (void)GemvTypeOf(l.ffn_down_exps.type, &type);
   GemvGrouped(l.ffn_down_exps.data, type,
               l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, moe_ids_, used,
-              hid, ff, moe_inter_, ff, moe_down_, nullptr);
+              1U, hid, ff, moe_inter_, ff, moe_down_, nullptr);
   RowWeightedSum(moe_down_, moe_weights_, out, used, hid, nullptr);
 
   // Always-on shared expert.
@@ -503,6 +569,232 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
   Gemv(l.shexp_down.data, type, l.shexp_down.rows, l.shexp_down.cols,
        l.shexp_down.row_bytes, sh_inter_, sh_down_, nullptr);
   Add(out, sh_down_, out, hid, nullptr);
+}
+
+void Executor::KdaBatch(Session& session, std::uint32_t il,
+                        const DeviceLayer& l, std::uint32_t rows) {
+  const std::uint32_t inner = c_.SsmInnerSize();
+  const std::uint32_t heads = c_.num_heads;
+  const std::uint32_t d = c_.ssm_head_dim;
+  const std::uint32_t kern = c_.ssm_conv_kernel;
+  const std::size_t hid = c_.hidden_size;
+  GemvType type;
+  const float* in = pf_normed_;
+  GemvTypeOf(l.ssm_q.type, &type);
+  GemvRows(l.ssm_q.data, type, rows, l.ssm_q.rows, l.ssm_q.cols,
+           l.ssm_q.row_bytes, in, static_cast<std::uint32_t>(hid), pf_kda_q_,
+           inner, nullptr);
+  GemvTypeOf(l.ssm_k.type, &type);
+  GemvRows(l.ssm_k.data, type, rows, l.ssm_k.rows, l.ssm_k.cols,
+           l.ssm_k.row_bytes, in, static_cast<std::uint32_t>(hid), pf_kda_k_,
+           inner, nullptr);
+  GemvTypeOf(l.ssm_v.type, &type);
+  GemvRows(l.ssm_v.data, type, rows, l.ssm_v.rows, l.ssm_v.cols,
+           l.ssm_v.row_bytes, in, static_cast<std::uint32_t>(hid), pf_kda_v_,
+           inner, nullptr);
+  GemvTypeOf(l.ssm_f.type, &type);
+  GemvRows(l.ssm_f.data, type, rows, l.ssm_f.rows, l.ssm_f.cols,
+           l.ssm_f.row_bytes, in, static_cast<std::uint32_t>(hid), pf_kda_f_,
+           inner, nullptr);
+  GemvTypeOf(l.ssm_g.type, &type);
+  GemvRows(l.ssm_g.data, type, rows, l.ssm_g.rows, l.ssm_g.cols,
+           l.ssm_g.row_bytes, in, static_cast<std::uint32_t>(hid), pf_kda_g_,
+           inner, nullptr);
+  GemvTypeOf(l.ssm_beta.type, &type);
+  GemvRows(l.ssm_beta.data, type, rows, l.ssm_beta.rows, l.ssm_beta.cols,
+           l.ssm_beta.row_bytes, in, static_cast<std::uint32_t>(hid),
+           pf_kda_beta_, heads, nullptr);
+
+  // The recurrent parts stay sequential: each row advances the conv history
+  // and the delta state, and the first rows-1 states are snapshotted so
+  // RollbackVerify can commit any prefix.
+  const std::size_t hist_stride = static_cast<std::size_t>(kern - 1U) * inner;
+  const std::size_t conv_slot = 3U * hist_stride;
+  const std::size_t state_elems = static_cast<std::size_t>(heads) * d * d;
+  float* hist = session.kda_conv_[il];
+  (void)GemvTypeOf(l.ssm_out.type, &type);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    Add(pf_kda_f_ + static_cast<std::size_t>(r) * inner, l.ssm_dt.f32(),
+        pf_kda_f_ + static_cast<std::size_t>(r) * inner, inner, nullptr);
+    ConvSilu(l.ssm_conv_q.f32(),
+             pf_kda_q_ + static_cast<std::size_t>(r) * inner, hist, kda_conv_q_,
+             inner, kern, nullptr);
+    ConvSilu(l.ssm_conv_k.f32(),
+             pf_kda_k_ + static_cast<std::size_t>(r) * inner,
+             hist + hist_stride, kda_conv_k_, inner, kern, nullptr);
+    ConvSilu(l.ssm_conv_v.f32(),
+             pf_kda_v_ + static_cast<std::size_t>(r) * inner,
+             hist + 2U * hist_stride, kda_conv_v_, inner, kern, nullptr);
+    KdaNormHeads(kda_conv_q_, kda_conv_k_, heads, d, c_.rms_eps,
+                 1.0F / std::sqrt(static_cast<float>(d)), nullptr);
+    KdaDelta(kda_conv_q_, kda_conv_k_, kda_conv_v_,
+             pf_kda_f_ + static_cast<std::size_t>(r) * inner,
+             pf_kda_beta_ + static_cast<std::size_t>(r) * heads, l.ssm_a.f32(),
+             l.ssm_norm.f32(), pf_kda_g_ + static_cast<std::size_t>(r) * inner,
+             session.kda_state_[il], kda_attn_, heads, d, c_.rms_eps,
+             c_.kda_gate_lower_bound, nullptr);
+    if (r + 1U < rows) {
+      (void)hipMemcpyAsync(session.kda_conv_snap_[il] + r * conv_slot, hist,
+                           conv_slot * sizeof(float), hipMemcpyDeviceToDevice,
+                           nullptr);
+      (void)hipMemcpyAsync(session.kda_state_snap_[il] + r * state_elems,
+                           session.kda_state_[il], state_elems * sizeof(float),
+                           hipMemcpyDeviceToDevice, nullptr);
+    }
+    Gemv(l.ssm_out.data, type, l.ssm_out.rows, l.ssm_out.cols,
+         l.ssm_out.row_bytes, kda_attn_,
+         pf_attn_ + static_cast<std::size_t>(r) * hid, nullptr);
+  }
+}
+
+void Executor::MlaBatch(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
+                        std::uint32_t base_pos, std::uint32_t rows) {
+  const std::uint32_t heads = c_.num_heads;
+  const std::uint32_t nope = c_.MlaNopeDim();
+  const std::uint32_t rot = c_.rotary_dim;
+  const std::uint32_t kv_rank = c_.kv_lora_rank;
+  const std::uint32_t v_dim = c_.mla_value_dim;
+  const std::size_t hid = c_.hidden_size;
+  const std::size_t qrow = static_cast<std::size_t>(heads) * c_.mla_head_dim;
+  const std::size_t arow = c_.MlaKeyDim();
+  const std::size_t absrow = static_cast<std::size_t>(heads) * c_.MlaKeyDim();
+  const std::size_t hrow = static_cast<std::size_t>(heads) * v_dim;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(c_.mla_head_dim));
+  GemvType type;
+  GemvTypeOf(l.attn_q.type, &type);
+  GemvRows(l.attn_q.data, type, rows, l.attn_q.rows, l.attn_q.cols,
+           l.attn_q.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+           pf_mla_q_, static_cast<std::uint32_t>(qrow), nullptr);
+  GemvTypeOf(l.attn_kv_a.type, &type);
+  GemvRows(l.attn_kv_a.data, type, rows, l.attn_kv_a.rows, l.attn_kv_a.cols,
+           l.attn_kv_a.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+           pf_mla_a_, static_cast<std::uint32_t>(arow), nullptr);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    const std::uint32_t pos = base_pos + r;
+    float* a = pf_mla_a_ + static_cast<std::size_t>(r) * arow;
+    float* q = pf_mla_q_ + static_cast<std::size_t>(r) * qrow;
+    RmsNorm(a, l.attn_kv_a_norm.f32(), c_.rms_eps, a, kv_rank, nullptr);
+    Rope(a + kv_rank, 1U, rot, rot, pos, c_.rope_theta, nullptr);
+    RopeStrided(q + nope, heads, c_.mla_head_dim, rot, pos, c_.rope_theta,
+                nullptr);
+    (void)hipMemcpyAsync(kv_cache + static_cast<std::size_t>(pos) * kv_rank, a,
+                         kv_rank * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+    (void)hipMemcpyAsync(kpe_cache + static_cast<std::size_t>(pos) * rot,
+                         a + kv_rank, rot * sizeof(float),
+                         hipMemcpyDeviceToDevice, nullptr);
+    float* abs = pf_mla_abs_ + static_cast<std::size_t>(r) * absrow;
+    (void)GemvTypeOf(l.attn_k_b.type, &type);
+    for (std::uint32_t h = 0; h < heads; ++h) {
+      Gemv(l.attn_k_b.Expert(h), type, kv_rank, nope, l.attn_k_b.row_bytes,
+           q + static_cast<std::size_t>(h) * c_.mla_head_dim,
+           abs + static_cast<std::size_t>(h) * c_.MlaKeyDim(), nullptr);
+      (void)hipMemcpyAsync(
+          abs + static_cast<std::size_t>(h) * c_.MlaKeyDim() + kv_rank,
+          q + static_cast<std::size_t>(h) * c_.mla_head_dim + nope,
+          rot * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
+    }
+    const std::uint32_t n_pos = pos + 1U;
+    const std::uint32_t tiles = MlaDecodeTiles(n_pos, kMlaTile);
+    MlaDecodePartial(abs, kv_cache, kpe_cache, n_pos, kMlaTile, scale, mla_ws_,
+                     heads, kv_rank, rot, nullptr);
+    MlaDecodeCombine(mla_ws_, tiles, heads, kv_rank, mla_latent_, nullptr);
+    GemvTypeOf(l.attn_v_b.type, &type);
+    float* head = pf_mla_head_ + static_cast<std::size_t>(r) * hrow;
+    for (std::uint32_t h = 0; h < heads; ++h) {
+      Gemv(l.attn_v_b.Expert(h), type, v_dim, kv_rank, l.attn_v_b.row_bytes,
+           mla_latent_ + static_cast<std::size_t>(h) * kv_rank,
+           head + static_cast<std::size_t>(h) * v_dim, nullptr);
+    }
+    GemvTypeOf(l.attn_gate.type, &type);
+    Gemv(l.attn_gate.data, type, l.attn_gate.rows, l.attn_gate.cols,
+         l.attn_gate.row_bytes, pf_normed_ + static_cast<std::size_t>(r) * hid,
+         mla_gate_, nullptr);
+    SigmoidInPlace(mla_gate_, heads, nullptr);
+    RowScale(head, mla_gate_, heads, v_dim, nullptr);
+  }
+  GemvTypeOf(l.attn_out.type, &type);
+  GemvRows(l.attn_out.data, type, rows, l.attn_out.rows, l.attn_out.cols,
+           l.attn_out.row_bytes, pf_mla_head_, static_cast<std::uint32_t>(hrow),
+           pf_attn_, static_cast<std::uint32_t>(hid), nullptr);
+}
+
+void Executor::FfnBatch(const DeviceLayer& l, std::uint32_t il,
+                        std::uint32_t rows) {
+  const std::size_t hid = c_.hidden_size;
+  if (c_.IsDenseFfnLayer(il)) {
+    // Dense layers are a small minority; the single-row path keeps their
+    // wide scratch reusable and the weight traffic is identical.
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      Ffn(l, il, pf_normed_ + static_cast<std::size_t>(r) * hid,
+          pf_ffn_ + static_cast<std::size_t>(r) * hid);
+    }
+    return;
+  }
+  const std::uint32_t used = c_.num_experts_used;
+  const std::uint32_t ff = c_.expert_ff;
+  const std::size_t slots = rows * used;
+  const std::size_t slot_gate = static_cast<std::size_t>(used) * ff;
+  const std::size_t slot_down = static_cast<std::size_t>(used) * hid;
+  const std::size_t shared = c_.shared_expert_ff;
+  GemvType type;
+  GemvTypeOf(l.router.type, &type);
+  GemvRows(l.router.data, type, rows, l.router.rows, l.router.cols,
+           l.router.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+           pf_moe_log_, c_.num_experts, nullptr);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    RouterTopK(pf_moe_log_ + static_cast<std::size_t>(r) * c_.num_experts,
+               l.exp_probs_b.f32(), c_.num_experts, c_.expert_groups,
+               c_.expert_groups_used, used, c_.expert_weights_scale,
+               pf_moe_ids_ + static_cast<std::size_t>(r) * used,
+               pf_moe_weights_ + static_cast<std::size_t>(r) * used, nullptr);
+  }
+  GemvTypeOf(l.ffn_gate_exps.type, &type);
+  GemvGrouped(l.ffn_gate_exps.data, type,
+              l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, pf_moe_ids_,
+              slots, used, ff, c_.hidden_size, pf_normed_,
+              static_cast<std::uint32_t>(hid), pf_moe_gate_, nullptr);
+  GemvTypeOf(l.ffn_up_exps.type, &type);
+  GemvGrouped(l.ffn_up_exps.data, type,
+              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, pf_moe_ids_, slots,
+              used, ff, c_.hidden_size, pf_normed_,
+              static_cast<std::uint32_t>(hid), pf_moe_up_, nullptr);
+  SwigluClamped(pf_moe_gate_, pf_moe_up_, pf_moe_inter_, slots * ff,
+                c_.swiglu_clamp_exp[il], nullptr);
+  GemvTypeOf(l.ffn_down_exps.type, &type);
+  GemvGrouped(l.ffn_down_exps.data, type,
+              l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, pf_moe_ids_,
+              slots, 1U, static_cast<std::uint32_t>(hid), ff, pf_moe_inter_, ff,
+              pf_moe_down_, nullptr);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    RowWeightedSum(pf_moe_down_ + static_cast<std::size_t>(r) * slot_down,
+                   pf_moe_weights_ + static_cast<std::size_t>(r) * used,
+                   pf_ffn_ + static_cast<std::size_t>(r) * hid, used,
+                   static_cast<std::uint32_t>(hid), nullptr);
+  }
+
+  // Always-on shared expert for every row.
+  GemvTypeOf(l.shexp_gate.type, &type);
+  GemvRows(l.shexp_gate.data, type, rows, l.shexp_gate.rows, l.shexp_gate.cols,
+           l.shexp_gate.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+           pf_sh_gate_, static_cast<std::uint32_t>(shared), nullptr);
+  GemvTypeOf(l.shexp_up.type, &type);
+  GemvRows(l.shexp_up.data, type, rows, l.shexp_up.rows, l.shexp_up.cols,
+           l.shexp_up.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+           pf_sh_up_, static_cast<std::uint32_t>(shared), nullptr);
+  SwigluClamped(pf_sh_gate_, pf_sh_up_, pf_sh_inter_, rows * shared,
+                c_.swiglu_clamp_shexp[il], nullptr);
+  GemvTypeOf(l.shexp_down.type, &type);
+  GemvRows(l.shexp_down.data, type, rows, l.shexp_down.rows, l.shexp_down.cols,
+           l.shexp_down.row_bytes, pf_sh_inter_,
+           static_cast<std::uint32_t>(shared), pf_sh_down_,
+           static_cast<std::uint32_t>(hid), nullptr);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    Add(pf_ffn_ + static_cast<std::size_t>(r) * hid,
+        pf_sh_down_ + static_cast<std::size_t>(r) * hid,
+        pf_ffn_ + static_cast<std::size_t>(r) * hid,
+        static_cast<std::uint32_t>(hid), nullptr);
+  }
 }
 
 bool Executor::Step(Session& session, std::int32_t token,
@@ -561,8 +853,9 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
   return true;
 }
 
-bool Executor::MtpStep(Session& session, std::int32_t token,
-                       std::string* error_msg) {
+bool Executor::MtpForward(Session& session, std::int32_t token,
+                          const float* hidden, bool with_logits,
+                          std::string* error_msg) {
   if (!model_.has_mtp()) {
     if (error_msg != nullptr) {
       *error_msg = "model has no MTP block";
@@ -588,7 +881,7 @@ bool Executor::MtpStep(Session& session, std::int32_t token,
   EmbedRow(model_.token_embd().data, type, static_cast<std::uint32_t>(token),
            static_cast<std::uint32_t>(hid), mtp_e_, nullptr);
   RmsNorm(mtp_e_, l.nextn_enorm.f32(), c_.rms_eps, mtp_e_, hid, nullptr);
-  RmsNorm(h_out_, l.nextn_hnorm.f32(), c_.rms_eps, mtp_h_, hid, nullptr);
+  RmsNorm(hidden, l.nextn_hnorm.f32(), c_.rms_eps, mtp_h_, hid, nullptr);
   Concat2(mtp_e_, mtp_h_, mtp_cat_, hid, nullptr);
   (void)GemvTypeOf(l.nextn_eh_proj.type, &type);
   Gemv(l.nextn_eh_proj.data, type, l.nextn_eh_proj.rows, l.nextn_eh_proj.cols,
@@ -602,13 +895,137 @@ bool Executor::MtpStep(Session& session, std::int32_t token,
   Ffn(l, c_.num_layers, normed_, ffn_);
   Add(ffn_inp_, ffn_, mtp_x_, hid, nullptr);
 
-  RmsNorm(mtp_x_, l.nextn_shared_head_norm.f32(), c_.rms_eps, normed_, hid,
-          nullptr);
-  (void)GemvTypeOf(model_.output().type, &type);
-  Gemv(model_.output().data, type, model_.output().rows, model_.output().cols,
-       model_.output().row_bytes, normed_, mtp_logits_, nullptr);
+  if (with_logits) {
+    // Keep the unnormalized output as the next draft's hidden input.
+    (void)hipMemcpyAsync(mtp_chain_, mtp_x_, hid * sizeof(*mtp_chain_),
+                         hipMemcpyDeviceToDevice, nullptr);
+    RmsNorm(mtp_x_, l.nextn_shared_head_norm.f32(), c_.rms_eps, normed_, hid,
+            nullptr);
+    (void)GemvTypeOf(model_.output().type, &type);
+    Gemv(model_.output().data, type, model_.output().rows, model_.output().cols,
+         model_.output().row_bytes, normed_, mtp_logits_, nullptr);
+  }
   ++session.mtp_position_;
   return true;
+}
+
+bool Executor::MtpStep(Session& session, std::int32_t token,
+                       std::string* error_msg) {
+  return MtpForward(session, token, h_out_, true, error_msg);
+}
+
+bool Executor::MtpDraft(Session& session, std::int32_t token,
+                        std::string* error_msg) {
+  return MtpForward(session, token, mtp_chain_, true, error_msg);
+}
+
+bool Executor::MtpAdvance(Session& session, std::int32_t token,
+                          const float* hidden, std::string* error_msg) {
+  return MtpForward(session, token, hidden, false, error_msg);
+}
+
+bool Executor::Verify(Session& session, std::int32_t t0,
+                      const std::int32_t* drafts, std::uint32_t k,
+                      std::string* error_msg) {
+  const auto fail = [&](const char* msg) {
+    if (error_msg != nullptr) {
+      *error_msg = msg;
+    }
+    return false;
+  };
+  if (!model_.has_mtp()) {
+    return fail("model has no MTP block");
+  }
+  if (drafts == nullptr || k == 0U || k + 1U > kMaxVerifyRows) {
+    return fail("invalid speculative draft count");
+  }
+  const std::uint32_t rows = k + 1U;
+  std::int32_t seq[kMaxVerifyRows];
+  seq[0] = t0;
+  for (std::uint32_t i = 0; i < k; ++i) {
+    seq[i + 1U] = drafts[i];
+  }
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    const std::int32_t token = seq[r];
+    if (token < 0 || static_cast<std::uint32_t>(token) >= c_.vocab_size) {
+      return fail("token id out of range");
+    }
+  }
+  if (session.position_ + rows > session.max_context()) {
+    return fail("context exhausted");
+  }
+
+  const std::size_t hid = c_.hidden_size;
+  session.verify_base_pos_ = session.position_;
+  GemvType type;
+  (void)GemvTypeOf(model_.token_embd().type, &type);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    EmbedRow(model_.token_embd().data, type, static_cast<std::uint32_t>(seq[r]),
+             static_cast<std::uint32_t>(hid),
+             pf_x_ + static_cast<std::size_t>(r) * hid, nullptr);
+  }
+
+  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+    const DeviceLayer& l = model_.layers()[il];
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      RmsNorm(pf_x_ + static_cast<std::size_t>(r) * hid, l.attn_norm.f32(),
+              c_.rms_eps, pf_normed_ + static_cast<std::size_t>(r) * hid, hid,
+              nullptr);
+    }
+    if (c_.IsMlaLayer(il)) {
+      MlaBatch(l, session.mla_kv_[il], session.mla_kpe_[il], session.position_,
+               rows);
+    } else {
+      KdaBatch(session, il, l, rows);
+    }
+    Add(pf_x_, pf_attn_, pf_x_, rows * hid, nullptr);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      RmsNorm(pf_x_ + static_cast<std::size_t>(r) * hid, l.ffn_norm.f32(),
+              c_.rms_eps, pf_normed_ + static_cast<std::size_t>(r) * hid, hid,
+              nullptr);
+    }
+    FfnBatch(l, il, rows);
+    Add(pf_x_, pf_ffn_, pf_x_, rows * hid, nullptr);
+  }
+
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    RmsNorm(pf_x_ + static_cast<std::size_t>(r) * hid,
+            model_.output_norm().f32(), c_.rms_eps,
+            pf_h_ + static_cast<std::size_t>(r) * hid, hid, nullptr);
+  }
+  (void)hipMemcpyAsync(h_out_, pf_h_ + static_cast<std::size_t>(k) * hid,
+                       hid * sizeof(*h_out_), hipMemcpyDeviceToDevice, nullptr);
+  (void)GemvTypeOf(model_.output().type, &type);
+  GemvRows(model_.output().data, type, rows, model_.output().rows,
+           model_.output().cols, model_.output().row_bytes, pf_h_,
+           static_cast<std::uint32_t>(hid), pf_logits_, c_.vocab_size, nullptr);
+  session.position_ += rows;
+  return true;
+}
+
+void Executor::RollbackVerify(Session& session, std::uint32_t keep) {
+  const std::uint32_t snap = keep - 1U;
+  const std::size_t conv_slot = 3U * (c_.ssm_conv_kernel - 1U) *
+                                static_cast<std::size_t>(c_.SsmInnerSize());
+  const std::size_t state_elems = static_cast<std::size_t>(c_.num_heads) *
+                                  c_.ssm_head_dim * c_.ssm_head_dim;
+  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+    if (session.kda_state_snap_[il] == nullptr) {
+      continue;
+    }
+    (void)hipMemcpyAsync(session.kda_state_[il],
+                         session.kda_state_snap_[il] + snap * state_elems,
+                         state_elems * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+    (void)hipMemcpyAsync(
+        session.kda_conv_[il], session.kda_conv_snap_[il] + snap * conv_slot,
+        conv_slot * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
+  }
+  session.position_ = session.verify_base_pos_ + keep;
+  session.mtp_position_ = session.verify_base_pos_ + keep;
+  (void)hipMemcpyAsync(
+      h_out_, pf_h_ + static_cast<std::size_t>(snap) * c_.hidden_size,
+      c_.hidden_size * sizeof(*h_out_), hipMemcpyDeviceToDevice, nullptr);
 }
 
 }  // namespace gufo::models::ling3_flash::rocm

@@ -60,6 +60,8 @@ int GenerateTurn(const Model& model, Session& session,
   }
   sampling::SamplerState sampler(opt.sampling, history);
   std::size_t generated = 0;
+  std::size_t drafted = 0;
+  std::size_t accepted = 0;
   const auto start = std::chrono::steady_clock::now();
   std::string error;
   while (generated < opt.max_tokens) {
@@ -69,6 +71,8 @@ int GenerateTurn(const Model& model, Session& session,
       std::cerr << "Ling 3.0 Flash decode failed: " << error << '\n';
       return 1;
     }
+    drafted += decoded.drafted;
+    accepted += decoded.accepted;
     for (const std::int32_t token : decoded.tokens) {
       const std::string piece = model.TokenText(token);
       std::cout << piece << std::flush;
@@ -86,7 +90,11 @@ int GenerateTurn(const Model& model, Session& session,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
     std::cerr << "Generated " << generated << " tokens (" << generated / seconds
-              << " tok/s)\n";
+              << " tok/s)";
+    if (drafted > 0U) {
+      std::cerr << " MTP accepted " << accepted << "/" << drafted;
+    }
+    std::cerr << '\n';
   }
   return 0;
 }
@@ -98,9 +106,10 @@ int RunLing3FlashPrompt(const cli::PromptOptions& opt,
                         std::chrono::steady_clock::time_point load_start,
                         const ReasoningOptions& reasoning) {
   (void)reader;
-  if (opt.force_cpu || !opt.speculative_backend.empty()) {
-    std::cerr << "Ling 3.0 Flash requires ROCm and does not support "
-                 "speculative decoding\n";
+  if (opt.force_cpu ||
+      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp")) {
+    std::cerr << "Ling 3.0 Flash requires ROCm and supports only "
+                 "--speculative mtp\n";
     PrintModelLoadTime(load_start, false);
     return 1;
   }
@@ -117,6 +126,15 @@ int RunLing3FlashPrompt(const cli::PromptOptions& opt,
   if (session == nullptr) {
     std::cerr << "Ling 3.0 Flash session failed: " << error << '\n';
     return 1;
+  }
+  if (opt.speculative_backend == "mtp") {
+    if (!model->HasMtp()) {
+      std::cerr << "Ling 3.0 Flash model has no MTP block; omit "
+                   "--speculative mtp\n";
+      return 1;
+    }
+    session->SetMtpEnabled(true);
+    session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
   }
 
   std::vector<std::int32_t> ids;
@@ -163,9 +181,10 @@ int RunLing3FlashChat(const cli::PromptOptions& opt,
                       std::chrono::steady_clock::time_point load_start,
                       const ReasoningOptions& reasoning) {
   (void)reader;
-  if (opt.force_cpu || !opt.speculative_backend.empty()) {
-    std::cerr << "Ling 3.0 Flash requires ROCm and does not support "
-                 "speculative decoding\n";
+  if (opt.force_cpu ||
+      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp")) {
+    std::cerr << "Ling 3.0 Flash requires ROCm and supports only "
+                 "--speculative mtp\n";
     PrintModelLoadTime(load_start, false);
     return 1;
   }
@@ -183,6 +202,10 @@ int RunLing3FlashChat(const cli::PromptOptions& opt,
   if (session == nullptr) {
     std::cerr << "Ling 3.0 Flash session failed: " << error << '\n';
     return 1;
+  }
+  if (model->HasMtp()) {
+    session->SetMtpEnabled(true);
+    session->SetDraftLimits(opt.min_draft_tokens, opt.draft_tokens);
   }
 
   std::vector<tokenization::ChatMessage> history;

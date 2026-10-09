@@ -62,13 +62,18 @@ std::vector<std::int32_t> EngineTokens(
 class Ling3TextRunnerState final : public TextRunnerState {
 public:
   Ling3TextRunnerState(const std::shared_ptr<Model>& model,
-                       std::uint32_t max_context) {
+                       std::uint32_t max_context, bool use_mtp,
+                       std::uint32_t min_drafts, std::uint32_t max_drafts) {
     std::string error;
     session_ = model->CreateSession(max_context, &error);
     if (session_ == nullptr) {
       throw std::runtime_error("Failed to create Ling 3.0 Flash session: " +
                                error);
     }
+    // A speculative session must fill the draft cache during prefill, so
+    // enable MTP before the first Sync.
+    session_->SetMtpEnabled(use_mtp);
+    session_->SetDraftLimits(min_drafts, max_drafts);
   }
 
   void Invalidate() noexcept override {
@@ -107,8 +112,14 @@ const Ling3TextRunnerState& RequireLing3State(const TextRunnerState& state) {
 /// context window.
 class Ling3TextRunner final : public TextModelRunner {
 public:
-  Ling3TextRunner(std::shared_ptr<Model> model, std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+  Ling3TextRunner(std::shared_ptr<Model> model, std::uint32_t max_context,
+                  bool use_mtp, std::uint32_t min_drafts,
+                  std::uint32_t max_drafts)
+      : model_(std::move(model)),
+        max_context_(max_context),
+        use_mtp_(use_mtp),
+        min_drafts_(min_drafts),
+        max_drafts_(max_drafts) {}
 
   [[nodiscard]] server::TextRunnerDescriptor Descriptor() const override {
     return {
@@ -122,7 +133,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0u,
                 .prefix_reuse = true,
@@ -186,7 +197,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<Ling3TextRunnerState>(model_, max_context_);
+    return std::make_unique<Ling3TextRunnerState>(
+        model_, max_context_, use_mtp_, min_drafts_, max_drafts_);
   }
 
   void PreparePrefixReuse(
@@ -266,6 +278,41 @@ public:
     return SelectNext(state, sampler);
   }
 
+  [[nodiscard]] server::TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (!use_mtp_ || max_tokens == 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "Ling 3.0 Flash MTP decode budget must be at least one token");
+    }
+    auto& ling3 = RequireLing3State(state);
+    if (ling3.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    Session::DecodeResult decoded;
+    std::string error;
+    if (!ling3.session().DecodeStep(max_tokens, sampler, &decoded, &error)) {
+      throw std::runtime_error("Ling 3.0 Flash MTP decode failed: " + error);
+    }
+    server::TextDecodeStep step;
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
+    ling3.set_position(ling3.session().Position());
+    step.draft_tokens = decoded.drafted;
+    step.draft_accepted_tokens = decoded.accepted;
+    return step;
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireLing3State(state).position();
@@ -274,6 +321,9 @@ public:
 private:
   std::shared_ptr<Model> model_;
   std::uint32_t max_context_;
+  bool use_mtp_;
+  std::uint32_t min_drafts_;
+  std::uint32_t max_drafts_;
 };
 
 }  // namespace
@@ -283,9 +333,11 @@ std::shared_ptr<Model> LoadServeModel(
     std::uint32_t max_context,
     const server::TextSpeculativeConfig& speculative_config,
     std::string* error) {
-  if (speculative_config.backend != server::TextSpeculativeBackend::kDisabled) {
+  if (speculative_config.backend != server::TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != server::TextSpeculativeBackend::kMtp) {
     SetError(error,
-             "Ling 3.0 Flash HTTP models do not support speculative decoding");
+             "Ling 3.0 Flash HTTP models support only MTP speculative "
+             "decoding (--speculative mtp)");
     return nullptr;
   }
   std::string load_error;
@@ -324,17 +376,28 @@ std::shared_ptr<TextModelRunner> CreateTextRunner(
   // keeps the full window.
   const auto per_session_context = static_cast<std::uint32_t>(
       std::max<std::size_t>(1, max_context / session_count));
-  if (speculative_config.backend != server::TextSpeculativeBackend::kDisabled) {
+  if (speculative_config.backend != server::TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != server::TextSpeculativeBackend::kMtp) {
     SetError(error,
-             "Ling 3.0 Flash HTTP models do not support speculative decoding");
+             "Ling 3.0 Flash HTTP models support only MTP speculative "
+             "decoding (--speculative mtp)");
+    return nullptr;
+  }
+  const bool use_mtp =
+      speculative_config.backend == server::TextSpeculativeBackend::kMtp;
+  if (use_mtp && !model->HasMtp()) {
+    SetError(error,
+             "Ling 3.0 Flash MTP speculative decoding requires a GGUF with "
+             "an MTP block");
     return nullptr;
   }
   if (!disk_cache_config.directory.empty()) {
     SetError(error, "Ling 3.0 Flash HTTP models do not support the disk cache");
     return nullptr;
   }
-  return std::make_shared<Ling3TextRunner>(std::move(model),
-                                           per_session_context);
+  return std::make_shared<Ling3TextRunner>(
+      std::move(model), per_session_context, use_mtp,
+      speculative_config.min_draft_tokens, speculative_config.max_draft_tokens);
 }
 
 }  // namespace gufo::models::ling3_flash

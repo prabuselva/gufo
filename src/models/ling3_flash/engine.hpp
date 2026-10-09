@@ -101,6 +101,8 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::size_t drafted{0};
+    std::size_t accepted{0};
   };
   /// Samples one token from the current logits, checks for stop, then feeds
   /// the token. The logits of the new last token are kept.
@@ -120,6 +122,16 @@ public:
   }
   void Reset();
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
+  /// Bounds on the per-round MTP draft count. The session starts at `max`
+  /// drafts, grows while drafts keep being fully accepted and shrinks on
+  /// rejections down to `min`; `min` == `max` pins the count.
+  void SetDraftLimits(std::uint32_t min_drafts, std::uint32_t max_drafts);
+  /// Enables the MTP draft cache and speculative decoding for this session.
+  /// Must be called before the first Sync: the draft cache is filled during
+  /// prompt processing and cannot be rebuilt lazily. A plain
+  /// (non-speculative) session leaves it off so prefill skips the draft block
+  /// entirely.
+  void SetMtpEnabled(bool enabled);
 
 private:
   friend class Model;
@@ -132,6 +144,15 @@ private:
   rocm::Executor* executor_;
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
+  // Readback scratch for speculative decoding: the draft block's logits and
+  // the verify rows (rocm::Executor::kMaxVerifyRows * vocab).
+  std::vector<float> draft_logits_;
+  std::vector<float> verify_rows_;
+  std::uint32_t draft_min_{1};
+  std::uint32_t draft_max_{4};
+  std::uint32_t draft_k_{4};
+  std::uint32_t draft_streak_{0};
+  bool mtp_enabled_{false};
   bool valid_{true};
 };
 

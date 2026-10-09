@@ -533,6 +533,7 @@ __global__ void GemvGroupedQ4_0(const Q4_0Block* __restrict__ w,
                                 const std::int32_t* __restrict__ ids,
                                 std::size_t expert_stride_blocks,
                                 const float* __restrict__ x,
+                                std::uint32_t slots_per_row,
                                 std::uint32_t x_stride, float* __restrict__ out,
                                 std::uint32_t used, std::uint32_t rows,
                                 std::uint32_t cols) {
@@ -546,7 +547,8 @@ __global__ void GemvGroupedQ4_0(const Q4_0Block* __restrict__ w,
   const Q4_0Block* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
       static_cast<std::size_t>(r) * nblocks;
-  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const float* __restrict__ xs =
+      x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
   float acc = 0.0f;
 #pragma unroll 4
@@ -566,6 +568,7 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
                                 const std::int32_t* __restrict__ ids,
                                 std::size_t expert_stride_blocks,
                                 const float* __restrict__ x,
+                                std::uint32_t slots_per_row,
                                 std::uint32_t x_stride, float* __restrict__ out,
                                 std::uint32_t used, std::uint32_t rows,
                                 std::uint32_t cols) {
@@ -579,7 +582,8 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
   const Q8_0Block* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
       static_cast<std::size_t>(r) * nblocks;
-  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const float* __restrict__ xs =
+      x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
   float acc = 0.0f;
 #pragma unroll 4
@@ -599,6 +603,7 @@ __global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
                                const std::int32_t* __restrict__ ids,
                                std::size_t expert_stride_blocks,
                                const float* __restrict__ x,
+                               std::uint32_t slots_per_row,
                                std::uint32_t x_stride, float* __restrict__ out,
                                std::uint32_t used, std::uint32_t rows,
                                std::uint32_t cols) {
@@ -612,7 +617,8 @@ __global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
   const Q4KBlock* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
       static_cast<std::size_t>(r) * nblocks;
-  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const float* __restrict__ xs =
+      x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
   float acc = 0.0f;
   for (std::uint32_t b = 0; b < nblocks; ++b) {
@@ -643,6 +649,7 @@ __global__ void GemvGroupedQ6K(const Q6KBlock* __restrict__ w,
                                const std::int32_t* __restrict__ ids,
                                std::size_t expert_stride_blocks,
                                const float* __restrict__ x,
+                               std::uint32_t slots_per_row,
                                std::uint32_t x_stride, float* __restrict__ out,
                                std::uint32_t used, std::uint32_t rows,
                                std::uint32_t cols) {
@@ -656,7 +663,8 @@ __global__ void GemvGroupedQ6K(const Q6KBlock* __restrict__ w,
   const Q6KBlock* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
       static_cast<std::size_t>(r) * nblocks;
-  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const float* __restrict__ xs =
+      x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
   float acc = 0.0f;
   for (std::uint32_t b = 0; b < nblocks; ++b) {
@@ -693,6 +701,7 @@ __global__ void GemvGroupedDense(const T* __restrict__ w,
                                  const std::int32_t* __restrict__ ids,
                                  std::size_t expert_stride_elems,
                                  const float* __restrict__ x,
+                                 std::uint32_t slots_per_row,
                                  std::uint32_t x_stride,
                                  float* __restrict__ out, std::uint32_t used,
                                  std::uint32_t rows, std::uint32_t cols) {
@@ -705,7 +714,8 @@ __global__ void GemvGroupedDense(const T* __restrict__ w,
   const T* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_elems +
       static_cast<std::size_t>(r) * cols;
-  const float* __restrict__ xs = x + static_cast<std::size_t>(s) * x_stride;
+  const float* __restrict__ xs =
+      x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
   float acc = 0.0f;
 #pragma unroll 4
@@ -950,37 +960,40 @@ void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
 
 void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
                  const std::int32_t* ids, std::uint32_t used,
-                 std::uint32_t rows, std::uint32_t cols, const float* x,
-                 std::uint32_t x_stride, float* out, hipStream_t stream) {
+                 std::uint32_t slots_per_row, std::uint32_t rows,
+                 std::uint32_t cols, const float* x, std::uint32_t x_stride,
+                 float* out, hipStream_t stream) {
   const std::size_t pairs = static_cast<std::size_t>(used) * rows;
   const std::uint32_t grid = static_cast<std::uint32_t>((pairs + 3U) / 4U);
   switch (type) {
     case GemvType::kQ4_0:
       GemvGroupedQ4_0<<<grid, dim3(128), 0, stream>>>(
           static_cast<const Q4_0Block*>(base), ids,
-          expert_stride / sizeof(Q4_0Block), x, x_stride, out, used, rows,
-          cols);
+          expert_stride / sizeof(Q4_0Block), x, slots_per_row, x_stride, out,
+          used, rows, cols);
       break;
     case GemvType::kQ8_0:
       GemvGroupedQ8_0<<<grid, dim3(128), 0, stream>>>(
           static_cast<const Q8_0Block*>(base), ids,
-          expert_stride / sizeof(Q8_0Block), x, x_stride, out, used, rows,
-          cols);
+          expert_stride / sizeof(Q8_0Block), x, slots_per_row, x_stride, out,
+          used, rows, cols);
       break;
     case GemvType::kQ4_K:
       GemvGroupedQ4K<<<grid, dim3(128), 0, stream>>>(
           static_cast<const Q4KBlock*>(base), ids,
-          expert_stride / sizeof(Q4KBlock), x, x_stride, out, used, rows, cols);
+          expert_stride / sizeof(Q4KBlock), x, slots_per_row, x_stride, out,
+          used, rows, cols);
       break;
     case GemvType::kQ6_K:
       GemvGroupedQ6K<<<grid, dim3(128), 0, stream>>>(
           static_cast<const Q6KBlock*>(base), ids,
-          expert_stride / sizeof(Q6KBlock), x, x_stride, out, used, rows, cols);
+          expert_stride / sizeof(Q6KBlock), x, slots_per_row, x_stride, out,
+          used, rows, cols);
       break;
     case GemvType::kF32:
       GemvGroupedDense<float><<<grid, dim3(128), 0, stream>>>(
           static_cast<const float*>(base), ids, expert_stride / sizeof(float),
-          x, x_stride, out, used, rows, cols);
+          x, slots_per_row, x_stride, out, used, rows, cols);
       break;
     // Q5_K only backs the dense attention-output projections; the routed
     // stacks are Q4_K/Q6_K (trunk) and Q4_0 (MTP).

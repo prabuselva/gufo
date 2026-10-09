@@ -58,6 +58,14 @@ private:
   float* mtp_kv_{nullptr};
   float* mtp_kpe_{nullptr};
 
+  // Verify rollback snapshots for the KDA layers (null on MLA layers): the
+  // conv history and recurrent state right after each of the first
+  // kMaxVerifyRows - 1 rows of the latest Verify, so a rejected draft can
+  // rewind to any committed prefix.
+  std::vector<float*> kda_conv_snap_;
+  std::vector<float*> kda_state_snap_;
+  std::uint32_t verify_base_pos_{0};
+
   std::vector<void*> allocations_;
   std::size_t allocated_bytes_{0};
   bool alloc_failed_{false};
@@ -78,6 +86,10 @@ private:
 /// prefill tier is a later optimization, not a correctness requirement.
 class Executor {
 public:
+  /// Rows a speculative verify pass can hold (token + drafts); matches the
+  /// per-token tier of the batched GEMV kernels.
+  static constexpr std::uint32_t kMaxVerifyRows = 5U;
+
   ~Executor();
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -117,10 +129,35 @@ public:
   /// the most recent Step; the result is in mtp_logits().
   bool MtpStep(Session& session, std::int32_t token,
                std::string* error_msg = nullptr);
+  /// Runs the MTP draft block for `token` from the previous draft's own
+  /// output hidden; the result is in mtp_logits(). Call after MtpStep or a
+  /// previous MtpDraft to chain speculative drafts.
+  bool MtpDraft(Session& session, std::int32_t token,
+                std::string* error_msg = nullptr);
+  /// Advances the draft cache over `token` with the trunk hidden row from
+  /// `verify_hidden()` after a fully accepted verify; runs no head.
+  bool MtpAdvance(Session& session, std::int32_t token, const float* hidden,
+                  std::string* error_msg = nullptr);
+  /// Batched speculative check: runs the trunk over `t0` followed by the `k`
+  /// draft tokens at consecutive positions, reading the trunk weights once
+  /// for the whole block. Row logits land in verify_logits() and the
+  /// output-normalized rows in verify_hidden(); h_out() then equals row k
+  /// and the trunk advances by k + 1 rows. RollbackVerify() rewinds the
+  /// recurrent state to any committed prefix afterwards.
+  bool Verify(Session& session, std::int32_t t0, const std::int32_t* drafts,
+              std::uint32_t k, std::string* error_msg = nullptr);
+  /// Commits the first `keep` verify rows: restores the KDA state and conv
+  /// history from the snapshot after row keep - 1 and rewinds the trunk and
+  /// draft positions (and h_out()) to just past that row.
+  void RollbackVerify(Session& session, std::uint32_t keep);
 
   [[nodiscard]] const float* logits() const noexcept { return logits_; }
   [[nodiscard]] const float* mtp_logits() const noexcept { return mtp_logits_; }
   [[nodiscard]] const float* h_out() const noexcept { return h_out_; }
+  [[nodiscard]] const float* verify_logits() const noexcept {
+    return pf_logits_;
+  }
+  [[nodiscard]] const float* verify_hidden() const noexcept { return pf_h_; }
 
 private:
   Executor(const Config& c, const DeviceModel& model) : c_(c), model_(model) {}
@@ -133,6 +170,18 @@ private:
   /// Dense FFN or group-routed MoE + shared expert for one row, following the
   /// layer's clamps.
   void Ffn(const DeviceLayer& l, std::uint32_t il, const float* x, float* out);
+
+  /// Draft-block forward fed by `hidden`; `with_logits` runs the shared head
+  /// (and keeps the unnormalized output in mtp_chain_ for the next draft).
+  bool MtpForward(Session& session, std::int32_t token, const float* hidden,
+                  bool with_logits, std::string* error_msg);
+  /// Multi-row variants driving the verify block over pf_normed_ -> pf_attn_
+  /// / pf_ffn_; the KDA batch also writes the per-row rollback snapshots.
+  void KdaBatch(Session& session, std::uint32_t il, const DeviceLayer& l,
+                std::uint32_t rows);
+  void MlaBatch(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
+                std::uint32_t base_pos, std::uint32_t rows);
+  void FfnBatch(const DeviceLayer& l, std::uint32_t il, std::uint32_t rows);
 
   float* AllocFloats(std::size_t n, std::string* error);
   std::int32_t* AllocInts(std::size_t n, std::string* error);
@@ -189,6 +238,39 @@ private:
   float* mtp_h_{nullptr};
   float* mtp_cat_{nullptr};
   float* mtp_x_{nullptr};
+  float* mtp_chain_{nullptr};  ///< Unnormalized draft output for MtpDraft.
+
+  // Speculative verify scratch (allocated when the model has an MTP block).
+  // Rows are the token plus up to kMaxVerifyRows - 1 drafts, stored densely
+  // with the row strides given below.
+  float* pf_x_{nullptr};       ///< [rows][hidden] residual stream.
+  float* pf_normed_{nullptr};  ///< [rows][hidden] normalized input.
+  float* pf_attn_{nullptr};    ///< [rows][hidden] attention results.
+  float* pf_ffn_{nullptr};     ///< [rows][hidden] FFN results.
+  float* pf_h_{nullptr};       ///< [rows][hidden] output-normalized rows.
+  float* pf_logits_{nullptr};  ///< [rows][vocab] row logits.
+  float* pf_kda_q_{
+      nullptr};  ///< [rows][inner] projections (beta [rows][heads]).
+  float* pf_kda_k_{nullptr};
+  float* pf_kda_v_{nullptr};
+  float* pf_kda_f_{nullptr};
+  float* pf_kda_g_{nullptr};
+  float* pf_kda_beta_{nullptr};
+  float* pf_mla_q_{nullptr};    ///< [rows][heads * mla_head_dim] raw queries.
+  float* pf_mla_a_{nullptr};    ///< [rows][MlaKeyDim] latent + rope rows.
+  float* pf_mla_abs_{nullptr};  ///< [rows][heads * MlaKeyDim] absorbed queries.
+  float* pf_mla_head_{nullptr};  ///< [rows][heads * value_dim] gated heads.
+  std::int32_t* pf_moe_ids_{nullptr};  ///< [rows][used] routed slot ids.
+  float* pf_moe_weights_{nullptr};     ///< [rows][used] routing weights.
+  float* pf_moe_log_{nullptr};         ///< [rows][num_experts] router rows.
+  float* pf_moe_gate_{nullptr};        ///< [rows][used * expert_ff]
+  float* pf_moe_up_{nullptr};          ///< [rows][used * expert_ff]
+  float* pf_moe_inter_{nullptr};       ///< [rows][used * expert_ff]
+  float* pf_moe_down_{nullptr};        ///< [rows][used * hidden]
+  float* pf_sh_gate_{nullptr};         ///< [rows][shared_expert_ff]
+  float* pf_sh_up_{nullptr};           ///< [rows][shared_expert_ff]
+  float* pf_sh_inter_{nullptr};        ///< [rows][shared_expert_ff]
+  float* pf_sh_down_{nullptr};         ///< [rows][hidden]
 
   std::uint32_t scratch_context_{0};
   std::vector<void*> allocations_;
