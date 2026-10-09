@@ -32,10 +32,13 @@ if (ENGINE_ENABLE_HIP)
   add_library(gufo_ling3_flash_kernels STATIC EXCLUDE_FROM_ALL
     kernels/rocm/gemv.hip.cpp
     kernels/rocm/kernels.hip.cpp
+    kernels/rocm/routed_f16.hip.cpp
     kernels/rocm/attention.hip.cpp)
   set_source_files_properties(kernels/rocm/gemv.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_source_files_properties(kernels/rocm/kernels.hip.cpp
+    PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(kernels/rocm/routed_f16.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_source_files_properties(kernels/rocm/attention.hip.cpp
     PROPERTIES LANGUAGE HIP)
