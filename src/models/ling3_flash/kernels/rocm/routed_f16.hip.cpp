@@ -459,9 +459,9 @@ __launch_bounds__(256) __global__
               f_live[u] ? __half2float(__builtin_bit_cast(__half, f_q6d[u]))
                         : 0.0F;
           const auto* sc = reinterpret_cast<const std::int8_t*>(&f_q6sc[u]);
-          const __half2 scales = __floats2half2_rn(
-              d * static_cast<float>(sc[0]), d * static_cast<float>(sc[1]));
-          s_scale[(f_c * BM) + row] = __builtin_bit_cast(std::uint32_t, scales);
+          scale_bias = __builtin_bit_cast(
+              std::uint32_t, __floats2half2_rn(d * static_cast<float>(sc[0]),
+                                               d * static_cast<float>(sc[1])));
         } else {
           s_codes[swizzle(row, f_c)] = f_codes[u];
         }
