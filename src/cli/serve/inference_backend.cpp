@@ -40,6 +40,8 @@
 #include "src/models/gemma4/engine.hpp"
 #include "src/models/gemma4/serve_runner.hpp"
 #include "src/models/gemma4/vision/prompt.hpp"
+#include "src/models/ling3_flash/engine.hpp"
+#include "src/models/ling3_flash/serve_runner.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -3248,6 +3250,17 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
   }
+  if (reader->GetMetadataString("general.architecture") == "bailingmoe3") {
+    auto model = models::ling3_flash::LoadServeModel(
+        model_path, *reader, max_context, speculative_config, &load_error);
+    if (model == nullptr) {
+      SetError(error, load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
+  }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
@@ -3659,6 +3672,41 @@ bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
   }
   try {
     auto runner = models::gemma4::CreateTextRunner(
+        std::move(model), max_context, session_count, speculative_config,
+        disk_cache_config, error);
+    if (runner == nullptr) {
+      return false;
+    }
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::ling3_flash::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Ling 3.0 Flash model must not be null");
+    return false;
+  }
+  try {
+    auto runner = models::ling3_flash::CreateTextRunner(
         std::move(model), max_context, session_count, speculative_config,
         disk_cache_config, error);
     if (runner == nullptr) {

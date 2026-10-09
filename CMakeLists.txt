@@ -42,6 +42,14 @@ if (EXISTS /opt/rocm)
   list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
 endif()
 
+# ROCm's hip/amd_detail/host_defines.h #defines __noinline__ as a macro, which
+# corrupts the [[__gnu__::__noinline__]] attribute in libstdc++ <format> when
+# a HIP header is parsed first. Parse <format> before any HIP header so the
+# attribute survives the macro expansion.
+if (ENGINE_ENABLE_HIP)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX,HIP>:-include;format>")
+endif()
+
 if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
   find_package(hip REQUIRED)
@@ -72,6 +80,9 @@ add_subdirectory(src/models/qwen3_tts)
 
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
 add_subdirectory(src/models/qwen3_asr)
+
+# Ling 3.0 Flash (bailingmoe3) — hybrid KDA + absorbed-MLA + MoE engine.
+add_subdirectory(src/models/ling3_flash)
 
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
@@ -189,11 +200,13 @@ add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp
   src/models/gemma4/cli_runner.cpp
+  src/models/ling3_flash/cli_runner.cpp
   src/models/qwen36_a3b/cli_runner.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next gufo_qwen36_a3b_engine gufo_gemma4_engine)
+    gufo_qwen38_flash_next gufo_qwen36_a3b_engine gufo_gemma4_engine
+    gufo_ling3_flash_engine)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -237,6 +250,7 @@ add_executable(gufo
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
   src/models/gemma4/serve_runner.cpp
+  src/models/ling3_flash/serve_runner.cpp
   src/models/qwen36_a3b/serve_runner.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
@@ -442,6 +456,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/qwen38_flash_next)
   add_subdirectory(tests/models/qwen36_a3b)
   add_subdirectory(tests/models/gemma4)
+  add_subdirectory(tests/models/ling3_flash)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test

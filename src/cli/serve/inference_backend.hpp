@@ -34,6 +34,10 @@ namespace gufo::models::gemma4 {
 class Model;
 }
 
+namespace gufo::models::ling3_flash {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -138,6 +142,17 @@ public:
   /// shared executor, so it serves exactly one concurrent session.
   bool load(std::shared_ptr<models::gemma4::Model> model, std::string* error,
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
+
+  /// Installs a previously loaded Ling 3.0 Flash model. The model owns one
+  /// shared executor plus a private KV/recurrent state per session, bounded
+  /// to 16 concurrent sessions with a divided context window.
+  bool load(std::shared_ptr<models::ling3_flash::Model> model,
+            std::string* error, std::uint32_t max_context = 4096,
+            std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
