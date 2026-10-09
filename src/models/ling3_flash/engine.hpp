@@ -122,9 +122,9 @@ public:
   }
   void Reset();
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
-  /// Bounds on the per-round MTP draft count. The session starts at `max`
-  /// drafts, grows while drafts keep being fully accepted and shrinks on
-  /// rejections down to `min`; `min` == `max` pins the count.
+  /// Bounds on the per-round MTP draft count. The session starts at `min`
+  /// drafts and grows by one after two consecutive fully accepted rounds,
+  /// dropping by one on any rejection; `min` == `max` pins the count.
   void SetDraftLimits(std::uint32_t min_drafts, std::uint32_t max_drafts);
   /// Enables the MTP draft cache and speculative decoding for this session.
   /// Must be called before the first Sync: the draft cache is filled during
