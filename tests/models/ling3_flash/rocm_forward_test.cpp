@@ -1,9 +1,9 @@
 // Runs the ROCm executor and the scalar oracle over the same tokens on the
 // real Ling 3.0 Flash artifact and requires them to agree: trunk logits, the
-// post-output_norm hidden stream, the MTP draft logits and a replay after
-// Reset. This is the end-to-end numerical contract for the GPU path; the
-// per-operator tests only pin the pieces. Skips (77) unless
-// GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash GGUF.
+// post-output_norm hidden stream, chunked Prefill at block boundaries, the
+// MTP draft logits and a replay after Reset. This is the end-to-end numerical
+// contract for the GPU path; the per-operator tests only pin the pieces.
+// Skips (77) unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash GGUF.
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -161,6 +161,40 @@ int main() {
   }
   const auto replay_logits = DownloadRaw(executor->logits(), c.vocab_size);
   Compare(cpu_logits, replay_logits, "replay logits");
+
+  // Chunked Prefill must land where the same prompt driven one Step at a
+  // time lands, at every block boundary: the KDA recurrence, the MLA caches
+  // and the position have to carry across separate Prefill calls.
+  oracle.Reset();
+  session->Reset();
+  std::vector<std::int32_t> long_prompt;
+  long_prompt.reserve(40);
+  for (std::uint32_t i = 0; i < 40; ++i) {
+    long_prompt.push_back(static_cast<std::int32_t>(1 + (i * 37U) % 1000U));
+  }
+  const std::uint32_t blocks[] = {1, 16, 22, 1};
+  std::size_t done = 0;
+  for (const std::uint32_t block : blocks) {
+    if (!executor->Prefill(*session, long_prompt.data() + done, block,
+                           &error)) {
+      std::cerr << "prefill block " << block << " failed: " << error << "\n";
+      return 1;
+    }
+    for (std::uint32_t i = 0; i < block; ++i) {
+      if (!oracle.Step(long_prompt[done + i], cpu_logits, cpu_hidden, &error)) {
+        std::cerr << "oracle prefill step failed: " << error << "\n";
+        return 1;
+      }
+    }
+    done += block;
+    const std::string tag = "prefill through " + std::to_string(done);
+    const auto gpu_logits = DownloadRaw(executor->logits(), c.vocab_size);
+    const auto gpu_hidden = DownloadRaw(executor->h_out(), c.hidden_size);
+    Compare(cpu_logits, gpu_logits, tag + " logits");
+    Compare(cpu_hidden, gpu_hidden, tag + " hidden");
+    Expect(ArgMax(cpu_logits) == ArgMax(gpu_logits), tag + " argmax matches");
+    Expect(session->position() == done, tag + " position advanced");
+  }
 
   if (failures != 0) {
     std::cerr << failures << " forward parity checks failed\n";

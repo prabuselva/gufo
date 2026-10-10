@@ -259,7 +259,7 @@ bool TestDense(const char* name, q::GemvType type,
 // match a CPU reference over the selected expert rows.
 bool TestGrouped(const char* name, q::GemvType type,
                  const std::vector<std::uint8_t>& w) {
-  constexpr std::uint32_t kExperts = 4;
+  // The uploaded weight tensor covers four experts; ids pick experts 2 and 0.
   constexpr std::uint32_t kUsed = 2;
   const std::int32_t ids[kUsed] = {2, 0};
   const std::size_t row_bytes = RowBytes(type);
@@ -274,8 +274,8 @@ bool TestGrouped(const char* name, q::GemvType type,
   t::CheckHip(hipMemcpy(d_ids.get(), ids, sizeof(ids), hipMemcpyHostToDevice),
               "upload expert ids");
   t::HipBuffer<float> d_out(kUsed * kRows);
-  q::GemvGrouped(d_w.get(), type, expert_bytes, d_ids.get(), kUsed, kRows,
-                 kCols, d_x.get(), 0U, d_out.get(), nullptr);
+  q::GemvGrouped(d_w.get(), type, expert_bytes, d_ids.get(), kUsed, kUsed,
+                 kRows, kCols, d_x.get(), 0U, d_out.get(), nullptr);
   t::CheckHip(hipDeviceSynchronize(), name);
   const auto got = t::Download(&d_out, kUsed * kRows);
 

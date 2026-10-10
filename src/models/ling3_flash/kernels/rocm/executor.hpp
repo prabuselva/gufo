@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_EXECUTOR_HPP_
 #define GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_EXECUTOR_HPP_
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -82,13 +83,19 @@ private:
 /// shared by every session (compute is serialized), while each session owns
 /// its recurrent state and caches. `Create` allocates the shared scratch;
 /// `CreateSession` allocates one session's state at its own context length.
-/// Prefill currently drives the same single-token path as decode; a batched
-/// prefill tier is a later optimization, not a correctness requirement.
+/// Prefill advances recurrent state with the same semantics as Step and
+/// produces bit-for-bit interchangeable session state; the chunked batch
+/// tier runs it whenever the dense weights support it.
 class Executor {
 public:
   /// Rows a speculative verify pass can hold (token + drafts); matches the
   /// per-token tier of the batched GEMV kernels.
   static constexpr std::uint32_t kMaxVerifyRows = 5U;
+
+  /// Tokens one chunked-prefill chunk holds; the batch tier scratch is sized
+  /// for exactly this many rows and a longer prompt is split into chunks of
+  /// it, so prefill cost is linear in the prompt with bounded scratch.
+  static constexpr std::uint32_t kPrefillChunkRows = 1024U;
 
   ~Executor();
   Executor(const Executor&) = delete;
@@ -121,8 +128,11 @@ public:
   /// Advances the trunk by one token; the result is in logits() and h_out().
   bool Step(Session& session, std::int32_t token,
             std::string* error_msg = nullptr);
-  /// Advances the trunk by `count` prompt tokens. Mirrors `count` Step()
-  /// calls; `logits()` and `h_out()` hold the final token's result.
+  /// Advances the trunk by `count` prompt tokens in chunks of at most
+  /// kPrefillChunkRows: the batch tier (chunked GEMMs, the recurrent KDA
+  /// recurrence, the tiled MLA prefill attention and the routed expert GEMM)
+  /// runs the whole chunk between the projections. `logits()` and `h_out()`
+  /// hold the final token's result, exactly as `count` Step() calls would.
   bool Prefill(Session& session, const std::int32_t* tokens,
                std::uint32_t count, std::string* error_msg = nullptr);
   /// Runs the MTP draft block for `token` using the trunk hidden state from
@@ -183,6 +193,17 @@ private:
                 std::uint32_t base_pos, std::uint32_t rows);
   void FfnBatch(const DeviceLayer& l, std::uint32_t il, std::uint32_t rows);
 
+  /// One chunked-prefill chunk over pf_x_[0:tokens]: the batch-tier layer
+  /// loop, updating the session caches and recurrent state for positions
+  /// [base_pos, base_pos + tokens).
+  void PrefillChunk(Session& session, std::uint32_t tokens,
+                    std::uint32_t base_pos);
+  void PrefillKda(Session& session, std::uint32_t il, const DeviceLayer& l,
+                  std::uint32_t tokens);
+  void PrefillMla(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
+                  std::uint32_t base_pos, std::uint32_t tokens);
+  void PrefillFfn(const DeviceLayer& l, std::uint32_t il, std::uint32_t tokens);
+
   float* AllocFloats(std::size_t n, std::string* error);
   std::int32_t* AllocInts(std::size_t n, std::string* error);
 
@@ -240,9 +261,10 @@ private:
   float* mtp_x_{nullptr};
   float* mtp_chain_{nullptr};  ///< Unnormalized draft output for MtpDraft.
 
-  // Speculative verify scratch (allocated when the model has an MTP block).
-  // Rows are the token plus up to kMaxVerifyRows - 1 drafts, stored densely
-  // with the row strides given below.
+  // Multi-row block scratch, shared by the speculative verify block (up to
+  // kMaxVerifyRows rows, allocated when the model has an MTP block) and the
+  // chunked prefill (up to kPrefillChunkRows rows, always allocated). Rows
+  // are dense with the strides given below.
   float* pf_x_{nullptr};       ///< [rows][hidden] residual stream.
   float* pf_normed_{nullptr};  ///< [rows][hidden] normalized input.
   float* pf_attn_{nullptr};    ///< [rows][hidden] attention results.
@@ -272,8 +294,46 @@ private:
   float* pf_sh_inter_{nullptr};        ///< [rows][shared_expert_ff]
   float* pf_sh_down_{nullptr};         ///< [rows][hidden]
 
+  // Chunked-prefill-only scratch, sized for kPrefillChunkRows rows. The raw
+  // projection planes above (pf_kda_*, pf_mla_q_/_a_/_head_, pf_moe_*,
+  // pf_sh_*) and the residual stream planes are shared with the verify pass.
+  __half* pf_xh_{nullptr};  ///< [rows][k] F16 activations for the F16 GEMMs
+                            ///< (row stride is the launch's k).
+  float* pf_cq_{nullptr};   ///< [rows][inner] convolved q/k/v streams.
+  float* pf_ck_{nullptr};
+  float* pf_cv_{nullptr};
+  float* pf_o_{nullptr};      ///< [rows][inner] raw pre-out-norm KDA attention.
+  float* pf_decay_{nullptr};  ///< [rows][inner] KdaPrep decay planes.
+  float* pf_bpre_{nullptr};   ///< [rows][heads] sigmoid(beta).
+  float* pf_kq_{nullptr};     ///< [rows][heads] dot(kn, qn).
+  float* pf_kda_hist_{nullptr};  ///< [3][kern-1][inner] next-history staging.
+  float* pf_mla_pabs_{nullptr};  ///< [rows][heads][kv_lora_rank] absorbed q.
+  float* pf_mla_qrp_{nullptr};   ///< [rows][heads][rotary] rotated rope halves.
+  float* pf_mla_qlatent_{nullptr};  ///< [rows][heads][kv_lora_rank] attn out.
+  float* pf_mla_pgate_{nullptr};    ///< [rows][heads] attention output gate.
+  float* pf_dn_gate_{nullptr};  ///< [rows][dense_ff] dense-FFN gate (up, inter)
+  float* pf_dn_up_{nullptr};
+  float* pf_dn_inter_{nullptr};
+  __half* pf_interh_{nullptr};  ///< [rows * used][expert_ff] routed inter.
+  float* pf_pdown_{nullptr};    ///< [rows * used][hidden] routed down.
+  std::int32_t* pf_counts_{nullptr};    ///< [num_experts] expert histogram.
+  std::int32_t* pf_bounds_{nullptr};    ///< [num_experts + 1] bucket starts.
+  std::int32_t* pf_cursors_{nullptr};   ///< [num_experts] scatter scratch.
+  std::int32_t* pf_rows_tok_{nullptr};  ///< compact row -> token / slot.
+  std::int32_t* pf_rows_slot_{nullptr};
+  std::int32_t* pf_tiles_{nullptr};     ///< compacted (expert, tile) list.
+  std::int32_t* pf_zero_ids_{nullptr};  ///< [rows] zeros (F32 router grouping).
+  std::int32_t* pf_head_ids_{nullptr};  ///< [rows * heads] slot -> head id.
+  std::int32_t* pf_drows_{nullptr};     ///< dense identity row map for a chunk.
+  std::int32_t* pf_dbounds_{nullptr};
+  std::int32_t* pf_dtiles_{nullptr};
+  bool prefill_ready_{false};  ///< The dense tier can run every trunk layer.
+  bool tier_failure_{false};   ///< A chunked-tier launch was rejected.
+
   std::uint32_t scratch_context_{0};
   std::vector<void*> allocations_;
+  std::vector<std::int32_t> tiles_host_;    ///< tile build scratch (host).
+  std::vector<std::uint32_t> counts_host_;  ///< expert counts download (host).
 };
 
 }  // namespace gufo::models::ling3_flash::rocm

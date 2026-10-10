@@ -9,11 +9,72 @@
 #include "src/models/ling3_flash/kernels/rocm/attention.hpp"
 #include "src/models/ling3_flash/kernels/rocm/gemv.hpp"
 #include "src/models/ling3_flash/kernels/rocm/kernels.hpp"
+#include "src/models/ling3_flash/kernels/rocm/routed_f16.hpp"
 
 namespace gufo::models::ling3_flash::rocm {
 namespace {
 
 constexpr std::uint32_t kMlaTile = 1024U;
+
+/// Maps a stored GGUF type onto the F16 WMMA tier (dense projections and
+/// routed experts). The block formats are decoded in-kernel; F32/F16 tensors
+/// (e.g. the KDA beta projection) and Q4_0 are not, and stay on the GEMV
+/// tier or the per-token path.
+bool WeightTypeOf(core::GgmlType t, WeightType* out) {
+  switch (t) {
+    case core::GgmlType::kQ5_1:
+      *out = WeightType::kQ5_1;
+      return true;
+    case core::GgmlType::kQ8_0:
+      *out = WeightType::kQ8_0;
+      return true;
+    case core::GgmlType::kQ4_K:
+      *out = WeightType::kQ4_K;
+      return true;
+    case core::GgmlType::kQ5_K:
+      *out = WeightType::kQ5_K;
+      return true;
+    case core::GgmlType::kQ6_K:
+      *out = WeightType::kQ6_K;
+      return true;
+    case core::GgmlType::kBF16:
+      *out = WeightType::kBF16;
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// True when every matrix the chunked-prefill tier projects with can be
+/// decoded by the F16 WMMA tier; a trunk holding a Q4_0 projection falls
+/// back to the per-token path in Prefill instead of failing Create.
+/// ssm_beta is excluded (it runs on the GEMV tier), and the swiglu gate
+/// variant only instantiates three decoders.
+bool DenseTierCovers(const DeviceLayer& l) {
+  WeightType w;
+  const core::GgmlType types[] = {
+      l.attn_q.type,   l.attn_kv_a.type,     l.attn_gate.type,
+      l.attn_out.type, l.ssm_q.type,         l.ssm_k.type,
+      l.ssm_v.type,    l.ssm_f.type,         l.ssm_g.type,
+      l.ssm_out.type,  l.ffn_gate.type,      l.ffn_up.type,
+      l.ffn_down.type, l.ffn_down_exps.type, l.shexp_gate.type,
+      l.shexp_up.type, l.shexp_down.type,
+  };
+  for (const core::GgmlType t : types) {
+    if (!WeightTypeOf(t, &w)) {
+      return false;
+    }
+  }
+  const core::GgmlType gated[] = {l.ffn_gate_exps.type, l.ffn_up_exps.type};
+  for (const core::GgmlType t : gated) {
+    if (!WeightTypeOf(t, &w) ||
+        (t != core::GgmlType::kQ4_K && t != core::GgmlType::kQ8_0 &&
+         t != core::GgmlType::kBF16)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 /// Maps a stored GGUF type onto the GEMV tier. Returns false for any format
 /// the tier cannot decode so `Create` can reject the artifact up front.
@@ -250,6 +311,107 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->sh_up_ == nullptr || e->sh_inter_ == nullptr) {
     return nullptr;
   }
+  // Chunked-prefill scratch: sized for one max-size chunk, always allocated.
+  // The planes the verify pass shares (residual stream, raw KDA/MLA/MoE
+  // projections) grow from kMaxVerifyRows to this row count.
+  const std::size_t cap = Executor::kPrefillChunkRows;
+  const std::size_t slots = cap * used;
+  const std::size_t compact_rows = RoutedCompactRows(slots, c.num_experts);
+  const std::size_t shared_ff = c.shared_expert_ff;
+  float** cf[] = {
+      &e->pf_x_,           &e->pf_normed_,   &e->pf_attn_,     &e->pf_ffn_,
+      &e->pf_kda_q_,       &e->pf_kda_k_,    &e->pf_kda_v_,    &e->pf_kda_f_,
+      &e->pf_kda_g_,       &e->pf_cq_,       &e->pf_ck_,       &e->pf_cv_,
+      &e->pf_o_,           &e->pf_decay_,    &e->pf_kda_hist_, &e->pf_dn_gate_,
+      &e->pf_dn_up_,       &e->pf_dn_inter_, &e->pf_pdown_,    &e->pf_sh_gate_,
+      &e->pf_sh_up_,       &e->pf_sh_inter_, &e->pf_sh_down_,  &e->pf_mla_qrp_,
+      &e->pf_mla_qlatent_, &e->pf_mla_pabs_,
+  };
+  const std::size_t c_n[] = {cap * hid,
+                             cap * hid,
+                             cap * hid,
+                             cap * hid,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             cap * inner,
+                             3U * (c.ssm_conv_kernel - 1U) * inner,
+                             cap * c.dense_ff,
+                             cap * c.dense_ff,
+                             cap * c.dense_ff,
+                             slots * hid,
+                             cap * shared_ff,
+                             cap * shared_ff,
+                             cap * shared_ff,
+                             cap * hid,
+                             cap * heads * c.rotary_dim,
+                             cap * heads * c.kv_lora_rank,
+                             cap * heads * c.kv_lora_rank};
+  for (std::size_t i = 0; i < sizeof(cf) / sizeof(cf[0]); ++i) {
+    *cf[i] = e->AllocFloats(c_n[i], err);
+    if (*cf[i] == nullptr) {
+      return nullptr;
+    }
+  }
+  // x rows are narrowed once per launch with the launch's k as stride; the
+  // plane is wide enough for the widest input (the dense-FFN inter).
+  e->pf_xh_ =
+      reinterpret_cast<__half*>(e->AllocFloats((cap * wide_ff + 1U) / 2U, err));
+  e->pf_interh_ =
+      reinterpret_cast<__half*>(e->AllocFloats((slots * ff + 1U) / 2U, err));
+  e->pf_kda_beta_ = e->AllocFloats(cap * heads, err);
+  e->pf_bpre_ = e->AllocFloats(cap * heads, err);
+  e->pf_kq_ = e->AllocFloats(cap * heads, err);
+  e->pf_mla_pgate_ = e->AllocFloats(cap * heads, err);
+  e->pf_mla_q_ = e->AllocFloats(cap * heads * c.mla_head_dim, err);
+  e->pf_mla_a_ = e->AllocFloats(cap * c.MlaKeyDim(), err);
+  e->pf_mla_head_ = e->AllocFloats(cap * heads * c.mla_value_dim, err);
+  e->pf_moe_weights_ = e->AllocFloats(cap * used, err);
+  e->pf_moe_log_ = e->AllocFloats(cap * c.num_experts, err);
+  e->pf_moe_ids_ = e->AllocInts(cap * used, err);
+  e->pf_counts_ = e->AllocInts(c.num_experts, err);
+  e->pf_bounds_ = e->AllocInts(c.num_experts + 1U, err);
+  e->pf_cursors_ = e->AllocInts(c.num_experts, err);
+  e->pf_rows_tok_ = e->AllocInts(compact_rows, err);
+  e->pf_rows_slot_ = e->AllocInts(compact_rows, err);
+  e->pf_tiles_ = e->AllocInts(compact_rows / 64U + c.num_experts + 8U, err);
+  e->pf_zero_ids_ = e->AllocInts(cap, err);
+  e->pf_head_ids_ = e->AllocInts(cap * heads, err);
+  e->pf_drows_ = e->AllocInts(cap, err);
+  e->pf_dbounds_ = e->AllocInts(2U, err);
+  e->pf_dtiles_ = e->AllocInts(cap / 16U, err);
+  if (e->pf_xh_ == nullptr || e->pf_interh_ == nullptr ||
+      e->pf_kda_beta_ == nullptr || e->pf_bpre_ == nullptr ||
+      e->pf_kq_ == nullptr || e->pf_mla_pgate_ == nullptr ||
+      e->pf_mla_q_ == nullptr || e->pf_mla_a_ == nullptr ||
+      e->pf_mla_head_ == nullptr || e->pf_moe_weights_ == nullptr ||
+      e->pf_moe_log_ == nullptr || e->pf_moe_ids_ == nullptr ||
+      e->pf_counts_ == nullptr || e->pf_bounds_ == nullptr ||
+      e->pf_cursors_ == nullptr || e->pf_rows_tok_ == nullptr ||
+      e->pf_rows_slot_ == nullptr || e->pf_tiles_ == nullptr ||
+      e->pf_zero_ids_ == nullptr || e->pf_head_ids_ == nullptr ||
+      e->pf_drows_ == nullptr || e->pf_dbounds_ == nullptr ||
+      e->pf_dtiles_ == nullptr) {
+    return nullptr;
+  }
+  // Constant index vectors for the grouped per-head GEMVs and the F32 router.
+  FillModuloIds(e->pf_head_ids_, static_cast<std::uint32_t>(cap * heads),
+                c.num_heads, nullptr);
+  FillModuloIds(e->pf_zero_ids_, static_cast<std::uint32_t>(cap), 1U, nullptr);
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (!DenseTierCovers(model.layers()[il])) {
+      break;
+    }
+    if (il + 1U == c.num_layers) {
+      e->prefill_ready_ = true;
+    }
+  }
   if (model.has_mtp()) {
     e->mtp_e_ = e->AllocFloats(hid, err);
     e->mtp_h_ = e->AllocFloats(hid, err);
@@ -257,49 +419,19 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->mtp_x_ = e->AllocFloats(hid, err);
     e->mtp_chain_ = e->AllocFloats(hid, err);
     const std::size_t k = Executor::kMaxVerifyRows;
-    e->pf_x_ = e->AllocFloats(k * hid, err);
-    e->pf_normed_ = e->AllocFloats(k * hid, err);
-    e->pf_attn_ = e->AllocFloats(k * hid, err);
-    e->pf_ffn_ = e->AllocFloats(k * hid, err);
     e->pf_h_ = e->AllocFloats(k * hid, err);
     e->pf_logits_ = e->AllocFloats(k * c.vocab_size, err);
-    e->pf_kda_q_ = e->AllocFloats(k * inner, err);
-    e->pf_kda_k_ = e->AllocFloats(k * inner, err);
-    e->pf_kda_v_ = e->AllocFloats(k * inner, err);
-    e->pf_kda_f_ = e->AllocFloats(k * inner, err);
-    e->pf_kda_g_ = e->AllocFloats(k * inner, err);
-    e->pf_kda_beta_ = e->AllocFloats(k * heads, err);
-    e->pf_mla_q_ = e->AllocFloats(k * heads * c.mla_head_dim, err);
-    e->pf_mla_a_ = e->AllocFloats(k * c.MlaKeyDim(), err);
     e->pf_mla_abs_ = e->AllocFloats(k * heads * c.MlaKeyDim(), err);
-    e->pf_mla_head_ = e->AllocFloats(k * heads * c.mla_value_dim, err);
-    e->pf_moe_ids_ = e->AllocInts(k * used, err);
-    e->pf_moe_weights_ = e->AllocFloats(k * used, err);
-    e->pf_moe_log_ = e->AllocFloats(k * c.num_experts, err);
     e->pf_moe_gate_ = e->AllocFloats(k * used * ff, err);
     e->pf_moe_up_ = e->AllocFloats(k * used * ff, err);
     e->pf_moe_inter_ = e->AllocFloats(k * used * ff, err);
     e->pf_moe_down_ = e->AllocFloats(k * used * hid, err);
-    e->pf_sh_gate_ = e->AllocFloats(k * c.shared_expert_ff, err);
-    e->pf_sh_up_ = e->AllocFloats(k * c.shared_expert_ff, err);
-    e->pf_sh_inter_ = e->AllocFloats(k * c.shared_expert_ff, err);
-    e->pf_sh_down_ = e->AllocFloats(k * hid, err);
     if (e->mtp_e_ == nullptr || e->mtp_h_ == nullptr ||
         e->mtp_cat_ == nullptr || e->mtp_x_ == nullptr ||
-        e->mtp_chain_ == nullptr || e->pf_x_ == nullptr ||
-        e->pf_normed_ == nullptr || e->pf_attn_ == nullptr ||
-        e->pf_ffn_ == nullptr || e->pf_h_ == nullptr ||
-        e->pf_logits_ == nullptr || e->pf_kda_q_ == nullptr ||
-        e->pf_kda_k_ == nullptr || e->pf_kda_v_ == nullptr ||
-        e->pf_kda_f_ == nullptr || e->pf_kda_g_ == nullptr ||
-        e->pf_kda_beta_ == nullptr || e->pf_mla_q_ == nullptr ||
-        e->pf_mla_a_ == nullptr || e->pf_mla_abs_ == nullptr ||
-        e->pf_mla_head_ == nullptr || e->pf_moe_ids_ == nullptr ||
-        e->pf_moe_weights_ == nullptr || e->pf_moe_log_ == nullptr ||
+        e->mtp_chain_ == nullptr || e->pf_h_ == nullptr ||
+        e->pf_logits_ == nullptr || e->pf_mla_abs_ == nullptr ||
         e->pf_moe_gate_ == nullptr || e->pf_moe_up_ == nullptr ||
-        e->pf_moe_inter_ == nullptr || e->pf_moe_down_ == nullptr ||
-        e->pf_sh_gate_ == nullptr || e->pf_sh_up_ == nullptr ||
-        e->pf_sh_inter_ == nullptr || e->pf_sh_down_ == nullptr) {
+        e->pf_moe_inter_ == nullptr || e->pf_moe_down_ == nullptr) {
       return nullptr;
     }
   }
@@ -840,16 +972,328 @@ bool Executor::Step(Session& session, std::int32_t token,
   return true;
 }
 
+void Executor::PrefillKda(Session& session, std::uint32_t il,
+                          const DeviceLayer& l, std::uint32_t tokens) {
+  const std::uint32_t inner = c_.SsmInnerSize();
+  const std::uint32_t heads = c_.num_heads;
+  const std::uint32_t d = c_.ssm_head_dim;
+  const std::uint32_t kern = c_.ssm_conv_kernel;
+  const std::size_t hid = c_.hidden_size;
+  const std::size_t hist_stride = static_cast<std::size_t>(kern - 1U) * inner;
+  WeightType w;
+  float* hist = session.kda_conv_[il];
+
+  NarrowActivations(pf_normed_, pf_xh_, false, tokens * hid, nullptr);
+  (void)WeightTypeOf(l.ssm_q.type, &w);
+  tier_failure_ |=
+      !DenseF16Gemm(l.ssm_q.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_,
+                    tokens, pf_kda_q_, nullptr, inner, hid, 0U, nullptr);
+  (void)WeightTypeOf(l.ssm_k.type, &w);
+  tier_failure_ |=
+      !DenseF16Gemm(l.ssm_k.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_,
+                    tokens, pf_kda_k_, nullptr, inner, hid, 0U, nullptr);
+  (void)WeightTypeOf(l.ssm_v.type, &w);
+  tier_failure_ |=
+      !DenseF16Gemm(l.ssm_v.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_,
+                    tokens, pf_kda_v_, nullptr, inner, hid, 0U, nullptr);
+  (void)WeightTypeOf(l.ssm_f.type, &w);
+  tier_failure_ |=
+      !DenseF16Gemm(l.ssm_f.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_,
+                    tokens, pf_kda_f_, nullptr, inner, hid, 0U, nullptr);
+  (void)WeightTypeOf(l.ssm_g.type, &w);
+  tier_failure_ |=
+      !DenseF16Gemm(l.ssm_g.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_,
+                    tokens, pf_kda_g_, nullptr, inner, hid, 0U, nullptr);
+  // beta is stored in F32, which the WMMA tier cannot decode; one grouped
+  // GEMV over zero-filled expert ids walks every token row at once.
+  GemvType beta;
+  (void)GemvTypeOf(l.ssm_beta.type, &beta);
+  GemvGrouped(l.ssm_beta.data, beta, 0U, pf_zero_ids_, tokens, 1U, heads,
+              static_cast<std::uint32_t>(hid), pf_normed_,
+              static_cast<std::uint32_t>(hid), pf_kda_beta_, nullptr);
+  AddBiasRows(pf_kda_f_, l.ssm_dt.f32(), tokens, inner, nullptr);
+
+  // The convolved streams land on separate planes (reading the raw projection
+  // rows of earlier tokens makes an in-place run wrong). The next conv
+  // history is staged outside the session buffer, then swapped in; the
+  // staging must be written before the swap overwrites the old rows.
+  KdaConvSiluPrefill(l.ssm_conv_q.f32(), pf_kda_q_, hist, pf_cq_, tokens, inner,
+                     kern, nullptr);
+  KdaConvSiluPrefill(l.ssm_conv_k.f32(), pf_kda_k_, hist + hist_stride, pf_ck_,
+                     tokens, inner, kern, nullptr);
+  KdaConvSiluPrefill(l.ssm_conv_v.f32(), pf_kda_v_, hist + 2U * hist_stride,
+                     pf_cv_, tokens, inner, kern, nullptr);
+  const float* proj[3] = {pf_kda_q_, pf_kda_k_, pf_kda_v_};
+  for (std::uint32_t s = 0; s < 3U; ++s) {
+    KdaHistoryUpdate(proj[s], hist + s * hist_stride,
+                     pf_kda_hist_ + s * hist_stride, tokens, inner, kern,
+                     nullptr);
+    (void)hipMemcpyAsync(hist + s * hist_stride, pf_kda_hist_ + s * hist_stride,
+                         hist_stride * sizeof(float), hipMemcpyDeviceToDevice,
+                         nullptr);
+  }
+
+  KdaNormHeadsPrefill(pf_cq_, pf_ck_, tokens, heads, d, c_.rms_eps,
+                      1.0F / std::sqrt(static_cast<float>(d)), nullptr);
+  KdaPrep(pf_kda_f_, l.ssm_a.f32(), pf_kda_beta_, pf_cq_, pf_ck_,
+          c_.kda_gate_lower_bound, pf_decay_, pf_bpre_, pf_kq_, tokens, heads,
+          d, nullptr);
+  KdaDeltaLoop(pf_cq_, pf_ck_, pf_cv_, pf_decay_, pf_bpre_, pf_kq_,
+               session.kda_state_[il], pf_o_, tokens, heads, d, nullptr, 0U,
+               nullptr);
+  KdaOutNormPrefill(pf_o_, pf_kda_g_, l.ssm_norm.f32(), tokens, heads, d,
+                    c_.rms_eps, nullptr);
+  NarrowActivations(pf_o_, pf_xh_, false, tokens * inner, nullptr);
+  (void)WeightTypeOf(l.ssm_out.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.ssm_out.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_attn_,
+                                 nullptr, hid, inner, 0U, nullptr);
+}
+
+void Executor::PrefillMla(const DeviceLayer& l, float* kv_cache,
+                          float* kpe_cache, std::uint32_t base_pos,
+                          std::uint32_t tokens) {
+  const std::uint32_t heads = c_.num_heads;
+  const std::uint32_t nope = c_.MlaNopeDim();
+  const std::uint32_t rot = c_.rotary_dim;
+  const std::uint32_t kv_rank = c_.kv_lora_rank;
+  const std::uint32_t v_dim = c_.mla_value_dim;
+  const std::size_t hid = c_.hidden_size;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(c_.mla_head_dim));
+  WeightType w;
+  GemvType type;
+
+  NarrowActivations(pf_normed_, pf_xh_, false, tokens * hid, nullptr);
+  (void)WeightTypeOf(l.attn_q.type, &w);
+  tier_failure_ |= !DenseF16Gemm(
+      l.attn_q.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_, tokens,
+      pf_mla_q_, nullptr, static_cast<std::size_t>(heads) * c_.mla_head_dim,
+      hid, 0U, nullptr);
+  (void)WeightTypeOf(l.attn_kv_a.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.attn_kv_a.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_mla_a_,
+                                 nullptr, c_.MlaKeyDim(), hid, 0U, nullptr);
+  (void)WeightTypeOf(l.attn_gate.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.attn_gate.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_mla_pgate_,
+                                 nullptr, heads, hid, 0U, nullptr);
+
+  // RoPE, the latent cache write and the absorbed query over the whole chunk.
+  MlaQRopeRows(pf_mla_q_, pf_mla_qrp_, base_pos, tokens, heads, c_.mla_head_dim,
+               nope, rot, c_.rope_theta, nullptr);
+  MlaKvANormRopeRows(pf_mla_a_, l.attn_kv_a_norm.f32(), c_.rms_eps, kv_cache,
+                     kpe_cache, base_pos, tokens, kv_rank, rot, c_.rope_theta,
+                     nullptr);
+  (void)GemvTypeOf(l.attn_k_b.type, &type);
+  GemvGrouped(l.attn_k_b.data, type, l.attn_k_b.row_bytes * kv_rank,
+              pf_head_ids_, tokens * heads, 1U, kv_rank, nope, pf_mla_q_,
+              c_.mla_head_dim, pf_mla_pabs_, nullptr);
+  MlaPrefill(pf_mla_pabs_, pf_mla_qrp_, kv_cache, kpe_cache, pf_mla_qlatent_,
+             base_pos, tokens, heads, kv_rank, rot, scale, nullptr);
+  (void)GemvTypeOf(l.attn_v_b.type, &type);
+  GemvGrouped(l.attn_v_b.data, type, l.attn_v_b.row_bytes * v_dim, pf_head_ids_,
+              tokens * heads, 1U, v_dim, kv_rank, pf_mla_qlatent_, kv_rank,
+              pf_mla_head_, nullptr);
+  SigmoidInPlace(pf_mla_pgate_, tokens * heads, nullptr);
+  RowScale(pf_mla_head_, pf_mla_pgate_, tokens * heads, v_dim, nullptr);
+
+  NarrowActivations(pf_mla_head_, pf_xh_, false, tokens * heads * v_dim,
+                    nullptr);
+  (void)WeightTypeOf(l.attn_out.type, &w);
+  tier_failure_ |=
+      !DenseF16Gemm(l.attn_out.data, w, pf_xh_, pf_drows_, pf_dbounds_,
+                    pf_dtiles_, tokens, pf_attn_, nullptr, hid,
+                    static_cast<std::size_t>(heads) * v_dim, 0U, nullptr);
+}
+
+void Executor::PrefillFfn(const DeviceLayer& l, std::uint32_t il,
+                          std::uint32_t tokens) {
+  const std::uint32_t hid = c_.hidden_size;
+  const std::uint32_t used = c_.num_experts_used;
+  const std::uint32_t ff = c_.expert_ff;
+  WeightType w;
+
+  NarrowActivations(pf_normed_, pf_xh_, false, tokens * hid, nullptr);
+  if (c_.IsDenseFfnLayer(il)) {
+    (void)WeightTypeOf(l.ffn_gate.type, &w);
+    tier_failure_ |= !DenseF16Gemm(l.ffn_gate.data, w, pf_xh_, pf_drows_,
+                                   pf_dbounds_, pf_dtiles_, tokens, pf_dn_gate_,
+                                   nullptr, c_.dense_ff, hid, 0U, nullptr);
+    (void)WeightTypeOf(l.ffn_up.type, &w);
+    tier_failure_ |= !DenseF16Gemm(l.ffn_up.data, w, pf_xh_, pf_drows_,
+                                   pf_dbounds_, pf_dtiles_, tokens, pf_dn_up_,
+                                   nullptr, c_.dense_ff, hid, 0U, nullptr);
+    SwigluClamped(pf_dn_gate_, pf_dn_up_, pf_dn_inter_,
+                  tokens * static_cast<std::uint32_t>(c_.dense_ff),
+                  c_.swiglu_clamp_shexp[il], nullptr);
+    NarrowActivations(pf_dn_inter_, pf_xh_, false,
+                      tokens * static_cast<std::uint32_t>(c_.dense_ff),
+                      nullptr);
+    (void)WeightTypeOf(l.ffn_down.type, &w);
+    tier_failure_ |= !DenseF16Gemm(l.ffn_down.data, w, pf_xh_, pf_drows_,
+                                   pf_dbounds_, pf_dtiles_, tokens, pf_ffn_,
+                                   nullptr, hid, c_.dense_ff, 0U, nullptr);
+    return;
+  }
+
+  // Router over the chunk; the F32 router matrix reads identity expert 0
+  // with a zero expert stride, so one grouped launch covers every token.
+  GemvType type;
+  (void)GemvTypeOf(l.router.type, &type);
+  GemvGrouped(l.router.data, type, 0U, pf_zero_ids_, tokens, 1U, c_.num_experts,
+              hid, pf_normed_, hid, pf_moe_log_, nullptr);
+  RouterTopKRows(pf_moe_log_, l.exp_probs_b.f32(), c_.num_experts,
+                 c_.expert_groups, c_.expert_groups_used, used,
+                 c_.expert_weights_scale, pf_moe_ids_, pf_moe_weights_, tokens,
+                 nullptr);
+  ExpertCounts(pf_moe_ids_, reinterpret_cast<std::uint32_t*>(pf_counts_),
+               tokens * used, c_.num_experts, nullptr);
+  RoutedCompact(pf_moe_ids_, reinterpret_cast<std::uint32_t*>(pf_counts_),
+                pf_bounds_, pf_cursors_, pf_rows_tok_, pf_rows_slot_, tokens,
+                used, c_.num_experts, nullptr);
+
+  // The tile list depends on the per-expert row counts; one device sync per
+  // MoE layer fetches the (tiny) histogram to build it on the host.
+  const std::uint32_t tile_rows = 64U;
+  (void)hipDeviceSynchronize();
+  counts_host_.resize(c_.num_experts);
+  (void)hipMemcpy(counts_host_.data(), pf_counts_,
+                  c_.num_experts * sizeof(std::uint32_t),
+                  hipMemcpyDeviceToHost);
+  tiles_host_.clear();
+  for (std::uint32_t e = 0; e < c_.num_experts; ++e) {
+    const std::uint32_t n_e = (counts_host_[e] + tile_rows - 1U) / tile_rows;
+    for (std::uint32_t j = 0; j < n_e; ++j) {
+      tiles_host_.push_back(static_cast<std::int32_t>(e | (j << 16U)));
+    }
+  }
+  const auto n_tiles = static_cast<std::uint32_t>(tiles_host_.size());
+  (void)hipMemcpyAsync(pf_tiles_, tiles_host_.data(),
+                       tiles_host_.size() * sizeof(std::int32_t),
+                       hipMemcpyHostToDevice, nullptr);
+
+  (void)WeightTypeOf(l.ffn_gate_exps.type, &w);
+  tier_failure_ |= !RoutedGatedF16Gemm(
+      l.ffn_gate_exps.data, l.ffn_up_exps.data, w, pf_xh_, pf_tiles_, n_tiles,
+      tile_rows, pf_bounds_, pf_rows_tok_, pf_rows_slot_,
+      c_.swiglu_clamp_exp[il], pf_interh_, ff, hid, nullptr);
+  (void)WeightTypeOf(l.ffn_down_exps.type, &w);
+  tier_failure_ |=
+      !RoutedF16Gemm(l.ffn_down_exps.data, w, pf_interh_, pf_tiles_, n_tiles,
+                     tile_rows, pf_bounds_, pf_rows_slot_, pf_rows_slot_,
+                     nullptr, 0.0F, pf_pdown_, nullptr, hid, ff, hid, nullptr);
+  RowWeightedSumTokens(pf_pdown_, pf_moe_weights_, pf_ffn_, tokens, used, hid,
+                       nullptr);
+
+  // Always-on shared expert for every row.
+  const std::size_t shared = c_.shared_expert_ff;
+  (void)WeightTypeOf(l.shexp_gate.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.shexp_gate.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_sh_gate_,
+                                 nullptr, shared, hid, 0U, nullptr);
+  (void)WeightTypeOf(l.shexp_up.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.shexp_up.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_sh_up_,
+                                 nullptr, shared, hid, 0U, nullptr);
+  SwigluClamped(pf_sh_gate_, pf_sh_up_, pf_sh_inter_,
+                tokens * static_cast<std::uint32_t>(shared),
+                c_.swiglu_clamp_shexp[il], nullptr);
+  NarrowActivations(pf_sh_inter_, pf_xh_, false, tokens * shared, nullptr);
+  (void)WeightTypeOf(l.shexp_down.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.shexp_down.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_sh_down_,
+                                 nullptr, hid, shared, 0U, nullptr);
+  Add(pf_ffn_, pf_sh_down_, pf_ffn_, tokens * hid, nullptr);
+}
+
+void Executor::PrefillChunk(Session& session, std::uint32_t tokens,
+                            std::uint32_t base_pos) {
+  const std::uint32_t hid = c_.hidden_size;
+  tier_failure_ = false;
+  DenseRowPrepare(pf_drows_, pf_dbounds_, pf_dtiles_, tokens, nullptr);
+  for (std::uint32_t il = 0; il < c_.num_layers; ++il) {
+    const DeviceLayer& l = model_.layers()[il];
+    RmsNormRows(pf_x_, l.attn_norm.f32(), c_.rms_eps, pf_normed_, tokens, hid,
+                nullptr);
+    if (c_.IsMlaLayer(il)) {
+      PrefillMla(l, session.mla_kv_[il], session.mla_kpe_[il], base_pos,
+                 tokens);
+    } else {
+      PrefillKda(session, il, l, tokens);
+    }
+    Add(pf_x_, pf_attn_, pf_x_, tokens * hid, nullptr);
+    RmsNormRows(pf_x_, l.ffn_norm.f32(), c_.rms_eps, pf_normed_, tokens, hid,
+                nullptr);
+    PrefillFfn(l, il, tokens);
+    Add(pf_x_, pf_ffn_, pf_x_, tokens * hid, nullptr);
+  }
+}
+
 bool Executor::Prefill(Session& session, const std::int32_t* tokens,
                        std::uint32_t count, std::string* error_msg) {
-  // The decode path is the reference-shaped implementation; a batched prefill
-  // tier is a pure optimization on top of it.
-  std::vector<std::int32_t> host(tokens, tokens + count);
-  for (const std::int32_t token : host) {
-    if (!Step(session, token, error_msg)) {
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (tokens[i] < 0 ||
+        static_cast<std::uint32_t>(tokens[i]) >= c_.vocab_size) {
+      if (error_msg != nullptr) {
+        *error_msg = "token id out of range";
+      }
       return false;
     }
   }
+  if (count > 0U && session.position() + count > session.max_context()) {
+    if (error_msg != nullptr) {
+      *error_msg = "context exhausted";
+    }
+    return false;
+  }
+  if (count == 0U) {
+    return true;
+  }
+  if (!prefill_ready_) {
+    // A trunk format the F16 WMMA tier cannot decode; the per-token path is
+    // the reference-shaped implementation and always correct.
+    for (std::uint32_t i = 0; i < count; ++i) {
+      if (!Step(session, tokens[i], error_msg)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const std::uint32_t hid = c_.hidden_size;
+  GemvType type;
+  (void)GemvTypeOf(model_.token_embd().type, &type);
+  std::uint32_t done = 0U;
+  while (done < count) {
+    const std::uint32_t rows =
+        count - done > kPrefillChunkRows ? kPrefillChunkRows : count - done;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      EmbedRow(model_.token_embd().data, type,
+               static_cast<std::uint32_t>(tokens[done + r]),
+               static_cast<std::uint32_t>(hid),
+               pf_x_ + static_cast<std::size_t>(r) * hid, nullptr);
+    }
+    PrefillChunk(session, rows, session.position_);
+    session.position_ += rows;
+    done += rows;
+    if (tier_failure_) {
+      // A kernel rejected a launch; the scratch beyond it is stale, so fail
+      // loudly instead of reporting garbage as a forward pass.
+      if (error_msg != nullptr) {
+        *error_msg = "chunked prefill tier rejected a projection";
+      }
+      return false;
+    }
+  }
+
+  // The final token's normalized hidden and logits, identical in shape to
+  // the tail of Step.
+  const std::uint32_t last = (count - 1U) % kPrefillChunkRows;
+  RmsNorm(pf_x_ + static_cast<std::size_t>(last) * hid,
+          model_.output_norm().f32(), c_.rms_eps, h_out_, hid, nullptr);
+  (void)GemvTypeOf(model_.output().type, &type);
+  Gemv(model_.output().data, type, model_.output().rows, model_.output().cols,
+       model_.output().row_bytes, h_out_, logits_, nullptr);
   return true;
 }
 
