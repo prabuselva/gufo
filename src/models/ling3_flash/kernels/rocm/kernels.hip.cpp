@@ -638,6 +638,12 @@ __global__ void RouterTopKKernel(const float* __restrict__ logits,
   float* selection = sm;
   float* probs = sm + n_exp;
   float* group_scores = sm + 2 * n_exp;
+  // One block per token row; the decode launcher keeps grid == 1 with a
+  // row-offset base pointer, so row == 0 reproduces the single-row path.
+  const std::uint32_t row = blockIdx.x;
+  logits += static_cast<std::size_t>(row) * n_exp;
+  ids += static_cast<std::size_t>(row) * used;
+  weights += static_cast<std::size_t>(row) * used;
   const std::uint32_t per_group = n_exp / groups;
   for (std::uint32_t e = threadIdx.x; e < n_exp; e += blockDim.x) {
     probs[e] = SigmoidD(logits[e]);
@@ -752,6 +758,153 @@ __global__ void RowWeightedSumKernel(const float* __restrict__ src,
     acc += weights[r] * src[static_cast<std::size_t>(r) * cols + i];
   }
   dst[i] = acc;
+}
+
+__global__ void RmsNormRowsKernel(const float* __restrict__ x,
+                                  const float* __restrict__ w, float eps,
+                                  float* __restrict__ out, std::uint32_t n) {
+  __shared__ double smem[8];
+  const std::size_t off = static_cast<std::size_t>(blockIdx.x) * n;
+  const float* xr = x + off;
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const double v = static_cast<double>(xr[i]);
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / ::sqrtf(static_cast<float>(BlockSumDouble(ss, smem) /
+                                        static_cast<double>(n)) +
+                     eps);
+  float* orow = out + off;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    orow[i] = xr[i] * scale * (w != nullptr ? w[i] : 1.0F);
+  }
+}
+
+__global__ void AddBiasRowsKernel(float* __restrict__ f,
+                                  const float* __restrict__ bias,
+                                  std::uint32_t n, std::size_t total) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < total) {
+    f[i] += bias[i - (i / n) * n];
+  }
+}
+
+__global__ void ExpertCountsKernel(const std::int32_t* __restrict__ ids,
+                                   std::uint32_t* __restrict__ counts,
+                                   std::size_t total) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < total && ids[i] >= 0) {
+    atomicAdd(&counts[ids[i]], 1U);
+  }
+}
+
+__global__ void FillModuloIdsKernel(std::int32_t* __restrict__ ids,
+                                    std::size_t total, std::uint32_t pattern) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < total) {
+    ids[i] = static_cast<std::int32_t>(i % pattern);
+  }
+}
+
+__global__ void RowWeightedSumTokensKernel(const float* __restrict__ src,
+                                           const float* __restrict__ weights,
+                                           float* __restrict__ dst,
+                                           std::uint32_t used,
+                                           std::uint32_t cols,
+                                           std::size_t total) {
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i >= total) {
+    return;
+  }
+  const std::size_t t = i / cols;
+  const std::uint32_t c = static_cast<std::uint32_t>(i - t * cols);
+  const float* srow = src + t * static_cast<std::size_t>(used) * cols;
+  const float* wrow = weights + t * used;
+  float acc = 0.0F;
+  for (std::uint32_t r = 0; r < used; ++r) {
+    acc += wrow[r] * srow[static_cast<std::size_t>(r) * cols + c];
+  }
+  dst[i] = acc;
+}
+
+__global__ void MlaQRopeRowsKernel(
+    float* __restrict__ q, float* __restrict__ qrp, std::uint32_t total_pairs,
+    std::uint32_t heads, std::uint32_t head_stride, std::uint32_t nope,
+    std::uint32_t rotary_dim, std::uint32_t start_pos, float theta) {
+  const std::uint32_t rp = rotary_dim / 2U;
+  const std::uint32_t per_token = heads * rp;
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total_pairs) {
+    return;
+  }
+  const std::uint32_t t = i / per_token;
+  const std::uint32_t rem = i - t * per_token;
+  const std::uint32_t h = rem / rp;
+  const std::uint32_t p = rem - h * rp;
+  float* v = q + static_cast<std::size_t>(t) * heads * head_stride +
+             static_cast<std::size_t>(h) * head_stride + nope;
+  const float freq = static_cast<float>(
+      ::pow(static_cast<double>(theta),
+            -2.0 * static_cast<double>(p) / static_cast<double>(rotary_dim)));
+  const float angle = static_cast<float>(start_pos + t) * freq;
+  double c = 0.0;
+  double s = 0.0;
+  ::sincos(static_cast<double>(angle), &s, &c);
+  const float a = v[2 * p];
+  const float b = v[2 * p + 1];
+  const float lo = a * c - b * s;
+  const float hi = a * s + b * c;
+  v[2 * p] = lo;
+  v[2 * p + 1] = hi;
+  float* qr = qrp + (static_cast<std::size_t>(t) * heads + h) * rotary_dim;
+  qr[2 * p] = lo;
+  qr[2 * p + 1] = hi;
+}
+
+__global__ void MlaKvANormRopeRowsKernel(
+    const float* __restrict__ a, const float* __restrict__ gamma, float eps,
+    float* __restrict__ kv_cache, float* __restrict__ kpe_cache,
+    std::uint32_t kv_rank, std::uint32_t rotary_dim, std::uint32_t start_pos,
+    float theta) {
+  __shared__ double smem[8];
+  const std::uint32_t t = blockIdx.x;
+  const float* ar = a + static_cast<std::size_t>(t) * (kv_rank + rotary_dim);
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < kv_rank; i += blockDim.x) {
+    const double v = static_cast<double>(ar[i]);
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / ::sqrtf(static_cast<float>(BlockSumDouble(ss, smem) /
+                                        static_cast<double>(kv_rank)) +
+                     eps);
+  float* kv = kv_cache + (static_cast<std::size_t>(start_pos) + t) * kv_rank;
+  for (std::uint32_t i = threadIdx.x; i < kv_rank; i += blockDim.x) {
+    kv[i] = ar[i] * scale * gamma[i];
+  }
+  const std::uint32_t rp = rotary_dim / 2U;
+  if (threadIdx.x < rp) {
+    const std::uint32_t p = threadIdx.x;
+    const float* v = ar + kv_rank;
+    const float freq = static_cast<float>(
+        ::pow(static_cast<double>(theta),
+              -2.0 * static_cast<double>(p) / static_cast<double>(rotary_dim)));
+    const float angle = static_cast<float>(start_pos + t) * freq;
+    double c = 0.0;
+    double s = 0.0;
+    ::sincos(static_cast<double>(angle), &s, &c);
+    const float a0 = v[2 * p];
+    const float b0 = v[2 * p + 1];
+    float* kpe =
+        kpe_cache + (static_cast<std::size_t>(start_pos) + t) * rotary_dim;
+    kpe[2 * p] = a0 * c - b0 * s;
+    kpe[2 * p + 1] = a0 * s + b0 * c;
+  }
 }
 
 std::uint32_t Blocks(std::uint32_t n, std::uint32_t block) {
@@ -944,6 +1097,80 @@ void RowWeightedSum(const float* src, const float* weights, float* dst,
                     hipStream_t stream) {
   RowWeightedSumKernel<<<Blocks(cols, 256), 256, 0, stream>>>(src, weights, dst,
                                                               rows, cols);
+}
+
+void RmsNormRows(const float* x, const float* w, float eps, float* out,
+                 std::uint32_t rows, std::uint32_t n, hipStream_t stream) {
+  RmsNormRowsKernel<<<rows, 256, 0, stream>>>(x, w, eps, out, n);
+}
+
+void AddBiasRows(float* f, const float* bias, std::uint32_t rows,
+                 std::uint32_t n, hipStream_t stream) {
+  // The 65535-block cap covers a chunk of up to 2048 rows for every stream
+  // width used by the executor (inner 4096 -> 32768 blocks).
+  const std::size_t total = static_cast<std::size_t>(rows) * n;
+  const std::uint32_t grid = static_cast<std::uint32_t>(
+      std::min<std::size_t>((total + 255U) / 256U, 65535U));
+  AddBiasRowsKernel<<<grid, 256, 0, stream>>>(f, bias, n, total);
+}
+
+void RouterTopKRows(const float* logits, const float* bias, std::uint32_t n_exp,
+                    std::uint32_t groups, std::uint32_t groups_used,
+                    std::uint32_t used, float weights_scale, std::int32_t* ids,
+                    float* weights, std::uint32_t tokens, hipStream_t stream) {
+  const std::uint32_t smem = (2 * n_exp + groups) * sizeof(float);
+  RouterTopKKernel<<<tokens, 512, smem, stream>>>(logits, bias, n_exp, groups,
+                                                  groups_used, used,
+                                                  weights_scale, ids, weights);
+}
+
+void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
+                  std::uint32_t n, std::uint32_t n_exp, hipStream_t stream) {
+  (void)hipMemsetAsync(counts, 0, n_exp * sizeof(std::uint32_t), stream);
+  const std::size_t total = n;
+  const std::uint32_t grid = static_cast<std::uint32_t>(
+      std::min<std::size_t>((total + 255U) / 256U, 65535U));
+  ExpertCountsKernel<<<grid, 256, 0, stream>>>(ids, counts, total);
+}
+
+void FillModuloIds(std::int32_t* ids, std::uint32_t n, std::uint32_t pattern,
+                   hipStream_t stream) {
+  const std::uint32_t grid = static_cast<std::uint32_t>(std::min<std::size_t>(
+      (static_cast<std::size_t>(n) + 255U) / 256U, 65535U));
+  FillModuloIdsKernel<<<grid, 256, 0, stream>>>(ids, n, pattern);
+}
+
+void RowWeightedSumTokens(const float* src, const float* weights, float* dst,
+                          std::uint32_t tokens, std::uint32_t used,
+                          std::uint32_t cols, hipStream_t stream) {
+  const std::size_t total = static_cast<std::size_t>(tokens) * cols;
+  const std::uint32_t grid = static_cast<std::uint32_t>(
+      std::min<std::size_t>((total + 255U) / 256U, 65535U));
+  RowWeightedSumTokensKernel<<<grid, 256, 0, stream>>>(src, weights, dst, used,
+                                                       cols, total);
+}
+
+void MlaQRopeRows(float* q, float* qrp, std::uint32_t start_pos,
+                  std::uint32_t tokens, std::uint32_t heads,
+                  std::uint32_t head_stride, std::uint32_t nope,
+                  std::uint32_t rotary_dim, float theta, hipStream_t stream) {
+  const std::size_t total =
+      static_cast<std::size_t>(tokens) * heads * (rotary_dim / 2U);
+  const std::uint32_t grid = static_cast<std::uint32_t>(
+      std::min<std::size_t>((total + 255U) / 256U, 65535U));
+  MlaQRopeRowsKernel<<<grid, 256, 0, stream>>>(
+      q, qrp, static_cast<std::uint32_t>(total), heads, head_stride, nope,
+      rotary_dim, start_pos, theta);
+}
+
+void MlaKvANormRopeRows(const float* a, const float* gamma, float eps,
+                        float* kv_cache, float* kpe_cache,
+                        std::uint32_t start_pos, std::uint32_t tokens,
+                        std::uint32_t kv_rank, std::uint32_t rotary_dim,
+                        float theta, hipStream_t stream) {
+  MlaKvANormRopeRowsKernel<<<tokens, 256, 0, stream>>>(
+      a, gamma, eps, kv_cache, kpe_cache, kv_rank, rotary_dim, start_pos,
+      theta);
 }
 
 }  // namespace gufo::models::ling3_flash::rocm

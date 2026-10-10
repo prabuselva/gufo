@@ -57,14 +57,46 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// from `swiglu_gate`. Exactly one of `out` / `out_half` is non-null.
 /// `swiglu_limit > 0` reproduces the reference clamp: the up value is clamped
 /// to [-limit, limit] and the gate's SiLU to (-inf, limit] before the product.
-/// `tile_rows` is 16, 48 or 64. Returns false for an unsupported shape.
+/// `tile_rows` is 16, 48 or 64. `out_stride` is the row stride of `out` /
+/// `out_half` (0 selects m); rows are still indexed through `rows_out`, so a
+/// padded or wider plane needs no identity indirection. Returns false for an
+/// unsupported shape.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,
                    const std::int32_t* rows_in, const std::int32_t* rows_out,
                    const float* swiglu_gate, float swiglu_limit, float* out,
                    __half* out_half, std::size_t m, std::size_t k,
-                   hipStream_t stream);
+                   std::size_t out_stride, hipStream_t stream);
+
+/// --- Dense token tier -------------------------------------------------------
+/// Runs of consecutive tokens projected by one matrix (the attention and
+/// dense-FFN projections of a prefill chunk) reuse the routed kernel with an
+/// identity bucket: prepare the map once per chunk with DenseRowPrepare and
+/// launch each projection with DenseF16Gemm. The F32 accumulation order is
+/// the routed kernel's; the epilogue writes plain rows (no SwiGLU), matching
+/// the Gemv/GemvRows results within the F16 narrowing of `x`.
+
+/// Writes the identity row map for tokens 0..tokens-1 into padded
+/// (16-rounded) rows `[tokens, padded)` marked -1, `pad_bounds = {0, padded}`
+/// and the bucket index vector `tiles[j] = j << 16` (j < padded / 16, valid
+/// for any tile_rows). `rows_out` and `tiles` need padded (and padded / 16)
+/// entries; capacity is sized once per chunk cap.
+void DenseRowPrepare(std::int32_t* rows_out, std::int32_t* pad_bounds,
+                     std::int32_t* tiles, std::uint32_t tokens,
+                     hipStream_t stream);
+
+/// Dense projection over token-major F16 rows `x` [tokens][k]: out[token]
+/// (m-wide, F32 `out` or F16 `out_half`, row stride `out_stride` or m) =
+/// W x[token] for the matrix `w` [m][k] in `type`. Selects the token macro
+/// tile size and reads the map DenseRowPrepare wrote for this chunk. Returns
+/// false for an unsupported shape (tokens == 0 or a k not divisible by the
+/// type's quant block).
+bool DenseF16Gemm(const void* w, WeightType type, const __half* x,
+                  const std::int32_t* rows_out, const std::int32_t* pad_bounds,
+                  const std::int32_t* tiles, std::uint32_t tokens, float* out,
+                  __half* out_half, std::size_t m, std::size_t k,
+                  std::size_t out_stride, hipStream_t stream);
 
 /// Fused gate+up routed GEMM. `gate` and `up` are the [n_experts][m][k] weight
 /// tensors in the same `type`; the kernel reads the F16 activation rows once

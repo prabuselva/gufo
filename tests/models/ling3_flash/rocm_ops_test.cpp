@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -165,7 +166,9 @@ bool TestConvSilu() {
       ref_hist[static_cast<std::size_t>(tt) * inner + ch] =
           hist[static_cast<std::size_t>(tt + 1) * inner + ch];
     }
-    ref_hist[static_cast<std::size_t>(kern - 2) * inner + ch] = value;
+    // The conv state keeps the raw projected rows, matching ConvSiluKernel
+    // and the prefill history update (the taps read pre-activation rows).
+    ref_hist[static_cast<std::size_t>(kern - 2) * inner + ch] = proj[ch];
   }
   t::HipBuffer<float> d_cw(inner * kern), d_proj(inner),
       d_hist(static_cast<std::size_t>(kern - 1) * inner), d_out(inner);
@@ -417,6 +420,262 @@ bool TestRouterTopK() {
   return ok;
 }
 
+// ------------------------------------------ Prefill batch tier parity
+//
+// Every batched operator must be bit-identical to launching its decode-side
+// counterpart once per row, so the chunked prefill path can swap them in
+// without touching numerics.
+
+template<typename T>
+bool SameBits(const std::vector<T>& reference, const std::vector<T>& got,
+              const char* name) {
+  const bool same = reference.size() == got.size() &&
+                    std::memcmp(reference.data(), got.data(),
+                                reference.size() * sizeof(T)) == 0;
+  std::cout << name << (same ? " bit-identical" : " NOT bit-identical") << '\n';
+  return same;
+}
+
+bool TestRmsNormRows() {
+  constexpr std::uint32_t rows = 6;
+  constexpr std::uint32_t n = 2560;
+  const auto x = t::MakeValues(rows * n, 0xA1000001U, 2.0F);
+  const auto w = t::MakeValues(n, 0xA1000002U, 1.0F, 1.0F);
+  t::HipBuffer<float> d_x(rows * n), d_w(n), d_ref(rows * n), d_out(rows * n);
+  t::Upload(&d_x, x);
+  t::Upload(&d_w, w);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    q::RmsNorm(d_x.get() + static_cast<std::size_t>(r) * n, d_w.get(), kEps,
+               d_ref.get() + static_cast<std::size_t>(r) * n, n, nullptr);
+  }
+  q::RmsNormRows(d_x.get(), d_w.get(), kEps, d_out.get(), rows, n, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RmsNormRows sync");
+  return SameBits(t::Download(&d_ref, rows * n), t::Download(&d_out, rows * n),
+                  "RmsNormRows");
+}
+
+bool TestAddBiasRows() {
+  constexpr std::uint32_t rows = 5;
+  constexpr std::uint32_t n = 2560;
+  const auto f = t::MakeValues(rows * n, 0xA2000001U, 3.0F);
+  const auto bias = t::MakeValues(n, 0xA2000002U, 1.0F);
+  std::vector<float> ref(rows * n);
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    for (std::uint32_t i = 0; i < n; ++i) {
+      ref[static_cast<std::size_t>(r) * n + i] =
+          f[static_cast<std::size_t>(r) * n + i] + bias[i];
+    }
+  }
+  t::HipBuffer<float> d_f(rows * n), d_bias(n);
+  t::Upload(&d_f, f);
+  t::Upload(&d_bias, bias);
+  q::AddBiasRows(d_f.get(), d_bias.get(), rows, n, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "AddBiasRows sync");
+  return SameBits(ref, t::Download(&d_f, rows * n), "AddBiasRows");
+}
+
+bool TestRouterTopKRows() {
+  constexpr std::uint32_t n_exp = 512;
+  constexpr std::uint32_t groups = 8;
+  constexpr std::uint32_t groups_used = 4;
+  constexpr std::uint32_t used = 8;
+  constexpr std::uint32_t tokens = 5;
+  constexpr float kScale = 2.5F;
+  std::vector<float> logits(tokens * n_exp);
+  for (std::uint32_t r = 0; r < tokens; ++r) {
+    const auto row =
+        t::MakeValues(n_exp, 0xA3000001U + r, 4.0F + static_cast<float>(r));
+    std::copy(row.begin(), row.end(),
+              logits.begin() + static_cast<std::size_t>(r) * n_exp);
+  }
+  const auto bias = t::MakeValues(n_exp, 0xA30000FFU, 0.5F);
+
+  t::HipBuffer<float> d_logits(tokens * n_exp), d_bias(n_exp);
+  t::Upload(&d_logits, logits);
+  t::Upload(&d_bias, bias);
+  t::HipBuffer<std::int32_t> d_ref_ids(tokens * used), d_ids(tokens * used);
+  t::HipBuffer<float> d_ref_weights(tokens * used), d_weights(tokens * used);
+  for (std::uint32_t r = 0; r < tokens; ++r) {
+    q::RouterTopK(d_logits.get() + static_cast<std::size_t>(r) * n_exp,
+                  d_bias.get(), n_exp, groups, groups_used, used, kScale,
+                  d_ref_ids.get() + static_cast<std::size_t>(r) * used,
+                  d_ref_weights.get() + static_cast<std::size_t>(r) * used,
+                  nullptr);
+  }
+  q::RouterTopKRows(d_logits.get(), d_bias.get(), n_exp, groups, groups_used,
+                    used, kScale, d_ids.get(), d_weights.get(), tokens,
+                    nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RouterTopKRows sync");
+  std::vector<std::int32_t> ref_ids(tokens * used), ids(tokens * used);
+  t::CheckHip(hipMemcpy(ref_ids.data(), d_ref_ids.get(), d_ref_ids.bytes(),
+                        hipMemcpyDeviceToHost),
+              "download ref ids");
+  t::CheckHip(
+      hipMemcpy(ids.data(), d_ids.get(), d_ids.bytes(), hipMemcpyDeviceToHost),
+      "download ids");
+  bool ok = SameBits(ref_ids, ids, "RouterTopKRows ids");
+  ok = SameBits(t::Download(&d_ref_weights, tokens * used),
+                t::Download(&d_weights, tokens * used),
+                "RouterTopKRows weights") &&
+       ok;
+  return ok;
+}
+
+bool TestExpertCountsAndFill() {
+  constexpr std::uint32_t n_exp = 512;
+  constexpr std::uint32_t n = 1057;
+  std::vector<std::int32_t> ids(n);
+  std::vector<std::uint32_t> ref_counts(n_exp, 0);
+  std::vector<std::int32_t> ref_pattern(n);
+  std::uint32_t state = 0xA4000001U;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    ids[i] = (t::NextRandom(&state) & 0x3FFU) < n_exp
+                 ? static_cast<std::int32_t>(t::NextRandom(&state) % n_exp)
+                 : -1;
+    if (ids[i] >= 0) {
+      ++ref_counts[static_cast<std::size_t>(ids[i])];
+    }
+    ref_pattern[i] = static_cast<std::int32_t>(i % 32U);
+  }
+  t::HipBuffer<std::int32_t> d_ids(n), d_pattern(n);
+  t::CheckHip(
+      hipMemcpy(d_ids.get(), ids.data(), d_ids.bytes(), hipMemcpyHostToDevice),
+      "upload expert ids");
+  t::HipBuffer<std::uint32_t> d_counts(n_exp);
+  q::ExpertCounts(d_ids.get(), d_counts.get(), n, n_exp, nullptr);
+  q::FillModuloIds(d_pattern.get(), n, 32, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "ExpertCounts sync");
+  std::vector<std::uint32_t> counts(n_exp);
+  t::CheckHip(hipMemcpy(counts.data(), d_counts.get(), d_counts.bytes(),
+                        hipMemcpyDeviceToHost),
+              "download counts");
+  bool ok = SameBits(ref_counts, counts, "ExpertCounts");
+  std::vector<std::int32_t> pattern(n);
+  t::CheckHip(hipMemcpy(pattern.data(), d_pattern.get(), d_pattern.bytes(),
+                        hipMemcpyDeviceToHost),
+              "download ids");
+  ok = SameBits(ref_pattern, pattern, "FillModuloIds") && ok;
+  return ok;
+}
+
+bool TestRowWeightedSumTokens() {
+  constexpr std::uint32_t tokens = 3;
+  constexpr std::uint32_t used = 8;
+  constexpr std::uint32_t cols = 768;
+  const auto src = t::MakeValues(tokens * used * cols, 0xA5000001U, 2.0F);
+  const auto weights = t::MakeValues(tokens * used, 0xA5000002U, 1.0F);
+  t::HipBuffer<float> d_src(tokens * used * cols), d_weights(tokens * used);
+  t::Upload(&d_src, src);
+  t::Upload(&d_weights, weights);
+  t::HipBuffer<float> d_ref(tokens * cols), d_out(tokens * cols);
+  for (std::uint32_t r = 0; r < tokens; ++r) {
+    q::RowWeightedSum(d_src.get() + static_cast<std::size_t>(r) * used * cols,
+                      d_weights.get() + static_cast<std::size_t>(r) * used,
+                      d_ref.get() + static_cast<std::size_t>(r) * cols, used,
+                      cols, nullptr);
+  }
+  q::RowWeightedSumTokens(d_src.get(), d_weights.get(), d_out.get(), tokens,
+                          used, cols, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RowWeightedSumTokens sync");
+  return SameBits(t::Download(&d_ref, tokens * cols),
+                  t::Download(&d_out, tokens * cols), "RowWeightedSumTokens");
+}
+
+bool TestMlaQRopeRows() {
+  constexpr std::uint32_t heads = 32;
+  constexpr std::uint32_t stride = 192;
+  constexpr std::uint32_t nope = 128;
+  constexpr std::uint32_t rotary = 64;
+  constexpr std::uint32_t tokens = 4;
+  constexpr std::uint32_t start_pos = 7;
+  constexpr float kTheta = 6.0e6F;
+  const auto q_in = t::MakeValues(tokens * heads * stride, 0xA6000001U, 2.0F);
+  t::HipBuffer<float> d_q1(tokens * heads * stride),
+      d_q2(tokens * heads * stride), d_qrp(tokens * heads * rotary);
+  t::Upload(&d_q1, q_in);
+  t::Upload(&d_q2, q_in);
+  for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+    q::RopeStrided(
+        d_q1.get() + static_cast<std::size_t>(tok) * heads * stride + nope,
+        heads, stride, rotary, start_pos + tok, kTheta, nullptr);
+  }
+  q::MlaQRopeRows(d_q2.get(), d_qrp.get(), start_pos, tokens, heads, stride,
+                  nope, rotary, kTheta, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "MlaQRopeRows sync");
+  bool ok =
+      SameBits(t::Download(&d_q1, tokens * heads * stride),
+               t::Download(&d_q2, tokens * heads * stride), "MlaQRopeRows q");
+  // The packed rope plane must carry exactly the rope segments the decode
+  // RopeStrided left inside each head row.
+  const auto rotated = t::Download(&d_q1, tokens * heads * stride);
+  std::vector<float> ref_qrp(static_cast<std::size_t>(tokens) * heads * rotary);
+  for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+    for (std::uint32_t h = 0; h < heads; ++h) {
+      const std::size_t src_off =
+          (static_cast<std::size_t>(tok) * heads + h) * stride + nope;
+      const std::size_t dst_off =
+          (static_cast<std::size_t>(tok) * heads + h) * rotary;
+      std::copy_n(rotated.begin() + static_cast<std::ptrdiff_t>(src_off),
+                  rotary,
+                  ref_qrp.begin() + static_cast<std::ptrdiff_t>(dst_off));
+    }
+  }
+  std::vector<float> qrp(ref_qrp.size());
+  t::CheckHip(
+      hipMemcpy(qrp.data(), d_qrp.get(), d_qrp.bytes(), hipMemcpyDeviceToHost),
+      "download qrp");
+  ok = SameBits(ref_qrp, qrp, "MlaQRopeRows packed") && ok;
+  return ok;
+}
+
+bool TestMlaKvANormRopeRows() {
+  constexpr std::uint32_t kv_rank = 512;
+  constexpr std::uint32_t rotary = 64;
+  constexpr std::uint32_t tokens = 3;
+  constexpr std::uint32_t start_pos = 5;
+  constexpr float kTheta = 6.0e6F;
+  const auto a = t::MakeValues(tokens * (kv_rank + rotary), 0xA7000001U, 2.0F);
+  const auto gamma = t::MakeValues(kv_rank, 0xA7000002U, 1.0F, 1.0F);
+  t::HipBuffer<float> d_a(tokens * (kv_rank + rotary)), d_gamma(kv_rank);
+  t::Upload(&d_a, a);
+  t::Upload(&d_gamma, gamma);
+  t::HipBuffer<float> d_kv_ref((start_pos + tokens) * kv_rank),
+      d_kpe_ref((start_pos + tokens) * rotary),
+      d_kv((start_pos + tokens) * kv_rank),
+      d_kpe((start_pos + tokens) * rotary);
+  // Rows before start_pos are never written: zero them so the bit compare
+  // only sees kernel output, not allocator garbage.
+  t::CheckHip(hipMemset(d_kv_ref.get(), 0, d_kv_ref.bytes()), "zero kv ref");
+  t::CheckHip(hipMemset(d_kpe_ref.get(), 0, d_kpe_ref.bytes()), "zero kpe ref");
+  t::CheckHip(hipMemset(d_kv.get(), 0, d_kv.bytes()), "zero kv");
+  t::CheckHip(hipMemset(d_kpe.get(), 0, d_kpe.bytes()), "zero kpe");
+  for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+    const float* row =
+        d_a.get() + static_cast<std::size_t>(tok) * (kv_rank + rotary);
+    q::RmsNorm(
+        row, d_gamma.get(), kEps,
+        d_kv_ref.get() + static_cast<std::size_t>(start_pos + tok) * kv_rank,
+        kv_rank, nullptr);
+    // Rope the raw rotary segment of the row in place in the kpe plane.
+    float* kpe =
+        d_kpe_ref.get() + static_cast<std::size_t>(start_pos + tok) * rotary;
+    t::CheckHip(hipMemcpy(kpe, row + kv_rank, rotary * sizeof(float),
+                          hipMemcpyDeviceToDevice),
+                "stage kpe row");
+    q::Rope(kpe, 1, 64, rotary, start_pos + tok, kTheta, nullptr);
+  }
+  q::MlaKvANormRopeRows(d_a.get(), d_gamma.get(), kEps, d_kv.get(), d_kpe.get(),
+                        start_pos, tokens, kv_rank, rotary, kTheta, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "MlaKvANormRopeRows sync");
+  bool ok = SameBits(t::Download(&d_kv_ref, (start_pos + tokens) * kv_rank),
+                     t::Download(&d_kv, (start_pos + tokens) * kv_rank),
+                     "MlaKvANormRopeRows kv") &&
+            SameBits(t::Download(&d_kpe_ref, (start_pos + tokens) * rotary),
+                     t::Download(&d_kpe, (start_pos + tokens) * rotary),
+                     "MlaKvANormRopeRows kpe");
+  return ok;
+}
+
 // ---------------------------------------------------------- SwigluClamped
 
 bool TestSwigluOne(float limit, std::uint32_t seed) {
@@ -458,6 +717,13 @@ int main() {
     ok = TestKdaDelta() && ok;
     ok = TestRouterTopK() && ok;
     ok = TestSwiglu() && ok;
+    ok = TestRmsNormRows() && ok;
+    ok = TestAddBiasRows() && ok;
+    ok = TestRouterTopKRows() && ok;
+    ok = TestExpertCountsAndFill() && ok;
+    ok = TestRowWeightedSumTokens() && ok;
+    ok = TestMlaQRopeRows() && ok;
+    ok = TestMlaKvANormRopeRows() && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

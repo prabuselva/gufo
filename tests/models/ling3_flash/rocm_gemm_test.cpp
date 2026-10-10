@@ -402,7 +402,7 @@ bool RoutedQuant(q::WeightType type, std::uint32_t seed) {
     if (!q::RoutedF16Gemm(
             d_w.get(), type, env.d_xh.get(), tiles.buf.get(), tiles.count, tr,
             env.d_bounds.get(), env.d_rows_token.get(), env.d_rows_slot.get(),
-            nullptr, 0.0F, d_out.get(), nullptr, kM, kK, nullptr)) {
+            nullptr, 0.0F, d_out.get(), nullptr, kM, kK, 0, nullptr)) {
       throw std::runtime_error("routed F16 GEMM rejected the shape");
     }
     t::CheckHip(hipGetLastError(), "routed F16 GEMM launch");
@@ -487,7 +487,7 @@ bool RoutedSwiglu(float limit) {
     if (!q::RoutedF16Gemm(weights.get(), q::WeightType::kQ4_K, env.d_xh.get(),
                           tiles.buf.get(), tiles.count, 64, env.d_bounds.get(),
                           env.d_rows_token.get(), env.d_rows_slot.get(),
-                          nullptr, 0.0F, d_out.get(), nullptr, kM, kK,
+                          nullptr, 0.0F, d_out.get(), nullptr, kM, kK, 0,
                           nullptr)) {
       throw std::runtime_error(std::string(name) + " GEMM rejected the shape");
     }
@@ -517,7 +517,7 @@ bool RoutedSwiglu(float limit) {
                           tk.buf.get(), tk.count, tr, env.d_bounds.get(),
                           env.d_rows_token.get(), env.d_rows_slot.get(),
                           d_gate_out.get(), clamp_limit, nullptr, d_out.get(),
-                          kM, kK, nullptr)) {
+                          kM, kK, 0, nullptr)) {
       throw std::runtime_error("up GEMM rejected the shape");
     }
     t::CheckHip(hipGetLastError(), "up GEMM launch");
@@ -566,7 +566,7 @@ bool RoutedGatedPair(float limit) {
   if (!q::RoutedF16Gemm(d_gate.get(), q::WeightType::kQ4_K, env.d_xh.get(),
                         tiles.buf.get(), tiles.count, 64, env.d_bounds.get(),
                         env.d_rows_token.get(), env.d_rows_slot.get(), nullptr,
-                        0.0F, d_gate_out.get(), nullptr, kM, kK, nullptr)) {
+                        0.0F, d_gate_out.get(), nullptr, kM, kK, 0, nullptr)) {
     throw std::runtime_error("pair gate GEMM rejected the shape");
   }
   t::HipBuffer<__half> d_sep(kSlots * kM);
@@ -575,7 +575,7 @@ bool RoutedGatedPair(float limit) {
                         tiles.buf.get(), tiles.count, 64, env.d_bounds.get(),
                         env.d_rows_token.get(), env.d_rows_slot.get(),
                         d_gate_out.get(), limit, nullptr, d_sep.get(), kM, kK,
-                        nullptr)) {
+                        0, nullptr)) {
     throw std::runtime_error("pair up GEMM rejected the shape");
   }
   t::CheckHip(hipGetLastError(), "pair GEMM launch");
@@ -602,6 +602,164 @@ bool RoutedGatedPair(float limit) {
                diffs, 0.0);
 }
 
+// ---- Dense token tier -----------------------------------------------------
+
+// The identity-bucket dense projection against the same double-dot oracle:
+// F32-out rows at a padded out_stride must land exactly, the half epilogue
+// must agree, and the wrapper must reject an unsupported k.
+bool DensePlain(std::uint32_t tokens, q::WeightType type, std::uint32_t seed) {
+  std::vector<std::uint8_t> w;
+  switch (type) {
+    case q::WeightType::kQ4_K:
+      w = EncodeQ4K(kM, seed);
+      break;
+    case q::WeightType::kQ5_K:
+      w = EncodeQ5K(kM, seed);
+      break;
+    case q::WeightType::kQ6_K:
+      w = EncodeQ6K(kM, seed);
+      break;
+    default:
+      w = EncodeQ8(kM, seed);
+      break;
+  }
+  t::HipBuffer<std::uint8_t> d_w(w.size());
+  t::CheckHip(hipMemcpy(d_w.get(), w.data(), w.size(), hipMemcpyHostToDevice),
+              "upload dense weights");
+  auto x =
+      t::MakeValues(static_cast<std::size_t>(tokens) * kK, seed + 1U, 0.5F);
+  std::vector<__half> x_half(x.size());
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x_half[i] = __float2half(x[i]);
+    // The oracle dots the half-rounded activations the kernel multiplies.
+    x[i] = __half2float(x_half[i]);
+  }
+  t::HipBuffer<float> d_xf(static_cast<std::size_t>(tokens) * kK);
+  t::HipBuffer<__half> d_xh(static_cast<std::size_t>(tokens) * kK);
+  t::Upload(&d_xf, x);
+  q::NarrowActivations(d_xf.get(), d_xh.get(), false, x.size(), nullptr);
+
+  const std::uint32_t padded = (tokens + 15U) / 16U * 16U;
+  t::HipBuffer<std::int32_t> d_rows(padded), d_bounds(2), d_tiles(padded / 16U);
+  q::DenseRowPrepare(d_rows.get(), d_bounds.get(), d_tiles.get(), tokens,
+                     nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "DenseRowPrepare sync");
+
+  std::vector<float> ref(static_cast<std::size_t>(tokens) * kM);
+  for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+    for (std::uint32_t row = 0; row < kM; ++row) {
+      ExpertRef(w, type, x, 0, tok, row,
+                &ref[static_cast<std::size_t>(tok) * kM + row]);
+    }
+  }
+
+  const auto run = [&](std::size_t out_stride) {
+    const std::size_t plane =
+        out_stride == 0 ? static_cast<std::size_t>(kM) : out_stride;
+    t::HipBuffer<float> d_out(static_cast<std::size_t>(tokens) * plane);
+    t::CheckHip(hipMemset(d_out.get(), 0x7F, d_out.bytes()),
+                "sentinel dense out");
+    if (!q::DenseF16Gemm(d_w.get(), type, d_xh.get(), d_rows.get(),
+                         d_bounds.get(), d_tiles.get(), tokens, d_out.get(),
+                         nullptr, kM, kK, out_stride, nullptr)) {
+      throw std::runtime_error("dense F16 GEMM rejected the shape");
+    }
+    t::CheckHip(hipGetLastError(), "dense F16 GEMM launch");
+    t::CheckHip(hipDeviceSynchronize(), "dense F16 GEMM sync");
+    return std::make_pair(
+        t::Download(&d_out, static_cast<std::size_t>(tokens) * plane), plane);
+  };
+
+  const std::string name =
+      std::string(TypeName(type)) + "Dense" + std::to_string(tokens);
+  const auto plain = run(0);
+  bool ok = Check(name.c_str(), WorstScaled(ref, plain.first), 2e-3);
+
+  // The same launch scattered into a wider plane: rows must land at the
+  // requested stride and the padding must keep the no-write sentinel.
+  const std::size_t wide = static_cast<std::size_t>(kM) + 8;
+  const auto strided = run(wide);
+  std::vector<float> packed(static_cast<std::size_t>(tokens) * kM);
+  std::vector<float> pad_gaps;
+  for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+    for (std::uint32_t row = 0; row < kM; ++row) {
+      packed[static_cast<std::size_t>(tok) * kM + row] =
+          strided.first[static_cast<std::size_t>(tok) * wide + row];
+    }
+    for (std::uint32_t row = kM; row < wide; ++row) {
+      pad_gaps.push_back(
+          strided.first[static_cast<std::size_t>(tok) * wide + row]);
+    }
+  }
+  ok = Check(std::string(name + "/stride").c_str(), WorstScaled(ref, packed),
+             2e-3) &&
+       ok;
+  bool untouched = true;
+  for (const float v : pad_gaps) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    untouched = untouched && bits == 0x7F7F7F7FU;
+  }
+  std::cout << name
+            << "/stride padding kept sentinel: " << (untouched ? "yes" : "NO")
+            << '\n';
+  ok = untouched && ok;
+
+  // F16 output plane for one mid-size chunk (the narrow epilogue path).
+  {
+    const std::size_t plane = static_cast<std::size_t>(kM) + 8;
+    t::HipBuffer<__half> d_h(static_cast<std::size_t>(tokens) * plane);
+    t::CheckHip(hipMemset(d_h.get(), 0, d_h.bytes()), "zero dense half");
+    if (!q::DenseF16Gemm(d_w.get(), type, d_xh.get(), d_rows.get(),
+                         d_bounds.get(), d_tiles.get(), tokens, nullptr,
+                         d_h.get(), kM, kK, plane, nullptr)) {
+      throw std::runtime_error("dense F16-out GEMM rejected the shape");
+    }
+    t::CheckHip(hipDeviceSynchronize(), "dense half sync");
+    const auto half_out =
+        DownloadHalf(&d_h, static_cast<std::size_t>(tokens) * plane);
+    std::vector<float> packed_h(static_cast<std::size_t>(tokens) * kM);
+    for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+      for (std::uint32_t row = 0; row < kM; ++row) {
+        packed_h[static_cast<std::size_t>(tok) * kM + row] =
+            half_out[static_cast<std::size_t>(tok) * plane + row];
+      }
+    }
+    ok = Check(std::string(name + "/half").c_str(), WorstScaled(ref, packed_h),
+               4e-3) &&
+         ok;
+  }
+  return ok;
+}
+
+// The wrapper contract: zero tokens and a k that is not a whole quant block
+// are rejected instead of launching a partial dot.
+bool DenseRejects() {
+  const auto w = EncodeQ4K(kM, 0xD1000001U);
+  t::HipBuffer<std::uint8_t> d_w(w.size());
+  t::CheckHip(hipMemcpy(d_w.get(), w.data(), w.size(), hipMemcpyHostToDevice),
+              "upload reject weights");
+  t::HipBuffer<__half> d_xh(static_cast<std::size_t>(16) * kK);
+  t::HipBuffer<std::int32_t> d_rows(16), d_bounds(2), d_tiles(1);
+  t::HipBuffer<float> d_out(16 * kM);
+  q::DenseRowPrepare(d_rows.get(), d_bounds.get(), d_tiles.get(), 16, nullptr);
+  bool ok = true;
+  if (q::DenseF16Gemm(d_w.get(), q::WeightType::kQ4_K, d_xh.get(), d_rows.get(),
+                      d_bounds.get(), d_tiles.get(), 0, d_out.get(), nullptr,
+                      kM, kK, 0, nullptr)) {
+    std::cout << "DenseRejects: tokens=0 was accepted\n";
+    ok = false;
+  }
+  if (q::DenseF16Gemm(d_w.get(), q::WeightType::kQ4_K, d_xh.get(), d_rows.get(),
+                      d_bounds.get(), d_tiles.get(), 16, d_out.get(), nullptr,
+                      kM, kK + 8, 0, nullptr)) {
+    std::cout << "DenseRejects: k not a multiple of 256 was accepted\n";
+    ok = false;
+  }
+  std::cout << "DenseRejects " << (ok ? "passed" : "FAILED") << '\n';
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -615,6 +773,15 @@ int main() {
     ok &= RoutedSwiglu(4.0F);
     ok &= RoutedGatedPair(0.0F);
     ok &= RoutedGatedPair(7.0F);
+    ok &= DensePlain(3, q::WeightType::kQ4_K, 0xD0000001U);
+    ok &= DensePlain(20, q::WeightType::kQ4_K, 0xD0000002U);
+    ok &= DensePlain(48, q::WeightType::kQ4_K, 0xD0000003U);
+    ok &= DensePlain(130, q::WeightType::kQ4_K, 0xD0000004U);
+    ok &= DensePlain(3, q::WeightType::kQ8_0, 0xD0000005U);
+    ok &= DensePlain(49, q::WeightType::kQ8_0, 0xD0000006U);
+    ok &= DensePlain(20, q::WeightType::kQ5_K, 0xD0000007U);
+    ok &= DensePlain(130, q::WeightType::kQ6_K, 0xD0000008U);
+    ok &= DenseRejects();
   } catch (const std::exception& error) {
     std::cerr << "ling3_flash rocm_gemm: " << error.what() << '\n';
     return 1;

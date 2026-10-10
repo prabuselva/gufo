@@ -141,6 +141,65 @@ void RowScale(float* x, const float* scales, std::uint32_t rows,
 void RowWeightedSum(const float* src, const float* weights, float* dst,
                     std::uint32_t rows, std::uint32_t cols, hipStream_t stream);
 
+/// --- Prefill batch tier
+/// ------------------------------------------------------- Row-parallel
+/// variants of the per-token operators that sit between the chunked GEMMs of
+/// `Executor::Prefill`. Each is bit-identical to launching the decode-side
+/// operator once per row.
+
+/// RmsNormRows over `rows` independent rows of length `n`:
+/// out[r*n:] = x[r*n:] * rsqrt(mean(x[r*n:]^2) + eps) * w.
+void RmsNormRows(const float* x, const float* w, float eps, float* out,
+                 std::uint32_t rows, std::uint32_t n, hipStream_t stream);
+
+/// f[r*n:] += bias[0:n] for every row, in place (the per-token dt bias ahead
+/// of KdaPrep, which consumes the biased f rows).
+void AddBiasRows(float* f, const float* bias, std::uint32_t rows,
+                 std::uint32_t n, hipStream_t stream);
+
+/// RouterTopK over a chunk: one block per token row of logits
+/// [tokens][n_exp]; ids/weights are [tokens][used].
+void RouterTopKRows(const float* logits, const float* bias, std::uint32_t n_exp,
+                    std::uint32_t groups, std::uint32_t groups_used,
+                    std::uint32_t used, float weights_scale, std::int32_t* ids,
+                    float* weights, std::uint32_t tokens, hipStream_t stream);
+
+/// counts[e] += 1 for every non-negative slot id equal to e over `n` ids.
+/// `counts` is zeroed by the launcher; block order does not affect counts.
+void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
+                  std::uint32_t n, std::uint32_t n_exp, hipStream_t stream);
+
+/// ids[i] = i % pattern for i in [0, n) (the identity stack index vector for
+/// the per-head attn_k_b/attn_v_b grouped GEMVs, pattern = num heads).
+void FillModuloIds(std::int32_t* ids, std::uint32_t n, std::uint32_t pattern,
+                   hipStream_t stream);
+
+/// RowWeightedSum over a chunk: dst[t*cols:] =
+/// sum_r weights[t*used + r] * src[(t*used + r)*cols:] per token.
+void RowWeightedSumTokens(const float* src, const float* weights, float* dst,
+                          std::uint32_t tokens, std::uint32_t used,
+                          std::uint32_t cols, hipStream_t stream);
+
+/// RoPE of the MLA q chunk over all heads (row stride `heads * head_stride`,
+/// rotary segment of each head row at `+nope`), in place, with token t at
+/// position `start_pos + t`; also writes the rotated segments packed as
+/// qrp[(t * heads + h) * rotary_dim:]. Bit-identical to RopeStrided per token.
+void MlaQRopeRows(float* q, float* qrp, std::uint32_t start_pos,
+                  std::uint32_t tokens, std::uint32_t heads,
+                  std::uint32_t head_stride, std::uint32_t nope,
+                  std::uint32_t rotary_dim, float theta, hipStream_t stream);
+
+/// MLA kv-a norm + rope over a chunk: token t writes the RMS-normalized
+/// kv-rank segment of row a[t * (kv_rank + rotary_dim):] to
+/// kv_cache[(start_pos + t) * kv_rank:] and the rope of its rotary segment to
+/// kpe_cache[(start_pos + t) * rotary_dim:]. Bit-identical to the decode
+/// RmsNorm + Rope pair.
+void MlaKvANormRopeRows(const float* a, const float* gamma, float eps,
+                        float* kv_cache, float* kpe_cache,
+                        std::uint32_t start_pos, std::uint32_t tokens,
+                        std::uint32_t kv_rank, std::uint32_t rotary_dim,
+                        float theta, hipStream_t stream);
+
 }  // namespace gufo::models::ling3_flash::rocm
 
 #endif  // GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_KERNELS_HPP_
