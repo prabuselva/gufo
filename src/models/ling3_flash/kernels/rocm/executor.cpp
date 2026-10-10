@@ -15,7 +15,7 @@
 namespace gufo::models::ling3_flash::rocm {
 namespace {
 
-constexpr std::uint32_t kMlaTile = 1024U;
+constexpr std::uint32_t kMlaTile = 256U;
 
 /// Maps a stored GGUF type onto the F16 WMMA tier (dense projections and
 /// routed experts). The block formats are decoded in-kernel; F32/F16 tensors

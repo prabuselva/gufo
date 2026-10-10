@@ -48,8 +48,13 @@ if (ENGINE_ENABLE_HIP)
     POSITION_INDEPENDENT_CODE ON)
   target_include_directories(gufo_ling3_flash_kernels PUBLIC
     ${PROJECT_SOURCE_DIR})
+  # The fused MLA prefill kernel spills 316 B/lane to scratch (DRAM) when
+  # NDEBUG is active: the allocator schedules a pathological region once the
+  # host-side assert paths vanish, and the kernel runs ~6x slower streaming
+  # register spills. -UNDEBUG restores spill-free codegen; keep it on the
+  # whole kernels target so no future kernel inherits the same artifact.
   target_compile_options(gufo_ling3_flash_kernels PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-UNDEBUG;-fno-finite-math-only;-Wno-unused-command-line-argument>)
   target_link_libraries(gufo_ling3_flash_kernels PUBLIC hip::host)
 
   # Host-side driver: streams the artifact to the GPU and runs the trunk and

@@ -27,6 +27,49 @@ __device__ __forceinline__ float WarpSumFloat(float value) {
   return value;
 }
 
+__device__ __forceinline__ double WarpSumDouble(double value) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    value += __shfl_xor_sync(~0ULL, value, off);
+  }
+  return value;
+}
+
+__device__ __forceinline__ float BlockMaxFloat(float value, float* red) {
+  const float local = WarpMaxFloat(value);
+  if ((threadIdx.x & 31U) == 0U) {
+    red[threadIdx.x >> 5] = local;
+  }
+  __syncthreads();
+  if (threadIdx.x < 32U) {
+    const float v =
+        (threadIdx.x < (blockDim.x >> 5)) ? red[threadIdx.x] : kNegInf;
+    const float m = WarpMaxFloat(v);
+    if (threadIdx.x == 0U) {
+      red[0] = m;
+    }
+  }
+  __syncthreads();
+  return red[0];
+}
+
+__device__ __forceinline__ float BlockSumFloat(float value, float* red) {
+  const float local = WarpSumFloat(value);
+  if ((threadIdx.x & 31U) == 0U) {
+    red[threadIdx.x >> 5] = local;
+  }
+  __syncthreads();
+  if (threadIdx.x < 32U) {
+    const float v = (threadIdx.x < (blockDim.x >> 5)) ? red[threadIdx.x] : 0.0F;
+    const float s = WarpSumFloat(v);
+    if (threadIdx.x == 0U) {
+      red[0] = s;
+    }
+  }
+  __syncthreads();
+  return red[0];
+}
+
 __global__ void MlaDecodePartialKernel(
     const float* __restrict__ q_abs, const float* __restrict__ kv,
     const float* __restrict__ kpe, std::uint32_t n_pos, std::uint32_t tile,
@@ -119,6 +162,169 @@ __global__ void MlaDecodePartialKernel(
   }
 }
 
+// Fast decode path: one block scores a four-head group over one position
+// tile. Stages rows in short chunks with coalesced float4 copies, scores one
+// (row, head) pair per warp from shared memory and reuses the staged rows,
+// with their per-head exponentials, for the latent mix. Every reduced sum
+// keeps at most a chunk-length run of fp32 fused products before widening to
+// fp64 (RDNA vector fp64 is far slower), which stays well inside the fp64
+// oracle tolerance. The scalar kernel above remains the fallback for shapes
+// that are not float4-shaped or use tiles longer than kDecodeMaxTile.
+constexpr std::uint32_t kDecodeGroup = 4U;
+constexpr std::uint32_t kDecodeRows = 8U;
+constexpr std::uint32_t kDecodeRowStride = 640U;
+constexpr std::uint32_t kDecodeMaxTile = 256U;
+
+__device__ __forceinline__ void StageDecodeRows(
+    float* s_base, std::uint32_t rows, const float* __restrict__ kv,
+    const float* __restrict__ kpe, std::size_t first_row, std::uint32_t kv_rank,
+    std::uint32_t rotary) {
+  const std::uint32_t kv4 = kv_rank >> 2U;
+  const std::uint32_t half4 = kv4 + (rotary >> 2U);
+  for (std::uint32_t p = threadIdx.x; p < rows * half4; p += blockDim.x) {
+    const std::uint32_t t = p / half4;
+    const std::uint32_t c = p - t * half4;
+    const std::size_t row = first_row + t;
+    const float4 v =
+        (c < kv4)
+            ? reinterpret_cast<const float4*>(kv + row * kv_rank)[c]
+            : reinterpret_cast<const float4*>(kpe + row * rotary)[c - kv4];
+    reinterpret_cast<float4*>(s_base + static_cast<std::size_t>(t) *
+                                           kDecodeRowStride)[c] = v;
+  }
+}
+
+__global__ void MlaDecodePartialGroupKernel(
+    const float* __restrict__ q_abs, const float* __restrict__ kv,
+    const float* __restrict__ kpe, std::uint32_t n_pos, std::uint32_t tile,
+    float scale, float* __restrict__ workspace, std::uint32_t heads,
+    std::uint32_t kv_rank, std::uint32_t rotary) {
+  __shared__ float s_row[kDecodeRows][kDecodeRowStride];
+  __shared__ float s_scores[kDecodeGroup][kDecodeMaxTile];
+  __shared__ float s_red[kDecodeGroup][32];
+  __shared__ float s_meta[kDecodeGroup][2];
+  const std::uint32_t row_dim = kv_rank + rotary;
+  const std::uint32_t row4 = row_dim >> 2U;
+  const std::uint32_t h0 = blockIdx.x * kDecodeGroup;
+  const std::uint32_t tile_idx = blockIdx.y;
+  const std::uint32_t tile_begin = tile_idx * tile;
+  const std::uint32_t tile_len = min(tile, n_pos - tile_begin);
+  const std::uint32_t tid = threadIdx.x;
+
+  // Pass A: scaled scores for this tile.
+  for (std::uint32_t base = 0; base < tile_len; base += kDecodeRows) {
+    const std::uint32_t rows =
+        tile_len - base < kDecodeRows ? tile_len - base : kDecodeRows;
+    __syncthreads();
+    StageDecodeRows(&s_row[0][0], rows, kv, kpe,
+                    static_cast<std::size_t>(tile_begin) + base, kv_rank,
+                    rotary);
+    __syncthreads();
+    const std::uint32_t jobs = rows * kDecodeGroup;
+    for (std::uint32_t job = tid >> 5U; job < jobs; job += blockDim.x >> 5U) {
+      const std::uint32_t t = job >> 2U;
+      const std::uint32_t g = job & 3U;
+      const float4* q = reinterpret_cast<const float4*>(
+          q_abs + static_cast<std::size_t>(h0 + g) * row_dim);
+      const float4* row = reinterpret_cast<const float4*>(&s_row[t][0]);
+      float pacc = 0.0F;
+      for (std::uint32_t c = tid & 31U; c < row4; c += 32U) {
+        const float4 a = row[c];
+        const float4 b = q[c];
+        pacc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+      }
+      double acc = WarpSumDouble(static_cast<double>(pacc));
+      if ((tid & 31U) == 0U) {
+        s_scores[g][base + t] = static_cast<float>(acc * scale);
+      }
+    }
+  }
+  __syncthreads();
+
+  // Per-head tile maximum, then replace the scores with their exponentials.
+  for (std::uint32_t g = 0; g < kDecodeGroup; ++g) {
+    float local_max = kNegInf;
+    for (std::uint32_t t = tid; t < tile_len; t += blockDim.x) {
+      local_max = fmaxf(local_max, s_scores[g][t]);
+    }
+    const float tile_max = BlockMaxFloat(local_max, s_red[g]);
+    float local_sum = 0.0F;
+    for (std::uint32_t t = tid; t < tile_len; t += blockDim.x) {
+      const float e = ::expf(s_scores[g][t] - tile_max);
+      s_scores[g][t] = e;
+      local_sum += e;
+    }
+    const float tile_sum = BlockSumFloat(local_sum, s_red[g]);
+    if (tid == 0U) {
+      s_meta[g][0] = tile_max;
+      s_meta[g][1] = tile_sum;
+    }
+  }
+
+  // Pass B: reuse every staged row for the latent mix of all four heads in
+  // the same ascending position order as the scalar kernel. Each chunk
+  // accumulates fp32 products per latent dimension and widens into a
+  // tile-long fp64 accumulator.
+  double acc[2][kDecodeGroup];
+  for (std::uint32_t i = 0; i < 2U; ++i) {
+#pragma unroll
+    for (std::uint32_t g = 0; g < kDecodeGroup; ++g) {
+      acc[i][g] = 0.0;
+    }
+  }
+  for (std::uint32_t base = 0; base < tile_len; base += kDecodeRows) {
+    const std::uint32_t rows =
+        tile_len - base < kDecodeRows ? tile_len - base : kDecodeRows;
+    __syncthreads();
+    StageDecodeRows(&s_row[0][0], rows, kv, kpe,
+                    static_cast<std::size_t>(tile_begin) + base, kv_rank,
+                    rotary);
+    __syncthreads();
+    for (std::uint32_t i = 0; i < 2U; ++i) {
+      const std::uint32_t r = tid + i * blockDim.x;
+      if (r >= kv_rank) {
+        continue;
+      }
+      float pacc[kDecodeGroup];
+#pragma unroll
+      for (std::uint32_t g = 0; g < kDecodeGroup; ++g) {
+        pacc[g] = 0.0F;
+      }
+      for (std::uint32_t t = 0; t < rows; ++t) {
+        const float v = s_row[t][r];
+#pragma unroll
+        for (std::uint32_t g = 0; g < kDecodeGroup; ++g) {
+          pacc[g] += s_scores[g][base + t] * v;
+        }
+      }
+#pragma unroll
+      for (std::uint32_t g = 0; g < kDecodeGroup; ++g) {
+        acc[i][g] += static_cast<double>(pacc[g]);
+      }
+    }
+  }
+  __syncthreads();
+  for (std::uint32_t i = 0; i < 2U; ++i) {
+    const std::uint32_t r = tid + i * blockDim.x;
+    if (r >= kv_rank) {
+      continue;
+    }
+#pragma unroll
+    for (std::uint32_t g = 0; g < kDecodeGroup; ++g) {
+      workspace[(static_cast<std::size_t>(tile_idx) * heads + h0 + g) *
+                    (kv_rank + 2U) +
+                2U + r] = static_cast<float>(acc[i][g]);
+    }
+  }
+  if (tid < kDecodeGroup) {
+    float* out =
+        workspace + (static_cast<std::size_t>(tile_idx) * heads + h0 + tid) *
+                        (kv_rank + 2U);
+    out[0] = s_meta[tid][0];
+    out[1] = s_meta[tid][1];
+  }
+}
+
 __global__ void MlaDecodeCombineKernel(const float* __restrict__ workspace,
                                        std::uint32_t tiles, std::uint32_t heads,
                                        std::uint32_t kv_rank,
@@ -191,6 +397,142 @@ constexpr std::uint32_t kPrefillQT = 32;
 constexpr std::uint32_t kPrefillKT = 8;
 constexpr std::uint32_t kPrefillMaxKv = 512;
 constexpr std::uint32_t kPrefillMaxRot = 64;
+
+// Fast prefill path. Each block covers a 32-query tile for one head with
+// eight warps; a warp owns four consecutive query rows. Query entries (16
+// latent dims plus the two rope dims the lane covers) and the warp lane's
+// 16 output accumulators live in registers for the whole loop, so key/value
+// rows stream through a 16-row shared-memory tile exactly once and scores
+// never touch shared memory. QK dots reduce with a butterfly, the online
+// softmax state stays in registers, and each lane writes back the same
+// accumulator slice it maintained. Ascending key order is preserved;
+// the kernel above remains the fallback for other shapes.
+constexpr std::uint32_t kPrefillFusedWarpQ = 4U;
+constexpr std::uint32_t kPrefillFusedKT = 16U;
+constexpr std::uint32_t kPrefillFusedWarps = 8U;
+constexpr std::uint32_t kPrefillFusedQTile = kPrefillFusedWarpQ * 8U;
+constexpr std::uint32_t kPrefillFusedKv = 512U;     // Ling3 MLA latent rank
+constexpr std::uint32_t kPrefillFusedKvSlot = 16U;  // kPrefillFusedKv / 32
+
+// KvSlice is a compile-time constant so the per-lane query and accumulator
+// arrays stay in registers.
+template<std::uint32_t KvSlice>
+__global__ void MlaPrefillFusedKernel(
+    const float* __restrict__ q_abs, const float* __restrict__ q_rope,
+    const float* __restrict__ kv, const float* __restrict__ kpe,
+    float* __restrict__ latent, std::uint32_t start_pos, std::uint32_t tokens,
+    std::uint32_t heads, std::uint32_t kv_rank, std::uint32_t rotary,
+    float scale) {
+  constexpr std::uint32_t kStride = kPrefillMaxKv + kPrefillMaxRot;
+  __shared__ float s_kv[kPrefillFusedKT][kStride];
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t h = blockIdx.x;
+  const std::uint32_t q0 = blockIdx.y * kPrefillFusedQTile;
+  const std::uint32_t q_last = min(q0 + kPrefillFusedQTile, tokens);
+  const std::uint32_t row_dim = kv_rank + rotary;
+
+  const std::uint32_t warp = tid >> 5U;
+  const std::uint32_t wi0 = q0 + warp * kPrefillFusedWarpQ;
+  // Beyond-tile warps must still stage shared rows: the staging loop strides
+  // by blockDim, so an exited warp would leave its slice stale. They only
+  // skip their own compute via the causal skip below.
+  const bool warp_active = wi0 < q_last;
+  // Per-lane query slices: dims lane + 32*i for the latent part and
+  // lane + 32*(i - slice) for the rope part.
+  float qreg[kPrefillFusedWarpQ][KvSlice];
+  float qrot[kPrefillFusedWarpQ][2U];
+  float acc[kPrefillFusedWarpQ][KvSlice];
+  float rmax[kPrefillFusedWarpQ];
+  float rsum[kPrefillFusedWarpQ];
+  for (std::uint32_t i = 0; i < kPrefillFusedWarpQ; ++i) {
+    const std::uint32_t token = wi0 + i;
+    const bool valid = token < q_last;
+    const std::size_t qo =
+        (static_cast<std::size_t>(valid ? token : q0) * heads + h) * kv_rank;
+    const std::size_t ro =
+        (static_cast<std::size_t>(valid ? token : q0) * heads + h) * rotary;
+    for (std::uint32_t d = 0; d < KvSlice; ++d) {
+      qreg[i][d] = valid ? q_abs[qo + lane + 32U * d] : 0.0F;
+      acc[i][d] = 0.0F;
+    }
+    qrot[i][0U] = valid ? q_rope[ro + lane] : 0.0F;
+    qrot[i][1U] = valid ? q_rope[ro + lane + 32U] : 0.0F;
+    rmax[i] = kNegInf;
+    rsum[i] = 0.0F;
+  }
+
+  const std::uint32_t causal_max = start_pos + q_last;
+  for (std::uint32_t base = 0; base < causal_max; base += kPrefillFusedKT) {
+    __syncthreads();
+    for (std::uint32_t idx = tid; idx < kPrefillFusedKT * row_dim;
+         idx += blockDim.x) {
+      const std::uint32_t k = idx / row_dim;
+      const std::uint32_t d = idx % row_dim;
+      const std::uint32_t j = base + k;
+      s_kv[k][d] =
+          (j < causal_max)
+              ? ((d < kv_rank) ? kv[static_cast<std::size_t>(j) * kv_rank + d]
+                               : kpe[static_cast<std::size_t>(j) * rotary +
+                                     (d - kv_rank)])
+              : 0.0F;
+    }
+    __syncthreads();
+
+    const std::uint32_t rows = causal_max - base < kPrefillFusedKT
+                                   ? causal_max - base
+                                   : kPrefillFusedKT;
+    const std::uint32_t qend =
+        wi0 + kPrefillFusedWarpQ < q_last ? wi0 + kPrefillFusedWarpQ : q_last;
+    if (!warp_active || base >= start_pos + qend) {
+      continue;  // Every row of this warp is causally beyond the chunk.
+    }
+#pragma unroll 4
+    for (std::uint32_t k = 0; k < rows; ++k) {
+      for (std::uint32_t i = 0; i < kPrefillFusedWarpQ; ++i) {
+        const std::uint32_t token = wi0 + i;
+        // Two independent partial dots halve the serial fp32 adder chain;
+        // each chain covers one half of the latent slice plus one rope dim.
+        float pa = qrot[i][0U] * s_kv[k][kv_rank + lane];
+        float pb = qrot[i][1U] * s_kv[k][kv_rank + lane + 32U];
+        for (std::uint32_t d = 0; d < KvSlice / 2U; ++d) {
+          pa += qreg[i][d] * s_kv[k][lane + 32U * d];
+          pb += qreg[i][d + KvSlice / 2U] *
+                s_kv[k][lane + 32U * (d + KvSlice / 2U)];
+        }
+        float p = pa + pb;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          p += __shfl_xor_sync(~0ULL, p, off);
+        }
+        float score = p * scale;
+        if (token >= q_last || base + k > start_pos + token) {
+          score = kNegInf;
+        }
+        const float m = fmaxf(rmax[i], score);
+        const float corr = (rmax[i] == kNegInf) ? 0.0F : ::expf(rmax[i] - m);
+        const float e = (score == kNegInf) ? 0.0F : ::expf(score - m);
+        rsum[i] = rsum[i] * corr + e;
+        rmax[i] = m;
+        for (std::uint32_t d = 0; d < KvSlice; ++d) {
+          acc[i][d] = acc[i][d] * corr + e * s_kv[k][lane + 32U * d];
+        }
+      }
+    }
+  }
+
+  for (std::uint32_t i = 0; i < kPrefillFusedWarpQ; ++i) {
+    const std::uint32_t token = wi0 + i;
+    if (token >= q_last) {
+      continue;
+    }
+    const std::size_t lo =
+        (static_cast<std::size_t>(token) * heads + h) * kv_rank;
+    for (std::uint32_t d = 0; d < KvSlice; ++d) {
+      latent[lo + lane + 32U * d] = acc[i][d] / rsum[i];
+    }
+  }
+}
 
 __global__ void MlaPrefillKernel(const float* __restrict__ q_abs,
                                  const float* __restrict__ q_rope,
@@ -321,6 +663,14 @@ void MlaDecodePartial(const float* q_abs, const float* kv, const float* kpe,
                       std::uint32_t kv_rank, std::uint32_t rotary,
                       hipStream_t stream) {
   const std::uint32_t tiles = MlaDecodeTiles(n_pos, tile);
+  if ((heads % kDecodeGroup) == 0U && (kv_rank & 3U) == 0U &&
+      (rotary & 3U) == 0U && kv_rank + rotary <= kDecodeRowStride &&
+      kv_rank <= 2U * 256U && tile <= kDecodeMaxTile) {
+    MlaDecodePartialGroupKernel<<<dim3(heads / kDecodeGroup, tiles), 256, 0,
+                                  stream>>>(q_abs, kv, kpe, n_pos, tile, scale,
+                                            workspace, heads, kv_rank, rotary);
+    return;
+  }
   MlaDecodePartialKernel<<<dim3(tiles, heads), 256, 0, stream>>>(
       q_abs, kv, kpe, n_pos, tile, scale, workspace, heads, kv_rank, rotary);
 }
@@ -338,6 +688,15 @@ void MlaPrefill(const float* q_abs, const float* q_rope, const float* kv,
                 std::uint32_t kv_rank, std::uint32_t rotary, float scale,
                 hipStream_t stream) {
   if (tokens == 0U || kv_rank > kPrefillMaxKv || rotary > kPrefillMaxRot) {
+    return;
+  }
+  if (kv_rank == kPrefillFusedKv && rotary == 2U * 32U) {
+    const std::uint32_t q_tiles =
+        (tokens + kPrefillFusedQTile - 1U) / kPrefillFusedQTile;
+    MlaPrefillFusedKernel<kPrefillFusedKvSlot>
+        <<<dim3(heads, q_tiles), kPrefillFusedWarps * 32U, 0, stream>>>(
+            q_abs, q_rope, kv, kpe, latent, start_pos, tokens, heads, kv_rank,
+            rotary, scale);
     return;
   }
   const std::uint32_t q_tiles = (tokens + kPrefillQT - 1U) / kPrefillQT;
