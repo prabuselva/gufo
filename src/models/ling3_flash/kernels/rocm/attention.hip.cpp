@@ -407,10 +407,11 @@ constexpr std::uint32_t kPrefillMaxRot = 64;
 // softmax state stays in registers, and each lane writes back the same
 // accumulator slice it maintained. Ascending key order is preserved;
 // the kernel above remains the fallback for other shapes.
-constexpr std::uint32_t kPrefillFusedWarpQ = 4U;
+constexpr std::uint32_t kPrefillFusedWarpQ = 2U;
 constexpr std::uint32_t kPrefillFusedKT = 16U;
-constexpr std::uint32_t kPrefillFusedWarps = 8U;
-constexpr std::uint32_t kPrefillFusedQTile = kPrefillFusedWarpQ * 8U;
+constexpr std::uint32_t kPrefillFusedWarps = 16U;
+constexpr std::uint32_t kPrefillFusedQTile =
+    kPrefillFusedWarpQ * kPrefillFusedWarps;
 constexpr std::uint32_t kPrefillFusedKv = 512U;     // Ling3 MLA latent rank
 constexpr std::uint32_t kPrefillFusedKvSlot = 16U;  // kPrefillFusedKv / 32
 
@@ -489,6 +490,13 @@ __global__ void MlaPrefillFusedKernel(
     }
 #pragma unroll 4
     for (std::uint32_t k = 0; k < rows; ++k) {
+      // Stage the key/value row into registers once; the QK dot and the PV
+      // update consume the same values, which halves shared-memory traffic
+      // per (query, key) pair without changing any operand or order.
+      float v[KvSlice];
+      for (std::uint32_t d = 0; d < KvSlice; ++d) {
+        v[d] = s_kv[k][lane + 32U * d];
+      }
       for (std::uint32_t i = 0; i < kPrefillFusedWarpQ; ++i) {
         const std::uint32_t token = wi0 + i;
         // Two independent partial dots halve the serial fp32 adder chain;
@@ -496,9 +504,8 @@ __global__ void MlaPrefillFusedKernel(
         float pa = qrot[i][0U] * s_kv[k][kv_rank + lane];
         float pb = qrot[i][1U] * s_kv[k][kv_rank + lane + 32U];
         for (std::uint32_t d = 0; d < KvSlice / 2U; ++d) {
-          pa += qreg[i][d] * s_kv[k][lane + 32U * d];
-          pb += qreg[i][d + KvSlice / 2U] *
-                s_kv[k][lane + 32U * (d + KvSlice / 2U)];
+          pa += qreg[i][d] * v[d];
+          pb += qreg[i][d + KvSlice / 2U] * v[d + KvSlice / 2U];
         }
         float p = pa + pb;
 #pragma unroll
@@ -515,7 +522,7 @@ __global__ void MlaPrefillFusedKernel(
         rsum[i] = rsum[i] * corr + e;
         rmax[i] = m;
         for (std::uint32_t d = 0; d < KvSlice; ++d) {
-          acc[i][d] = acc[i][d] * corr + e * s_kv[k][lane + 32U * d];
+          acc[i][d] = acc[i][d] * corr + e * v[d];
         }
       }
     }

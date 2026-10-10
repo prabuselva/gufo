@@ -145,6 +145,247 @@ Buffers MakeBuffers(std::uint32_t rows, std::uint32_t tokens,
 void RunVariant(bool fused, const Buffers& b, std::uint32_t start_pos,
                 std::uint32_t tokens);
 
+
+// CANDIDATE: fused-prefill variant with the staged KV row reused in
+// registers between the QK dot and the PV update. Operations and their
+// order are bit-identical to MlaPrefillFusedKernel; only LDS traffic halves.
+template<std::uint32_t KvSlice, std::uint32_t Warps, std::uint32_t WarpQ>
+__global__ void FusedKVReuse(
+    const float* __restrict__ q_abs, const float* __restrict__ q_rope,
+    const float* __restrict__ kv, const float* __restrict__ kpe,
+    float* __restrict__ latent, std::uint32_t start_pos, std::uint32_t tokens,
+    std::uint32_t heads, std::uint32_t kv_rank, std::uint32_t rotary,
+    float scale) {
+  using namespace gufo::models::ling3_flash::rocm;
+  namespace qn = gufo::models::ling3_flash::rocm;
+  constexpr std::uint32_t kStride = qn::kPrefillMaxKv + qn::kPrefillMaxRot;
+  constexpr std::uint32_t kKT = qn::kPrefillFusedKT;
+  __shared__ float s_kv[kKT][kStride];
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t h = blockIdx.x;
+  const std::uint32_t q0 = blockIdx.y * (Warps * WarpQ);
+  const std::uint32_t q_last = min(q0 + (Warps * WarpQ), tokens);
+  const std::uint32_t row_dim = kv_rank + rotary;
+  const std::uint32_t warp = tid >> 5U;
+  const std::uint32_t wi0 = q0 + warp * WarpQ;
+  const bool warp_active = wi0 < q_last;
+  float qreg[WarpQ][KvSlice];
+  float qrot[WarpQ][2U];
+  float acc[WarpQ][KvSlice];
+  float rmax[WarpQ];
+  float rsum[WarpQ];
+  for (std::uint32_t i = 0; i < WarpQ; ++i) {
+    const std::uint32_t token = wi0 + i;
+    const bool valid = token < q_last;
+    const std::size_t qo =
+        (static_cast<std::size_t>(valid ? token : q0) * heads + h) * kv_rank;
+    const std::size_t ro =
+        (static_cast<std::size_t>(valid ? token : q0) * heads + h) * rotary;
+    for (std::uint32_t d = 0; d < KvSlice; ++d) {
+      qreg[i][d] = valid ? q_abs[qo + lane + 32U * d] : 0.0F;
+      acc[i][d] = 0.0F;
+    }
+    qrot[i][0U] = valid ? q_rope[ro + lane] : 0.0F;
+    qrot[i][1U] = valid ? q_rope[ro + lane + 32U] : 0.0F;
+    rmax[i] = qn::kNegInf;
+    rsum[i] = 0.0F;
+  }
+  const std::uint32_t causal_max = start_pos + q_last;
+  for (std::uint32_t base = 0; base < causal_max; base += kKT) {
+    __syncthreads();
+    for (std::uint32_t idx = tid; idx < kKT * row_dim; idx += blockDim.x) {
+      const std::uint32_t k = idx / row_dim;
+      const std::uint32_t d = idx % row_dim;
+      const std::uint32_t j = base + k;
+      s_kv[k][d] = (j < causal_max)
+                       ? ((d < kv_rank)
+                              ? kv[static_cast<std::size_t>(j) * kv_rank + d]
+                              : kpe[static_cast<std::size_t>(j) * rotary +
+                                    (d - kv_rank)])
+                       : 0.0F;
+    }
+    __syncthreads();
+    const std::uint32_t rows =
+        causal_max - base < kKT ? causal_max - base : kKT;
+    const std::uint32_t qend =
+        wi0 + WarpQ < q_last ? wi0 + WarpQ : q_last;
+    if (!warp_active || base >= start_pos + qend) {
+      continue;
+    }
+#pragma unroll 4
+    for (std::uint32_t k = 0; k < rows; ++k) {
+      float v[KvSlice];
+      for (std::uint32_t d = 0; d < KvSlice; ++d) {
+        v[d] = s_kv[k][lane + 32U * d];
+      }
+      for (std::uint32_t i = 0; i < WarpQ; ++i) {
+        const std::uint32_t token = wi0 + i;
+        float pa = qrot[i][0U] * s_kv[k][kv_rank + lane];
+        float pb = qrot[i][1U] * s_kv[k][kv_rank + lane + 32U];
+        for (std::uint32_t d = 0; d < KvSlice / 2U; ++d) {
+          pa += qreg[i][d] * v[d];
+          pb += qreg[i][d + KvSlice / 2U] * v[d + KvSlice / 2U];
+        }
+        float p = pa + pb;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          p += __shfl_xor_sync(~0ULL, p, off);
+        }
+        float score = p * scale;
+        if (token >= q_last || base + k > start_pos + token) {
+          score = qn::kNegInf;
+        }
+        const float m = fmaxf(rmax[i], score);
+        const float corr =
+            (rmax[i] == qn::kNegInf) ? 0.0F : ::expf(rmax[i] - m);
+        const float e = (score == qn::kNegInf) ? 0.0F : ::expf(score - m);
+        rsum[i] = rsum[i] * corr + e;
+        rmax[i] = m;
+        for (std::uint32_t d = 0; d < KvSlice; ++d) {
+          acc[i][d] = acc[i][d] * corr + e * v[d];
+        }
+      }
+    }
+  }
+  for (std::uint32_t i = 0; i < WarpQ; ++i) {
+    const std::uint32_t token = wi0 + i;
+    if (token >= q_last) {
+      continue;
+    }
+    const std::size_t lo =
+        (static_cast<std::size_t>(token) * heads + h) * kv_rank;
+    for (std::uint32_t d = 0; d < KvSlice; ++d) {
+      latent[lo + lane + 32U * d] = acc[i][d] / rsum[i];
+    }
+  }
+}
+
+// Runs candidate 0 = shipped fused, 1 = FusedKVReuse.
+void RunCand(int cand, const Buffers& b, std::uint32_t start_pos,
+             std::uint32_t tokens) {
+  const float scale = 1.0F / std::sqrt(192.0F);
+  const std::uint32_t q_tiles =
+      (tokens + q::kPrefillFusedQTile - 1U) / q::kPrefillFusedQTile;
+  if (cand == 0) {
+    q::MlaPrefillFusedKernel<q::kPrefillFusedKvSlot>
+        <<<dim3(kHeads, q_tiles), q::kPrefillFusedWarps * 32U>>>(
+            b.q, b.qr, b.kv, b.kpe, b.out, start_pos, tokens, kHeads, kKvRank,
+            kRot, scale);
+  } else if (cand == 1) {
+    FusedKVReuse<q::kPrefillFusedKvSlot, 8U, 4U>
+        <<<dim3(kHeads, q_tiles), 8U * 32U>>>(
+            b.q, b.qr, b.kv, b.kpe, b.out, start_pos, tokens, kHeads, kKvRank,
+            kRot, scale);
+  } else if (cand == 2) {
+    const std::uint32_t qt = (tokens + 32U - 1U) / 32U;
+    (void)q_tiles;
+    FusedKVReuse<q::kPrefillFusedKvSlot, 16U, 2U>
+        <<<dim3(kHeads, qt), 16U * 32U>>>(
+            b.q, b.qr, b.kv, b.kpe, b.out, start_pos, tokens, kHeads, kKvRank,
+            kRot, scale);
+  } else {
+    const std::uint32_t qt = (tokens + 64U - 1U) / 64U;
+    (void)q_tiles;
+    FusedKVReuse<q::kPrefillFusedKvSlot, 16U, 4U>
+        <<<dim3(kHeads, qt), 16U * 32U>>>(
+            b.q, b.qr, b.kv, b.kpe, b.out, start_pos, tokens, kHeads, kKvRank,
+            kRot, scale);
+  }
+}
+
+double TimeCand(int cand, const Buffers& b, std::uint32_t start_pos,
+                std::uint32_t tokens) {
+  hipEvent_t e0, e1;
+  hipEventCreate(&e0);
+  hipEventCreate(&e1);
+  RunCand(cand, b, start_pos, tokens);
+  CheckCuda(hipDeviceSynchronize(), "warm");
+  float best = 1e30F;
+  for (int r = 0; r < 3; ++r) {
+    hipEventRecord(e0);
+    for (int i = 0; i < 5; ++i) {
+      RunCand(cand, b, start_pos, tokens);
+    }
+    hipEventRecord(e1);
+    CheckCuda(hipDeviceSynchronize(), "sync");
+    float ms = 0.0F;
+    hipEventElapsedTime(&ms, e0, e1);
+    best = ms < best ? ms : best;
+  }
+  hipEventDestroy(e0);
+  hipEventDestroy(e1);
+  return static_cast<double>(best) * 1000.0 / 5.0;
+}
+
+std::vector<float> Random(std::size_t n, std::uint32_t seed);
+
+int Cand() {
+  // Shapes from real prefill: 4096-ctx chunks of 1024 and a 16384-ctx
+  // sample. Correctness gate: bit-identical to the shipped fused kernel.
+  for (auto sh : {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
+                      1024U, 4096U, 16U},
+                  {2048U, 16384U, 16U}, {2048U, 16384U, 100U}}) {
+    const std::uint32_t tok = std::get<0>(sh);
+    const std::uint32_t ctx = std::get<1>(sh);
+    const std::uint32_t nchunk = ctx / tok;
+    auto q_abs = Random(static_cast<std::size_t>(tok) * kHeads * kKvRank, 7);
+    auto q_rope = Random(static_cast<std::size_t>(tok) * kHeads * kRot, 8);
+    auto kv = Random(static_cast<std::size_t>(ctx) * kKvRank, 9);
+    auto kpe = Random(static_cast<std::size_t>(ctx) * kRot, 10);
+    for (std::uint32_t c = 0; c < nchunk; ++c) {
+      const std::uint32_t start = c * tok;
+      if (c + 1U < nchunk && c % 4U != 3U) {
+        continue;  // sample chunk depths
+      }
+      Buffers b = MakeBuffers(ctx, tok, q_abs, q_rope, kv, kpe);
+      RunCand(0, b, start, tok);
+      CheckCuda(hipDeviceSynchronize(), "r0");
+      std::vector<float> got0(static_cast<std::size_t>(tok) * kHeads *
+                                  kKvRank,
+                              0.0F);
+      CheckCuda(hipMemcpy(got0.data(), b.out, got0.size() * 4,
+                          hipMemcpyDeviceToHost),
+                "o0");
+      const double t0 = TimeCand(0, b, start, tok);
+      for (int v = 1; v <= 3; ++v) {
+        (void)hipMemset(b.out, 0, got0.size() * 4);
+        RunCand(v, b, start, tok);
+        CheckCuda(hipDeviceSynchronize(), "r1");
+        std::vector<float> got1(got0.size(), 0.0F);
+        CheckCuda(hipMemcpy(got1.data(), b.out, got1.size() * 4,
+                            hipMemcpyDeviceToHost),
+                  "o1");
+        double bits = 0.0;
+        double nans = 0.0;
+        double max_rel = 0.0;
+        for (std::size_t i = 0; i < got0.size(); ++i) {
+          if (std::isnan(got0[i]) || std::isnan(got1[i])) {
+            nans += 1.0;
+          }
+          if (got0[i] != got1[i]) {
+            bits += 1.0;
+            const double m = std::fabs(got1[i] - got0[i]);
+            max_rel = m > max_rel ? m : max_rel;
+          }
+        }
+        const double tv = TimeCand(v, b, start, tok);
+        std::printf(
+            "  tok=%4u ctx=%5u start=%5u v%d  bitdiff=%.0f/%zu maxabs %.1e"
+            " nans %.0f   fused %9.1f -> %9.1f us  gain %5.2fx\n",
+            tok, ctx, start, v, bits, got0.size(), max_rel, nans, t0, tv,
+            t0 / tv);
+      }
+      hipFree(b.q);
+      hipFree(b.qr);
+      hipFree(b.kv);
+      hipFree(b.kpe);
+      hipFree(b.out);
+    }
+  }
+  return 0;
+}
+
 // Replay the real engine-dumped (GUFO_MLA_DUMP) chunk records: one line in
 // meta per record followed by q, q_rope, kv, kpe float blocks in data file.
 int ReplayReal(const std::string& data_path, const std::string& meta_path) {
@@ -358,6 +599,9 @@ int Replay(const std::string& args) {
 int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "replay") {
     return Replay(argc > 2 ? std::string(argv[2]) : std::string());
+  }
+  if (argc > 1 && std::string(argv[1]) == "cand") {
+    return Cand();
   }
   const bool quick = argc > 1;
   bool ok = true;
