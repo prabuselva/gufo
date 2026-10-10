@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "src/models/ling3_flash/kernels/rocm/attention.hpp"
 #include "src/models/ling3_flash/kernels/rocm/gemv.hpp"
@@ -45,32 +46,43 @@ bool WeightTypeOf(core::GgmlType t, WeightType* out) {
   }
 }
 
-/// True when every matrix the chunked-prefill tier projects with can be
-/// decoded by the F16 WMMA tier; a trunk holding a Q4_0 projection falls
-/// back to the per-token path in Prefill instead of failing Create.
-/// ssm_beta is excluded (it runs on the GEMV tier), and the swiglu gate
-/// variant only instantiates three decoders.
-bool DenseTierCovers(const DeviceLayer& l) {
+/// True when every matrix the chunked-prefill tier projects for one layer
+/// can be decoded by the F16 WMMA tier; a trunk format it cannot decode
+/// falls back to the per-token path in Prefill instead of failing Create.
+/// Only the projections this layer kind actually uses are checked: KDA
+/// layers hold no MLA tensors and vice versa, and ssm_beta (F32) plus the
+/// router run on the GEMV tier. The swiglu gate variant only instantiates
+/// three decoders.
+bool DenseTierCovers(const Config& c, std::uint32_t il, const DeviceLayer& l) {
   WeightType w;
-  const core::GgmlType types[] = {
-      l.attn_q.type,   l.attn_kv_a.type,     l.attn_gate.type,
-      l.attn_out.type, l.ssm_q.type,         l.ssm_k.type,
-      l.ssm_v.type,    l.ssm_f.type,         l.ssm_g.type,
-      l.ssm_out.type,  l.ffn_gate.type,      l.ffn_up.type,
-      l.ffn_down.type, l.ffn_down_exps.type, l.shexp_gate.type,
-      l.shexp_up.type, l.shexp_down.type,
-  };
+  std::vector<core::GgmlType> types;
+  if (c.IsMlaLayer(il)) {
+    types = {l.attn_q.type, l.attn_kv_a.type, l.attn_gate.type,
+             l.attn_out.type};
+  } else {
+    types = {l.ssm_q.type, l.ssm_k.type, l.ssm_v.type,
+             l.ssm_f.type, l.ssm_g.type, l.ssm_out.type};
+  }
+  if (c.IsDenseFfnLayer(il)) {
+    types.insert(types.end(),
+                 {l.ffn_gate.type, l.ffn_up.type, l.ffn_down.type});
+  } else {
+    types.insert(types.end(), {l.ffn_down_exps.type, l.shexp_gate.type,
+                               l.shexp_up.type, l.shexp_down.type});
+  }
   for (const core::GgmlType t : types) {
     if (!WeightTypeOf(t, &w)) {
       return false;
     }
   }
-  const core::GgmlType gated[] = {l.ffn_gate_exps.type, l.ffn_up_exps.type};
-  for (const core::GgmlType t : gated) {
-    if (!WeightTypeOf(t, &w) ||
-        (t != core::GgmlType::kQ4_K && t != core::GgmlType::kQ8_0 &&
-         t != core::GgmlType::kBF16)) {
-      return false;
+  if (!c.IsDenseFfnLayer(il)) {
+    const core::GgmlType gated[] = {l.ffn_gate_exps.type, l.ffn_up_exps.type};
+    for (const core::GgmlType t : gated) {
+      if (!WeightTypeOf(t, &w) ||
+          (t != core::GgmlType::kQ4_K && t != core::GgmlType::kQ8_0 &&
+           t != core::GgmlType::kBF16)) {
+        return false;
+      }
     }
   }
   return true;
@@ -405,7 +417,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                 c.num_heads, nullptr);
   FillModuloIds(e->pf_zero_ids_, static_cast<std::uint32_t>(cap), 1U, nullptr);
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-    if (!DenseTierCovers(model.layers()[il])) {
+    if (!DenseTierCovers(c, il, model.layers()[il])) {
       break;
     }
     if (il + 1U == c.num_layers) {
