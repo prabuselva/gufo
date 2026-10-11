@@ -53,3 +53,15 @@ Prefill still decays 833→402 t/s from 2K→16K depth, driven by the same
 attention kernel. `#pragma unroll 4` on the key loop
 now warns (`loop not unrolled`) in the 16-warp form; harmless, revisit if the
 loop is touched again.
+Reference refresh (llama.cpp b11557, ROCm + Vulkan, October 12,
+`BENCHMARKS.md`): the 2K→16K decay is *not* a hardware ceiling — llama.cpp
+holds 659→507 (ROCm) / 619→504 (Vulkan) over the same depth range where Gufo
+falls 840→402, putting Gufo 20% behind at pp16384 after its +27%/+36% lead
+at pp2048. On decode, llama.cpp's Vulkan path runs 41.4–41.6 t/s cold
+against Gufo's 33.6 (tg128) / 32.4 (tg1024); their tg1024 is no slower than
+tg128, and their pp2048+tg blends imply rate-consistent cold-level decode at
+depth (b11557 reports only blended pair rates), while Gufo loses a further ~4–6% preparing a
+2048-token frontier before timed generation (`--n-prompt 0 --n-gen 128,1024
+-d 2048`: 31.40/31.35). The decode-frontier depth cost (`MlaDecodePartial`
+scan shape, `KdaDeltaKernel` state readout) is the concrete follow-up; the
+prefill decay remains the biggest known gap to the reference.
