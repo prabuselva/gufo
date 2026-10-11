@@ -3,9 +3,9 @@
 AMD Strix Halo `gfx1151`, 128 GB unified memory.
 `Ling-3.0-flash-Q4_K_M` (two-shard GGUF). Gufo `bench`, exclusive GPU
 (`tools/bench/gpu_exclusive.sh`), greedy. Latest column: October 11, 2026,
-working-tree routed-GEMM live-token-tile change; pp cells are medians of two
-matched ABBA reps against the `9b1434ca` binary in the same exclusive
-sessions, tg1024 medians of three. llama.cpp reference: October 11,
+bit-exact parallel router top-k; all cells are means of the two matched
+ABBA reps against the `b59fdf3a` binary within the same full-recipe
+exclusive runs (`gufo_bench_rrfull`). llama.cpp reference: October 11,
 `pp` cells only, matched model and prompt length.
 
 Positive gain favors Gufo. [Quality evidence](QUALITY.md) ·
@@ -13,19 +13,18 @@ Positive gain favors Gufo. [Quality evidence](QUALITY.md) ·
 
 ## Prefill and decode
 
-| Cell | Gufo pp/tg (tok/s) | prev Gufo (`9b1434ca`) | Δ | llama.cpp (tok/s) | Gain |
+| Cell | Gufo pp/tg (tok/s) | prev Gufo (`b59fdf3a`) | Δ | llama.cpp (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| pp2048 | 832.56 | 802.74 | +3.7% | 605.92 | +37.4% |
-| pp4096 | 735.71 | 714.66 | +2.9% | 551.23 | +33.5% |
-| pp8192 | 578.04 | 562.12 | +2.8% | 496.35 | +16.5% |
-| pp16384 | 401.51 | 395.30 | +1.6% | — | — |
-| tg128 | 30.45 | 30.45 | — | — | — |
-| tg1024 | 28.95 | 28.56 | +1.4% | — | — |
+| pp2048 | 836.79 | 809.03 | +3.4% | 605.92 | +38.1% |
+| pp4096 | 738.07 | 715.15 | +3.2% | 551.23 | +33.9% |
+| pp8192 | 575.05 | 563.95 | +2.0% | 496.35 | +15.9% |
+| pp16384 | 393.45 | 388.38 | +1.3% | — | — |
+| tg128 | 32.58 | 30.10 | +8.2% | — | — |
+| tg1024 | 31.47 | 29.24 | +7.6% | — | — |
 
-The routed-GEMM change leaves decode on the unchanged GEMV path: matched
-tg1024 runs overlapped (base 28.53/28.95/28.75, candidate 29.18/28.75/28.95),
-so the tg delta is noise, not a gain; tg128 is carried forward from
-`9b1434ca` un-re-measured.
+Both decode cells separate cleanly (new min above prev max in the matched
+ABBA order). pp16384 is noisy in both binaries (spread ≈4%, orders overlap);
+its direction matches the other pp cells but the magnitude is within noise.
 
 ## Measurement detail
 
@@ -35,8 +34,10 @@ tools/bench/bench_bg.sh <name> <s> build/release/gufo bench \
   --n-prompt 2048,4096,8192,16384 --n-gen 128,1024
 ```
 
-Raw logs: `/tmp/opencode/gufo_bench_e2eab.log`,
-`/tmp/opencode/gufo_bench_e2etg.log` (current),
+Raw logs: `/tmp/opencode/gufo_bench_rrfull.log` (current, matched ABBA full
+recipe), `/tmp/opencode/gufo_bench_rrabba2.log` (decode-only pair),
+`/tmp/opencode/gufo_bench_e2eab.log`,
+`/tmp/opencode/gufo_bench_e2etg.log`,
 `/tmp/opencode/gufo_bench_w16e2e.log` (`9b1434ca`),
 `/tmp/opencode/gufo_bench_final.log` (`473c946b`).
 Kernel-level microbenchmarks: `tools/bench/ling3_mla_prefill_bench.hip`

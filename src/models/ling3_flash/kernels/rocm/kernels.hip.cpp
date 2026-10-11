@@ -49,6 +49,51 @@ __device__ __forceinline__ double BlockSumDouble(double value, double* smem) {
   return smem[0];
 }
 
+/// Block-wide argmax over one candidate per thread, choosing the lowest index
+/// on exact-value ties; reproduces a first-strict-max ascending scan of an
+/// array by a single thread. `vsm`/`ism` need (blockDim.x + 31) / 32 + 1
+/// entries and the caller must sync before the next call on the same arrays.
+__device__ __forceinline__ std::uint32_t BlockArgMax(float v, std::uint32_t idx,
+                                                     float* vsm,
+                                                     std::uint32_t* ism) {
+  const unsigned lane = threadIdx.x & 31U;
+  const unsigned warp = threadIdx.x >> 5;
+  const unsigned warps = (blockDim.x + 31U) >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_down_sync(~0ULL, v, off);
+    const std::uint32_t oi = __shfl_down_sync(~0ULL, idx, off);
+    if (ov > v || (ov == v && oi < idx)) {
+      v = ov;
+      idx = oi;
+    }
+  }
+  if (lane == 0U) {
+    vsm[warp] = v;
+    ism[warp] = idx;
+  }
+  __syncthreads();
+  if (warp == 0U) {
+    const bool owned = lane < warps;
+    v = owned ? vsm[lane] : kNegInf;
+    idx = owned ? ism[lane] : 0xFFFFFFFFU;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(~0ULL, v, off);
+      const std::uint32_t oi = __shfl_down_sync(~0ULL, idx, off);
+      if (ov > v || (ov == v && oi < idx)) {
+        v = ov;
+        idx = oi;
+      }
+    }
+    if (lane == 0U) {
+      ism[warps] = idx;
+    }
+  }
+  __syncthreads();
+  return ism[warps];
+}
+
 __global__ void RmsNormKernel(const float* __restrict__ x,
                               const float* __restrict__ w, float eps,
                               float* __restrict__ out, std::uint32_t n) {
@@ -645,6 +690,9 @@ __global__ void RouterTopKKernel(const float* __restrict__ logits,
   ids += static_cast<std::size_t>(row) * used;
   weights += static_cast<std::size_t>(row) * used;
   const std::uint32_t per_group = n_exp / groups;
+  __shared__ bool keep[64];
+  __shared__ float red_v[20];
+  __shared__ std::uint32_t red_i[20];
   for (std::uint32_t e = threadIdx.x; e < n_exp; e += blockDim.x) {
     probs[e] = SigmoidD(logits[e]);
     selection[e] = probs[e] + bias[e];
@@ -668,24 +716,20 @@ __global__ void RouterTopKKernel(const float* __restrict__ logits,
       group_scores[g] = best + second;
     }
     __syncthreads();
-    __shared__ bool keep[64];
-    if (threadIdx.x == 0U) {
-      for (std::uint32_t g = 0; g < groups; ++g) {
-        keep[g] = false;
-      }
-      for (std::uint32_t s = 0; s < groups_used; ++s) {
-        std::uint32_t best_g = 0U;
-        float best = kNegInf;
-        for (std::uint32_t g = 0; g < groups; ++g) {
-          if (!keep[g] && group_scores[g] > best) {
-            best = group_scores[g];
-            best_g = g;
-          }
-        }
-        keep[best_g] = true;
-      }
+    if (threadIdx.x < groups) {
+      keep[threadIdx.x] = false;
     }
     __syncthreads();
+    for (std::uint32_t s = 0; s < groups_used; ++s) {
+      const std::uint32_t g = threadIdx.x;
+      const std::uint32_t best_g =
+          BlockArgMax((g < groups && !keep[g]) ? group_scores[g] : kNegInf, g,
+                      red_v, red_i);
+      if (threadIdx.x == best_g) {
+        keep[best_g] = true;
+      }
+      __syncthreads();
+    }
     for (std::uint32_t g = threadIdx.x; g < groups; g += blockDim.x) {
       if (!keep[g]) {
         for (std::uint32_t i = 0; i < per_group; ++i) {
@@ -695,22 +739,31 @@ __global__ void RouterTopKKernel(const float* __restrict__ logits,
     }
     __syncthreads();
   }
-  if (threadIdx.x == 0U) {
-    double sum = 0.0;
-    for (std::uint32_t s = 0; s < used; ++s) {
-      std::uint32_t best_e = 0U;
-      float best = kNegInf;
-      for (std::uint32_t e = 0; e < n_exp; ++e) {
-        if (selection[e] > best) {
-          best = selection[e];
-          best_e = e;
-        }
+  // Greedy top-k over experts: one block-wide (max, lowest-index) argmax per
+  // round replaces the former thread-0 serial scan chain.
+  double sum = 0.0;
+  for (std::uint32_t s = 0; s < used; ++s) {
+    float v = kNegInf;
+    std::uint32_t idx = 0xFFFFFFFFU;
+    for (std::uint32_t e = threadIdx.x; e < n_exp; e += blockDim.x) {
+      const float value = selection[e];
+      if (value > v) {
+        v = value;
+        idx = e;
       }
+    }
+    const std::uint32_t best_e = BlockArgMax(v, idx, red_v, red_i);
+    if (threadIdx.x == best_e) {
       selection[best_e] = kNegInf;
+    }
+    if (threadIdx.x == 0U) {
       ids[s] = static_cast<std::int32_t>(best_e);
       weights[s] = probs[best_e];
       sum += static_cast<double>(probs[best_e]);
     }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U) {
     const float norm = 1.0F / fmaxf(static_cast<float>(sum), kWeightsSumEps);
     for (std::uint32_t s = 0; s < used; ++s) {
       weights[s] *= norm * weights_scale;

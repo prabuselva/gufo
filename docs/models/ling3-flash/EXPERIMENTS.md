@@ -16,9 +16,18 @@
 | ISA mix of the shipped Q4_K BN64 kernels (`hipcc --cuda-device-only -S`, `tools/prof/isa_mix.py`) | Measurement only. Per whole kernel, down 3739 / gate 1758 instructions: WMMA ≈1%, packed decode 4–6%, 64-bit address math (paired `v_add_co`, `v_mad_u64_u32`, `v_lshlrev_b64`) ≈15%, f32 scale products (`v_mul_f32` 119/64, `v_fma_f32` 96/48), `s_delay_alu` fillers 17%/14%. Every remaining gain must remove issued instructions — pipeline retiming and scheduling hints are exhausted. |
 | Loop-body ISA decomposition of the KB steady loop (back-edge span analysis of the same listings) | Measurement only. The KB loop itself (down 336 instr: 16 WMMA, 96 packed decode, ~34 LDS loads, 4 global loads; gate 374 with the same shape) contains no 64-bit pointer math and no f32 scale products — the kernel-level address/f32 counts live entirely in the once-per-block prologue and peeled epilogue chains (~900-2900 instructions vs 40-80 × 350 of loop work). A buffer-load/addressing rework therefore has near-zero expected steady-state gain and was dropped before implementation. Remaining in-loop headroom: decode chain (ablation ≤7%) and WMMA staging only. |
 | `#pragma unroll 2` on the KB loop | Rejected: bit-identical (same Fnv sums), resources unchanged (114/108 VGPR, occupancy 12, no spill), but exclusive ABBA gate 3362→3404 µs (+1.2%), down 1956→1979 µs (+1.1%). Schedule slack is already covered by occupancy. |
+| Decode pass profile attribution (`tools/prof/prof.py run --stages ling3`, pp2048/tg64, exclusive; pass-204 kernel table via `prof_results.db`) | Measurement only. Decode is GEMV-tier + fixed-overhead: per token GemvGroupedQ4K 5.8 ms, GemvQ8_0 5.5, GemvQ6K 3.7, GemvQ4K 3.7, **RouterTopKKernel 2.7 ms (~9%, 40× 67.8 µs)**, GemvF32 1.7, KdaDelta 1.6; ~1911 dispatches/token, 31.2 ms kernel time vs ~13 ms DRAM roofline. |
+| Parallel `RouterTopKKernel` top-k (block-wide `BlockArgMax` (max value, lowest-index) rounds replacing the thread-0 serial group-select and expert argmax-removal scans; winner thread writes the `-inf` removal, thread-0 keeps the single-precision order-sensitive weight writes and double renorm sum) | Retained (working tree): bit-identical to the serial kernel in 112/112 randomized A/B cases (old/new extracted from git, `n_exp` 64–512, `groups` 1–64, random + adversarial-tie logits, 1 and 3 token rows; harness `/tmp/opencode/router_ab.hip`) and `ling3_flash.rocm_ops` contract pass (`RouterTopKRows` reports bit-identical, weights worst error 9.8e-8). Kernel micro (exclusive): 64.0→16.6 µs/call (−74%). The old cost was thread-0-only: `used×n_exp` + `groups_used×groups` dependent LDS scans ≈5100 ops ≈50 µs of single-thread latency chain. e2e exclusive ABBA (full recipe, `/tmp/opencode/gufo_bench_rrfull.log`): tg128 +8.2%, tg1024 +7.6% (29.24→31.47), pp +2.0…+3.4% (`RouterTopKRows` shares the kernel). |
 
-Open items: decode stays ~30 t/s versus the 37 t/s target — the MoE
-`RoutedF16GEMMKernel`/GEMV group remains the next lever; after the
+Open items: decode reaches 31.5 t/s (tg1024) after the router change, still
+short of the ~37 t/s roofline target; the remaining decode mass is the GEMV
+tier (GemvGroupedQ4K 5.8 ms, GemvQ8_0 5.5, GemvQ6K 3.7, GemvQ4K 3.7 ms/token
+at 32-58 µs/call, all one-warp-per-row with scalar
+`row[b].qs[lane]` byte loads) — the gemma4 vec4 Q8_0 pattern
+(`docs/models/gemma4/EXPERIMENTS.md`, gated `cols % 128 == 0`, +4.3% e2e
+there, quality-contract not bit-identity) is the next lever, and ~1911
+dispatches/token with ~12% pass gaps keeps launch-count reduction open. On the
+prefill side, after the
 live-token-tile skip the stage-ablation split above shows no dominant term
 (weight global loads and WMMA each recover ≤17%, the rest being pipeline
 latency), and the double-buffered LDS variant was rejected because the
