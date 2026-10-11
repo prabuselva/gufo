@@ -607,32 +607,23 @@ void Executor::MlaLayer(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
   Gemv(l.attn_kv_a.data, type, l.attn_kv_a.rows, l.attn_kv_a.cols,
        l.attn_kv_a.row_bytes, x, mla_kv_a_, nullptr);
 
-  // The latent half is RMS-normalized and appended to the cache; the rope half
-  // is rotated at this position and appended beside it. The q rope tail is
-  // rotated in place inside each 192-wide head row.
-  RmsNorm(mla_kv_a_, l.attn_kv_a_norm.f32(), c_.rms_eps, mla_kv_a_, kv_rank,
-          nullptr);
-  Rope(mla_kv_a_ + kv_rank, 1U, rot, rot, pos, c_.rope_theta, nullptr);
-  RopeStrided(mla_q_ + nope, heads, c_.mla_head_dim, rot, pos, c_.rope_theta,
-              nullptr);
-  (void)hipMemcpyAsync(kv_cache + static_cast<std::size_t>(pos) * kv_rank,
-                       mla_kv_a_, kv_rank * sizeof(float),
-                       hipMemcpyDeviceToDevice, nullptr);
-  (void)hipMemcpyAsync(kpe_cache + static_cast<std::size_t>(pos) * rot,
-                       mla_kv_a_ + kv_rank, rot * sizeof(float),
-                       hipMemcpyDeviceToDevice, nullptr);
+  // The latent half is RMS-normalized straight into the cache row; the rope
+  // half is rotated into the kpe row beside it. Each q rope tail is rotated
+  // out of its 192-wide head row directly into the absorbed-query row.
+  RmsNorm(mla_kv_a_, l.attn_kv_a_norm.f32(), c_.rms_eps,
+          kv_cache + static_cast<std::size_t>(pos) * kv_rank, kv_rank, nullptr);
+  RopeTo(mla_kv_a_ + kv_rank, kpe_cache + static_cast<std::size_t>(pos) * rot,
+         1U, rot, rot, rot, pos, c_.rope_theta, nullptr);
+  RopeTo(mla_q_ + nope, mla_q_abs_ + kv_rank, heads, c_.mla_head_dim,
+         kv_rank + rot, rot, pos, c_.rope_theta, nullptr);
 
   // Absorbed query: wk_b maps each head's nope half to the latent rank; the
-  // rotated rope tail is copied behind it.
+  // rope tail already sits behind it.
   (void)GemvTypeOf(l.attn_k_b.type, &type);
   for (std::uint32_t h = 0; h < heads; ++h) {
     Gemv(l.attn_k_b.Expert(h), type, kv_rank, nope, l.attn_k_b.row_bytes,
          mla_q_ + static_cast<std::size_t>(h) * c_.mla_head_dim,
          mla_q_abs_ + static_cast<std::size_t>(h) * (kv_rank + rot), nullptr);
-    (void)hipMemcpyAsync(
-        mla_q_abs_ + static_cast<std::size_t>(h) * (kv_rank + rot) + kv_rank,
-        mla_q_ + static_cast<std::size_t>(h) * c_.mla_head_dim + nope,
-        rot * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
   }
 
   const std::uint32_t n_pos = pos + 1U;
@@ -817,26 +808,19 @@ void Executor::MlaBatch(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
     const std::uint32_t pos = base_pos + r;
     float* a = pf_mla_a_ + static_cast<std::size_t>(r) * arow;
     float* q = pf_mla_q_ + static_cast<std::size_t>(r) * qrow;
-    RmsNorm(a, l.attn_kv_a_norm.f32(), c_.rms_eps, a, kv_rank, nullptr);
-    Rope(a + kv_rank, 1U, rot, rot, pos, c_.rope_theta, nullptr);
-    RopeStrided(q + nope, heads, c_.mla_head_dim, rot, pos, c_.rope_theta,
-                nullptr);
-    (void)hipMemcpyAsync(kv_cache + static_cast<std::size_t>(pos) * kv_rank, a,
-                         kv_rank * sizeof(float), hipMemcpyDeviceToDevice,
-                         nullptr);
-    (void)hipMemcpyAsync(kpe_cache + static_cast<std::size_t>(pos) * rot,
-                         a + kv_rank, rot * sizeof(float),
-                         hipMemcpyDeviceToDevice, nullptr);
     float* abs = pf_mla_abs_ + static_cast<std::size_t>(r) * absrow;
+    RmsNorm(a, l.attn_kv_a_norm.f32(), c_.rms_eps,
+            kv_cache + static_cast<std::size_t>(pos) * kv_rank, kv_rank,
+            nullptr);
+    RopeTo(a + kv_rank, kpe_cache + static_cast<std::size_t>(pos) * rot, 1U,
+           rot, rot, rot, pos, c_.rope_theta, nullptr);
+    RopeTo(q + nope, abs + kv_rank, heads, c_.mla_head_dim, c_.MlaKeyDim(), rot,
+           pos, c_.rope_theta, nullptr);
     (void)GemvTypeOf(l.attn_k_b.type, &type);
     for (std::uint32_t h = 0; h < heads; ++h) {
       Gemv(l.attn_k_b.Expert(h), type, kv_rank, nope, l.attn_k_b.row_bytes,
            q + static_cast<std::size_t>(h) * c_.mla_head_dim,
            abs + static_cast<std::size_t>(h) * c_.MlaKeyDim(), nullptr);
-      (void)hipMemcpyAsync(
-          abs + static_cast<std::size_t>(h) * c_.MlaKeyDim() + kv_rank,
-          q + static_cast<std::size_t>(h) * c_.mla_head_dim + nope,
-          rot * sizeof(float), hipMemcpyDeviceToDevice, nullptr);
     }
     const std::uint32_t n_pos = pos + 1U;
     const std::uint32_t tiles = MlaDecodeTiles(n_pos, kMlaTile);

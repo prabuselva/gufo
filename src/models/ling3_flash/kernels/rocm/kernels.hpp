@@ -40,6 +40,13 @@ void RopeStrided(float* x, std::uint32_t heads, std::uint32_t stride,
                  std::uint32_t rotary_dim, std::uint32_t pos, float theta,
                  hipStream_t stream);
 
+/// RoPE reading row h from `in + h * in_stride` and writing the rotated pairs
+/// to `out + h * out_stride`; identical arithmetic to the in-place kernels.
+void RopeTo(const float* in, float* out, std::uint32_t heads,
+            std::uint32_t in_stride, std::uint32_t out_stride,
+            std::uint32_t rotary_dim, std::uint32_t pos, float theta,
+            hipStream_t stream);
+
 /// One causal depthwise conv tap step for q/k/v: `conv_w` is [inner][kern]
 /// (channel-major taps), `history` is [kern-1][inner] oldest-first and is
 /// shifted in place, `out = silu(conv(proj))`.

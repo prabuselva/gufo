@@ -162,6 +162,33 @@ __global__ void RopeKernel(float* __restrict__ x, std::uint32_t heads,
   v[2 * p + 1] = a * s + b * c;
 }
 
+__global__ void RopeKernelTo(const float* __restrict__ in,
+                             float* __restrict__ out, std::uint32_t heads,
+                             std::uint32_t in_stride, std::uint32_t out_stride,
+                             std::uint32_t rotary_dim, std::uint32_t pos,
+                             float theta) {
+  const std::uint32_t pairs = rotary_dim / 2U;
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= heads * pairs) {
+    return;
+  }
+  const std::uint32_t h = i / pairs;
+  const std::uint32_t p = i % pairs;
+  const float* src = in + static_cast<std::size_t>(h) * in_stride;
+  float* dst = out + static_cast<std::size_t>(h) * out_stride;
+  const float freq = static_cast<float>(
+      ::pow(static_cast<double>(theta),
+            -2.0 * static_cast<double>(p) / static_cast<double>(rotary_dim)));
+  const float angle = static_cast<float>(pos) * freq;
+  double c = 0.0;
+  double s = 0.0;
+  ::sincos(static_cast<double>(angle), &s, &c);
+  const float a = src[2 * p];
+  const float b = src[2 * p + 1];
+  dst[2 * p] = a * c - b * s;
+  dst[2 * p + 1] = a * s + b * c;
+}
+
 __global__ void ConvSiluKernel(const float* __restrict__ conv_w,
                                const float* __restrict__ proj,
                                float* __restrict__ history,
@@ -999,6 +1026,15 @@ void RopeStrided(float* x, std::uint32_t heads, std::uint32_t stride,
   const std::uint32_t pairs = heads * (rotary_dim / 2U);
   RopeKernel<<<Blocks(pairs, 256), 256, 0, stream>>>(x, heads, stride,
                                                      rotary_dim, pos, theta);
+}
+
+void RopeTo(const float* in, float* out, std::uint32_t heads,
+            std::uint32_t in_stride, std::uint32_t out_stride,
+            std::uint32_t rotary_dim, std::uint32_t pos, float theta,
+            hipStream_t stream) {
+  const std::uint32_t pairs = heads * (rotary_dim / 2U);
+  RopeKernelTo<<<Blocks(pairs, 256), 256, 0, stream>>>(
+      in, out, heads, in_stride, out_stride, rotary_dim, pos, theta);
 }
 
 void ConvSilu(const float* conv_w, const float* proj, float* history,

@@ -33,6 +33,18 @@ Decode is no longer dominated by the Q8_0 GEMV tier: the vec4 kernel is
 ~30% faster on every dense shape at kernel level, yet realizes ~3% decode,
 so remaining wall time sits in MoE GEMV, other quant tiers and launch gaps.
 
+## MTP speculative decode
+
+`--speculative mtp`, tg1024 after pp2048, matched BAAB exclusive pair
+(October 11, `gufo_bench_ropebaab`): direct MLA cache-row writes (rope-tail
+and kpe rows written by the kernels instead of per-token `hipMemcpyAsync`
+appends) move 36.22 ± 0.18 / 36.22 ± 0.28 to 36.91 ± 0.22 / 37.33 ± 0.05
+(**+2.5%**), each candidate run above both controls. The same change is
++1.4% on plain tg1024 (31.80/31.53 → 32.07/32.15, `gufo_bench_plain`); the
+absolute plain level reads ~31.7–32.2 across sessions, so the retained
+table above is unchanged pending a full-recipe matched rerun. Prefill paths
+are untouched (prefill already wrote cache rows directly).
+
 ## Measurement detail
 
 ```sh
@@ -41,7 +53,9 @@ tools/bench/bench_bg.sh <name> <s> build/release/gufo bench \
   --n-prompt 2048,4096,8192,16384 --n-gen 128,1024
 ```
 
-Raw logs: `/tmp/opencode/gufo_bench_v4full.log` (current, matched BAAB full
+Raw logs: `/tmp/opencode/gufo_bench_ropebaab.log` and
+`/tmp/opencode/gufo_bench_plain.log` (MTP/plain tg1024 BAAB pairs for the
+MLA copy removal), `/tmp/opencode/gufo_bench_v4full.log` (current, matched BAAB full
 recipe), `/tmp/opencode/gufo_bench_v4tg1k.log` (dedicated tg1024 ×3 pair),
 `/tmp/opencode/gufo_bench_v4micro.log` (Q8_0 scalar vs vec4 kernel micro),
 `/tmp/opencode/gufo_bench_rrfull.log` (router change, matched ABBA full
