@@ -10,12 +10,16 @@
 | Shipped-form 8-warp with KV register reuse only | Superseded by the combined 16-warp change (1.02–1.05× alone). |
 | WMMA/fp16 attention scores | Deferred: tolerance risk against the 5e-4 prefill contract; not attempted. |
 | Live-token-tile skip extended to every `RoutedF16GEMMKernel` instantiation (was `kPair`/`kQ5`/`kQ8 BN≥48` only; plain Q4_K/Q5_K/Q6_K paths ran WMMA for dead token tiles of short expert buckets) | Retained (working tree): `tools/bench/ling3_routed_bench.hip` (tokens=1024, α=0.09, fixed seed) down launch 2444→1950 µs (−20.2%, both run orders in matched exclusive sessions), layer −6.5%; outputs bit-identical (Fnv sums `0848f30e6e00c75d`/`5ab1d584de7338af` unchanged, oracle ratios unchanged). Side effect: Q4_K BN64 down instantiation 172→111 VGPR, 0 spill, occupancy 12. e2e exclusive ABBA pp +3.7/+2.9/+2.8/+1.6% at pp2048/4096/8192/16384. |
+| Compile-time stage ablation of the post-skip Q4_K bench kernels (temporary `#if` guards removing one pipeline stage at a time: WMMA→scalar fold, nibble decode→register fill, activation-frag LDS loads→const, activation/weight global loads→const; one exclusive session, base re-measured 3×: gate 3324–3421 µs, down 1937–1962 µs) | Measurement only (guards reverted). Recovery vs base — gate: weight global loads −17%, WMMA −14%, weight decode −7%, activation global −5%, activation-frag LDS loads ~0%; down: WMMA −12%, weight global −8%, decode −7%, activation global −2%, frag LDS ~0%. No single dominant stage; the ≥60% residual is the single-buffered per-K-block `__syncthreads`/LDS round-trip chain, so further decode micro-tuning cannot pay — a pipeline restructure (double-buffered LDS with one barrier per stage, or global→LDS-direct weight loads) is the next real lever. Hardware context (`gfx1151_peak`): WMMA fp16 55.25 TFLOPS, VALU fp32 23.95 TFLOPS, DRAM read 240.7 GB/s; gate runs at 34% of the WMMA bound. |
+| Double-buffered LDS KB pipeline in `RoutedF16GEMMKernel` (two parity planes, one `__syncthreads` per stage instead of two, register prefetch kept at depth 1 with the next stage's global load issued after the commit; instantiations whose doubled plan exceeds the 64 KB static-LDS limit keep the old loop) | Rejected: bit-identical (same Fnv sums) but slower in exclusive ABBA — gate 3371→3726 µs (+10.5%), down 1952→2199 µs (+12.7%). The doubled plan halves resident workgroups (Q4_K BN64 down: LDS 13440→26880 B, occupancy 12→8 waves/SIMD, 111→118 VGPR), and this kernel hides its barrier latency through wave occupancy, so the halved occupancy costs more than the removed barrier. Single-buffered + occupancy is the local optimum; restructurings that keep the LDS footprint (e.g. more work per wave to shrink sync frequency) remain open. |
 
 Open items: decode stays ~30 t/s versus the 37 t/s target — the MoE
 `RoutedF16GEMMKernel`/GEMV group remains the next lever; after the
-live-token-tile skip the down GEMM is weight-decode-bound (`isa_mix.py`:
-35% "valu other" + 12% salu vs 0.4% wmma in the Q4_K BN64 instantiation,
-epilogue address math and the 16-element BK=2 decode loop dominate), and the
+live-token-tile skip the stage-ablation split above shows no dominant term
+(weight global loads and WMMA each recover ≤17%, the rest being pipeline
+latency), and the double-buffered LDS variant was rejected because the
+occupancy it sacrifices outweighs the removed barrier, so further gains must
+raise per-wave work or cut bytes moved rather than retime the KB loop. The
 gate launch (paired path, 1.7× the down MACs) is now the larger kernel.
 Prefill still decays 833→402 t/s from 2K→16K depth, driven by the same
 attention kernel. `#pragma unroll 4` on the key loop
