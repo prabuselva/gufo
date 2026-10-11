@@ -9,10 +9,15 @@
 | 16 warps with Q-tile 64 (`WarpQ` 4) | Rejected: 1.27–1.36× — worse than tile-32 at 16K depth (805→846 µs) with equal short-context gains. |
 | Shipped-form 8-warp with KV register reuse only | Superseded by the combined 16-warp change (1.02–1.05× alone). |
 | WMMA/fp16 attention scores | Deferred: tolerance risk against the 5e-4 prefill contract; not attempted. |
+| Live-token-tile skip extended to every `RoutedF16GEMMKernel` instantiation (was `kPair`/`kQ5`/`kQ8 BN≥48` only; plain Q4_K/Q5_K/Q6_K paths ran WMMA for dead token tiles of short expert buckets) | Retained (working tree): `tools/bench/ling3_routed_bench.hip` (tokens=1024, α=0.09, fixed seed) down launch 2444→1950 µs (−20.2%, both run orders in matched exclusive sessions), layer −6.5%; outputs bit-identical (Fnv sums `0848f30e6e00c75d`/`5ab1d584de7338af` unchanged, oracle ratios unchanged). Side effect: Q4_K BN64 down instantiation 172→111 VGPR, 0 spill, occupancy 12. e2e exclusive ABBA pp +3.7/+2.9/+2.8/+1.6% at pp2048/4096/8192/16384. |
 
 Open items: decode stays ~30 t/s versus the 37 t/s target — the MoE
-`RoutedF16GEMMKernel`/GEMV group is the next lever; prefill still decays
-802→395 t/s from 2K→16K depth, driven by the same attention kernel
-(48% of pp8192 GPU time at `473c946b`). `#pragma unroll 4` on the key loop
+`RoutedF16GEMMKernel`/GEMV group remains the next lever; after the
+live-token-tile skip the down GEMM is weight-decode-bound (`isa_mix.py`:
+35% "valu other" + 12% salu vs 0.4% wmma in the Q4_K BN64 instantiation,
+epilogue address math and the 16-element BK=2 decode loop dominate), and the
+gate launch (paired path, 1.7× the down MACs) is now the larger kernel.
+Prefill still decays 833→402 t/s from 2K→16K depth, driven by the same
+attention kernel. `#pragma unroll 4` on the key loop
 now warns (`loop not unrolled`) in the 16-warp form; harmless, revisit if the
 loop is touched again.
