@@ -14,6 +14,7 @@
 | Double-buffered LDS KB pipeline in `RoutedF16GEMMKernel` (two parity planes, one `__syncthreads` per stage instead of two, register prefetch kept at depth 1 with the next stage's global load issued after the commit; instantiations whose doubled plan exceeds the 64 KB static-LDS limit keep the old loop) | Rejected: bit-identical (same Fnv sums) but slower in exclusive ABBA — gate 3371→3726 µs (+10.5%), down 1952→2199 µs (+12.7%). The doubled plan halves resident workgroups (Q4_K BN64 down: LDS 13440→26880 B, occupancy 12→8 waves/SIMD, 111→118 VGPR), and this kernel hides its barrier latency through wave occupancy, so the halved occupancy costs more than the removed barrier. Single-buffered + occupancy is the local optimum; restructurings that keep the LDS footprint (e.g. more work per wave to shrink sync frequency) remain open. |
 | Hardware counters per dispatch (`rocprofv3`, exclusive sessions) | Measurement only. Issue-throughput bound: gate VALU ≈171 M instructions ≈57% of peak issue, LDS ≈9%; waits split WAIT_CNT 61% / BARRIER 18%; `SQC_DCACHE_MISSES` ≈1k per dispatch — weight streams are L1/L2-resident, so bytes-moved and DRAM-swizzle levers are dead. |
 | ISA mix of the shipped Q4_K BN64 kernels (`hipcc --cuda-device-only -S`, `tools/prof/isa_mix.py`) | Measurement only. Per whole kernel, down 3739 / gate 1758 instructions: WMMA ≈1%, packed decode 4–6%, 64-bit address math (paired `v_add_co`, `v_mad_u64_u32`, `v_lshlrev_b64`) ≈15%, f32 scale products (`v_mul_f32` 119/64, `v_fma_f32` 96/48), `s_delay_alu` fillers 17%/14%. Every remaining gain must remove issued instructions — pipeline retiming and scheduling hints are exhausted. |
+| Loop-body ISA decomposition of the KB steady loop (back-edge span analysis of the same listings) | Measurement only. The KB loop itself (down 336 instr: 16 WMMA, 96 packed decode, ~34 LDS loads, 4 global loads; gate 374 with the same shape) contains no 64-bit pointer math and no f32 scale products — the kernel-level address/f32 counts live entirely in the once-per-block prologue and peeled epilogue chains (~900-2900 instructions vs 40-80 × 350 of loop work). A buffer-load/addressing rework therefore has near-zero expected steady-state gain and was dropped before implementation. Remaining in-loop headroom: decode chain (ablation ≤7%) and WMMA staging only. |
 | `#pragma unroll 2` on the KB loop | Rejected: bit-identical (same Fnv sums), resources unchanged (114/108 VGPR, occupancy 12, no spill), but exclusive ABBA gate 3362→3404 µs (+1.2%), down 1956→1979 µs (+1.1%). Schedule slack is already covered by occupancy. |
 
 Open items: decode stays ~30 t/s versus the 37 t/s target — the MoE
@@ -21,10 +22,10 @@ Open items: decode stays ~30 t/s versus the 37 t/s target — the MoE
 live-token-tile skip the stage-ablation split above shows no dominant term
 (weight global loads and WMMA each recover ≤17%, the rest being pipeline
 latency), and the double-buffered LDS variant was rejected because the
-occupancy it sacrifices outweighs the removed barrier, further gains must
-remove issued instructions — the 64-bit address arithmetic (~15% of the ISA)
-and f32 scale products in the commit path are the largest bit-exact targets,
-while counter evidence rules out bytes-moved work. The
+occupancy it sacrifices outweighs the removed barrier; the KB loop body is
+already lean (no address math, no f32 scale products), so the only remaining
+in-loop lever is the packed decode chain (≤7% ablation ceiling), which is not
+bit-identical to shorten. The
 gate launch (paired path, 1.7× the down MACs) is now the larger kernel.
 Prefill still decays 833→402 t/s from 2K→16K depth, driven by the same
 attention kernel. `#pragma unroll 4` on the key loop
