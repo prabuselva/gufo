@@ -19,15 +19,19 @@
 | Decode pass profile attribution (`tools/prof/prof.py run --stages ling3`, pp2048/tg64, exclusive; pass-204 kernel table via `prof_results.db`) | Measurement only. Decode is GEMV-tier + fixed-overhead: per token GemvGroupedQ4K 5.8 ms, GemvQ8_0 5.5, GemvQ6K 3.7, GemvQ4K 3.7, **RouterTopKKernel 2.7 ms (~9%, 40× 67.8 µs)**, GemvF32 1.7, KdaDelta 1.6; ~1911 dispatches/token, 31.2 ms kernel time vs ~13 ms DRAM roofline. |
 | Parallel `RouterTopKKernel` top-k (block-wide `BlockArgMax` (max value, lowest-index) rounds replacing the thread-0 serial group-select and expert argmax-removal scans; winner thread writes the `-inf` removal, thread-0 keeps the single-precision order-sensitive weight writes and double renorm sum) | Retained (`967de4ba`): bit-identical to the serial kernel in 112/112 randomized A/B cases (old/new extracted from git, `n_exp` 64–512, `groups` 1–64, random + adversarial-tie logits, 1 and 3 token rows; harness `/tmp/opencode/router_ab.hip`) and `ling3_flash.rocm_ops` contract pass (`RouterTopKRows` reports bit-identical, weights worst error 9.8e-8). Kernel micro (exclusive): 64.0→16.6 µs/call (−74%). The old cost was thread-0-only: `used×n_exp` + `groups_used×groups` dependent LDS scans ≈5100 ops ≈50 µs of single-thread latency chain. e2e exclusive ABBA (full recipe, `/tmp/opencode/gufo_bench_rrfull.log`): tg128 +8.2%, tg1024 +7.6% (29.24→31.47), pp +2.0…+3.4% (`RouterTopKRows` shares the kernel). |
 | vec4 Q8_0 dense GEMV ported from gemma4 (`GemvQ8_0Vec4`, gated `cols % 128 == 0` in `Gemv()`) | Retained (working tree): quality-contract not bit-identity; `ling3_flash_rocm_gemv_test` GemvQ8_0 worst error 2.3e-5 (tol 2e-3, `kCols=2560` exercises the vec4 path). Kernel micro (exclusive, 5000-launch, `/tmp/opencode/gufo_bench_v4micro.log`): −30% on all five dense shapes (2560×2560 15.76→10.98 µs, 6144×2560 34.06→21.72). e2e exclusive: short tg256 ABBA inconclusive (+0.6%, overlapping); dedicated tg1024 BAAB ×3 (+1.0%, separated, `gufo_bench_v4tg1k`); matched full-recipe BAAB (`gufo_bench_v4full`) tg128 +2.9%, tg1024 +3.2%, both fully separated, pp cells within noise (pp16384 noisy). Realized gain ≪ the 5.5 ms/token Q8_0 share × 30%, so decode wall time now sits in the MoE/other-quant tiers and launch gaps, not Q8_0 bytes. |
+| Wide Q4_K grouped walk: one `uint32` weight load per lane per super-block (128 B/warp/instr, scale pair unpacked once, `Q4ScaleMin` ×2 instead of ×8 per lane) | Rejected after the `packed >> (4*i)` → `>> (8*i)` nibble bug was fixed (one-hot element-map probe `/tmp/opencode/gq4map`: all 256 elements map to the scalar-rule byte/nibble; wide-vs-scalar maxdiff 1.2–2.4e-4 in `/tmp/opencode/gq4w`): exclusive micro is *slower* — 768×2560 47.3→49.8 µs/call (+5.3%), 2560×768 53.9→55.2 (+2.5%). The scalar `qs[lane]` walk is already a fully-coalesced 32 B/warp/instr stream at ~70–78% of the 240.7 GB/s read peak and the wide x-loads (two 32-element windows per lane, 8×4 B instead of 2×16 B vector gathers) forfeit more than the weight-load count saves; kernel reverted to the shipped walk. |
 
 Open items: decode reaches 32.2 t/s (tg1024) after the router and vec4
 changes, still short of the ~37 t/s roofline target. The Q8_0 result shows
 kernel-level savings do not convert 1:1 at this operating point (~1911
 dispatches/token, ~31 ms kernel time vs ~13 ms DRAM roofline, ~12% pass
-gaps), so the next levers are the largest GEMV tiers themselves —
-GemvGroupedQ4K 5.8 ms, GemvQ6K 3.7, GemvQ4K 3.7 ms/token at 32-58 µs/call,
-all one-warp-per-row with scalar `row[b].qs[lane]` byte loads (vec4-style
-widening or row pairing) — and launch-count reduction / GemvF32 wg32.
+gaps). Wide-load widening of `GemvGroupedQ4K` was measured and rejected
+above (weights already coalesced and near the DRAM read ceiling; GroupedQ6K
+runs *below* its byte floor via L2 reuse, so byte-count levers are spent
+there too), so the remaining levers are structural — row pairing in the
+grouped tiers (2 rows/warp to halve dispatches and share `ids`/scale
+prologues), launch-count reduction (~1911 dispatches/token, 3.6 ms idle),
+and GemvF32 wg32→128 (1.69 ms/token at 75× 22.5 µs).
 `GemvRows` (multi-token draft verify) still uses only the scalar Q8_0 path.
 On the
 prefill side, after the
