@@ -129,6 +129,58 @@ __global__ void GemvQ8_0(const Q8_0Block* __restrict__ w,
   }
 }
 
+// ---- vec4 Q8_0 variant (cols % 128 == 0) --------------------------------
+//
+// The scalar kernel loads one int8 per lane per quant block (a 32-byte warp
+// transaction every 34-byte stride). This variant loads a uint32 per lane
+// covering four contiguous codes of one block: for a group of four blocks,
+// lane l reads block g*4 + l/8 at word (4l) % 32, so the warp pulls a full
+// 128-byte qs span per instruction. Each block's scale applies to the four
+// codes the lane read, so dequantization stays exact; only the summation
+// order differs from the scalar kernel (inside the 2e-3 GEMV tolerance, and
+// the retained gemma4 form measures ~1.1e-3 worst case). Requires
+// cols % 128 == 0; the host dispatch falls back to the scalar kernel
+// otherwise. Ported from src/models/gemma4/kernels/rocm/gemv.hip.cpp.
+
+__global__ void GemvQ8_0Vec4(const Q8_0Block* __restrict__ w,
+                             const float* __restrict__ x,
+                             float* __restrict__ out, std::uint32_t rows,
+                             std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t groups = cols / 128U;
+  const Q8_0Block* __restrict__ row =
+      w + static_cast<std::size_t>(r) * (cols / 32U);
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t g = 0; g < groups; ++g) {
+    const std::uint32_t blk = g * 4U + lane / 8U;
+    const std::uint32_t word = (4U * lane) % 32U;
+    std::int32_t packed;
+    __builtin_memcpy(&packed, &row[blk].qs[word], 4);
+    const float d = __half2float(row[blk].d);
+    const std::uint32_t k = blk * 32U + word;
+    acc +=
+        d * static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) * x[k];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 8) & 0xFF)) *
+           x[k + 1];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 16) & 0xFF)) *
+           x[k + 2];
+    acc += d *
+           static_cast<float>(static_cast<std::int8_t>((packed >> 24) & 0xFF)) *
+           x[k + 3];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
 // Q4_K walk: lane L takes the element at offset L of each of the eight
 // 32-element groups (e = L + 32 j), so the nibble reads coalesce across the
 // warp. The dequant mirrors the oracle's Q4Value: value = d*scale_j*q -
@@ -884,8 +936,13 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
           static_cast<const Q4_0Block*>(base), x, out, rows, cols);
       break;
     case GemvType::kQ8_0:
-      GemvQ8_0<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
-          static_cast<const Q8_0Block*>(base), x, out, rows, cols);
+      if (cols % 128U == 0U) {
+        GemvQ8_0Vec4<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+            static_cast<const Q8_0Block*>(base), x, out, rows, cols);
+      } else {
+        GemvQ8_0<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+            static_cast<const Q8_0Block*>(base), x, out, rows, cols);
+      }
       break;
     case GemvType::kQ4_K:
       GemvQ4K<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
