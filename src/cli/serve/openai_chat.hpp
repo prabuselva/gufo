@@ -26,14 +26,22 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
 /// Shared effort names; each API applies its own thinking and alias rules.
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
 
-/// Reasoning and visible text of a generation without tools or schemas, split
-/// exactly as Chat Completions reports them.
-struct GeneratedText {
-  std::string reasoning;
-  std::string text;
-};
-GeneratedText SplitGeneratedText(
-    std::string_view text, TextGenerationBackend::InitialOutputState initial);
+/// Messages tools and tool_choice, mapped onto the Chat tool declarations so
+/// framing, schema constraints and replayed tool turns match Chat.
+std::optional<HttpResponse> ParseAnthropicToolControls(const json::Value& body,
+                                                       ChatRequest* chat);
+/// One Messages image block (base64 or HTTPS URL source), appended to the
+/// message at the current end of its text.
+bool ParseAnthropicImage(const json::Value& block,
+                         tokenization::ChatMessage* message,
+                         core::ImageReadBudget& budget, std::string* error);
+/// One Messages turn with tool_use or tool_result blocks. Each tool_result
+/// becomes a tool message, with its images; text and images in the same user
+/// turn follow as a user message.
+bool ParseAnthropicToolMessage(const json::Value& item,
+                               std::vector<tokenization::ChatMessage>* messages,
+                               core::ImageReadBudget& budget,
+                               std::string* error);
 /// Responses text output uses the same reasoning/UTF-8 filter and scheduler
 /// as Chat Completions, including streaming cancellation and cache retention.
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,
@@ -42,6 +50,14 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   std::size_t max_tokens,
                                   const sampling::SamplingConfig& sampling,
                                   bool stream);
+/// Messages output through the same path: content blocks when buffered,
+/// Anthropic SSE events when streamed.
+HttpResponse CreateAnthropicMessage(const HttpRequest& request,
+                                    TextGenerationBackend& backend,
+                                    const ChatRequest& chat,
+                                    std::size_t max_tokens,
+                                    const sampling::SamplingConfig& sampling,
+                                    bool stream);
 
 }  // namespace gufo::server
 

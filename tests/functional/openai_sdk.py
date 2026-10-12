@@ -25,8 +25,10 @@ from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, Ope
 from openai.types import Completion, CompletionChoice
 from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
+from tool_streaming import check_tool_streaming
 from discovery import check_discovery
 from image_inputs import check_image_count, check_image_inputs
+from tool_images import check_tool_images
 from tool_native import check_finite_argument_types, check_native_tool_schemas
 from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_history,
                         check_untyped_agent_tools, check_mixed_tool_schemas,
@@ -35,8 +37,13 @@ from cache_edits import check_cache_edits
 from cache_concurrency import check_cache_concurrency
 from cache_shared_prefix import check_cache_shared_prefix
 from cache_bridge import check_cache_bridge
+from cache_compaction import check_cache_compaction
+from cache_workloads import check_cache_transforms, check_cache_pressure
+from cache_messages_loop import check_cache_messages_loop
 from system_injection import check_system_injection
 from cache_growth import check_cache_growth
+from messages_tools import check_messages_tools
+from messages_count_tokens import check_messages_count_tokens, check_messages_image_counts
 from cache_depth import check_cache_depth
 from cache_rotation import check_cache_rotation
 from prefill_scheduling import check_prefill_scheduling
@@ -89,7 +96,7 @@ def chat_result(client, request, streaming=False, on_chunk=None, on_open=None):
             "tools": [t.to_dict() for t in choice.message.tool_calls or []],
             "finish": choice.finish_reason, "usage": result.usage.to_dict(),
         }
-    text, reasoning, tools, finish, usage = "", "", [], None, None
+    text, reasoning, tools, finish, usage = "", "", {}, None, None
     with result:
         if on_open:
             on_open()
@@ -101,10 +108,34 @@ def chat_result(client, request, streaming=False, on_chunk=None, on_open=None):
             for choice in chunk.choices:
                 text += choice.delta.content or ""
                 reasoning += getattr(choice.delta, "reasoning_content", "") or ""
-                tools.extend(t.to_dict() for t in choice.delta.tool_calls or [])
+                for delta in choice.delta.tool_calls or []:
+                    assert 0 <= delta.index <= len(tools), delta
+                    call = tools.setdefault(delta.index, {
+                        "id": "", "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+                    if delta.id:
+                        assert not call["id"], ("repeated tool ID", delta)
+                        call["id"] = delta.id
+                    if delta.function:
+                        call["function"]["name"] += delta.function.name or ""
+                        call["function"]["arguments"] += delta.function.arguments or ""
                 finish = choice.finish_reason or finish
     assert finish is not None and usage is not None, (finish, usage)
-    return dict(text=text, reasoning=reasoning, tools=tools, finish=finish, usage=usage)
+    complete, partial = [], []
+    for call in tools.values():
+        assert call["id"] and call["function"]["name"], call
+        try:
+            json.loads(call["function"]["arguments"])
+        except json.JSONDecodeError:
+            assert finish == "length" or (finish == "stop" and request.get("stop")), (
+                "unfinished tool in a successful turn", call, finish)
+            partial.append(call)
+        else:
+            complete.append(call)
+    result = dict(text=text, reasoning=reasoning, tools=complete, finish=finish, usage=usage)
+    if partial:
+        result["partial_tools"] = partial
+    return result
 
 
 def check_stops(client, model, checks):
@@ -2523,11 +2554,11 @@ def check_server_metrics(client, model, checks, width, context, speculative):
     assert proposed > 0 if speculative != "off" else proposed == 0, final
 
 
-SDK_SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "image-count", "structured", "structured-limits",
-              "tool-reasoning", "reasoning-separator",
-              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "structured", "structured-limits",
+              "tool-reasoning", "tool-streaming", "reasoning-separator",
+              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
               "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix",
-              "cache-bridge", "system-injection")
+              "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "system-injection")
 
 
 def main():
@@ -2562,10 +2593,10 @@ def main():
     parser.add_argument("--server-log", type=Path,
                         help="Server log; shows retry copies refused under memory pressure")
     args = parser.parse_args()
-    if args.suite in ("discovery", "all") and args.expected_input_modalities is None:
-        parser.error("discovery requires --expected-input-modalities text or text,image")
-    if args.suite in ("image-inputs", "image-count") and not args.vision:
-        parser.error("image-inputs and image-count require --vision and a loaded projector")
+    if args.suite in ("discovery", "messages-image-counts", "all") and args.expected_input_modalities is None:
+        parser.error("discovery and messages-image-counts require --expected-input-modalities text or text,image")
+    if args.suite in ("image-inputs", "image-count", "tool-images") and not args.vision:
+        parser.error("image-inputs, image-count and tool-images require --vision and a loaded projector")
     if args.suite in ("all", "sampling-defaults") and not args.sampling_preset:
         parser.error("--sampling-preset is required for all/sampling-defaults")
     if not isinstance(args.sampling_overrides, dict):
@@ -2603,6 +2634,11 @@ def main():
                                      "response": [recorder.response_hook]}
     )) as client:
         suites = {
+            "messages-count-tokens": lambda: check_messages_count_tokens(
+                client, args.model, checks, args.context),
+            "messages-image-counts": lambda: check_messages_image_counts(
+                client, args.model, checks, args.context, image_content,
+                args.expected_input_modalities.split(",")),
             "discovery": lambda: check_discovery(
                 client, args.model, checks, args.context,
                 args.expected_input_modalities.split(",")),
@@ -2615,6 +2651,9 @@ def main():
             "image-count": lambda: check_image_count(
                 client, args.model, checks, image_content, chat_result, response_result,
                 args.context, args.concurrency),
+            "tool-images": lambda: check_tool_images(
+                client, args.model, checks, image_content, chat_result, response_result,
+                args.server_log),
             "structured": lambda: check_structured_outputs(client, args.model, checks, args.vision),
             "structured-limits": lambda: check_structured_limits(client, args.model, checks, args.vision),
             "native-tools": lambda: check_native_tools(client, args.model, checks, args.vision),
@@ -2625,11 +2664,14 @@ def main():
                 client, args.model, checks, chat_result, args.sampling_preset),
             "reasoning-separator": lambda: check_reasoning_separator(
                 client, args.model, checks, chat_result),
+            "tool-streaming": lambda: check_tool_streaming(client, args.model, checks, chat_result),
             "tool-agent": lambda: check_tool_agent(
                 client, args.model, checks, chat_result, args.vision, image_content),
             "tool-agent-loop": lambda: check_tool_agent_loop(client, args.model, checks, chat_result),
             "tool-history": lambda: check_tool_history(
                 client, args.model, checks, chat_result, args.vision, image_content),
+            "messages-tools": lambda: check_messages_tools(
+                client, args.model, checks, chat_result),
             "tool-untyped": lambda: check_untyped_agent_tools(
                 client, args.model, checks, chat_result, args.vision, image_content),
             "tool-mixed": lambda: check_mixed_tool_schemas(
@@ -2674,11 +2716,20 @@ def main():
                 client, args.model, checks, chat_result),
             "cache-bridge": lambda: check_cache_bridge(
                 client, args.model, checks, chat_result, args.snapshot_capacity_bytes),
+            "cache-compaction": lambda: check_cache_compaction(
+                client, args.model, checks, chat_result, args.context, args.server_log),
+            "cache-transforms": lambda: check_cache_transforms(
+                client, args.model, checks, chat_result, args.context, args.server_log),
+            "cache-pressure": lambda: check_cache_pressure(
+                client, args.model, checks, chat_result, args.snapshot_capacity_bytes,
+                args.concurrency),
+            "cache-messages-loop": lambda: check_cache_messages_loop(
+                client, args.model, checks, chat_result, args.context),
             "system-injection": lambda: check_system_injection(
                 client, args.model, checks, chat_result),
         }
-        selected = ([name for name in suites if name not in ("tool-native-types", "cache-bridge", "prefill-scheduling")
-                     and (name not in ("image-inputs", "image-count") or args.vision)]
+        selected = ([name for name in suites if name not in ("tool-native-types", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "prefill-scheduling")
+                     and (name not in ("image-inputs", "image-count", "tool-images") or args.vision)]
                     if args.suite == "all" else
                     ["native-tools", "auto-tools"] if args.suite == "tools" else [args.suite])
         for name in selected:
