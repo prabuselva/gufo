@@ -440,7 +440,8 @@ if (BUILD_TESTING)
     src/cli/serve/openai_chat.cpp
     src/models/deepseek_v4_flash/chat_template.cpp
   )
-  target_link_libraries(openai_chat_test PRIVATE gufo_core)
+  # Gemma 4 native tool-call parsing lives in the model package.
+  target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_gemma4)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")

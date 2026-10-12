@@ -180,6 +180,23 @@ public:
         min_drafts_(min_drafts),
         max_drafts_(max_drafts) {}
 
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+
+  // Grammar-constrained decoding needs token-level pieces: a greedy-merge
+  // tokenizer otherwise hides the native call delimiters behind merges the
+  // sampler cannot validate against the grammar.
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->tokenizer().GetVocabSize(), [this](std::uint32_t id) {
+          const auto& tokenizer = model_->tokenizer();
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer.DecodeTokenCopy(id), tokenizer.IsStopToken(id)};
+        });
+  }
+
   [[nodiscard]] server::TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),

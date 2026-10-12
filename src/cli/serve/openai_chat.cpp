@@ -29,6 +29,8 @@
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
+#include "src/models/gemma4/chat_template.hpp"
+#include "src/models/gemma4/tool_syntax.hpp"
 
 namespace gufo::server {
 
@@ -97,6 +99,8 @@ ToolMarkerSet ToolMarkers(
   // framing: returning it as content would double it when history is replayed.
   static constexpr std::array<std::string_view, 2> deepseek{
       "\n\n<｜DSML｜tool_calls>", "<｜DSML｜tool_calls>"};
+  static constexpr std::array<std::string_view, 1> gemma{
+      models::gemma4::kToolCallStart};
   // The JSON fallback has no native counterpart in llama.cpp. Its grammar
   // leaves text before <tool_call> unconstrained, where models still write
   // their native call syntax; keep recognizing every opener there.
@@ -104,8 +108,11 @@ ToolMarkerSet ToolMarkers(
     return kToolMarkers;
   // Match the canonical opener selected by JsonConstraint::WithTools. Other
   // dialects are ordinary prose under that grammar, not additional calls.
-  return *format == Format::kDeepSeek ? ToolMarkerSet(deepseek)
-                                      : ToolMarkerSet(qwen);
+  if (*format == Format::kDeepSeek)
+    return ToolMarkerSet(deepseek);
+  if (*format == Format::kGemma4)
+    return ToolMarkerSet(gemma);
+  return ToolMarkerSet(qwen);
 }
 
 // A native function header, rather than a bare marker mentioned in prose,
@@ -157,7 +164,7 @@ ToolCloserSet ToolClosers(
   // As in llama.cpp, DeepSeek content is everything outside its native call
   // block, which ends the output: there is no echo to strip, and client
   // envelope syntax the model writes stays visible text.
-  if (*format == Format::kDeepSeek)
+  if (*format == Format::kDeepSeek || *format == Format::kGemma4)
     return {};
   // Mirror ToolMarkers: stripping follows the dialect the request admitted,
   // and another dialect's closing tags are ordinary prose like its openers —
@@ -2115,25 +2122,103 @@ ParsedGeneration ParseGeneration(
   return parsed;
 }
 
+// The declared tool a Gemma 4 call body addresses: `call:NAME{`.
+[[nodiscard]] bool GemmaToolDeclared(
+    std::string_view body, std::span<const tokenization::ChatTool> tools) {
+  constexpr std::string_view prefix = "call:";
+  if (!body.starts_with(prefix))
+    return false;
+  const auto rest = body.substr(prefix.size());
+  const auto end = rest.find('{');
+  if (end == std::string_view::npos)
+    return false;
+  const auto name = rest.substr(0, end);
+  for (const auto& tool : tools)
+    if (tool.name == name)
+      return true;
+  return false;
+}
+
+// Native Gemma 4 calls: `<|tool_call>call:NAME{...}<tool_call|>` blocks under
+// the mandatory thought channel. Grammar guarantees the framing; this splits
+// complete blocks from prose. An unclosed block is held: a streamed turn
+// waits for its close, and a truncated one stays hidden markup.
+ParsedGeneration ParseGemmaGeneration(
+    std::string_view raw, std::span<const tokenization::ChatTool> tools,
+    ChatRequest::ToolChoice choice, bool enforce_required, QuoteTracker& quotes,
+    ToolCloserSet closers) {
+  ParsedGeneration parsed;
+  const bool recognize =
+      !tools.empty() && choice != ChatRequest::ToolChoice::kNone;
+  std::string text;
+  std::size_t cursor = 0;
+  if (recognize) {
+    quotes.Reset(raw);
+    while (true) {
+      const auto marker =
+          EarliestMarker(raw, ToolMarkerSet(&models::gemma4::kToolCallStart, 1),
+                         quotes, cursor);
+      if (marker == std::string_view::npos)
+        break;
+      const auto begin = marker + models::gemma4::kToolCallStart.size();
+      const auto close = raw.find(models::gemma4::kToolCallEnd, begin);
+      if (close == std::string_view::npos)
+        break;  // An unclosed call hides the rest of the turn.
+      text.append(ContentBefore(raw, cursor, marker, closers, quotes, tools));
+      const auto body = raw.substr(begin, close - begin);
+      const auto call = models::gemma4::ParseToolCall(body);
+      if (call && GemmaToolDeclared(body, tools)) {
+        ParsedToolCall parsed_call;
+        parsed_call.id = RandomId("call_");
+        parsed_call.name = call->name;
+        for (const auto& member : call->arguments.members()) {
+          tokenization::ChatMessage::ToolArgument argument;
+          argument.name = member.first;
+          argument.is_string = member.second.is_string();
+          argument.value =
+              argument.is_string ? member.second.str() : member.second.dump();
+          parsed_call.arguments.push_back(std::move(argument));
+        }
+        parsed.tool_calls.push_back(std::move(parsed_call));
+      }
+      cursor = close + models::gemma4::kToolCallEnd.size();
+    }
+  }
+  text.append(ContentBefore(raw, cursor, raw.size(), closers, quotes, tools));
+  if (enforce_required && choice == ChatRequest::ToolChoice::kRequired &&
+      parsed.tool_calls.empty())
+    throw TextGenerationError(TextGenerationErrorCode::kToolChoiceUnsatisfied,
+                              "model did not produce a declared tool call");
+  parsed.text = std::move(text);
+  parsed.hide_tool_markup = true;
+  return parsed;
+}
+
 ParsedGeneration ParseStructuredGeneration(
     std::string_view raw, TextGenerationBackend::InitialOutputState initial,
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool gemma = false) {
   ParsedGeneration parsed;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
     if (leading != std::string_view::npos &&
-        raw.substr(leading).starts_with(kThinkStart)) {
+        raw.substr(leading).starts_with(
+            gemma ? std::string_view(models::gemma4::kThoughtStart)
+                  : kThinkStart)) {
       raw.remove_prefix(leading);
       initial = TextGenerationBackend::InitialOutputState::kReasoning;
     }
   }
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning) {
-    if (raw.starts_with("<think>"))
-      raw.remove_prefix(7);
-    const auto end = raw.find("</think>");
+    const std::string_view opener =
+        gemma ? std::string_view(models::gemma4::kThoughtStart) : "<think>";
+    const std::string_view closer =
+        gemma ? std::string_view(models::gemma4::kThoughtEnd) : "</think>";
+    if (raw.starts_with(opener))
+      raw.remove_prefix(opener.size());
+    const auto end = raw.find(closer);
     quotes.Reset(raw);
     const auto call =
         !tools.empty() && choice != ChatRequest::ToolChoice::kNone
@@ -2148,14 +2233,14 @@ ParsedGeneration ParseStructuredGeneration(
       parsed.reasoning_content = std::string(raw.substr(0, end));
       if (end == std::string_view::npos)
         return parsed;
-      raw.remove_prefix(end + 8);
+      raw.remove_prefix(end + closer.size());
       raw = AfterReasoningSeparator(raw, markers);
     }
   }
   const auto content = tool_only ? raw : Trim(raw);
   quotes.Reset(content);
   if (const auto marker = EarliestMarker(content, markers, quotes);
-      !tools.empty() && choice != ChatRequest::ToolChoice::kNone &&
+      !gemma && !tools.empty() && choice != ChatRequest::ToolChoice::kNone &&
       (tool_only || marker == 0) && marker != std::string_view::npos &&
       !content.substr(marker).starts_with("<tool_call>")) {
     auto native = ParseGeneration(
@@ -2163,6 +2248,12 @@ ParsedGeneration ParseStructuredGeneration(
         choice, enforce_required, markers, closers, quotes, partial);
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
+  }
+  if (gemma) {
+    auto generated = ParseGemmaGeneration(content, tools, choice,
+                                          enforce_required, quotes, closers);
+    generated.reasoning_content = std::move(parsed.reasoning_content);
+    return generated;
   }
   constexpr std::string_view tool_start = "<tool_call>";
   auto marker = tool_only ? EarliestMarker(content, markers, quotes) : 0;
@@ -2371,7 +2462,7 @@ public:
       TextGenerationBackend::InitialOutputState initial_output_state,
       EmitCallback emit_piece, bool structured, bool tool_only,
       bool recognize_tools, ToolMarkerSet markers, ToolCloserSet closers,
-      std::span<const tokenization::ChatTool> tools)
+      std::span<const tokenization::ChatTool> tools, bool gemma)
       : emit_piece_(std::move(emit_piece)),
         raw_content_(structured || tool_only),
         tool_only_(tool_only),
@@ -2379,6 +2470,10 @@ public:
         markers_(markers),
         closers_(closers),
         tools_(tools) {
+    if (gemma) {
+      reasoning_open_ = models::gemma4::kThoughtStart;
+      reasoning_close_ = models::gemma4::kThoughtEnd;
+    }
     if (initial_output_state ==
         TextGenerationBackend::InitialOutputState::kReasoning) {
       state_ = State::kThinking;
@@ -2401,18 +2496,18 @@ public:
     if (reasoning_start_) {
       // A prompt-opened reasoning phase may still emit its opening tag.
       // Match the buffered parser without exposing a split opener as thought.
-      if (!final && kThinkStart.starts_with(pending_) &&
-          pending_.size() < kThinkStart.size())
+      if (!final && reasoning_open_.starts_with(pending_) &&
+          pending_.size() < reasoning_open_.size())
         return true;
-      if (pending_.starts_with(kThinkStart))
-        pending_.erase(0, kThinkStart.size());
+      if (pending_.starts_with(reasoning_open_))
+        pending_.erase(0, reasoning_open_.size());
       reasoning_start_ = false;
     }
     if (raw_content_ && state_ == State::kContent && !trim_reasoning_separator_)
       return StructuredContent();
 
     if (state_ == State::kInitial) {
-      constexpr std::string_view kThinkStart = "<think>";
+      const std::string_view kThinkStart = reasoning_open_;
       std::string_view view = pending_;
       while (!view.empty() &&
              std::isspace(static_cast<unsigned char>(view.front())) != 0) {
@@ -2439,7 +2534,7 @@ public:
     }
 
     if (state_ == State::kThinking) {
-      constexpr std::string_view kThinkEnd = "</think>";
+      const std::string_view kThinkEnd = reasoning_close_;
       const auto offset = pending_offset();
       const auto think_found = raw_.find(kThinkEnd, offset);
       const std::size_t end_pos = think_found == std::string::npos
@@ -2682,6 +2777,8 @@ private:
   std::size_t emitted_reasoning_bytes_{0};
   bool trim_reasoning_separator_{false};
   bool reasoning_start_{false};
+  std::string_view reasoning_open_ = kThinkStart;
+  std::string_view reasoning_close_ = kThinkEnd;
 };
 
 struct ToolDelta {
@@ -2760,7 +2857,7 @@ ParsedGeneration StreamingGeneration(
     const StreamingTextFilter& filter, const ChatRequest& chat,
     TextGenerationBackend::InitialOutputState initial, ToolMarkerSet markers,
     ToolCloserSet closers, QuoteTracker& quotes, bool enforce_required,
-    bool partial = false) {
+    bool partial = false, bool gemma = false) {
   // Native grammars establish argument framing before the value completes.
   // Recovery from unconstrained/JSON fallback text still requires a full call.
   partial = partial && markers.size() <= 2;
@@ -2769,7 +2866,7 @@ ParsedGeneration StreamingGeneration(
                    filter.raw(), initial, chat.tools, chat.tool_choice,
                    enforce_required,
                    chat.constrained_tools && !chat.response_format, markers,
-                   closers, quotes, partial)
+                   closers, quotes, partial, gemma)
              : ParseGeneration(filter.raw(), initial, chat.tools,
                                chat.tool_choice, enforce_required, markers,
                                closers, quotes, partial);
@@ -3041,6 +3138,8 @@ HttpResponse NonStreamingResponse(
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const auto result = generation->Wait();
   const auto format = generation->ToolFormat();
+  const bool gemma_format =
+      *format == sampling::JsonConstraint::ToolFormat::kGemma4;
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
   core::Utf8Decoder decoder;
@@ -3054,7 +3153,7 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
+                markers, closers, quotes, false, gemma_format)
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
@@ -3113,6 +3212,8 @@ HttpResponse StreamingResponse(
   const long long created = Now();
   const std::string model = backend.model_id();
   const auto format = generation->ToolFormat();
+  const bool gemma_format =
+      *format == sampling::JsonConstraint::ToolFormat::kGemma4;
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
@@ -3128,7 +3229,7 @@ HttpResponse StreamingResponse(
           },
       .streaming_body =
           [request, generation = std::move(generation), id, created, model,
-           initial_output_state, markers, closers,
+           initial_output_state, markers, closers, gemma_format,
            stream_log](const HttpResponse::BodyWriter& writer) {
             bool connected = true;
             bool started = false;
@@ -3167,7 +3268,7 @@ HttpResponse StreamingResponse(
                 request.chat.constrained_tools && !request.chat.response_format,
                 !request.chat.tools.empty() &&
                     request.chat.tool_choice != ChatRequest::ToolChoice::kNone,
-                markers, closers, request.chat.tools);
+                markers, closers, request.chat.tools, gemma_format);
             StreamingToolCalls tools([&](const ToolDelta& call) {
               // Completion without additional arguments needs no Chat delta.
               if (call.id.empty() && call.arguments.empty())
@@ -3206,11 +3307,12 @@ HttpResponse StreamingResponse(
                     if (!begin() || !filter.Push(piece))
                       return false;
                     return !filter.in_tools() || markers.size() > 2 ||
-                           tools.Update(StreamingGeneration(
-                                            filter, request.chat,
-                                            initial_output_state, markers,
-                                            closers, quotes, false, true)
-                                            .tool_calls);
+                           tools.Update(
+                               StreamingGeneration(filter, request.chat,
+                                                   initial_output_state,
+                                                   markers, closers, quotes,
+                                                   false, true, gemma_format)
+                                   .tool_calls);
                   },
                   on_progress, begin);
               stream_log->details = GenerationLogDetails(result);
@@ -3228,7 +3330,7 @@ HttpResponse StreamingResponse(
                   TextGenerationBackend::FinishReason::kStop;
               const auto generated = StreamingGeneration(
                   filter, request.chat, initial_output_state, markers, closers,
-                  quotes, !interrupted);
+                  quotes, !interrupted, false, gemma_format);
               if (!tools.Finish(generated.tool_calls, interrupted))
                 return;
               if (!filter.Finish(generated.hide_tool_markup, generated.text,
@@ -3930,11 +4032,13 @@ HttpResponse CreateCompatibilityResponse(
   auto generation = backend.start_chat(chat, max_tokens, sampling,
                                        request.is_cancelled, stream);
   const auto format = generation->ToolFormat();
+  const bool gemma_format =
+      *format == sampling::JsonConstraint::ToolFormat::kGemma4;
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
-  const auto run = [generation, initial, chat, markers, closers,
+  const auto run = [generation, initial, chat, markers, closers, gemma_format,
                     model = backend.model_id(), stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
@@ -3963,7 +4067,7 @@ HttpResponse CreateCompatibilityResponse(
         chat.constrained_tools && !chat.response_format,
         !chat.tools.empty() &&
             chat.tool_choice != ChatRequest::ToolChoice::kNone,
-        markers, closers, chat.tools);
+        markers, closers, chat.tools, gemma_format);
     StreamingToolCalls tools([&](const ToolDelta& call) {
       if (output.Tool(call))
         return true;
@@ -3986,7 +4090,8 @@ HttpResponse CreateCompatibilityResponse(
                          return !filter.in_tools() || markers.size() > 2 ||
                                 tools.Update(StreamingGeneration(
                                                  filter, chat, initial, markers,
-                                                 closers, quotes, false, true)
+                                                 closers, quotes, false, true,
+                                                 gemma_format)
                                                  .tool_calls);
                        },
                        on_progress, begin)
@@ -4013,8 +4118,9 @@ HttpResponse CreateCompatibilityResponse(
       }
       const bool interrupted =
           result.finish_reason != TextGenerationBackend::FinishReason::kStop;
-      const auto generated = StreamingGeneration(filter, chat, initial, markers,
-                                                 closers, quotes, !interrupted);
+      const auto generated =
+          StreamingGeneration(filter, chat, initial, markers, closers, quotes,
+                              !interrupted, false, gemma_format);
       if (!tools.Finish(generated.tool_calls, interrupted)) {
         generation->Cancel();
         return json::Value();

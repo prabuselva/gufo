@@ -43,6 +43,12 @@ add_test(NAME gemma4.chat_template COMMAND gemma4_chat_template_test)
 set_tests_properties(gemma4.chat_template PROPERTIES LABELS "gemma4;cpu")
 add_dependencies(gemma4_tests gemma4_chat_template_test)
 
+add_executable(gemma4_tool_syntax_test tool_syntax_test.cpp)
+target_link_libraries(gemma4_tool_syntax_test PRIVATE gufo_gemma4)
+add_test(NAME gemma4.tool_syntax COMMAND gemma4_tool_syntax_test)
+set_tests_properties(gemma4.tool_syntax PROPERTIES LABELS "gemma4;cpu")
+add_dependencies(gemma4_tests gemma4_tool_syntax_test)
+
 # Runs the scalar oracle over the real artifact (a few tokens). Built only when
 # the reference library is requested, and skips (77) without the GGUF.
 add_executable(gemma4_reference_test EXCLUDE_FROM_ALL reference_test.cpp)

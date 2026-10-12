@@ -176,6 +176,23 @@ public:
         min_drafts_(min_drafts),
         max_drafts_(max_drafts) {}
 
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kGemma4;
+  }
+
+  // Grammar-constrained decoding needs token-level pieces: a greedy-merge
+  // tokenizer otherwise hides the native call delimiters behind merges the
+  // sampler cannot validate against the grammar.
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->tokenizer().VocabSize(), [this](std::uint32_t id) {
+          const auto& tokenizer = model_->tokenizer();
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer.TokenToPiece(id), id == tokenizer.EosId()};
+        });
+  }
+
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
@@ -294,9 +311,17 @@ public:
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return request.reasoning.enabled.value_or(false)
-               ? TextGenerationBackend::InitialOutputState::kReasoning
-               : TextGenerationBackend::InitialOutputState::kContent;
+    if (!request.reasoning.enabled.value_or(true))
+      // Thinking off: the answer follows directly, but the grammar still
+      // tolerates a channel the model opens on its own.
+      return TextGenerationBackend::InitialOutputState::kAuto;
+    // After a tool response the chat template opened the thought channel
+    // in the prompt; otherwise the model opens it inside its turn.
+    const bool after_tool =
+        !request.messages.empty() &&
+        request.messages.back().role == tokenization::ChatRole::kTool;
+    return after_tool ? TextGenerationBackend::InitialOutputState::kReasoning
+                      : TextGenerationBackend::InitialOutputState::kAuto;
   }
 
   [[nodiscard]] std::string Decode(

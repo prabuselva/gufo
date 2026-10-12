@@ -15,6 +15,7 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
+#include "src/models/gemma4/chat_template.hpp"
 
 namespace gufo::server {
 
@@ -81,9 +82,21 @@ std::optional<ChatRequest> ConstrainChatRequest(
     constrained.messages.insert(constrained.messages.begin(),
                                 std::move(message));
   }
-  if (runner.InitialOutputState(request) ==
-      TextGenerationBackend::InitialOutputState::kReasoning)
-    grammar = sampling::JsonConstraint::WithReasoning(grammar);
+  const auto initial_state = runner.InitialOutputState(request);
+  const bool gemma4 =
+      runner.ToolFormat() == sampling::JsonConstraint::ToolFormat::kGemma4;
+  if (initial_state == TextGenerationBackend::InitialOutputState::kReasoning) {
+    // The Gemma 4 template has opened the thought channel: the model must
+    // close it before the answer.
+    grammar = gemma4 ? sampling::JsonConstraint::WithReasoning(
+                           grammar, models::gemma4::kThoughtEnd)
+                     : sampling::JsonConstraint::WithReasoning(grammar);
+  } else if (gemma4 && initial_state ==
+                           TextGenerationBackend::InitialOutputState::kAuto) {
+    // The model may open and close the thought channel inside its turn.
+    grammar = sampling::JsonConstraint::WithReasoning(
+        grammar, models::gemma4::kThoughtEnd, models::gemma4::kThoughtStart);
+  }
   sampling->constraint = runner.BindConstraint(grammar);
   return constrained;
 }

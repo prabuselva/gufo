@@ -4,6 +4,7 @@
 add_library(gufo_gemma4 STATIC
   chat_template.cpp
   config.cpp
+  tool_syntax.cpp
   tokenizer.cpp
   weights.cpp
   vision/config.cpp
