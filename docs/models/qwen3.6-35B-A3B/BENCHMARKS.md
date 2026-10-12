@@ -21,6 +21,21 @@ short-context gap to the reference (96 %→100 % at 512, 88 %→95 % at 16 K). T
 **reference** column is unchanged from the October 3 session (the reference tree
 does not carry the route). Decode is unaffected (batch 1 never trips the route).
 
+The **gufo** column was re-measured 2026-10-08 on `967f2370` plus the GDN
+launcher fix (`GdnDeltaLoopKernel` caps per-lane state at `kRows ≤ 4` when
+`kCols > 4`, removing the clang-23 scratch spill on the verify-path
+instantiations; the live `<8, 4>` instantiation is unchanged and bit-identical,
+and the prefill path uses `GdnDeltaLoopRowSplitKernel`). The fix is neutral: an
+exclusive-GPU A/B alternating the base and fixed binaries in fresh processes
+measures ≤0.5 % apart at every depth (pp1024 2175.3 vs 2177.0, pp8192 2344.1
+vs 2350.0, pp16384 2142.1 vs 2138.2, tg128 45.55 vs 45.34). This column is a
+**fresh-process-per-depth** sweep, the reproducible regime on this machine: the
+same binary swings 16 % at pp512 (1420–1697 t/s) across sessions, and inside a
+single-process sweep the short-depth rows degrade after the preceding depths (a
+pp8192 warm-up does not recover them), so single-sweep columns only match when
+the machine happens to start boosted. This column matches or exceeds the
+2026-10-07 table at every depth (pp1024 2219.7 vs 2183.1).
+
 `gufo bench` is greedy argmax with no chat template (thinking off), 3
 repetitions, identical flags for both binaries. The `±` is the stddev over the
 timed repetitions. Measuring the reference on this machine rather than quoting
@@ -31,19 +46,19 @@ machine, so the same-machine ratios are lower than its self-reported ones.
 
 | Prefill prompt (tokens) | gufo (t/s) | reference (t/s) | ratio |
 | ---: | ---: | ---: | ---: |
-| 512 | 1656.6 ± 4.1 | 1648.1 ± 10.0 | 100 % |
-| 1024 | 2183.1 ± 5.3 | 2201.6 ± 6.1 | 99 % |
-| 2048 | 2377.1 ± 5.2 | 2403.3 ± 4.1 | 99 % |
-| 4096 | 2372.8 ± 6.3 | 2425.1 ± 2.2 | 98 % |
-| 8192 | 2254.0 ± 7.0 | 2341.1 ± 4.2 | 96 % |
-| 16384 | 2110.8 ± 1.8 | 2217.8 ± 1.7 | 95 % |
-| 32768 | 1866.3 ± 3.3 | 1941.7 ± 15.1 | 96 % |
-| 65536 | 1467.2 ± 27.3 | 1592.3 ± 1.1 | 92 % |
-| 102400 | 1186.2 ± 5.2 | 1331.4 ± 2.3 | 89 % |
+| 512 | 1696.8 ± 8.8 | 1648.1 ± 10.0 | 103 % |
+| 1024 | 2219.7 ± 8.1 | 2201.6 ± 6.1 | 101 % |
+| 2048 | 2421.1 ± 2.5 | 2403.3 ± 4.1 | 101 % |
+| 4096 | 2404.6 ± 4.4 | 2425.1 ± 2.2 | 99 % |
+| 8192 | 2349.5 ± 2.1 | 2341.1 ± 4.2 | 100 % |
+| 16384 | 2144.1 ± 29.2 | 2217.8 ± 1.7 | 97 % |
+| 32768 | 1854.5 ± 2.3 | 1941.7 ± 15.1 | 96 % |
+| 65536 | 1491.5 ± 5.0 | 1592.3 ± 1.1 | 94 % |
+| 102400 | 1180.1 ± 4.1 | 1331.4 ± 2.3 | 89 % |
 
 | Workload | gufo (t/s) | reference (t/s) | ratio |
 | --- | ---: | ---: | ---: |
-| tg128 (greedy, no MTP) | 44.99 ± 0.08 | 50.80 ± 0.04 | 89 % |
+| tg128 (greedy, no MTP) | 45.09 ± 0.12 | 50.80 ± 0.04 | 89 % |
 
 ## Qwen3.6-35B-A3B, UD-Q4_K_XL
 
@@ -112,10 +127,10 @@ exceeds the ~60 t/s target and the reference's measured bench MTP n=2 (63.41).
 
 The production serving path (MTP, adaptive draft) meets the throughput target.
 On a strict like-for-like `gufo bench` basis measured on this machine, gufo is at
-parity at 512 and the reference stays ahead at depth; the residual gaps are
+parity through 8 K and the reference stays ahead at depth; the residual gaps are
 kernel-efficiency differences, not methodology:
 
-- **Long-context prefill (100 % at 512 → 95 % at 16 K → 89 % at 100 K).** The
+- **Long-context prefill (103 % at 512 → 97 % at 16 K → 89 % at 100 K).** The
   earlier monotonic collapse (91 % → 68 %) is fixed. The dominant cause was not
   the attention kernel itself: every plain (non-speculative) prefill was still
   running the MTP draft layer through the scalar oracle attention
@@ -136,9 +151,9 @@ the same WMMA kernel as the trunk. That lifted pp16384 from 1515 to 1883 t/s
    — see [EXPERIMENTS.md](EXPERIMENTS.md) "Routed MoE fused gate+up". The latest
    lever is the model-private **dense-F16 WMMA route** for the Q8_0 projections
    (binary16 activations at `batch >= 96`), worth ~5–10 % prefill; the table's
-   gufo column now includes all of these (peak 2377 at pp2048, 2111 at 16 K). The
-   residual 95 % at 16384 is the remaining kernel-efficiency gap in the attention
-   core. The reference's
+gufo column now includes all of these (peak 2421 at pp2048, 2144 at 16 K). The
+    residual 97 % at 16384 is the remaining kernel-efficiency gap in the attention
+    core. The reference's
   **head-major packed KV fast path** (`attention_wmma.hip`, gated to
   `batch_size >= 1024`) repacks each KV head into a contiguous `[context]
   [head_dim]` slab so consecutive key rows sit 512 B apart (fully coalesced)
@@ -155,10 +170,10 @@ the same WMMA kernel as the trunk. That lifted pp16384 from 1515 to 1883 t/s
   ablation of the production packed tile at 100 K confirms the attention core is
   now **WMMA-compute-bound** (S + PV matmuls ≈ 55 % of the kernel, global KV load
   only ≈ 5 %), so neither the repack nor a full-KV-group re-read cut can close
-the gap; the residual widening past 16 K (96 % at 32 K → 92 % at 64 K → 89 % at
+the gap; the residual widening past 16 K (96 % at 32 K → 94 % at 64 K → 89 % at
    100 K) is matmul efficiency, not data movement. See [EXPERIMENTS.md](EXPERIMENTS.md)
    and [OPTIMIZATIONS.md](OPTIMIZATIONS.md) "Prefill attention WMMA + row-split GDN".
- - **Greedy decode (89 %).** At 44.99 t/s the step moves ~3.07 GB of active
+ - **Greedy decode (89 %).** At 45.09 t/s the step moves ~3.07 GB of active
   weights/token, i.e. ~136 GB/s effective against the ~240 GB/s streaming peak
   (roofline ~78 t/s, [OPTIMIZATIONS.md](OPTIMIZATIONS.md)). The Q8_0 `lm_head`
   GEMV is at the DRAM ceiling (231 GB/s), but the grouped MoE and `lin_gemm_in`
@@ -185,11 +200,10 @@ both binaries — `B=./build/release/gufo` (gufo) and
 
 ```sh
 MODEL=.../Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf
-"$B" bench --model "$MODEL" \
-  --n-prompt 512,1024,2048,4096,8192,16384 --n-gen 128 --repetitions 3
-# Long-context rows (32 K/64 K/100 K); n-gen 1 skips decode, ~8 min per binary:
-"$B" bench --model "$MODEL" \
-  --n-prompt 32768,65536,102400 --n-gen 1 --repetitions 3
+# One fresh process per depth (see the 2026-10-08 note on sweep-state drift):
+for D in 512 1024 2048 4096 8192 16384 32768 65536 102400; do
+  "$B" bench --model "$MODEL" --n-prompt "$D" --n-gen 128 --repetitions 3
+done
 for N in 1 2; do
   "$B" bench --model "$MODEL" \
     --speculative mtp --mtp-model "$MODEL" \

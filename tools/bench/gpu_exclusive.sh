@@ -86,13 +86,21 @@ respawned=0
 
 log() { printf '\n=== [gpu_exclusive] %s ===\n' "$*"; }
 
-# Only real `gufo serve` processes: the executable must be named `gufo` AND its
-# args must contain the `serve` subcommand. Matching the bare string "gufo serve"
-# with pgrep -f also hits wrappers/benchmarks whose command line merely mentions
-# it, which would make stop_server kill the benchmark itself.
+# Only real `gufo serve` processes: the executable's comm must be `gufo` or a
+# versioned archive name `gufo-<digits>` (respawn replays the captured
+# /proc/PID/exe path, e.g. /opt/llm/gufo/bin/gufo-20261006, whose comm then
+# stops matching a bare `gufo`), AND its args must contain the `serve`
+# subcommand. Matching the bare string "gufo serve" with pgrep -f also hits
+# wrappers/benchmarks whose command line merely mentions it, which would make
+# stop_server kill the benchmark itself.
 server_pids() {
-  local p
-  for p in $(pgrep -x gufo 2>/dev/null || true); do
+  local p comm
+  for p in $(pgrep -f gufo 2>/dev/null || true); do
+    comm="$(cat "/proc/$p/comm" 2>/dev/null)" || continue
+    case "$comm" in
+      gufo | gufo-[0-9]*) ;;
+      *) continue ;;
+    esac
     if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q ' serve '; then
       printf '%s\n' "$p"
     fi
