@@ -453,10 +453,35 @@ bool TestNormsAndAdd() {
   for (std::uint32_t i = 0; i < kHidden; ++i) {
     ref_add[i] = single[i] + addend[i];
   }
+  q::RmsNormRows(d_x.get(), d_gamma.get(), d_out.get(), kRows, kHidden, 1e-6F,
+                 nullptr);
+  q::Add(d_out.get(), d_x.get(), kRows * kHidden, nullptr);
+  t::HipBuffer<float> d_fused(x.size());
+  q::RmsNormAddRows(d_x.get(), d_gamma.get(), d_x.get(), d_fused.get(), kRows,
+                    kHidden, 1e-6F, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RmsNormAddRows synchronization");
+  const auto two_pass = t::Download(&d_out, x.size());
+  const auto fused = t::Download(&d_fused, x.size());
+  bool bits_ok = true;
+  std::size_t ndiff = 0;
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    if (std::memcmp(&two_pass[i], &fused[i], sizeof(float)) != 0) {
+      if (ndiff < 12) {
+        std::cerr << "RmsNormAddRows bit diff at " << i << " (row "
+                  << i / kHidden << " col " << i % kHidden << "): two_pass "
+                  << two_pass[i] << " fused " << fused[i] << '\n';
+      }
+      ++ndiff;
+      bits_ok = false;
+    }
+  }
+  std::cout << "RmsNormAddRows bit-exact " << (bits_ok ? "yes" : "NO") << " ("
+            << ndiff << " diffs)\n";
+
   return Check("Add",
                t::WorstRelative(ref_add, t::Download(&d_single, kHidden)),
                1e-6) &&
-         ok;
+         ok && bits_ok;
 }
 
 bool TestGemmShape(std::uint32_t rows, std::uint32_t batch, const char* label,

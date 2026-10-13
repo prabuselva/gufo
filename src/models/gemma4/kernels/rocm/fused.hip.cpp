@@ -282,6 +282,83 @@ __global__ void FusedAddRmsNormKernel(float* x, const float* addend,
   }
 }
 
+// RMSNorm with the residual accumulate folded into its store pass:
+// out[row][i] = (x[row][i]*scale*gamma[i]) + addend[row][i] (or + addend when
+// gamma is null). Same per-element values and rounding as running
+// RmsNormKernel and then AddKernel(a[i] += b[i]), minus the extra read-write
+// pass over the row.
+__global__ void RmsNormKernelAdd(const float* x, const float* gamma,
+                                 const float* addend, float* out,
+                                 std::uint32_t dim, float eps) {
+  __shared__ double reduce[32];
+  const std::size_t row = blockIdx.x;
+  const float* xr = x + row * dim;
+  if ((dim & 3U) == 0U) {
+    const float4* x4 = reinterpret_cast<const float4*>(xr);
+    const float4* a4 = reinterpret_cast<const float4*>(addend + row * dim);
+    const std::uint32_t n4 = dim / 4U;
+    float ss = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
+    float4* orow = reinterpret_cast<float4*>(out + row * dim);
+    // The store must keep the two-pass rounding chain fl(fl(v*scale*g)) + a.
+    // Default -ffp-contract contracts the final add into an FMA (ROCm's
+    // __fadd_rn/__fmul_rn are plain operator wrappers and do NOT prevent it;
+    // measured 23 % of elements off by 1 ulp), so contraction is disabled for
+    // exactly these loops. The sum-of-squares above keeps the compiler's
+    // default contraction, identical to RmsNormKernel.
+    if (gamma != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(gamma);
+      {
+#pragma clang fp contract(off)
+        for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+          const float4 v = x4[i];
+          const float4 g = g4[i];
+          const float4 a = a4[i];
+          orow[i] = {v.x * scale * g.x + a.x, v.y * scale * g.y + a.y,
+                     v.z * scale * g.z + a.z, v.w * scale * g.w + a.w};
+        }
+      }
+    } else {
+      {
+#pragma clang fp contract(off)
+        for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+          const float4 v = x4[i];
+          const float4 a = a4[i];
+          orow[i] = {v.x * scale + a.x, v.y * scale + a.y, v.z * scale + a.z,
+                     v.w * scale + a.w};
+        }
+      }
+    }
+    return;
+  }
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const double v = xr[i];
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(dim)) +
+                   eps);
+  float* orow = out + row * dim;
+  const float* ar = addend + row * dim;
+  {
+#pragma clang fp contract(off)
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      const float v = xr[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+      orow[i] = v + ar[i];
+    }
+  }
+}
+
 __global__ void AddKernel(float* a, const float* b, std::size_t count) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
@@ -646,6 +723,13 @@ void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
                      hipStream_t stream) {
   const dim3 block(std::min<std::uint32_t>(dim, 256U));
   RmsNormKernelHalf<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
+}
+
+void RmsNormAddRows(const float* x, const float* gamma, const float* addend,
+                    float* out, std::uint32_t rows, std::uint32_t dim,
+                    float eps, hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  RmsNormKernelAdd<<<rows, block, 0, stream>>>(x, gamma, addend, out, dim, eps);
 }
 
 void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,

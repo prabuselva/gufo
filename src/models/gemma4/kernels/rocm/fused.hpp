@@ -39,6 +39,13 @@ void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
                      std::uint32_t rows, std::uint32_t dim, float eps,
                      hipStream_t stream);
 
+/// RMSNorm with the residual accumulate folded into the store pass:
+/// out[r][d] = (x[r][d]*scale*gamma[d]) + addend[r][d]. Bit-identical to
+/// RmsNormRows followed by Add(out, addend); `gamma` may be null (scale 1).
+void RmsNormAddRows(const float* x, const float* gamma, const float* addend,
+                    float* out, std::uint32_t rows, std::uint32_t dim,
+                    float eps, hipStream_t stream);
+
 /// Single-row residual add fused with the following RMSNorm: `x += addend`,
 /// then `out = rmsnorm(x) * gamma`. Bit-identical to Add then RmsNormRows with
 /// rows == 1. `out` may alias `x`; `gamma` may be null (scale 1).

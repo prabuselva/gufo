@@ -425,9 +425,8 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
   }
   Gemv(l.attn_output.data, ot, hidden, heads * head_dim,
        l.attn_output.row_bytes, attn_, proj_, nullptr);
-  RmsNormRows(proj_, l.post_attention_norm.f32(), attn_out_, 1, hidden,
-              c.rms_eps, nullptr);
-  Add(attn_out_, cur_, hidden, nullptr);
+  RmsNormAddRows(proj_, l.post_attention_norm.f32(), cur_, attn_out_, 1, hidden,
+                 c.rms_eps, nullptr);
 
   // Shared dense FFN: down( gelu(gate(x)) * up(x) ), then its post-norm.
   RmsNormRows(attn_out_, l.ffn_norm.f32(), normed_, 1, hidden, c.rms_eps,
@@ -696,9 +695,8 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   }
   Gemm(l.attn_output.data, ot, hidden, heads * head_dim,
        l.attn_output.row_bytes, pf_attn_, pf_proj_, tokens, nullptr);
-  RmsNormRows(pf_proj_, l.post_attention_norm.f32(), pf_attn_out_, tokens,
-              hidden, c.rms_eps, nullptr);
-  Add(pf_attn_out_, pf_cur_, rows * hidden, nullptr);
+  RmsNormAddRows(pf_proj_, l.post_attention_norm.f32(), pf_cur_, pf_attn_out_,
+                 tokens, hidden, c.rms_eps, nullptr);
 
   GemvType ft{};
   if (!GemvTypeOf(l.ffn_gate.type, &ft) || !GemvTypeOf(l.ffn_up.type, &ft) ||
@@ -1014,9 +1012,8 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
     }
     Gemv(l.attn_output.data, ot, hidden, heads * head_dim,
          l.attn_output.row_bytes, d_attn_, d_proj_, nullptr);
-    RmsNormRows(d_proj_, l.post_attention_norm.f32(), d_attn_out_, 1, hidden,
-                dc.rms_eps, nullptr);
-    Add(d_attn_out_, d_cur_, hidden, nullptr);
+    RmsNormAddRows(d_proj_, l.post_attention_norm.f32(), d_cur_, d_attn_out_, 1,
+                   hidden, dc.rms_eps, nullptr);
 
     RmsNormRows(d_attn_out_, l.ffn_norm.f32(), d_normed_, 1, hidden, dc.rms_eps,
                 nullptr);

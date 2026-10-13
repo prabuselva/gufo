@@ -342,7 +342,24 @@ it only pays together with the fork's register-frugal 2.5 template
       −0.8 % regression until control binaries were alternated). Matched
       alternation pp2048: candidate 3114.13/3124.67/3132.15/3141.87 vs fresh
       control 3105.32/3104.83/3045.84 (candidate never loses the pair);
-      paired pp8192 2935.91 vs control 2898.82 (+1.3 %). 2048→4 launches.
+       paired pp8192 2935.91 vs control 2898.82 (+1.3 %). 2048→4 launches.
+       **Fused residual-add into the RMSNorm store pass (`RmsNormAddRows`,
+       fork `PostAttentionNormKernel` analogue, now default)**: one launch
+       writes `norm(x)*g + addend` at the three post-attention/pre-FFN sites
+       (prefill, decode `StepLayer`, MTP draft), removing one full-width
+       `Add` pass per layer (~8.6 µs/pp-rep vs fork). Bit-identical to
+       `RmsNormRows` + `Add` by construction, and pinned by a memcmp unit
+       check in `gemma4.rocm_kernels`. Gates (`gufo_bench_lever2d.log`):
+       kernels/forward pass; validator kl **0.0000930581** tv 0.0000874606
+       top-1 match EXACT; paired pp2048 cand vs control +0.57/+0.42/+0.31 %
+       (cand won all three pairs), pp8192 cand-first 2960.51 vs control
+       2929.84 (+1.05 %, order bias against the candidate there).
+       Lesson pinned by isolation harness: ROCm `__fadd_rn`/`__fmul_rn` are
+       plain operator wrappers and do **not** block FMA contraction — the
+       fused store `v*scale*g + a` silently fused into an FMA (23 % of
+       elements 1 ulp off). `#pragma clang fp contract(off)` scoped to a
+       nested block around only the store loops (sumsq keeps its contracted
+       reduction) restores bit-exactness at −O2/−O3.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.
