@@ -219,8 +219,25 @@ it only pays together with the fork's register-frugal 2.5 template
        keeps identical full-precision trig, so its speed comes from work
        layout, not accuracy trade. Re-profiled budget per pp2048 prefill
        (`/tmp/opencode/prof_pc2k`, trace 3 prefills): MoE 182+27 `MoeFinish`
-       +12 blk29-fallback, dense F16 ≈148, attention ≈59, rope+norms ≈81,
-       NarrowHalf 14 (now gone), router SGEMM 15, `mul_mat_q` 12.
+        +12 blk29-fallback, dense F16 ≈148, attention ≈59, rope+norms ≈81,
+        NarrowHalf 14 (now gone), router SGEMM 15, `mul_mat_q` 12.
+        **3.2e warp-wide QK/KV norm-rope kernels**: `QknormRopeWarpKernel` and
+        `KvNormRopeWriteWarpKernel` give each warp one whole head — NEOX pairs
+        `(i, half+i)` load straight into registers, the RMS sum is a double
+        butterfly tree (`WarpAllReduceSumD`, every lane holds the sum, no
+        broadcast), and there is no shared memory or block barrier; wrappers
+        launch 32-thread grids `(tokens, heads)` when `head_dim % 64 == 0`
+        (≤1024) and keep the old block kernels otherwise. Per-element
+        arithmetic is unchanged (double RMS sum → float scale → rope with the
+        same `sincosf`); only the sum's association order moves, so the
+        recorded KL drifts with it. Measured exclusive: pp2048 **2724.58
+        (+2.9 % vs 2647.97)**, pp8192 **2456.90 (+0.7 %)**, tg 42.05/41.99
+        neutral; validate top1_match=yes, kl 0.0119523936 tv 0.0139146945
+        (was 0.0100832073 — association-order shift, RECORDED, not a
+        regression flag); both gates pass (`gufo_bench_rope1.log`). Same-quant
+        d0 gap now 3760 vs 2725 = **1.38×**; remaining budget concentrates in
+        MoE gate 116 + down 67, dense F16 ≈148 and attention ≈59 — next
+        levers live there, not in elementwise.
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position

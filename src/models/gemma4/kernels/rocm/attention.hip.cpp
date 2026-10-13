@@ -20,6 +20,15 @@ __device__ __forceinline__ double WarpReduceSumD(double v) {
   return v;
 }
 
+// Butterfly tree: every lane ends with the full sum, so callers can use the
+// result directly instead of broadcasting lane 0 afterwards.
+__device__ __forceinline__ double WarpAllReduceSumD(double v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v += __shfl_xor(v, offset);
+  }
+  return v;
+}
+
 __device__ __forceinline__ double BlockReduceSumD(double v, double* shared) {
   const int lane = static_cast<int>(threadIdx.x) % warpSize;
   const int warp = static_cast<int>(threadIdx.x) / warpSize;
@@ -77,6 +86,107 @@ __device__ __forceinline__ void RopeHead(float* buf, std::uint32_t head_dim,
 }
 
 constexpr float kRmsEps = 1.0e-6F;
+
+// Warp-wide variants: one warp owns a whole head, the NEOX pairs and their
+// RMS sum stay in registers, and the reduction is a bare warp shuffle tree.
+// head_dim must be a multiple of 64 so each lane owns (head_dim/64) NEOX
+// pairs; the block kernels below are the fallback for exotic widths. The
+// arithmetic per element is the same (norm scale in float over a double sum,
+// then rope); only the sum's association order moves, and it stays in double.
+__global__ void QknormRopeWarpKernel(const float* q, const float* gamma,
+                                     float* out, std::uint32_t heads,
+                                     std::uint32_t head_dim,
+                                     const float* inv_freq,
+                                     std::uint32_t start) {
+  const std::uint32_t token = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::size_t o =
+      (static_cast<std::size_t>(token) * heads + head) * head_dim;
+  const float* row = q + o;
+  const std::uint32_t half = head_dim / 2U;
+  const std::uint32_t pairs = half / warpSize;
+  float a[16];
+  float b[16];
+  double ss = 0.0;
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = threadIdx.x + warpSize * m;
+    a[m] = row[i];
+    b[m] = row[half + i];
+    ss += static_cast<double>(a[m]) * a[m] + static_cast<double>(b[m]) * b[m];
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(ss) /
+                                      static_cast<double>(head_dim)) +
+                   kRmsEps);
+  float* orow = out + o;
+  const float pos = static_cast<float>(start + token);
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = threadIdx.x + warpSize * m;
+    const float ya = a[m] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+    const float yb = b[m] * scale * (gamma != nullptr ? gamma[half + i] : 1.0F);
+    float s;
+    float c;
+    sincosf(pos * inv_freq[i], &s, &c);
+    orow[i] = ya * c - yb * s;
+    orow[half + i] = ya * s + yb * c;
+  }
+}
+
+__global__ void KvNormRopeWriteWarpKernel(
+    const float* k, const float* v, const float* k_gamma, __half* k_cache,
+    __half* v_cache, std::uint32_t kv_heads, std::uint32_t head_dim,
+    const float* inv_freq, std::uint32_t start) {
+  const std::uint32_t token = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::size_t o =
+      (static_cast<std::size_t>(token) * kv_heads + head) * head_dim;
+  const float* krow = k + o;
+  const float* vrow = v + o;
+  const std::uint32_t half = head_dim / 2U;
+  const std::uint32_t pairs = half / warpSize;
+  float ka[16];
+  float kb[16];
+  float vb[16];
+  float va[16];
+  double kss = 0.0;
+  double vss = 0.0;
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = threadIdx.x + warpSize * m;
+    ka[m] = krow[i];
+    kb[m] = krow[half + i];
+    va[m] = vrow[i];
+    vb[m] = vrow[half + i];
+    kss +=
+        static_cast<double>(ka[m]) * ka[m] + static_cast<double>(kb[m]) * kb[m];
+    vss +=
+        static_cast<double>(va[m]) * va[m] + static_cast<double>(vb[m]) * vb[m];
+  }
+  const float kscale =
+      1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(kss) /
+                                      static_cast<double>(head_dim)) +
+                   kRmsEps);
+  const float vscale =
+      1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(vss) /
+                                      static_cast<double>(head_dim)) +
+                   kRmsEps);
+  const std::size_t c =
+      (static_cast<std::size_t>(start) + token) * kv_heads * head_dim +
+      static_cast<std::uint32_t>(head) * head_dim;
+  const float pos = static_cast<float>(start + token);
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = threadIdx.x + warpSize * m;
+    const float ya = ka[m] * kscale * (k_gamma != nullptr ? k_gamma[i] : 1.0F);
+    const float yb =
+        kb[m] * kscale * (k_gamma != nullptr ? k_gamma[half + i] : 1.0F);
+    float s;
+    float c2;
+    sincosf(pos * inv_freq[i], &s, &c2);
+    k_cache[c + i] = __float2half(ya * c2 - yb * s);
+    k_cache[c + half + i] = __float2half(ya * s + yb * c2);
+    v_cache[c + i] = __float2half(va[m] * vscale);
+    v_cache[c + half + i] = __float2half(vb[m] * vscale);
+  }
+}
 
 __global__ void QknormRopeKernel(const float* q, const float* gamma, float* out,
                                  std::uint32_t heads, std::uint32_t head_dim,
@@ -721,8 +831,13 @@ void QknormRope(const float* q, const float* gamma, float* out,
                 std::uint32_t tokens, std::uint32_t heads,
                 std::uint32_t head_dim, const float* inv_freq,
                 std::uint32_t start, hipStream_t stream) {
-  QknormRopeKernel<<<dim3(tokens, heads), 256, 0, stream>>>(
-      q, gamma, out, heads, head_dim, inv_freq, start);
+  if (head_dim % 64U == 0U && head_dim <= 1024U) {
+    QknormRopeWarpKernel<<<dim3(tokens, heads), 32, 0, stream>>>(
+        q, gamma, out, heads, head_dim, inv_freq, start);
+  } else {
+    QknormRopeKernel<<<dim3(tokens, heads), 256, 0, stream>>>(
+        q, gamma, out, heads, head_dim, inv_freq, start);
+  }
 }
 
 void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
@@ -730,8 +845,13 @@ void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
                      std::uint32_t tokens, std::uint32_t kv_heads,
                      std::uint32_t head_dim, const float* inv_freq,
                      hipStream_t stream) {
-  KvNormRopeWriteKernel<<<dim3(tokens, kv_heads), 256, 0, stream>>>(
-      k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start);
+  if (head_dim % 64U == 0U && head_dim <= 1024U) {
+    KvNormRopeWriteWarpKernel<<<dim3(tokens, kv_heads), 32, 0, stream>>>(
+        k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start);
+  } else {
+    KvNormRopeWriteKernel<<<dim3(tokens, kv_heads), 256, 0, stream>>>(
+        k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start);
+  }
 }
 
 void AttentionDecode(const float* q, const __half* k_cache,
