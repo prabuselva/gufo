@@ -263,10 +263,29 @@ it only pays together with the fork's register-frugal 2.5 template
         fork's 123 ms still needs the streaming-path itself (`kTokTiles`
         issue rate/LDS), lesson: check cache-level traffic before tile
         multiplicity.
+        **3.2g skip-rescale port evaluated and rejected (reverted)**: fork
+        `ac2a4d67` per-row-block `__all(scale == 1)` gate around the WMMA
+        attention accumulator rescale was applied verbatim to
+        `AttentionPrefillWmmaKernel` and measured twice exclusive.
+        Gates passed, KL **bit-identical 0.0100832073**, but pp2048
+        2857.15/2862.62 (vs 2877.10/2875.09) and pp8192 2539.89/2555.35 (vs
+        2581.04) — consistently −0.4 %…−1.6 %. The fork's wave owns one row
+        block so one ballot skips a uniform large tail; our waves share all
+        `kRowBlocks`, so several per-tile ballots cost more than the mostly-
+        dead multiplies saved. Lesson: branch-shaped wins do not port across
+        wave mappings. The remaining fork attention deltas (`ccef541a`
+        two-blocks/WGP with `waves_per_eu`, `c96e2714` next-tile K/V register
+        prefetch + sliding staging, `4a1a1c3c` rotated-dims-only global-layer
+        caches) are structural: porting them means their wave-per-(row-block,
+        128-dim-slice) mapping and their cache layout, not their predicates.
+        Prior isolated `waves_per_eu(8)` on our layout REGRESSED, so pair it
+        with the two-block shape if attempted.
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position
-      KL at 16 K gate.
+      KL at 16 K gate. Attention budget at pp2048 timed pass: 91.9 ms vs fork
+      46 ms — the largest remaining gap (dense FFN GEMM per-shape tiles is
+      next at ~−38 ms: fork attn-out "two-block 8×1" 2013→1759 µs).
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.
