@@ -222,22 +222,31 @@ it only pays together with the fork's register-frugal 2.5 template
         +12 blk29-fallback, dense F16 ≈148, attention ≈59, rope+norms ≈81,
         NarrowHalf 14 (now gone), router SGEMM 15, `mul_mat_q` 12.
         **3.2e warp-wide QK/KV norm-rope kernels**: `QknormRopeWarpKernel` and
-        `KvNormRopeWriteWarpKernel` give each warp one whole head — NEOX pairs
-        `(i, half+i)` load straight into registers, the RMS sum is a double
-        butterfly tree (`WarpAllReduceSumD`, every lane holds the sum, no
-        broadcast), and there is no shared memory or block barrier; wrappers
-        launch 32-thread grids `(tokens, heads)` when `head_dim % 64 == 0`
-        (≤1024) and keep the old block kernels otherwise. Per-element
-        arithmetic is unchanged (double RMS sum → float scale → rope with the
-        same `sincosf`); only the sum's association order moves, so the
-        recorded KL drifts with it. Measured exclusive: pp2048 **2724.58
-        (+2.9 % vs 2647.97)**, pp8192 **2456.90 (+0.7 %)**, tg 42.05/41.99
-        neutral; validate top1_match=yes, kl 0.0119523936 tv 0.0139146945
-        (was 0.0100832073 — association-order shift, RECORDED, not a
-        regression flag); both gates pass (`gufo_bench_rope1.log`). Same-quant
-        d0 gap now 3760 vs 2725 = **1.38×**; remaining budget concentrates in
-        MoE gate 116 + down 67, dense F16 ≈148 and attention ≈59 — next
-        levers live there, not in elementwise.
+        `KvNormRopeWriteWarpKernel` give each warp ONE TOKEN and loop heads —
+        the `(pos, inv_freq)` rope angles are computed once per token
+        (shared by all 16 Q / 8 KV heads) into registers, NEOX pairs
+        `(i, half+i)` and the double RMS sum stay in registers per head with a
+        butterfly shuffle (`WarpAllReduceSumD`, no broadcast); block-shaped
+        (128 threads = 4 tokens). Wrappers select it for `tokens ≥ 32` &&
+        `head_dim % 64 == 0` (≤1024) and keep the block kernels otherwise —
+        at decode width a single warp looping 16 heads serializes and tg fell
+        42→38 until the `tokens ≥ 32` guard sent decode back to the per-
+        (token, head) block kernels. The first warp-per-HEAD cut is what the
+        timed profile (pass tables, `/tmp/opencode/prof_rope`) exposed as
+        still-bound (`QknormRope` 36 ms + `KvNormRopeWrite` 28 ms/prefill,
+        ≈55 GB/s vs ≈156 GB/s achieved by nearby norms). Final numbers
+        (exclusive): pp2048 **2852.38/2874.42 (+8.5 % vs 2647.97)**, pp8192
+        **2570.96 (+5.4 %)**, tg 42.3–42.8 neutral; validate KL **0.0100832073
+        tv 0.0122322326 — bit-identical to the 3.2b baseline** (double RMS
+        sums round to the same float scale; the intermediate 0.01195/0.01267
+        KL prints came from the decode path using warp kernels, gone once
+        decode reverted), both gates pass (`gufo_bench_rope{1,2,3}.log`).
+        Same-quant d0 gap now 3760 vs 2874 = **1.31×**. Fresh per-pp2048
+        timing-pass budget (before this cut): MoE `RoutedHalfDown` 164+95 +
+        `MoeFinish` 42 + `RoutedF16` 17, DenseF16 ≈227 (18.5 %),
+        attention 89, rope+norms ≈122 (now ≈90), router SGEMM 21,
+        `mul_mat_q<8,80>` 18 — next levers: MoE gate/up GEMM (fork 123 vs
+        our 259+finish) and attention (fork 46 vs 89).
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position
