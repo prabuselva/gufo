@@ -198,6 +198,29 @@ it only pays together with the fork's register-frugal 2.5 template
        re-stream count, not numerics). `gufo_bench_{pc2048,pc8192}.log`.
        Same-quant d0 gap vs fork now 3760 vs 2649 = **1.42×**; re-profile
        before picking the next lever — MoE's 4×-streamed share shrank.
+       **3.2d producer fusion, first slice (small win, zero numerics
+       change)**: the router's `MulInPlace(router_scale)` + `ScaleInPlace
+       (1/sqrt(hidden))` fold into the norm store (`RmsNormKernel`
+       `post_scale`/`post_k`, multiply order matching the standalone chain);
+       the attention-input norm writes one binary16 row (`pf_qkv_half_`)
+       shared by q/k/v via widened `GemmHalfIn` (now also `kF16` with the
+       8192-col extension, `HalfInWindow` probe) — replacing three
+       `NarrowHalf` passes and the FP32 row when all three shapes qualify
+       (all 30 layers here). Measured exclusive: pp2048 2647.97 (flat vs
+       2649.47), **pp8192 2439.35 (+1.2 % vs 2409.30)**, tg 42.2-42.5
+       neutral; validate kl 0.0100832073 **bit-identical** (rounding path
+       proven equal); `gemma4.rocm_kernels` + `rocm_forward` pass
+       (`gufo_bench_fus1.log`). Lesson: the fork's ~120→36 ms "elementwise"
+       delta is NOT its producer fusion (worth only ≈15 ms here) — the gap
+       concentrates in `QknormRopeKernel` **722 µs/call** +
+       `KvNormRopeWriteKernel` 528 µs/call (≈50 ms/prefill vs the fork's
+       whole "QkvPost and norms ~36 ms"), i.e. rope-trig/block-shape bound
+       (`sincosf` per element at attention.hip.cpp), next lever; the fork
+       keeps identical full-precision trig, so its speed comes from work
+       layout, not accuracy trade. Re-profiled budget per pp2048 prefill
+       (`/tmp/opencode/prof_pc2k`, trace 3 prefills): MoE 182+27 `MoeFinish`
+       +12 blk29-fallback, dense F16 ≈148, attention ≈59, rope+norms ≈81,
+       NarrowHalf 14 (now gone), router SGEMM 15, `mul_mat_q` 12.
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position

@@ -233,14 +233,25 @@ bool DenseF16Window(std::uint32_t batch, std::uint32_t rows,
          cols <= kDenseF16MaxCols;
 }
 
+bool HalfInWindow(GemvType type, std::uint32_t batch, std::uint32_t rows,
+                  std::uint32_t cols) {
+  if (type == GemvType::kQ8_0) {
+    return DenseF16Window(batch, rows, cols);
+  }
+  // Native-F16 (retyped BF16) weights: identical bounds to the `Gemm` kF16
+  // branch, including the 8192-column extension for the attention output.
+  return type == GemvType::kF16 && batch >= kDenseF16MinBatch &&
+         rows >= kDenseF16MinRows && cols <= 2 * kDenseF16MaxCols;
+}
+
 bool GemmHalfIn(const void* base, GemvType type, std::uint32_t rows,
                 std::uint32_t cols, const __half* xh, float* out,
                 std::uint32_t batch, hipStream_t stream) {
-  if (type != GemvType::kQ8_0 || !DenseF16Window(batch, rows, cols)) {
+  if (!HalfInWindow(type, batch, rows, cols)) {
     return false;
   }
   return DenseF16Gemm(base, xh, out, batch, rows, cols, stream,
-                      HalfPlan(rows, cols));
+                      HalfPlan(rows, cols), type == GemvType::kF16);
 }
 
 void GemmMoe(const void* base, GemvType type, std::uint32_t rows,

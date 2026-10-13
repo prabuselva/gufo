@@ -265,6 +265,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
   if (e->pf_normed_half_ == nullptr)
     return nullptr;
+  e->pf_qkv_half_ = reinterpret_cast<__half*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
+  if (e->pf_qkv_half_ == nullptr)
+    return nullptr;
   e->pf_act_ffn_half_ = reinterpret_cast<__half*>(e->AllocBytes(
       static_cast<std::size_t>(C) * ffn * sizeof(__half), error_msg));
   if (e->pf_act_ffn_half_ == nullptr)
@@ -589,9 +593,6 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   const float* inv_freq = model_.inv_freq(il);
   const std::size_t rows = tokens;
 
-  RmsNormRows(pf_cur_, l.attn_norm.f32(), pf_normed_, tokens, hidden, c.rms_eps,
-              nullptr);
-
   GemvType qt{};
   GemvType kt{};
   GemvType vt{};
@@ -599,17 +600,46 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     return Fail(error_msg,
                 "unsupported attention type at layer " + std::to_string(il));
   }
-  Gemm(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
-       pf_normed_, pf_q_, tokens, nullptr);
-  Gemm(l.attn_k.data, kt, kvh * head_dim, hidden, l.attn_k.row_bytes,
-       pf_normed_, pf_k_, tokens, nullptr);
-  if (!l.attn_v.empty()) {
-    if (!GemvTypeOf(l.attn_v.type, &vt)) {
-      return Fail(error_msg,
-                  "unsupported attn_v type at layer " + std::to_string(il));
+  if (!l.attn_v.empty() && !GemvTypeOf(l.attn_v.type, &vt)) {
+    return Fail(error_msg,
+                "unsupported attn_v type at layer " + std::to_string(il));
+  }
+  // Wide-batch binary16 attention input: one F16 row produced by the norm is
+  // shared by all three projections, replacing the FP32->F16 narrowing pass
+  // each `Gemm` would insert into its own scratch (and the FP32 row write)
+  // while the values stay bit-identical to norm-then-narrow. Gated on all
+  // three shapes taking the half-in route together; anything else keeps the
+  // FP32 path bit-for-bit.
+  const bool qkv_half =
+      hidden % 32U == 0U &&
+      HalfInWindow(qt, tokens, heads * head_dim, hidden) &&
+      HalfInWindow(kt, tokens, kvh * head_dim, hidden) &&
+      (l.attn_v.empty() || HalfInWindow(vt, tokens, kvh * head_dim, hidden));
+  if (qkv_half) {
+    RmsNormRowsHalf(pf_cur_, l.attn_norm.f32(), pf_qkv_half_, tokens, hidden,
+                    c.rms_eps, nullptr);
+    const bool ok = GemmHalfIn(l.attn_q.data, qt, heads * head_dim, hidden,
+                               pf_qkv_half_, pf_q_, tokens, nullptr) &&
+                    GemmHalfIn(l.attn_k.data, kt, kvh * head_dim, hidden,
+                               pf_qkv_half_, pf_k_, tokens, nullptr) &&
+                    (l.attn_v.empty() ||
+                     GemmHalfIn(l.attn_v.data, vt, kvh * head_dim, hidden,
+                                pf_qkv_half_, pf_v_, tokens, nullptr));
+    if (!ok) {
+      return Fail(error_msg, "attention projection GEMM failed at layer " +
+                                 std::to_string(il));
     }
-    Gemm(l.attn_v.data, vt, kvh * head_dim, hidden, l.attn_v.row_bytes,
-         pf_normed_, pf_v_, tokens, nullptr);
+  } else {
+    RmsNormRows(pf_cur_, l.attn_norm.f32(), pf_normed_, tokens, hidden,
+                c.rms_eps, nullptr);
+    Gemm(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
+         pf_normed_, pf_q_, tokens, nullptr);
+    Gemm(l.attn_k.data, kt, kvh * head_dim, hidden, l.attn_k.row_bytes,
+         pf_normed_, pf_k_, tokens, nullptr);
+    if (!l.attn_v.empty()) {
+      Gemm(l.attn_v.data, vt, kvh * head_dim, hidden, l.attn_v.row_bytes,
+           pf_normed_, pf_v_, tokens, nullptr);
+    }
   }
 
   QknormRope(pf_q_, l.attn_q_norm.f32(), pf_qn_, tokens, heads, head_dim,
@@ -675,12 +705,12 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes,
          pf_act_, pf_mlp_, tokens, nullptr);
   }
+  // One pass: the router's per-dimension scale and the RMS 1/sqrt(hidden)
+  // constant fold into the norm store (same multiply order as the old
+  // RmsNormRows + MulInPlace + ScaleInPlace chain).
   RmsNormRows(pf_attn_out_, nullptr, pf_router_in_, tokens, hidden, c.rms_eps,
-              nullptr);
-  MulInPlace(pf_router_in_, l.router_scale.f32(), rows * hidden, hidden,
-             nullptr);
-  ScaleInPlace(pf_router_in_, 1.0F / std::sqrt(static_cast<float>(hidden)),
-               rows * hidden, nullptr);
+              l.router_scale.f32(),
+              1.0F / std::sqrt(static_cast<float>(hidden)), nullptr);
   GemvType rt{};
   if (!GemvTypeOf(l.router.type, &rt)) {
     return Fail(error_msg, "unsupported router type");

@@ -248,6 +248,10 @@ private:
   // geglu act, consumed directly by the dense F16 up/gate/down GEMMs so the
   // FP32->F16 narrowing pass is skipped. Only used on the F16 dense route.
   __half* pf_normed_half_{nullptr};
+  // Attention-input norm in binary16 (shared by the q/k/v projections when all
+  // three take the half-in GEMM route), kept separate from `pf_normed_half_`
+  // (shared FFN) so the two norms never alias across a layer.
+  __half* pf_qkv_half_{nullptr};
   __half* pf_act_ffn_half_{nullptr};
   float* pf_expert_out_{nullptr};
   /// Prefill residual ping-pong: pf_cur_ alternates with pf_next_.

@@ -35,12 +35,18 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
 bool DenseF16Window(std::uint32_t batch, std::uint32_t rows,
                     std::uint32_t cols);
 
+/// Whether `GemmHalfIn(type, ...)` runs this shape: Q8_0 inside
+/// `DenseF16Window`, native-F16 weights (the retyped BF16 tier) inside the
+/// same bounds with the 8192-column extension the `Gemm` kF16 branch uses.
+bool HalfInWindow(GemvType type, std::uint32_t batch, std::uint32_t rows,
+                  std::uint32_t cols);
+
 /// The binary16-activation sibling of `Gemm`: runs the dense F16 WMMA GEMM
 /// directly on pre-narrowed F16 activations `xh` ([batch x cols]), skipping the
 /// FP32->F16 narrowing pass `Gemm` inserts. `out` is [batch x rows] F32.
-/// Returns false (launching nothing) when `type` is not Q8_0 or the shape is
-/// outside `DenseF16Window`, so the caller falls back to the FP32 `Gemm` path.
-/// Asynchronous on `stream`.
+/// Returns false (launching nothing) when `HalfInWindow` rejects the type and
+/// shape, so the caller falls back to the FP32 `Gemm` path. Asynchronous on
+/// `stream`.
 bool GemmHalfIn(const void* base, GemvType type, std::uint32_t rows,
                 std::uint32_t cols, const __half* xh, float* out,
                 std::uint32_t batch, hipStream_t stream);

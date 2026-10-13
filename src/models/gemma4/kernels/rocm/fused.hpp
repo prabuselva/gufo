@@ -16,9 +16,19 @@ namespace gufo::models::gemma4::rocm {
 
 /// out[r][d] = (x[r][d] * rsqrt(mean_d x^2 + eps)) * gamma[d]. `rows`
 /// independent norms of `dim` elements; `gamma` may be null (scale 1).
+/// When `post_scale` is not null the row is additionally scaled per element
+/// out[r][d] *= post_scale[d] * post_k, with the multiply order
+/// ((v*scale)*post_scale)*post_k of the standalone Mul/Scale pass chain (the
+/// router input fold).
 void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
-                 hipStream_t stream);
+                 const float* post_scale, float post_k, hipStream_t stream);
+
+inline void RmsNormRows(const float* x, const float* gamma, float* out,
+                        std::uint32_t rows, std::uint32_t dim, float eps,
+                        hipStream_t stream) {
+  RmsNormRows(x, gamma, out, rows, dim, eps, nullptr, 1.0F, stream);
+}
 
 /// Binary16-output RMSNorm: the same reduction and scale as `RmsNormRows` (the
 /// sum-of-squares stays in double, the scale in float) but the row is stored as

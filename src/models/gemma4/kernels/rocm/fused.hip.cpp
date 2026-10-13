@@ -86,7 +86,8 @@ __device__ __forceinline__ void BlockReduceMaxIndex(float value, int index,
 }
 
 __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
-                              std::uint32_t dim, float eps) {
+                              std::uint32_t dim, float eps,
+                              const float* post_scale, float post_k) {
   __shared__ double reduce[32];
   const std::size_t row = blockIdx.x;
   const float* xr = x + row * dim;
@@ -108,6 +109,9 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
                          static_cast<double>(dim)) +
                      eps);
     float4* orow = reinterpret_cast<float4*>(out + row * dim);
+    // `post_scale`/`post_k` fold the router's per-dimension scale and RMS
+    // constant into this pass; their multiply order ((v*scale)*g*s)*k matches
+    // the standalone RmsNormRows -> MulInPlace -> ScaleInPlace chain exactly.
     if (gamma != nullptr) {
       const float4* g4 = reinterpret_cast<const float4*>(gamma);
       for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
@@ -115,6 +119,13 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
         const float4 g = g4[i];
         orow[i] = {v.x * scale * g.x, v.y * scale * g.y, v.z * scale * g.z,
                    v.w * scale * g.w};
+      }
+    } else if (post_scale != nullptr) {
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 s = reinterpret_cast<const float4*>(post_scale)[i];
+        orow[i] = {(v.x * scale * s.x) * post_k, (v.y * scale * s.y) * post_k,
+                   (v.z * scale * s.z) * post_k, (v.w * scale * s.w) * post_k};
       }
     } else {
       for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
@@ -135,7 +146,8 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
                    eps);
   float* orow = out + row * dim;
   for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
-    orow[i] = xr[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+    const float v = xr[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+    orow[i] = post_scale != nullptr ? v * post_scale[i] * post_k : v;
   }
 }
 
@@ -611,9 +623,10 @@ void GegluF16Separate(const float* gate, const float* up, __half* act,
 
 void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
-                 hipStream_t stream) {
+                 const float* post_scale, float post_k, hipStream_t stream) {
   const dim3 block(std::min<std::uint32_t>(dim, 256U));
-  RmsNormKernel<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
+  RmsNormKernel<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps, post_scale,
+                                            post_k);
 }
 
 void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
