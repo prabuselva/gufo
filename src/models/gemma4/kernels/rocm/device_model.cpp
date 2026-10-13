@@ -252,26 +252,153 @@ struct Uploader {
     return ptr;
   }
 
+  // Same retyping as Half() for a fused buffer: one BF16 -> binary16 job
+  // over the whole buffer, retyping the per-tensor views too. Binary16
+  // elements are the same size as BF16, so every view offset stays valid.
+  void HalfFused(DeviceTensor& fused, const std::string& name,
+                 std::initializer_list<DeviceTensor*> views) {
+    if (!ok || fused.empty() || fused.type != core::GgmlType::kBF16) {
+      return;
+    }
+    halves.push_back(
+        {fused.data, static_cast<std::size_t>(fused.rows) * fused.cols, name});
+    fused.type = core::GgmlType::kF16;
+    for (DeviceTensor* v : views) {
+      if (!v->empty()) {
+        v->type = core::GgmlType::kF16;
+      }
+    }
+  }
+
+  struct FusePart {
+    const TensorRef* t;
+    bool required;
+  };
+
+  // Uploads projections that share type and input columns as ONE row-major
+  // concatenation (q, k, v or gate, up in order) and points the per-tensor
+  // views at their column slices. GGUF stores every part as a stack of
+  // fixed-length rows over the same columns, so the concatenation is exactly
+  // the fused [sum(rows)][row_bytes] matrix every decoder already reads:
+  // a view at its start offset is indistinguishable from a standalone
+  // tensor, while prefill can run one wide GEMM instead of one per part.
+  // Returns an empty tensor (and leaves every view untouched) when the
+  // parts cannot share a buffer, so the caller stays on the per-tensor
+  // path. Optional empty parts just drop out of the fusion.
+  DeviceTensor Fuse(const std::vector<FusePart>& parts,
+                    const std::vector<DeviceTensor*>& views,
+                    const std::string& name) {
+    DeviceTensor f;
+    if (!ok || parts.size() != views.size() || parts.size() < 2) {
+      return f;
+    }
+    std::size_t total = 0;
+    core::GgmlType type{core::GgmlType::kF32};
+    std::size_t cols = 0;
+    std::size_t row_bytes = 0;
+    bool have = false;
+    for (const FusePart& p : parts) {
+      const TensorRef& t = *p.t;
+      if (t.empty()) {
+        if (p.required) {
+          return f;
+        }
+        continue;
+      }
+      // Requantized parts would change row length and per-row layout; the
+      // per-tensor path already handles those encodings.
+      const bool native =
+          t.type != core::GgmlType::kQ6_K && t.type != core::GgmlType::kQ4_0 &&
+          t.type != core::GgmlType::kQ4_K && t.type != core::GgmlType::kQ5_K;
+      if (!native || t.experts != 1) {
+        return f;
+      }
+      if (!have) {
+        type = t.type;
+        cols = t.cols;
+        row_bytes = t.RowBytes();
+        have = true;
+      } else if (t.type != type || t.cols != cols ||
+                 t.RowBytes() != row_bytes) {
+        return f;
+      }
+      total += t.SizeBytes();
+    }
+    if (!have) {
+      return f;
+    }
+    void* ptr = nullptr;
+    if (hipMalloc(&ptr, total) != hipSuccess) {
+      Fail("hipMalloc failed for " + name + " (" + std::to_string(total) +
+           " bytes)");
+      return f;
+    }
+    allocations.push_back(ptr);
+    bytes += total;
+    std::size_t off = 0;
+    std::uint32_t rows = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const TensorRef& t = *parts[i].t;
+      if (t.empty()) {
+        continue;
+      }
+      const std::size_t size = t.SizeBytes();
+      auto* dst = static_cast<std::uint8_t*>(ptr) + off;
+      if (!stager.Copy(t.shard, t.file_offset, size, dst, error)) {
+        Fail("upload failed for " + name + " part " + std::string(t.name) +
+             (error != nullptr ? ": " + *error : std::string()));
+        return f;
+      }
+      views[i]->data = dst;
+      views[i]->type = t.type;
+      views[i]->cols = static_cast<std::uint32_t>(t.cols);
+      views[i]->rows = static_cast<std::uint32_t>(t.rows);
+      views[i]->experts = 1;
+      views[i]->row_bytes = t.RowBytes();
+      rows += static_cast<std::uint32_t>(t.rows);
+      off += size;
+    }
+    f.data = ptr;
+    f.type = type;
+    f.cols = static_cast<std::uint32_t>(cols);
+    f.rows = rows;
+    f.row_bytes = row_bytes;
+    return f;
+  }
+
   DeviceLayer Layer(const LayerWeights& l, bool swa) {
     DeviceLayer d;
     d.swa = swa;
     d.attn_norm = Copy(l.attn_norm);
-    d.attn_q = Copy(l.attn_q);
-    Half(d.attn_q, "attn_q");
-    d.attn_k = Copy(l.attn_k);
-    Half(d.attn_k, "attn_k");
-    d.attn_v = Copy(l.attn_v);
-    Half(d.attn_v, "attn_v");
+    d.attn_qkv =
+        Fuse({{&l.attn_q, true}, {&l.attn_k, true}, {&l.attn_v, false}},
+             {&d.attn_q, &d.attn_k, &d.attn_v}, "attn_qkv");
+    if (d.attn_qkv.empty()) {
+      d.attn_q = Copy(l.attn_q);
+      Half(d.attn_q, "attn_q");
+      d.attn_k = Copy(l.attn_k);
+      Half(d.attn_k, "attn_k");
+      d.attn_v = Copy(l.attn_v);
+      Half(d.attn_v, "attn_v");
+    } else {
+      HalfFused(d.attn_qkv, "attn_qkv", {&d.attn_q, &d.attn_k, &d.attn_v});
+    }
     d.attn_q_norm = Copy(l.attn_q_norm);
     d.attn_k_norm = Copy(l.attn_k_norm);
     d.attn_output = Copy(l.attn_output);
     Half(d.attn_output, "attn_output");
     d.post_attention_norm = Copy(l.post_attention_norm);
     d.ffn_norm = Copy(l.ffn_norm);
-    d.ffn_gate = Copy(l.ffn_gate);
-    Half(d.ffn_gate, "ffn_gate");
-    d.ffn_up = Copy(l.ffn_up);
-    Half(d.ffn_up, "ffn_up");
+    d.ffn_gate_up = Fuse({{&l.ffn_gate, true}, {&l.ffn_up, true}},
+                         {&d.ffn_gate, &d.ffn_up}, "ffn_gate_up");
+    if (d.ffn_gate_up.empty()) {
+      d.ffn_gate = Copy(l.ffn_gate);
+      Half(d.ffn_gate, "ffn_gate");
+      d.ffn_up = Copy(l.ffn_up);
+      Half(d.ffn_up, "ffn_up");
+    } else {
+      HalfFused(d.ffn_gate_up, "ffn_gate_up", {&d.ffn_gate, &d.ffn_up});
+    }
     d.ffn_down = Copy(l.ffn_down);
     Half(d.ffn_down, "ffn_down");
     d.post_ffw_norm = Copy(l.post_ffw_norm);

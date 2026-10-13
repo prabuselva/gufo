@@ -109,16 +109,20 @@ void GegluF16(const __half* gu, __half* act, std::size_t count,
               std::uint32_t ff, hipStream_t stream);
 
 /// The shared-FFN variant with separate gate and up projections:
-/// act[i] = gelu_tanh(gate[i]) * up[i] over `count` elements laid out as
-/// [rows][ff] rows in all three buffers.
+/// act[r][i] = gelu_tanh(gate[r][i]) * up[r][i] over `count` = rows * ff
+/// act elements. `pitch` is the float stride of one gate/up input row: `ff`
+/// for standalone projections, or 2 * ff when they are halves of a fused
+/// gate/up GEMM output (gate first). `act` is always packed [rows][ff].
 void GegluF32Separate(const float* gate, const float* up, float* act,
-                      std::size_t count, hipStream_t stream);
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream);
 
 /// Binary16-output shared-FFN geglu: reads the FP32 gate/up rows, stores the
 /// act row as F16 so the following dense F16 down GEMM consumes it directly
 /// (skipping the FP32->F16 narrowing pass and halving the act-row traffic).
 void GegluF16Separate(const float* gate, const float* up, __half* act,
-                      std::size_t count, hipStream_t stream);
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream);
 
 }  // namespace gufo::models::gemma4::rocm
 

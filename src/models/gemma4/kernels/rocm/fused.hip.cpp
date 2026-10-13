@@ -539,13 +539,18 @@ __global__ void SoftcapKernel(float* x, float cap, std::size_t count) {
   }
 }
 
+// `pitch` is the float stride of one input row: `ff` for standalone gate/up
+// projections, or 2 * ff when they are halves of a fused gate/up GEMM output.
 __global__ void GegluSeparateKernel(const float* gate, const float* up,
-                                    float* act, std::size_t count) {
+                                    float* act, std::size_t count,
+                                    std::uint32_t ff, std::uint32_t pitch) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += stride) {
-    act[i] = DGelu(gate[i]) * up[i];
+    const std::size_t row = i / ff;
+    const std::size_t j = row * pitch + i - row * ff;
+    act[i] = DGelu(gate[j]) * up[j];
   }
 }
 
@@ -555,12 +560,15 @@ __global__ void GegluSeparateKernel(const float* gate, const float* up,
 // it the compiler fuses the final mul into the cvt and single-rounds, whereas
 // the FP32 path stores the float act and NarrowHalf rounds it again.
 __global__ void GegluSeparateHalfKernel(const float* gate, const float* up,
-                                        __half* act, std::size_t count) {
+                                        __half* act, std::size_t count,
+                                        std::uint32_t ff, std::uint32_t pitch) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += stride) {
-    volatile float r = DGelu(gate[i]) * up[i];
+    const std::size_t row = i / ff;
+    const std::size_t j = row * pitch + i - row * ff;
+    volatile float r = DGelu(gate[j]) * up[j];
     act[i] = __float2half(r);
   }
 }
@@ -600,25 +608,29 @@ void SoftcapInPlace(float* x, float cap, std::size_t count,
 }
 
 void GegluF32Separate(const float* gate, const float* up, float* act,
-                      std::size_t count, hipStream_t stream) {
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream) {
   if (count == 0) {
     return;
   }
   const std::size_t block = 256;
   const std::size_t grid =
       std::min<std::size_t>((count + block - 1) / block, 65535);
-  GegluSeparateKernel<<<grid, block, 0, stream>>>(gate, up, act, count);
+  GegluSeparateKernel<<<grid, block, 0, stream>>>(gate, up, act, count, ff,
+                                                  pitch);
 }
 
 void GegluF16Separate(const float* gate, const float* up, __half* act,
-                      std::size_t count, hipStream_t stream) {
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream) {
   if (count == 0) {
     return;
   }
   const std::size_t block = 256;
   const std::size_t grid =
       std::min<std::size_t>((count + block - 1) / block, 65535);
-  GegluSeparateHalfKernel<<<grid, block, 0, stream>>>(gate, up, act, count);
+  GegluSeparateHalfKernel<<<grid, block, 0, stream>>>(gate, up, act, count, ff,
+                                                      pitch);
 }
 
 void RmsNormRows(const float* x, const float* gamma, float* out,

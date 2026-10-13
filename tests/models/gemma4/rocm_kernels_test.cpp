@@ -40,6 +40,16 @@ bool Check(const char* name, double worst, double tolerance) {
   return true;
 }
 
+double WorstAbsoluteHalf(const std::vector<__half>& a,
+                         const std::vector<__half>& b) {
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    worst = std::max(worst, static_cast<double>(std::fabs(__half2float(a[i]) -
+                                                          __half2float(b[i]))));
+  }
+  return worst;
+}
+
 // BF16 is the top 16 bits of a float32; encode round-to-nearest-even and
 // decode exactly so the host reference matches the kernel bit-for-bit.
 std::uint16_t FloatToBf16Bits(float f) {
@@ -684,7 +694,7 @@ bool TestAttention() {
       t::Upload(&d_q, q);
       t::Upload(&d_g, gamma);
       q::QknormRope(d_q.get(), d_g.get(), d_o.get(), tokens, kHeads, hd,
-                    d_inv.get(), 17, nullptr);
+                    d_inv.get(), 17, kHeads * hd, nullptr);
       t::CheckHip(hipDeviceSynchronize(), "QknormRope synchronization");
       const auto got = t::Download(&d_o, q.size());
       std::vector<float> ref(q.size());
@@ -718,6 +728,31 @@ bool TestAttention() {
       ok = Check(("QknormRope " + tag).c_str(), t::WorstAbsolute(ref, got),
                  1e-5) &&
            ok;
+
+      // Fused-slice input: the same rows placed at a wider pitch (a fused
+      // qkv box's column slice with other projections around it) must give
+      // the identical output.
+      {
+        const std::uint32_t pitch = kHeads * hd + 37;
+        std::vector<float> wide(static_cast<std::size_t>(tokens) * pitch,
+                                -3.25F);
+        for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+          for (std::uint32_t i = 0; i < kHeads * hd; ++i) {
+            wide[static_cast<std::size_t>(tok) * pitch + i] =
+                q[static_cast<std::size_t>(tok) * kHeads * hd + i];
+          }
+        }
+        t::HipBuffer<float> d_wide(wide.size()), d_wide_o(q.size());
+        t::Upload(&d_wide, wide);
+        q::QknormRope(d_wide.get(), d_g.get(), d_wide_o.get(), tokens, kHeads,
+                      hd, d_inv.get(), 17, pitch, nullptr);
+        t::CheckHip(hipDeviceSynchronize(),
+                    "QknormRope pitched synchronization");
+        const auto got_wide = t::Download(&d_wide_o, q.size());
+        ok = Check(("QknormRope pitched " + tag).c_str(),
+                   t::WorstAbsolute(ref, got_wide), 1e-5) &&
+             ok;
+      }
     }
 
     // KvNormRopeWrite: 3 tokens x kvh heads into an F16 cache at start=9.
@@ -738,7 +773,7 @@ bool TestAttention() {
       t::HipBuffer<__half> d_kc(cache), d_vc(cache);
       q::KvNormRopeWrite(d_k.get(), d_v.get(), d_g.get(), d_kc.get(),
                          d_vc.get(), start, tokens, kvh, hd, d_inv.get(),
-                         nullptr);
+                         kvh * hd, nullptr);
       t::CheckHip(hipDeviceSynchronize(), "KvNormRopeWrite synchronization");
       std::vector<__half> kc(cache), vc(cache);
       t::CheckHip(
@@ -801,6 +836,64 @@ bool TestAttention() {
       ok = Check(("KvNormRopeWrite V " + tag).c_str(),
                  t::WorstRelative(ref_v, got_v), 1e-6) &&
            ok;
+
+      // Fused-slice input: k and v rows placed side by side at a wider pitch
+      // (a fused qkv box) must write the identical cache rows.
+      {
+        const std::uint32_t pitch = kvh * hd * 2U + 37U;
+        std::vector<float> wide_k(static_cast<std::size_t>(tokens) * pitch,
+                                  -3.25F);
+        std::vector<float> wide_v(static_cast<std::size_t>(tokens) * pitch,
+                                  -3.25F);
+        for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+          for (std::uint32_t i = 0; i < kvh * hd; ++i) {
+            wide_k[static_cast<std::size_t>(tok) * pitch + i] =
+                k[static_cast<std::size_t>(tok) * kvh * hd + i];
+            wide_v[static_cast<std::size_t>(tok) * pitch + kvh * hd + i] =
+                v[static_cast<std::size_t>(tok) * kvh * hd + i];
+          }
+        }
+        t::HipBuffer<float> d_wk(wide_k.size()), d_wv(wide_v.size());
+        t::Upload(&d_wk, wide_k);
+        t::Upload(&d_wv, wide_v);
+        t::HipBuffer<__half> d_kc2(cache), d_vc2(cache);
+        q::KvNormRopeWrite(d_wk.get(), d_wv.get() + kvh * hd, d_g.get(),
+                           d_kc2.get(), d_vc2.get(), start, tokens, kvh, hd,
+                           d_inv.get(), pitch, nullptr);
+        t::CheckHip(hipDeviceSynchronize(),
+                    "KvNormRopeWrite pitched synchronization");
+        std::vector<__half> kc2(cache), vc2(cache);
+        t::CheckHip(hipMemcpy(kc2.data(), d_kc2.get(), d_kc2.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite pitched K download");
+        t::CheckHip(hipMemcpy(vc2.data(), d_vc2.get(), d_vc2.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite pitched V download");
+        // The first launch's caches are still untouched on the device, and
+        // identical launches are bit-deterministic here, so reload them and
+        // compare only the rows the kernels wrote; the pitched read must
+        // reproduce the natural one exactly. The rest of each cache is
+        // uninitialized on both sides.
+        std::vector<__half> kc_n(cache), vc_n(cache);
+        t::CheckHip(hipMemcpy(kc_n.data(), d_kc.get(), d_kc.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite natural K reload");
+        t::CheckHip(hipMemcpy(vc_n.data(), d_vc.get(), d_vc.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite natural V reload");
+        const std::size_t lo = static_cast<std::size_t>(start) * kvh * hd;
+        const std::size_t hi = lo + static_cast<std::size_t>(tokens) * kvh * hd;
+        const std::vector<__half> kc_w(kc_n.begin() + lo, kc_n.begin() + hi);
+        const std::vector<__half> vc_w(vc_n.begin() + lo, vc_n.begin() + hi);
+        const std::vector<__half> kc2_w(kc2.begin() + lo, kc2.begin() + hi);
+        const std::vector<__half> vc2_w(vc2.begin() + lo, vc2.begin() + hi);
+        ok = Check(("KvNormRopeWrite pitched K " + tag).c_str(),
+                   WorstAbsoluteHalf(kc_w, kc2_w), 0.0F) &&
+             ok;
+        ok = Check(("KvNormRopeWrite pitched V " + tag).c_str(),
+                   WorstAbsoluteHalf(vc_w, vc2_w), 0.0F) &&
+             ok;
+      }
     }
 
     // Decode attention over an F16 cache: dense and windowed.

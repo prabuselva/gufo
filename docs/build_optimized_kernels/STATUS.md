@@ -280,6 +280,32 @@ it only pays together with the fork's register-frugal 2.5 template
         128-dim-slice) mapping and their cache layout, not their predicates.
         Prior isolated `waves_per_eu(8)` on our layout REGRESSED, so pair it
         with the two-block shape if attempted.
+        **3.2h upload-time QKV and gate/up fusion (port of the fork's
+        concat-with-views)**: `Fuse()` stores q,k,v and gate,up as one
+        row-major weight matrix per layer and points the per-tensor views at
+        natural-layout slices; decode needs no change. Prefill fuses exactly
+        when the half-in window holds — ONE wide `GemmHalfIn` emits the whole
+        `[tokens][qkv_rows]` (gate-first `[tokens][2*ffn]`) box and the
+        norm/RoPE consumers read the column slices at the fused row pitch —
+        and otherwise the parts run their own GEMMs into natural boxes of the
+        same scratch. Quality: pp2048 validator kl/tv **bit-identical to the
+        unfused reference** (0.0002145108 / 0.0001046539 RECORDED), short
+        fallback (64 tokens, batch < `kDenseF16MinBatch` → per-view path)
+        RECORDED 0.0002459717, `rocm_forward` passed, kernels test extended
+        with pitched-K/V cache rows reloaded from the device and checked
+        bit-exact against the natural launch. Timing (exclusive window):
+        pp2048 2965.95/2959.31 (vs 2877.10/2875.09, **+2.9 %**), pp8192
+        2660.27 (vs 2581.04, **+3.1 %**), vs fork 3760 the remaining gap is
+        the known 3.4 attention/FFN window work. Two follow-ups: driving a
+        fused wide box through the FP32 `Gemm` routes FAILS the validator
+        (kl 0.7277, deterministic across the Q8_0/F16 fallbacks) while every
+        other route is bit-exact — the fused gate above keeps that route out
+        of production, its root cause is still open; and the natural K/V
+        units of `rocm_kernels_test` compare against a reference loop that
+        overwrites the downloaded host caches before `got_k`/`got_v` reads
+        them, so that check is tautological at HEAD and needs a tolerance
+        redo (the new pitched checks avoid it by comparing launches, not
+        re-derived values).
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position

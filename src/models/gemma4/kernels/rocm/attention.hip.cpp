@@ -95,12 +95,16 @@ constexpr float kRmsEps = 1.0e-6F;
 // kernels below are the fallback for exotic widths. Per-element arithmetic is
 // the same (norm scale in float over a double sum, then rope); only the sum's
 // association order moves, and it stays in double.
+// `pitch` is the float stride of one input token row: equal to
+// heads * head_dim for a standalone q projection, or to the fused qkv row
+// width when q is a column slice of a wider fused GEMM output. The output
+// stays packed (heads * head_dim) because attention reads only q.
 __global__ void QknormRopeWarpKernel(const float* q, const float* gamma,
                                      float* out, std::uint32_t tokens,
                                      std::uint32_t heads,
                                      std::uint32_t head_dim,
-                                     const float* inv_freq,
-                                     std::uint32_t start) {
+                                     const float* inv_freq, std::uint32_t start,
+                                     std::uint32_t pitch) {
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t token =
       blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
@@ -118,7 +122,7 @@ __global__ void QknormRopeWarpKernel(const float* q, const float* gamma,
   }
   float a[16];
   float b[16];
-  const float* row = q + static_cast<std::size_t>(token) * heads * head_dim;
+  const float* row = q + static_cast<std::size_t>(token) * pitch;
   float* orow = out + static_cast<std::size_t>(token) * heads * head_dim;
   for (std::uint32_t head = 0; head < heads; ++head) {
     double ss = 0.0;
@@ -148,7 +152,8 @@ __global__ void QknormRopeWarpKernel(const float* q, const float* gamma,
 __global__ void KvNormRopeWriteWarpKernel(
     const float* k, const float* v, const float* k_gamma, __half* k_cache,
     __half* v_cache, std::uint32_t tokens, std::uint32_t kv_heads,
-    std::uint32_t head_dim, const float* inv_freq, std::uint32_t start) {
+    std::uint32_t head_dim, const float* inv_freq, std::uint32_t start,
+    std::uint32_t pitch) {
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t token =
       blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
@@ -168,8 +173,8 @@ __global__ void KvNormRopeWriteWarpKernel(
   float kb[16];
   float va[16];
   float vb[16];
-  const float* krow = k + static_cast<std::size_t>(token) * kv_heads * head_dim;
-  const float* vrow = v + static_cast<std::size_t>(token) * kv_heads * head_dim;
+  const float* krow = k + static_cast<std::size_t>(token) * pitch;
+  const float* vrow = v + static_cast<std::size_t>(token) * pitch;
   __half* kc =
       k_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
   __half* vc =
@@ -216,14 +221,17 @@ __global__ void KvNormRopeWriteWarpKernel(
 
 __global__ void QknormRopeKernel(const float* q, const float* gamma, float* out,
                                  std::uint32_t heads, std::uint32_t head_dim,
-                                 const float* inv_freq, std::uint32_t start) {
+                                 const float* inv_freq, std::uint32_t start,
+                                 std::uint32_t pitch) {
   __shared__ float buf[512];
   __shared__ double reduce[32];
   const std::uint32_t token = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
+  const std::size_t o_in = static_cast<std::size_t>(token) * pitch +
+                           static_cast<std::size_t>(head) * head_dim;
   const std::size_t o =
       (static_cast<std::size_t>(token) * heads + head) * head_dim;
-  NormHead(q + o, gamma, buf, head_dim, kRmsEps, reduce);
+  NormHead(q + o_in, gamma, buf, head_dim, kRmsEps, reduce);
   __syncthreads();
   RopeHead(buf, head_dim, inv_freq, start + token);
   __syncthreads();
@@ -232,19 +240,17 @@ __global__ void QknormRopeKernel(const float* q, const float* gamma, float* out,
   }
 }
 
-__global__ void KvNormRopeWriteKernel(const float* k, const float* v,
-                                      const float* k_gamma, __half* k_cache,
-                                      __half* v_cache, std::uint32_t kv_heads,
-                                      std::uint32_t head_dim,
-                                      const float* inv_freq,
-                                      std::uint32_t start) {
+__global__ void KvNormRopeWriteKernel(
+    const float* k, const float* v, const float* k_gamma, __half* k_cache,
+    __half* v_cache, std::uint32_t kv_heads, std::uint32_t head_dim,
+    const float* inv_freq, std::uint32_t start, std::uint32_t pitch) {
   __shared__ float kb[512];
   __shared__ float vb[512];
   __shared__ double reduce[32];
   const std::uint32_t token = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
-  const std::size_t o =
-      (static_cast<std::size_t>(token) * kv_heads + head) * head_dim;
+  const std::size_t o = static_cast<std::size_t>(token) * pitch +
+                        static_cast<std::size_t>(head) * head_dim;
   NormHead(k + o, k_gamma, kb, head_dim, kRmsEps, reduce);
   __syncthreads();
   NormHead(v + o, nullptr, vb, head_dim, kRmsEps, reduce);
@@ -856,16 +862,16 @@ __launch_bounds__(kWaves * 32, 1) __global__
 void QknormRope(const float* q, const float* gamma, float* out,
                 std::uint32_t tokens, std::uint32_t heads,
                 std::uint32_t head_dim, const float* inv_freq,
-                std::uint32_t start, hipStream_t stream) {
+                std::uint32_t start, std::uint32_t pitch, hipStream_t stream) {
   // One warp per token only pays off once tokens provide their own
   // parallelism; at decode widths the block kernel's per-(token, head)
   // blocks finish sooner than a single warp looping every head.
   if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
     QknormRopeWarpKernel<<<(tokens + 3U) / 4U, 128, 0, stream>>>(
-        q, gamma, out, tokens, heads, head_dim, inv_freq, start);
+        q, gamma, out, tokens, heads, head_dim, inv_freq, start, pitch);
   } else {
     QknormRopeKernel<<<dim3(tokens, heads), 256, 0, stream>>>(
-        q, gamma, out, heads, head_dim, inv_freq, start);
+        q, gamma, out, heads, head_dim, inv_freq, start, pitch);
   }
 }
 
@@ -873,14 +879,15 @@ void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
                      __half* k_cache, __half* v_cache, std::uint32_t start,
                      std::uint32_t tokens, std::uint32_t kv_heads,
                      std::uint32_t head_dim, const float* inv_freq,
-                     hipStream_t stream) {
+                     std::uint32_t pitch, hipStream_t stream) {
   if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
     KvNormRopeWriteWarpKernel<<<(tokens + 3U) / 4U, 128, 0, stream>>>(
         k, v, k_gamma, k_cache, v_cache, tokens, kv_heads, head_dim, inv_freq,
-        start);
+        start, pitch);
   } else {
     KvNormRopeWriteKernel<<<dim3(tokens, kv_heads), 256, 0, stream>>>(
-        k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start);
+        k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start,
+        pitch);
   }
 }
 

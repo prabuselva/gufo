@@ -204,16 +204,17 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   GUFO_ALLOC(pf_cur_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_next_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_normed_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_q_, static_cast<std::size_t>(C) * q_dim);
+  // One region holds both projection layouts: the fused GEMM box
+  // [tokens][qkv_rows] starts at the base with the fused row pitch, while
+  // the unfused fallback packs a natural [tokens][rows] box per tensor at
+  // fixed offsets. Both fit in the same bytes the three boxes needed.
+  GUFO_ALLOC(pf_qkv_, static_cast<std::size_t>(C) * (q_dim + 2U * kv_dim));
   GUFO_ALLOC(pf_qn_, static_cast<std::size_t>(C) * q_dim);
-  GUFO_ALLOC(pf_k_, static_cast<std::size_t>(C) * kv_dim);
-  GUFO_ALLOC(pf_v_, static_cast<std::size_t>(C) * kv_dim);
   GUFO_ALLOC(pf_attn_, static_cast<std::size_t>(C) * q_dim);
   GUFO_ALLOC(pf_proj_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_attn_out_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_mlp_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_gate_, static_cast<std::size_t>(C) * ffn);
-  GUFO_ALLOC(pf_up_, static_cast<std::size_t>(C) * ffn);
+  GUFO_ALLOC(pf_gu_, static_cast<std::size_t>(C) * 2U * ffn);
   GUFO_ALLOC(pf_act_, static_cast<std::size_t>(C) * ffn);
   GUFO_ALLOC(pf_router_in_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_router_logits_, static_cast<std::size_t>(C) * c.num_experts);
@@ -401,11 +402,11 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
   }
 
   QknormRope(q_, l.attn_q_norm.f32(), qn_, 1, heads, head_dim, inv_freq, pos,
-             nullptr);
+             heads * head_dim, nullptr);
   KvNormRopeWrite(k_raw_, l.attn_v.empty() ? k_raw_ : v_raw_,
                   l.attn_k_norm.f32(), session.k_cache_[il],
                   session.v_cache_[il], pos, 1, kvh, head_dim, inv_freq,
-                  nullptr);
+                  kvh * head_dim, nullptr);
 
   const std::uint32_t window = l.swa ? c.sliding_window : 0;
   const std::uint32_t n_keys = pos + 1;
@@ -436,7 +437,8 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
        up_, nullptr);
   Gemv(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes, normed_,
        gate_, nullptr);
-  GegluF32Separate(gate_, up_, act_, c.ffn_length, nullptr);
+  GegluF32Separate(gate_, up_, act_, c.ffn_length, c.ffn_length, c.ffn_length,
+                   nullptr);
   Gemv(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes, act_,
        mlp_, nullptr);
   RmsNormRows(mlp_, l.post_ffw_norm_1.f32(), mlp1_, 1, hidden, c.rms_eps,
@@ -592,6 +594,34 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   const std::uint32_t kvh = c.NumKvHeads(il);
   const float* inv_freq = model_.inv_freq(il);
   const std::size_t rows = tokens;
+  const std::size_t chunk = static_cast<std::size_t>(prefill_chunk_);
+  const std::uint32_t q_dim = heads * head_dim;
+  const std::uint32_t kv_dim = kvh * head_dim;
+  // A fused upload stores q (and k, v) as one matrix whose rows concatenate
+  // the parts' rows, so ONE GEMM emits the whole [tokens][qkv_rows] box and
+  // the rope/norm consumers read the column slices with the fused row pitch.
+  // The fused box only takes the half-in route, so execution fuses exactly
+  // when that window is active; any other batch or shape runs the per-tensor
+  // GEMMs into natural-size boxes at fixed offsets of the same scratch region
+  // (the fused tensor views are natural-layout slices either way).
+  GemvType qkvt{};
+  if (!l.attn_qkv.empty() && !GemvTypeOf(l.attn_qkv.type, &qkvt)) {
+    return Fail(error_msg,
+                "unsupported attn_qkv type at layer " + std::to_string(il));
+  }
+  const bool fused_qkv = !l.attn_qkv.empty() && (hidden % 32U == 0U) &&
+                         HalfInWindow(qkvt, tokens, l.attn_qkv.rows, hidden);
+  const std::uint32_t qkv_rows = fused_qkv ? l.attn_qkv.rows : 0;
+  float* q_dst = pf_qkv_;
+  // Fused: k/v are column slices, so their pointers step by the fused row's
+  // column prefix. Unfused: each part owns a natural box at a fixed offset.
+  float* k_dst = fused_qkv ? pf_qkv_ + q_dim
+                           : pf_qkv_ + chunk * static_cast<std::size_t>(q_dim);
+  float* v_dst =
+      fused_qkv ? pf_qkv_ + q_dim + kv_dim
+                : pf_qkv_ + chunk * static_cast<std::size_t>(q_dim + kv_dim);
+  const std::uint32_t q_pitch = fused_qkv ? qkv_rows : q_dim;
+  const std::uint32_t kv_pitch = fused_qkv ? qkv_rows : kv_dim;
 
   GemvType qt{};
   GemvType kt{};
@@ -605,26 +635,29 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
                 "unsupported attn_v type at layer " + std::to_string(il));
   }
   // Wide-batch binary16 attention input: one F16 row produced by the norm is
-  // shared by all three projections, replacing the FP32->F16 narrowing pass
+  // shared by all projections, replacing the FP32->F16 narrowing pass
   // each `Gemm` would insert into its own scratch (and the FP32 row write)
   // while the values stay bit-identical to norm-then-narrow. Gated on all
-  // three shapes taking the half-in route together; anything else keeps the
+  // shapes taking the half-in route together; anything else keeps the
   // FP32 path bit-for-bit.
   const bool qkv_half =
-      hidden % 32U == 0U &&
-      HalfInWindow(qt, tokens, heads * head_dim, hidden) &&
-      HalfInWindow(kt, tokens, kvh * head_dim, hidden) &&
-      (l.attn_v.empty() || HalfInWindow(vt, tokens, kvh * head_dim, hidden));
+      fused_qkv ||
+      (hidden % 32U == 0U && HalfInWindow(qt, tokens, q_dim, hidden) &&
+       HalfInWindow(kt, tokens, kv_dim, hidden) &&
+       (l.attn_v.empty() || HalfInWindow(vt, tokens, kv_dim, hidden)));
   if (qkv_half) {
     RmsNormRowsHalf(pf_cur_, l.attn_norm.f32(), pf_qkv_half_, tokens, hidden,
                     c.rms_eps, nullptr);
-    const bool ok = GemmHalfIn(l.attn_q.data, qt, heads * head_dim, hidden,
-                               pf_qkv_half_, pf_q_, tokens, nullptr) &&
-                    GemmHalfIn(l.attn_k.data, kt, kvh * head_dim, hidden,
-                               pf_qkv_half_, pf_k_, tokens, nullptr) &&
-                    (l.attn_v.empty() ||
-                     GemmHalfIn(l.attn_v.data, vt, kvh * head_dim, hidden,
-                                pf_qkv_half_, pf_v_, tokens, nullptr));
+    const bool ok =
+        fused_qkv ? GemmHalfIn(l.attn_qkv.data, qkvt, qkv_rows, hidden,
+                               pf_qkv_half_, pf_qkv_, tokens, nullptr)
+                  : GemmHalfIn(l.attn_q.data, qt, q_dim, hidden, pf_qkv_half_,
+                               q_dst, tokens, nullptr) &&
+                        GemmHalfIn(l.attn_k.data, kt, kv_dim, hidden,
+                                   pf_qkv_half_, k_dst, tokens, nullptr) &&
+                        (l.attn_v.empty() ||
+                         GemmHalfIn(l.attn_v.data, vt, kv_dim, hidden,
+                                    pf_qkv_half_, v_dst, tokens, nullptr));
     if (!ok) {
       return Fail(error_msg, "attention projection GEMM failed at layer " +
                                  std::to_string(il));
@@ -632,21 +665,21 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   } else {
     RmsNormRows(pf_cur_, l.attn_norm.f32(), pf_normed_, tokens, hidden,
                 c.rms_eps, nullptr);
-    Gemm(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
-         pf_normed_, pf_q_, tokens, nullptr);
-    Gemm(l.attn_k.data, kt, kvh * head_dim, hidden, l.attn_k.row_bytes,
-         pf_normed_, pf_k_, tokens, nullptr);
+    Gemm(l.attn_q.data, qt, q_dim, hidden, l.attn_q.row_bytes, pf_normed_,
+         q_dst, tokens, nullptr);
+    Gemm(l.attn_k.data, kt, kv_dim, hidden, l.attn_k.row_bytes, pf_normed_,
+         k_dst, tokens, nullptr);
     if (!l.attn_v.empty()) {
-      Gemm(l.attn_v.data, vt, kvh * head_dim, hidden, l.attn_v.row_bytes,
-           pf_normed_, pf_v_, tokens, nullptr);
+      Gemm(l.attn_v.data, vt, kv_dim, hidden, l.attn_v.row_bytes, pf_normed_,
+           v_dst, tokens, nullptr);
     }
   }
 
-  QknormRope(pf_q_, l.attn_q_norm.f32(), pf_qn_, tokens, heads, head_dim,
-             inv_freq, start, nullptr);
-  KvNormRopeWrite(pf_k_, l.attn_v.empty() ? pf_k_ : pf_v_, l.attn_k_norm.f32(),
+  QknormRope(pf_qkv_, l.attn_q_norm.f32(), pf_qn_, tokens, heads, head_dim,
+             inv_freq, start, q_pitch, nullptr);
+  KvNormRopeWrite(k_dst, l.attn_v.empty() ? k_dst : v_dst, l.attn_k_norm.f32(),
                   session.k_cache_[il], session.v_cache_[il], start, tokens,
-                  kvh, head_dim, inv_freq, nullptr);
+                  kvh, head_dim, inv_freq, kv_pitch, nullptr);
 
   const std::uint32_t window = l.swa ? c.sliding_window : 0;
   AttentionPrefill(pf_qn_, session.k_cache_[il], session.v_cache_[il], pf_attn_,
@@ -673,23 +706,40 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   // row traffic. Gated so all three projections take the F16 route together
   // (up/gate shape [ffn x hidden], down shape [hidden x ffn]) and their K is a
   // multiple of 32, which is exactly when GemmHalfIn cannot fall back; any
-  // other shape or batch keeps the bit-identical FP32 path.
+  // other shape or batch keeps the bit-identical FP32 path. The fused box
+  // rides this route or not at all: outside the window the parts run their
+  // own GEMMs into natural-size boxes (the fused views are slices either way).
   const bool ffn_half = ft == GemvType::kQ8_0 && (hidden % 32U == 0U) &&
                         (c.ffn_length % 32U == 0U) &&
                         DenseF16Window(tokens, c.ffn_length, hidden) &&
                         DenseF16Window(tokens, hidden, c.ffn_length);
+  const bool fused_gu = !l.ffn_gate_up.empty() && ffn_half &&
+                        DenseF16Window(tokens, l.ffn_gate_up.rows, hidden);
+  // Same fused/unfused split as the attention projections: one wide GEMM
+  // emits [tokens][2 * ffn] (gate columns first) or the parts write their
+  // own natural boxes at fixed offsets of pf_gu_.
+  const float* gu_gate = pf_gu_;
+  const float* gu_up =
+      fused_gu ? pf_gu_ + c.ffn_length
+               : pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length);
+  const std::uint32_t gu_pitch = fused_gu ? l.ffn_gate_up.rows : c.ffn_length;
   if (ffn_half) {
     RmsNormRowsHalf(pf_attn_out_, l.ffn_norm.f32(), pf_normed_half_, tokens,
                     hidden, c.rms_eps, nullptr);
-    const bool ok = GemmHalfIn(l.ffn_up.data, ft, c.ffn_length, hidden,
-                               pf_normed_half_, pf_up_, tokens, nullptr) &&
-                    GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden,
-                               pf_normed_half_, pf_gate_, tokens, nullptr);
+    const bool ok =
+        fused_gu ? GemmHalfIn(l.ffn_gate_up.data, ft, l.ffn_gate_up.rows,
+                              hidden, pf_normed_half_, pf_gu_, tokens, nullptr)
+                 : GemmHalfIn(
+                       l.ffn_up.data, ft, c.ffn_length, hidden, pf_normed_half_,
+                       pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length),
+                       tokens, nullptr) &&
+                       GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden,
+                                  pf_normed_half_, pf_gu_, tokens, nullptr);
     if (!ok) {
       return Fail(error_msg, "shared FFN up/gate GEMM failed");
     }
-    GegluF16Separate(pf_gate_, pf_up_, pf_act_ffn_half_, rows * c.ffn_length,
-                     nullptr);
+    GegluF16Separate(gu_gate, gu_up, pf_act_ffn_half_, rows * c.ffn_length,
+                     c.ffn_length, gu_pitch, nullptr);
     if (!GemmHalfIn(l.ffn_down.data, ft, hidden, c.ffn_length, pf_act_ffn_half_,
                     pf_mlp_, tokens, nullptr)) {
       return Fail(error_msg, "shared FFN down GEMM failed");
@@ -698,10 +748,12 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     RmsNormRows(pf_attn_out_, l.ffn_norm.f32(), pf_normed_, tokens, hidden,
                 c.rms_eps, nullptr);
     Gemm(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes,
-         pf_normed_, pf_up_, tokens, nullptr);
+         pf_normed_, pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length),
+         tokens, nullptr);
     Gemm(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
-         pf_normed_, pf_gate_, tokens, nullptr);
-    GegluF32Separate(pf_gate_, pf_up_, pf_act_, rows * c.ffn_length, nullptr);
+         pf_normed_, pf_gu_, tokens, nullptr);
+    GegluF32Separate(gu_gate, gu_up, pf_act_, rows * c.ffn_length, c.ffn_length,
+                     gu_pitch, nullptr);
     Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes,
          pf_act_, pf_mlp_, tokens, nullptr);
   }
@@ -940,7 +992,7 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
     Gemv(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
          d_normed_, d_q_, nullptr);
     QknormRope(d_q_, l.attn_q_norm.f32(), d_qn_, 1, heads, head_dim, inv_freq,
-               pos, nullptr);
+               pos, heads * head_dim, nullptr);
 
     // Read the trunk KV cache read-only over the rows the trunk has written.
     const std::uint32_t window = swa ? dc.sliding_window : 0;
@@ -972,7 +1024,7 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
          nullptr);
     Gemv(l.ffn_gate.data, ft, dffn, hidden, l.ffn_gate.row_bytes, d_normed_,
          d_gate_, nullptr);
-    GegluF32Separate(d_gate_, d_up_, d_act_, dffn, nullptr);
+    GegluF32Separate(d_gate_, d_up_, d_act_, dffn, dffn, dffn, nullptr);
     Gemv(l.ffn_down.data, ft, hidden, dffn, l.ffn_down.row_bytes, d_act_,
          d_proj_, nullptr);
     RmsNormRows(d_proj_, l.post_ffw_norm.f32(), d_mlp1_, 1, hidden, dc.rms_eps,

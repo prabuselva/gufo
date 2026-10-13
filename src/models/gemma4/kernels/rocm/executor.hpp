@@ -221,16 +221,16 @@ private:
   std::uint32_t prefill_chunk_{0};
   float* pf_next_{nullptr};
   float* pf_normed_{nullptr};
-  float* pf_q_{nullptr};
+  // One region each for the attention and gate/up projections: a fused GEMM
+  // box with the fused row pitch starts at the base, while unfused per-tensor
+  // GEMMs write natural [chunk][rows] boxes at fixed offsets.
+  float* pf_qkv_{nullptr};
   float* pf_qn_{nullptr};
-  float* pf_k_{nullptr};
-  float* pf_v_{nullptr};
   float* pf_attn_{nullptr};
   float* pf_proj_{nullptr};
   float* pf_attn_out_{nullptr};
   float* pf_mlp_{nullptr};
-  float* pf_gate_{nullptr};
-  float* pf_up_{nullptr};
+  float* pf_gu_{nullptr};
   float* pf_act_{nullptr};
   float* pf_router_in_{nullptr};
   float* pf_router_logits_{nullptr};

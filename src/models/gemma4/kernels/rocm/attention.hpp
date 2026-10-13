@@ -19,20 +19,24 @@ namespace gufo::models::gemma4::rocm {
 // [position][kv_head][head_dim].
 
 // Per-head RMSNorm(gamma) + NEOX rope of the Q projection.
-// q/out: [tokens][heads][head_dim] F32.
+// out: [tokens][heads][head_dim] F32. `pitch` is the float stride of one q
+// input row: heads * head_dim for a standalone projection, or the fused qkv
+// row width when q is a column slice of a fused GEMM output.
 void QknormRope(const float* q, const float* gamma, float* out,
                 std::uint32_t tokens, std::uint32_t heads,
                 std::uint32_t head_dim, const float* inv_freq,
-                std::uint32_t start, hipStream_t stream);
+                std::uint32_t start, std::uint32_t pitch, hipStream_t stream);
 
 // Per-head RMSNorm(k_gamma) + rope of K and weightless RMSNorm of V, written
 // to the F16 caches at [start, start + tokens). `v == k` means V is the
-// normed (pre-rope) K, as on full-attention layers.
+// normed (pre-rope) K, as on full-attention layers. `pitch` is the shared
+// float stride of the k and v input rows (kv_heads * head_dim standalone, or
+// the fused qkv row width for column slices).
 void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
                      __half* k_cache, __half* v_cache, std::uint32_t start,
                      std::uint32_t tokens, std::uint32_t kv_heads,
                      std::uint32_t head_dim, const float* inv_freq,
-                     hipStream_t stream);
+                     std::uint32_t pitch, hipStream_t stream);
 
 // Single-query GQA decode attention over cache positions [lo, n_keys).
 // q: [heads][head_dim] F32, out: [heads][head_dim] F32.
