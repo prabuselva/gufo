@@ -256,6 +256,8 @@ private:
   float* pf_expert_out_{nullptr};
   /// Prefill residual ping-pong: pf_cur_ alternates with pf_next_.
   float* pf_cur_{nullptr};
+  /// Device token ids for one prefill chunk (batched embedding lookup).
+  std::int32_t* pf_tok_{nullptr};
 
   // MTP draft scratch (attached on demand). cur_/other_ ping-pong the draft
   // residual; the draft attention reuses attn_scratch_ (same head geometry).

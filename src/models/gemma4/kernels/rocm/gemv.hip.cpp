@@ -576,6 +576,68 @@ __global__ void EmbedRowHalf(const __half* __restrict__ w,
   }
 }
 
+// Batched embedding lookup: one launch per prefill chunk. blockIdx.y selects
+// the token row; each flat element maps exactly as in the single-row kernels,
+// with `scale` a single float multiply applied where ScaleInPlace would.
+__global__ void EmbedRowsQ8_0(const Q8_0Block* __restrict__ emb,
+                              const std::int32_t* __restrict__ tokens,
+                              float* __restrict__ out, std::uint32_t cols,
+                              float scale) {
+  const std::uint32_t row = blockIdx.y;
+  const std::uint32_t nblocks = cols / 32U;
+  const std::uint32_t b = blockIdx.x * blockDim.x / 32U + threadIdx.x / 32U;
+  if (b >= nblocks) {
+    return;
+  }
+  const Q8_0Block* __restrict__ w =
+      emb + static_cast<std::size_t>(tokens[row]) * nblocks + b;
+  const float d = __half2float(w->d);
+  const std::size_t o = static_cast<std::size_t>(row) * cols +
+                        static_cast<std::size_t>(b) * 32U + threadIdx.x % 32U;
+  out[o] = (d * static_cast<float>(w->qs[threadIdx.x % 32U])) * scale;
+}
+
+__global__ void EmbedRowsF32(const float* __restrict__ emb,
+                             const std::int32_t* __restrict__ tokens,
+                             float* __restrict__ out, std::uint32_t cols,
+                             float scale) {
+  const std::uint32_t row = blockIdx.y;
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < cols) {
+    const std::size_t w = static_cast<std::size_t>(tokens[row]) * cols + i;
+    out[static_cast<std::size_t>(row) * cols + i] = emb[w] * scale;
+  }
+}
+
+__global__ void EmbedRowsBf16(const hip_bfloat16* __restrict__ emb,
+                              const std::int32_t* __restrict__ tokens,
+                              float* __restrict__ out, std::uint32_t cols,
+                              float scale) {
+  const std::uint32_t row = blockIdx.y;
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < cols) {
+    const std::size_t w = static_cast<std::size_t>(tokens[row]) * cols + i;
+    out[static_cast<std::size_t>(row) * cols + i] =
+        static_cast<float>(emb[w]) * scale;
+  }
+}
+
+__global__ void EmbedRowsHalf(const __half* __restrict__ emb,
+                              const std::int32_t* __restrict__ tokens,
+                              float* __restrict__ out, std::uint32_t cols,
+                              float scale) {
+  const std::uint32_t row = blockIdx.y;
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < cols) {
+    const std::size_t w = static_cast<std::size_t>(tokens[row]) * cols + i;
+    out[static_cast<std::size_t>(row) * cols + i] =
+        __half2float(emb[w]) * scale;
+  }
+}
+
 __global__ void GemvHalf(const __half* __restrict__ w,
                          const float* __restrict__ x, float* __restrict__ out,
                          std::uint32_t rows, std::uint32_t cols) {
@@ -670,6 +732,45 @@ void EmbedRow(const void* base, GemvType type, std::uint32_t row,
     // Q4_K/Q5_K are routed-expert encodings; ValidateTypes keeps them off the
     // embedding lookup, which only ever sees the Q8_0/F32/BF16/kF16 token
     // table.
+    case GemvType::kQ4_K:
+    case GemvType::kQ5_K:
+      break;
+  }
+}
+
+void EmbedRows(const void* base, GemvType type, const std::int32_t* tokens,
+               std::uint32_t rows, std::uint32_t cols, float scale, float* out,
+               hipStream_t stream) {
+  if (rows == 0U) {
+    return;
+  }
+  constexpr std::uint32_t block = 256U;
+  switch (type) {
+    case GemvType::kQ8_0: {
+      const std::uint32_t nblocks = cols / 32U;
+      EmbedRowsQ8_0<<<dim3((nblocks * 32U + block - 1U) / block, rows), block,
+                      0, stream>>>(static_cast<const Q8_0Block*>(base), tokens,
+                                   out, cols, scale);
+      break;
+    }
+    case GemvType::kF32: {
+      EmbedRowsF32<<<dim3((cols + block - 1U) / block, rows), block, 0,
+                     stream>>>(static_cast<const float*>(base), tokens, out,
+                               cols, scale);
+      break;
+    }
+    case GemvType::kBF16: {
+      EmbedRowsBf16<<<dim3((cols + block - 1U) / block, rows), block, 0,
+                      stream>>>(static_cast<const hip_bfloat16*>(base), tokens,
+                                out, cols, scale);
+      break;
+    }
+    case GemvType::kF16: {
+      EmbedRowsHalf<<<dim3((cols + block - 1U) / block, rows), block, 0,
+                      stream>>>(static_cast<const __half*>(base), tokens, out,
+                                cols, scale);
+      break;
+    }
     case GemvType::kQ4_K:
     case GemvType::kQ5_K:
       break;

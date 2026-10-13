@@ -92,6 +92,17 @@ bool GemvMulti(const GemvMultiProj* projs, std::uint32_t n, const float* x,
 void EmbedRow(const void* base, GemvType type, std::uint32_t row,
               std::uint32_t cols, float* out, hipStream_t stream);
 
+/// Batched embedding lookup for a prefill chunk: one launch gathers
+/// out[t][i] = W[tokens[t]][i] * scale for all `rows` token ids (a device
+/// array) into a [rows x cols] row-major box. Each element maps exactly as in
+/// EmbedRow, and the single fold of `scale` into the stored value rounds
+/// exactly like a following ScaleInPlace(x, scale), so a chunk is
+/// bit-identical to the per-token EmbedRow loop plus ScaleInPlace.
+/// Asynchronous on `stream` (null uses the default stream).
+void EmbedRows(const void* base, GemvType type, const std::int32_t* tokens,
+               std::uint32_t rows, std::uint32_t cols, float scale, float* out,
+               hipStream_t stream);
+
 }  // namespace gufo::models::gemma4::rocm
 
 #endif  // GUFO_MODELS_GEMMA4_KERNELS_ROCM_GEMV_HPP_

@@ -204,6 +204,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   GUFO_ALLOC(pf_cur_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_next_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_normed_, static_cast<std::size_t>(C) * hidden);
+  e->pf_tok_ = reinterpret_cast<std::int32_t*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * sizeof(std::int32_t), error_msg));
+  if (e->pf_tok_ == nullptr)
+    return nullptr;
   // One region holds both projection layouts: the fused GEMM box
   // [tokens][qkv_rows] starts at the base with the fused row pitch, while
   // the unfused fallback packs a natural [tokens][rows] box per tensor at
@@ -516,20 +520,21 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
   }
   const std::uint32_t hidden = c.hidden_size;
   std::vector<std::int32_t> host_tokens(tokens, tokens + count);
+  for (const std::int32_t tok : host_tokens) {
+    if (tok < 0 || static_cast<std::uint32_t>(tok) >= c.vocab_size) {
+      return Fail(error_msg, "token id out of range");
+    }
+  }
 
+  const float emb_scale = std::sqrt(static_cast<float>(hidden));
   for (std::uint32_t start = 0; start < count; start += prefill_chunk_) {
     const std::uint32_t T = std::min(prefill_chunk_, count - start);
-    for (std::uint32_t t = 0; t < T; ++t) {
-      const std::int32_t tok = host_tokens[start + t];
-      if (tok < 0 || static_cast<std::uint32_t>(tok) >= c.vocab_size) {
-        return Fail(error_msg, "token id out of range");
-      }
-      EmbedRow(model_.token_embd().data, emb_type,
-               static_cast<std::uint32_t>(tok), hidden,
-               pf_cur_ + static_cast<std::size_t>(t) * hidden, nullptr);
+    if (hipMemcpy(pf_tok_, host_tokens.data() + start, T * sizeof(std::int32_t),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      return Fail(error_msg, "embedding token upload failed");
     }
-    ScaleInPlace(pf_cur_, std::sqrt(static_cast<float>(hidden)),
-                 static_cast<std::size_t>(T) * hidden, nullptr);
+    EmbedRows(model_.token_embd().data, emb_type, pf_tok_, T, hidden, emb_scale,
+              pf_cur_, nullptr);
     // Splice the image embeddings over the scaled token rows they replace.
     // Both regions are contiguous [rows][hidden], so each overlap is one D2D
     // copy. Gemma does not scale the image rows, so this runs after the

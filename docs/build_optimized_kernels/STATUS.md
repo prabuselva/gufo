@@ -331,6 +331,18 @@ it only pays together with the fork's register-frugal 2.5 template
       head-dim partial sums, exact-half operands); pp2048
       **3118.36/3114.87 (+5.2 % vs 2965.95/2959.31)**, pp8192 **2929.57
       (+10.1 % vs 2660.27)**. Same-quant d0 gap 3760 vs 3118 = **1.21×**.
+      **Batched embedding lookup (fork `BatchedEmbeddingLookupKernel`
+      analogue, now default)**: one launch per prefill chunk (`EmbedRows`, grid
+      (col-chunks, rows), `sqrt(hidden)` folded into the store, host-validated
+      token ids uploaded per chunk) replaces the per-token `EmbedRow` loop +
+      `ScaleInPlace` in `Executor::Prefill`; chunk embedding is bit-identical
+      by construction (validator kl 0.0000930581 tv 0.0000874606 top-1 match
+      unchanged, kernels/forward pass). Timing must be paired in-window: the
+      first bench after a window starts reads cold-low (this was misread as a
+      −0.8 % regression until control binaries were alternated). Matched
+      alternation pp2048: candidate 3114.13/3124.67/3132.15/3141.87 vs fresh
+      control 3105.32/3104.83/3045.84 (candidate never loses the pair);
+      paired pp8192 2935.91 vs control 2898.82 (+1.3 %). 2048→4 launches.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.
