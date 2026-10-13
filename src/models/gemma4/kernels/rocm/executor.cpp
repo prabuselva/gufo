@@ -726,9 +726,19 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
       fused_gu ? pf_gu_ + c.ffn_length
                : pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length);
   const std::uint32_t gu_pitch = fused_gu ? l.ffn_gate_up.rows : c.ffn_length;
+  // One launch for the three norms taken off the post-attention row: the
+  // binary16 FFN input (inside the F16 window only; the FP32 branch keeps
+  // its own `RmsNormRows`), the router input with the router's
+  // per-dimension scale and the RMS 1/sqrt(hidden) constant folded into the
+  // store, and the binary16 routed-expert input (identical rounding to the
+  // old RmsNormRows + NarrowActivations pair). Every store pass runs the
+  // standalone kernel's loop, so all three outputs stay bit-identical.
+  RmsNormRowsTriple(pf_attn_out_, tokens, hidden, c.rms_eps,
+                    ffn_half ? l.ffn_norm.f32() : nullptr,
+                    ffn_half ? pf_normed_half_ : nullptr, l.router_scale.f32(),
+                    1.0F / std::sqrt(static_cast<float>(hidden)), pf_router_in_,
+                    l.pre_ffw_norm_2.f32(), pf_x_half_, nullptr);
   if (ffn_half) {
-    RmsNormRowsHalf(pf_attn_out_, l.ffn_norm.f32(), pf_normed_half_, tokens,
-                    hidden, c.rms_eps, nullptr);
     const bool ok =
         fused_gu ? GemmHalfIn(l.ffn_gate_up.data, ft, l.ffn_gate_up.rows,
                               hidden, pf_normed_half_, pf_gu_, tokens, nullptr)
@@ -760,12 +770,6 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes,
          pf_act_, pf_mlp_, tokens, nullptr);
   }
-  // One pass: the router's per-dimension scale and the RMS 1/sqrt(hidden)
-  // constant fold into the norm store (same multiply order as the old
-  // RmsNormRows + MulInPlace + ScaleInPlace chain).
-  RmsNormRows(pf_attn_out_, nullptr, pf_router_in_, tokens, hidden, c.rms_eps,
-              l.router_scale.f32(),
-              1.0F / std::sqrt(static_cast<float>(hidden)), nullptr);
   GemvType rt{};
   if (!GemvTypeOf(l.router.type, &rt)) {
     return Fail(error_msg, "unsupported router type");
@@ -775,11 +779,6 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   RouterTopK(pf_router_logits_, c.num_experts, pf_ids_, pf_weights_, tokens,
              c.num_experts, c.num_experts_used, nullptr);
 
-  // The routed input is written as binary16 directly by the norm (identical
-  // rounding to the old RmsNormRows + NarrowActivations pair), so MoeBatch
-  // consumes the half rows without a second full-width pass.
-  RmsNormRowsHalf(pf_attn_out_, l.pre_ffw_norm_2.f32(), pf_x_half_, tokens,
-                  hidden, c.rms_eps, nullptr);
   if (!MoeBatch(l, pf_ids_, tokens, error_msg)) {
     return false;
   }

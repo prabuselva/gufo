@@ -46,6 +46,20 @@ void RmsNormAddRows(const float* x, const float* gamma, const float* addend,
                     float* out, std::uint32_t rows, std::uint32_t dim,
                     float eps, hipStream_t stream);
 
+/// One launch computing the three RMS norms taken off the same `x` rows:
+/// the binary16 FFN input `ffn_half = rmsnorm(x)*ffn_gamma`, the router input
+/// `router_out = (rmsnorm(x)*router_scale)*router_k` (null `router_out`
+/// disables the slot), and the binary16 routed-expert input
+/// `preffw_half = rmsnorm(x)*preffw_gamma`. A null `ffn_half` disables that
+/// slot; `ffn_gamma`/`preffw_gamma` may be null (scale 1). Each computed slot
+/// is bit-identical to the corresponding standalone `RmsNormRowsHalf` /
+/// `RmsNormRows` (with `post_scale`) launch.
+void RmsNormRowsTriple(const float* x, std::uint32_t rows, std::uint32_t dim,
+                       float eps, const float* ffn_gamma, __half* ffn_half,
+                       const float* router_scale, float router_k,
+                       float* router_out, const float* preffw_gamma,
+                       __half* preffw_half, hipStream_t stream);
+
 /// Single-row residual add fused with the following RMSNorm: `x += addend`,
 /// then `out = rmsnorm(x) * gamma`. Bit-identical to Add then RmsNormRows with
 /// rows == 1. `out` may alias `x`; `gamma` may be null (scale 1).

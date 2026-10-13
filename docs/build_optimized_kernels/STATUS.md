@@ -354,12 +354,27 @@ it only pays together with the fork's register-frugal 2.5 template
        top-1 match EXACT; paired pp2048 cand vs control +0.57/+0.42/+0.31 %
        (cand won all three pairs), pp8192 cand-first 2960.51 vs control
        2929.84 (+1.05 %, order bias against the candidate there).
-       Lesson pinned by isolation harness: ROCm `__fadd_rn`/`__fmul_rn` are
-       plain operator wrappers and do **not** block FMA contraction — the
-       fused store `v*scale*g + a` silently fused into an FMA (23 % of
-       elements 1 ulp off). `#pragma clang fp contract(off)` scoped to a
-       nested block around only the store loops (sumsq keeps its contracted
-       reduction) restores bit-exactness at −O2/−O3.
+        Lesson pinned by isolation harness: ROCm `__fadd_rn`/`__fmul_rn` are
+        plain operator wrappers and do **not** block FMA contraction — the
+        fused store `v*scale*g + a` silently fused into an FMA (23 % of
+        elements 1 ulp off). `#pragma clang fp contract(off)` scoped to a
+        nested block around only the store loops (sumsq keeps its contracted
+        reduction) restores bit-exactness at −O2/−O3.
+        **Three post-attention norms -> one launch (`RmsNormRowsTriple`,
+        prefill, now default)**: the FFN-norm binary16 slot (F16-window
+        only), the router input (null gamma + `router_scale`/1/sqrt(hidden)
+        fold) and the pre-FFW binary16 slot all norm the same `pf_attn_out_`
+        rows, so one launch shares the sumsq and runs the three store loops
+        (each verbatim from `RmsNormKernelHalf`/`RmsNormKernel` post_scale,
+        same block=min(dim,256)/grid=rows geometry); 3 launches/layer -> 1.
+        Bit-identical per slot by construction, pinned by a three-output
+        memcmp unit check (plus a router-only null-slot call) in
+        `gemma4.rocm_kernels`. Gates (`gufo_bench_lever3.log`, `lever3b`):
+        kernels/forward pass; validator kl **0.0000930581** tv 0.0000874606
+        top-1 match EXACT; seven matched pp2048 pairs cand mean 3125.96 vs
+        control 3084.95 (+1.33 %, cand won 5/7, pair deltas
+        +2.09/+4.20/-0.12/+0.20/-0.57/+0.67/+2.93 %), pp8192 cand-first
+        2974.88 vs control 2955.60 (+0.65 %).
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.

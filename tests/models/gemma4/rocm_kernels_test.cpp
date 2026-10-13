@@ -478,10 +478,81 @@ bool TestNormsAndAdd() {
   std::cout << "RmsNormAddRows bit-exact " << (bits_ok ? "yes" : "NO") << " ("
             << ndiff << " diffs)\n";
 
+  // Triple norm: one launch producing the FFN-half, router and pre-FFW-half
+  // slots must be bit-identical to the three standalone launches (and the
+  // router slot to the folded RmsNormRows post_scale pass).
+  const auto gamma2 = t::MakeValues(kHidden, 0x2E2E2E2EU, 1.0F, 1.0F);
+  const auto rscale = t::MakeValues(kHidden, 0x1F1F1F1FU, 1.0F, 1.0F);
+  t::HipBuffer<float> d_gamma2(gamma2.size());
+  t::Upload(&d_gamma2, gamma2);
+  t::HipBuffer<float> d_rscale(rscale.size());
+  t::Upload(&d_rscale, rscale);
+  const float kpost = 0.01882F;
+  t::HipBuffer<__half> d_ref_ffn(x.size());
+  t::HipBuffer<float> d_ref_router(x.size());
+  t::HipBuffer<__half> d_ref_preffw(x.size());
+  q::RmsNormRowsHalf(d_x.get(), d_gamma.get(), d_ref_ffn.get(), kRows, kHidden,
+                     1e-6F, nullptr);
+  q::RmsNormRows(d_x.get(), nullptr, d_ref_router.get(), kRows, kHidden, 1e-6F,
+                 d_rscale.get(), kpost, nullptr);
+  q::RmsNormRowsHalf(d_x.get(), d_gamma2.get(), d_ref_preffw.get(), kRows,
+                     kHidden, 1e-6F, nullptr);
+  t::HipBuffer<__half> d_tri_ffn(x.size());
+  t::HipBuffer<float> d_tri_router(x.size());
+  t::HipBuffer<__half> d_tri_preffw(x.size());
+  q::RmsNormRowsTriple(d_x.get(), kRows, kHidden, 1e-6F, d_gamma.get(),
+                       d_tri_ffn.get(), d_rscale.get(), kpost,
+                       d_tri_router.get(), d_gamma2.get(), d_tri_preffw.get(),
+                       nullptr);
+  // Router-only slots (null half outputs) must run and match too.
+  t::HipBuffer<float> d_tri_router2(x.size());
+  q::RmsNormRowsTriple(d_x.get(), kRows, kHidden, 1e-6F, nullptr, nullptr,
+                       d_rscale.get(), kpost, d_tri_router2.get(), nullptr,
+                       nullptr, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RmsNormRowsTriple synchronization");
+  bool tri_ok = true;
+  std::size_t tri_diffs = 0;
+  const auto cmp = [&](const char* name, const void* a, const void* b,
+                       std::size_t count, std::size_t elem) {
+    const auto* pa = static_cast<const unsigned char*>(a);
+    const auto* pb = static_cast<const unsigned char*>(b);
+    for (std::size_t i = 0; i < count; ++i) {
+      if (std::memcmp(pa + i * elem, pb + i * elem, elem) != 0) {
+        ++tri_diffs;
+        tri_ok = false;
+      }
+    }
+    if (!tri_ok) {
+      std::cerr << name << " Triple bit diff\n";
+    }
+  };
+  const auto dl_half = [](t::HipBuffer<__half>* buf, std::size_t n) {
+    std::vector<__half> data(n);
+    t::CheckHip(hipMemcpy(data.data(), buf->get(), n * sizeof(__half),
+                          hipMemcpyDeviceToHost),
+                "download half buffer");
+    return data;
+  };
+  const auto ref_ffn_h = dl_half(&d_ref_ffn, x.size());
+  const auto tri_ffn_h = dl_half(&d_tri_ffn, x.size());
+  const auto ref_router = t::Download(&d_ref_router, x.size());
+  const auto tri_router = t::Download(&d_tri_router, x.size());
+  const auto tri_router2 = t::Download(&d_tri_router2, x.size());
+  const auto ref_preffw_h = dl_half(&d_ref_preffw, x.size());
+  const auto tri_preffw_h = dl_half(&d_tri_preffw, x.size());
+  cmp("ffn", ref_ffn_h.data(), tri_ffn_h.data(), x.size(), sizeof(__half));
+  cmp("router", ref_router.data(), tri_router.data(), x.size(), sizeof(float));
+  cmp("router-only", ref_router.data(), tri_router2.data(), x.size(),
+      sizeof(float));
+  cmp("preffw", ref_preffw_h.data(), tri_preffw_h.data(), x.size(),
+      sizeof(__half));
+  std::cout << "RmsNormRowsTriple bit-exact " << (tri_ok ? "yes" : "NO") << " ("
+            << tri_diffs << " diffs)\n";
+
   return Check("Add",
                t::WorstRelative(ref_add, t::Download(&d_single, kHidden)),
                1e-6) &&
-         ok && bits_ok;
+         ok && bits_ok && tri_ok;
 }
 
 bool TestGemmShape(std::uint32_t rows, std::uint32_t batch, const char* label,

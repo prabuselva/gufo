@@ -359,6 +359,117 @@ __global__ void RmsNormKernelAdd(const float* x, const float* gamma,
   }
 }
 
+// Three RMSNorms over the same rows in one launch, sharing the per-row
+// sum-of-squares: an optional binary16 FFN-norm output, an optional FP32
+// router output (null gamma, per-dimension post-scale with the RMS constant
+// folded) and an optional binary16 pre-FFW output. Each store loop is the
+// verbatim loop from RmsNormKernelHalf / RmsNormKernel, and the sumsq uses
+// the same float partials and double block reduce, so every slot is
+// bit-identical to running the standalone kernels (same block geometry).
+__global__ void RmsNormKernelTriple(const float* x, std::uint32_t dim,
+                                    float eps, const float* ffn_gamma,
+                                    __half* ffn_half, const float* router_scale,
+                                    float router_k, float* router_out,
+                                    const float* preffw_gamma,
+                                    __half* preffw_half) {
+  __shared__ double reduce[32];
+  const std::size_t row = blockIdx.x;
+  const float* xr = x + row * dim;
+  if ((dim & 3U) == 0U) {
+    const float4* x4 = reinterpret_cast<const float4*>(xr);
+    const std::uint32_t n4 = dim / 4U;
+    float ss = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
+    if (ffn_half != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(ffn_gamma);
+      __half* orow = ffn_half + row * dim;
+      // volatile round-trip through float before the F16 store, matching
+      // RmsNormKernelHalf (two roundings, not the contracted cvt).
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 g =
+            g4 != nullptr ? g4[i] : make_float4(1.0F, 1.0F, 1.0F, 1.0F);
+        volatile float rx = v.x * scale * g.x;
+        volatile float ry = v.y * scale * g.y;
+        volatile float rz = v.z * scale * g.z;
+        volatile float rw = v.w * scale * g.w;
+        orow[4 * i] = __float2half(rx);
+        orow[4 * i + 1] = __float2half(ry);
+        orow[4 * i + 2] = __float2half(rz);
+        orow[4 * i + 3] = __float2half(rw);
+      }
+    }
+    if (router_out != nullptr) {
+      float4* orow = reinterpret_cast<float4*>(router_out + row * dim);
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 s = reinterpret_cast<const float4*>(router_scale)[i];
+        orow[i] = {
+            (v.x * scale * s.x) * router_k, (v.y * scale * s.y) * router_k,
+            (v.z * scale * s.z) * router_k, (v.w * scale * s.w) * router_k};
+      }
+    }
+    if (preffw_half != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(preffw_gamma);
+      __half* orow = preffw_half + row * dim;
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 g =
+            g4 != nullptr ? g4[i] : make_float4(1.0F, 1.0F, 1.0F, 1.0F);
+        volatile float rx = v.x * scale * g.x;
+        volatile float ry = v.y * scale * g.y;
+        volatile float rz = v.z * scale * g.z;
+        volatile float rw = v.w * scale * g.w;
+        orow[4 * i] = __float2half(rx);
+        orow[4 * i + 1] = __float2half(ry);
+        orow[4 * i + 2] = __float2half(rz);
+        orow[4 * i + 3] = __float2half(rw);
+      }
+    }
+    return;
+  }
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const double v = xr[i];
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(dim)) +
+                   eps);
+  if (ffn_half != nullptr) {
+    __half* orow = ffn_half + row * dim;
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      volatile float r =
+          xr[i] * scale * (ffn_gamma != nullptr ? ffn_gamma[i] : 1.0F);
+      orow[i] = __float2half(r);
+    }
+  }
+  if (router_out != nullptr) {
+    float* orow = router_out + row * dim;
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      const float v = xr[i] * scale * 1.0F;
+      orow[i] = v * router_scale[i] * router_k;
+    }
+  }
+  if (preffw_half != nullptr) {
+    __half* orow = preffw_half + row * dim;
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      volatile float r =
+          xr[i] * scale * (preffw_gamma != nullptr ? preffw_gamma[i] : 1.0F);
+      orow[i] = __float2half(r);
+    }
+  }
+}
+
 __global__ void AddKernel(float* a, const float* b, std::size_t count) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
@@ -730,6 +841,17 @@ void RmsNormAddRows(const float* x, const float* gamma, const float* addend,
                     float eps, hipStream_t stream) {
   const dim3 block(std::min<std::uint32_t>(dim, 256U));
   RmsNormKernelAdd<<<rows, block, 0, stream>>>(x, gamma, addend, out, dim, eps);
+}
+
+void RmsNormRowsTriple(const float* x, std::uint32_t rows, std::uint32_t dim,
+                       float eps, const float* ffn_gamma, __half* ffn_half,
+                       const float* router_scale, float router_k,
+                       float* router_out, const float* preffw_gamma,
+                       __half* preffw_half, hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  RmsNormKernelTriple<<<rows, block, 0, stream>>>(
+      x, dim, eps, ffn_gamma, ffn_half, router_scale, router_k, router_out,
+      preffw_gamma, preffw_half);
 }
 
 void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,
