@@ -524,14 +524,18 @@ it only pays together with the fork's register-frugal 2.5 template
           direct pp2048 A/B same session (`gufo_bench_lever6_fork.log`,
           3 fork-FIRST pairs): fork 3276.22 (3291.42/3279.17/3258.07) vs
           lever-6 candidate 3185.45 (3210.50/3208.73/3137.12) = −2.8 %.
-          This contradicts the composition of the two same-window
-          measurements (forkab −1.3 % + this lever +2.1 % ≈ +0.8 %) and
-          both fork windows used FORK-FIRST ordering while the fork
-          absolute also drifted +0.8 % vs forkab; the candidate absolute
-          stayed put. Protocol fix for the next cross window: include
-          CAND-FIRST pairs alternating with fork-first ones before
-          trusting any gap claim; current honest bracket: fork ahead by
-          ~0–3 % on pp2048.
+          ORDER-BIAS PROBES SAME SESSION (`gufo_bench_ordprobe.log`,
+          2 fork-first + 2 cand-first pairs): fork 3290.40 vs cand 3172.02,
+          cand lost all four order-paired deltas (−85.7/−109.8/−127.0/
+          −151.0) = **−3.6 %**, order effect <=0.6 % — NOT positioning.
+          Residual puzzle kept on record: within-own-binary windows stay
+          self-consistent (lever-6 +2.1 % over `gufo_ctrl_v6`) yet absolute
+          levels shift +-4 % between windows even for identical binaries,
+          so only direct fork A/B numbers count for the gap. Honest gap
+          now: **fork ahead by ~2.8-3.6 % on pp2048**. (forkab's −1.3 % is
+          superseded as a gap reference: same ordering, lower fork
+          absolute; treat older cross-window gap figures as noise until a
+          dedicated multi-pair cross window re-establishes the level.)
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
