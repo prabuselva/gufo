@@ -1204,7 +1204,11 @@ bool LaunchRoutedHalfGemm(ExpertFormat format, const void* w, const void* x,
                           const std::int32_t* rows_out, float* out,
                           void* out_half, std::uint32_t m, std::uint32_t k,
                           hipStream_t stream, bool geglu) {
-  if (tile_rows != 96 || n_tiles == 0 ||
+  // 128-row tiles exist only for Q8_0 (balanced Gemma buckets stream each
+  // expert's weights once instead of twice); the tile builder and this
+  // launcher must agree on the size.
+  if ((tile_rows != 96 && tile_rows != 128) ||
+      (tile_rows == 128 && format != ExpertFormat::kQ8_0) || n_tiles == 0 ||
       (out == nullptr) == (out_half == nullptr) ||
       (format != ExpertFormat::kQ5_1 && format != ExpertFormat::kQ8_0 &&
        format != ExpertFormat::kF16 && format != ExpertFormat::kQ4_0 &&
@@ -1268,7 +1272,19 @@ bool LaunchRoutedHalfGemm(ExpertFormat format, const void* w, const void* x,
       if (k % kDownStageK != 0 || (out == nullptr) != geglu) {
         return false;
       }
-      if (geglu) {
+      if (tile_rows == 128) {
+        if (geglu) {
+          RoutedHalfDownKernel<ExpertFormat::kQ8_0, 128, true>
+              <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
+                                                    rows_in, rows_out, nullptr,
+                                                    oh, m, k);
+        } else {
+          RoutedHalfDownKernel<ExpertFormat::kQ8_0, 128>
+              <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
+                                              rows_in, rows_out, out, nullptr,
+                                              m, k);
+        }
+      } else if (geglu) {
         RoutedHalfDownKernel<ExpertFormat::kQ8_0, 96, true>
             <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
                                                   rows_in, rows_out, nullptr,

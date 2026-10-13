@@ -760,8 +760,14 @@ bool Executor::MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
   const bool own_down = half_shape &&
                         PrefillFormatOf(l.ffn_down_exps.type, &fmt_down) &&
                         OwnDownFormat(fmt_down);
-  const std::uint32_t rows_gu = own_gu ? 96 : 64;
-  const std::uint32_t rows_down = own_down ? 96 : 64;
+  // Q8_0 buckets at Gemma scale (top-8 of 2048 tokens over 128 experts ~=
+  // 128 rows) fit one 128-row tile, halving per-expert weight re-streaming
+  // vs 96; other owned formats stay at 96.
+  const auto gu_tile = [](ExpertFormat f) {
+    return f == ExpertFormat::kQ8_0 ? 128U : 96U;
+  };
+  const std::uint32_t rows_gu = own_gu ? gu_tile(fmt_gu) : 64U;
+  const std::uint32_t rows_down = own_down ? gu_tile(fmt_down) : 64U;
   const std::size_t tile_span =
       RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 48);
   std::int32_t* tiles_gu = pf_tiles_dev_;
@@ -784,7 +790,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
   // GegluF16 pass is needed.
   if (own_gu) {
     if (!LaunchRoutedHalfGemm(fmt_gu, l.ffn_gate_up_exps.data, pf_x_half_,
-                              tiles_gu, n_tiles_gu, 96, pf_pad_bounds_,
+                              tiles_gu, n_tiles_gu, rows_gu, pf_pad_bounds_,
                               pf_rows_token_, pf_rows_slot_, nullptr,
                               pf_act_half_, 2 * c.expert_ff, c.hidden_size,
                               nullptr, /*geglu=*/true)) {
@@ -801,9 +807,10 @@ bool Executor::MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
   }
   if (own_down) {
     if (!LaunchRoutedHalfGemm(fmt_down, l.ffn_down_exps.data, pf_act_half_,
-                              tiles_down, n_tiles_down, 96, pf_pad_bounds_,
-                              pf_rows_slot_, pf_rows_slot_, pf_expert_out_,
-                              nullptr, c.hidden_size, c.expert_ff, nullptr,
+                              tiles_down, n_tiles_down, rows_down,
+                              pf_pad_bounds_, pf_rows_slot_, pf_rows_slot_,
+                              pf_expert_out_, nullptr, c.hidden_size,
+                              c.expert_ff, nullptr,
                               /*geglu=*/false)) {
       return Fail(error_msg, "LaunchRoutedHalfGemm down unsupported");
     }
