@@ -138,7 +138,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   std::unique_ptr<Executor> e(new Executor(model.config(), model));
   const Config& c = e->c_;
   if (prefill_chunk == 0) {
-    prefill_chunk = 512;
+    prefill_chunk = 2048;
   }
   if (model.token_embd().empty() || model.output().empty()) {
     Fail(error_msg, "model has no token embedding");

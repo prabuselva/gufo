@@ -40,7 +40,7 @@ struct ModelOptions {
   std::uint32_t max_context = 4096;
   // Rows per batched prefill pass. Bounds the shared prefill scratch; the
   // executor loops over chunks of this size for longer prompts.
-  std::uint32_t prefill_chunk = 512;
+  std::uint32_t prefill_chunk = 2048;
   // Optional MTP draft sidecar artifact. When set, the draft is loaded and
   // speculative decoding is available; sessions opt in with SetMtpEnabled.
   std::string draft_path;

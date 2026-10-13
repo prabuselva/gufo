@@ -177,9 +177,27 @@ it only pays together with the fork's register-frugal 2.5 template
       QknormRope 41 + RmsNorm-family 48 + MoeFinish 47 + Cijk 28 + `mul_mat_q`
       21 (`qfn_mmq` — caller to be identified; ≈29-layer shape, not lm_head
       budget arithmetic) and elementwise `NarrowHalf` 14 ms. The fork's
-      remaining 3326-vs-2180 gap therefore lives in the dense/attention/
-      elementwise fusion pipeline (fork h_half end-to-end, `LaunchDenseHalfGemm`
-      dense projections, fused rope/norm), not the routed expert GEMMs.
+       remaining 3326-vs-2180 gap therefore lives in the dense/attention/
+       elementwise fusion pipeline (fork h_half end-to-end, `LaunchDenseHalfGemm`
+       dense projections, fused rope/norm), not the routed expert GEMMs.
+       **3.2c `prefill_chunk` 512 → 2048 (biggest single lever; supersedes
+       the attribution above — fork benchmark stake corrected again)**: the
+       cited fork figure 3326 belongs to the fork's UD-Q8_K_XL AR table at
+       d4096 (3324.04, `gufo_franzmoca/docs/models/gemma-4-26b-a4b/
+       BENCHMARKS.md`); **on this same quant the fork's d0 (≈pp2048) is
+       3760.40** — a real same-artifact gap, not a quant mismatch. Their
+       EXPERIMENTS.md times routed GEMMs "per 2048 rows" per layer, while we
+       chunked prefill through an unsettable default `prefill_chunk = 512`
+       (`engine.hpp`, `executor.cpp` fallback — no CLI ever assigned it), so
+       every MoE layer streams the touched expert weights **4×** and tiles
+       four times at quarter-M. Both defaults raised to the fork's 2048; all
+       buffers derive from `C`, no capacity fixes needed. Measured exclusive:
+       pp2048 **2649.47** (+21.8 % vs 2175.67), pp8192 **2409.30** (+22.2 %
+       vs 1971.91), tg 42.57/42.28 neutral; validate kl **0.0100832073**
+       tv 0.0122322326 — bit-identical to 3.2b (chunking only changes weight
+       re-stream count, not numerics). `gufo_bench_{pc2048,pc8192}.log`.
+       Same-quant d0 gap vs fork now 3760 vs 2649 = **1.42×**; re-profile
+       before picking the next lever — MoE's 4×-streamed share shrank.
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position
