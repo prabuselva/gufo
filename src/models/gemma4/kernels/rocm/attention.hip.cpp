@@ -228,7 +228,12 @@ __global__ void KvNormRopeWriteWarpKernel(
 // QknormRopeWarpKernel and KvNormRopeWriteWarpKernel, so q and v are
 // bit-identical to running the two kernels back to back and K differs only on
 // rope rounding ties (see the store-loop note below). The RoPE sincos are
-// computed once per warp and shared by all of its heads.
+// computed once per warp and shared by all of its heads. HD selects a
+// compile-time head_dim so the per-head loops and register arrays specialize
+// and fully unroll; HD == 0 keeps the runtime head_dim for exotic shapes.
+// Unrolling preserves the element and accumulation order, so every instance
+// is bit-identical to the runtime one.
+template<std::uint32_t HD>
 __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
                                   float* q_out, const float* k, const float* v,
                                   const float* k_gamma, __half* k_cache,
@@ -237,6 +242,8 @@ __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
                                   std::uint32_t head_dim, const float* inv_freq,
                                   std::uint32_t start, std::uint32_t q_pitch,
                                   std::uint32_t kv_pitch) {
+  const std::uint32_t hdim = HD != 0U ? HD : head_dim;
+  constexpr std::uint32_t kPairs = HD != 0U ? HD / 64U : 16U;
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t warp = threadIdx.x / warpSize;
   const std::uint32_t warps = blockDim.x / warpSize;
@@ -245,10 +252,10 @@ __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
   if (warp >= total) {
     return;
   }
-  const std::uint32_t half = head_dim / 2U;
+  const std::uint32_t half = hdim / 2U;
   const std::uint32_t pairs = half / warpSize;
-  float cs[16];
-  float sn[16];
+  float cs[kPairs];
+  float sn[kPairs];
   const float pos = static_cast<float>(start + token);
   for (std::uint32_t m = 0; m < pairs; ++m) {
     const std::uint32_t i = lane + warpSize * m;
@@ -257,17 +264,17 @@ __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
   const float* qrow = q + static_cast<std::size_t>(token) * q_pitch;
   const float* krow = k + static_cast<std::size_t>(token) * kv_pitch;
   const float* vrow = v + static_cast<std::size_t>(token) * kv_pitch;
-  float* orow0 = q_out + static_cast<std::size_t>(token) * heads * head_dim;
+  float* orow0 = q_out + static_cast<std::size_t>(token) * heads * hdim;
   __half* kc0 =
-      k_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
+      k_cache + (static_cast<std::size_t>(start) + token) * kv_heads * hdim;
   __half* vc0 =
-      v_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
+      v_cache + (static_cast<std::size_t>(start) + token) * kv_heads * hdim;
   for (std::uint32_t h = warp; h < total; h += warps) {
     if (h < heads) {
-      float a[16];
-      float b[16];
-      const float* row = qrow + h * head_dim;
-      float* orow = orow0 + h * head_dim;
+      float a[kPairs];
+      float b[kPairs];
+      const float* row = qrow + h * hdim;
+      float* orow = orow0 + h * hdim;
       double ss = 0.0;
       for (std::uint32_t m = 0; m < pairs; ++m) {
         const std::uint32_t i = lane + warpSize * m;
@@ -278,7 +285,7 @@ __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
       }
       const float scale =
           1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(ss) /
-                                          static_cast<double>(head_dim)) +
+                                          static_cast<double>(hdim)) +
                        kRmsEps);
       // Q rope stores: bit-identical to the standalone kernel's contraction
       // choice at the pinned toolchain, pinned by the QkvPost unit test.
@@ -294,14 +301,14 @@ __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
       continue;
     }
     const std::uint32_t hq = h - heads;
-    float ka[16];
-    float kb[16];
-    float va[16];
-    float vb[16];
-    const float* kr = krow + hq * head_dim;
-    const float* vr = vrow + hq * head_dim;
-    __half* kc = kc0 + hq * head_dim;
-    __half* vc = vc0 + hq * head_dim;
+    float ka[kPairs];
+    float kb[kPairs];
+    float va[kPairs];
+    float vb[kPairs];
+    const float* kr = krow + hq * hdim;
+    const float* vr = vrow + hq * hdim;
+    __half* kc = kc0 + hq * hdim;
+    __half* vc = vc0 + hq * hdim;
     double kss = 0.0;
     double vss = 0.0;
     for (std::uint32_t m = 0; m < pairs; ++m) {
@@ -317,11 +324,11 @@ __global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
     }
     const float kscale =
         1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(kss) /
-                                        static_cast<double>(head_dim)) +
+                                        static_cast<double>(hdim)) +
                      kRmsEps);
     const float vscale =
         1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(vss) /
-                                        static_cast<double>(head_dim)) +
+                                        static_cast<double>(hdim)) +
                      kRmsEps);
     // contract(off): the RoPE store must not contract into an FMA so this
     // kernel's arithmetic stays revision-stable. The standalone kernel's
@@ -681,9 +688,19 @@ void QkvPost(const float* q, const float* q_gamma, float* q_out, const float* k,
              const float* inv_freq, std::uint32_t start, std::uint32_t q_pitch,
              std::uint32_t kv_pitch, hipStream_t stream) {
   if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
-    QkvPostWarpKernel<<<tokens, 512, 0, stream>>>(
-        q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
-        head_dim, inv_freq, start, q_pitch, kv_pitch);
+    if (head_dim == 256U) {
+      QkvPostWarpKernel<256U><<<tokens, 512, 0, stream>>>(
+          q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+          head_dim, inv_freq, start, q_pitch, kv_pitch);
+    } else if (head_dim == 512U) {
+      QkvPostWarpKernel<512U><<<tokens, 512, 0, stream>>>(
+          q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+          head_dim, inv_freq, start, q_pitch, kv_pitch);
+    } else {
+      QkvPostWarpKernel<0U><<<tokens, 512, 0, stream>>>(
+          q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+          head_dim, inv_freq, start, q_pitch, kv_pitch);
+    }
   } else {
     QknormRope(q, q_gamma, q_out, tokens, heads, head_dim, inv_freq, start,
                q_pitch, stream);
