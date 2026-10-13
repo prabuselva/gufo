@@ -308,10 +308,29 @@ it only pays together with the fork's register-frugal 2.5 template
         re-derived values).
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
-- [ ] 3.4 Attention occupancy + derived keys for global layers; per-position
+- [~] 3.4 Attention occupancy + derived keys for global layers; per-position
       KL at 16 K gate. Attention budget at pp2048 timed pass: 91.9 ms vs fork
       46 ms — the largest remaining gap (dense FFN GEMM per-shape tiles is
       next at ~−38 ms: fork attn-out "two-block 8×1" 2013→1759 µs).
+      **3.4a two-blocks-per-WGP WMMA attention port (fork `ccef541a` +
+      `c96e2714` wave mapping, `half_store.hpp`)**: the fork's
+      `WmmaPrefillAttentionKernel` (wave owns one row block × one 128-dim
+      slice: 64 Q + 64 O VGPRs, binary16 caches, `waves_per_eu` pinned,
+      next-tile register prefetch, sliding staging through the ring slot —
+      ours runs `ring=0` direct indexing over the full F16 cache) replaces
+      the 8-wave `AttentionPrefillWmmaKernel` behind
+      `LaunchWmmaPrefillAttention`; hd256 runs 2 heads × 4 query blocks (two
+      blocks/WGP), hd512 4×1; geometries outside 256/512 or GQA not
+      divisible by `kHeads` fall back to the scalar oracle. The fork's
+      `kGlobal` derived-keys fast path is compiled but gated on
+      `rope_pairs==64`, so it stays dormant until the rotated-dims-only
+      cache lands (3.4b). Gates (`gufo_bench_attnport.log`):
+      `gemma4.rocm_kernels` (incl. the AttentionPrefill-vs-oracle unit) +
+      `rocm_forward` pass; validator kl **0.0000930581** tv 0.0000874606
+      top-1 match — 2.3× better than 3.2h's 0.0002145108 (identical
+      head-dim partial sums, exact-half operands); pp2048
+      **3118.36/3114.87 (+5.2 % vs 2965.95/2959.31)**, pp8192 **2929.57
+      (+10.1 % vs 2660.27)**. Same-quant d0 gap 3760 vs 3118 = **1.21×**.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.

@@ -33,6 +33,7 @@ if (ENGINE_ENABLE_HIP)
   # stay faithful to the scalar oracle.
   add_library(gufo_gemma4_kernels STATIC EXCLUDE_FROM_ALL
     kernels/rocm/attention.hip.cpp
+    kernels/rocm/attention_wmma.hip.cpp
     kernels/rocm/fused.hip.cpp
     kernels/rocm/gemv.hip.cpp
     kernels/rocm/gemm.hip.cpp
@@ -40,6 +41,7 @@ if (ENGINE_ENABLE_HIP)
     kernels/rocm/routed_f16.hip.cpp
     vision/kernels.hip.cpp)
   set_source_files_properties(kernels/rocm/attention.hip.cpp
+    kernels/rocm/attention_wmma.hip.cpp
     kernels/rocm/fused.hip.cpp
     kernels/rocm/gemv.hip.cpp kernels/rocm/gemm.hip.cpp
     kernels/rocm/moe_prefill.hip.cpp
