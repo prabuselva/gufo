@@ -2,6 +2,12 @@
 
 Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
 
+Record-keeping (golden rule): every lever — accepted AND rejected — gets its
+record appended here (implementation, quality evidence, gates, matched
+exclusive-window timings, lesson) as part of the same commit, and the
+pp2048 timed-pass gap budget is re-measured against the fork after every
+accepted lever. The backlog below is never trusted from memory.
+
 ## Phase 1 — Quality harness (gates all later phases)
 
 - [x] 1.1 Port oracle KL harness: `tests/models/gemma4/reference_probe.cpp`,
@@ -57,7 +63,12 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
       (`/tmp/opencode/gufo_bench_g4pp2k{,b}.log`).
 - [ ] 2.2 `gemm/wmma_gemv` width-invariant decode/verify GEMV + split-K
       `gemv_tasks` + `half_store`.
-- [ ] 2.3 K-quant decode variants (Q4_0/Q5_0/Q4_K/Q5_K/Q6_K/Q8_0).
+- [ ] 2.3 K-quant decode variants (Q4_0/Q5_0/Q4_K/Q5_K/Q6_K/Q8_0). Code
+      audit (lever-5 era): present — `GemvType` {F32,Q8_0,BF16,F16,Q4_K,Q5_K}
+      (`gemv.hpp:21`) + grouped decode GEMVs for Q8_0/Q4_K/Q5_K incl. Pair
+      variants (`gemv.hip.cpp:134-266`); missing — Q4_0/Q5_0/Q6_K dense
+      decode variants (such models exit `GemvTypeOf` at `executor.cpp:18-40`);
+      fork ships Q4_0/Q5_0 experts+dense (`b459d349`, `22341ae7`).
 - [~] 2.4 `moe/` routed prefill tiled GEMM: device tile maps, half I/O, GeGLU
       epilogue, 64-row down tiles, one-launch decode-width rows, exact top-8.
       Most of this is already in `routed_f16.hip.cpp` (device-built tile maps
@@ -78,8 +89,16 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
       (`/tmp/opencode/gufo_bench_gomoe{,val}.log`). pp8192 1919.22
       (`gufo_bench_gomoe8k.log`) — no matched pre-MoeFinish control at 8192
       (retained Q8_K_XL figure 1782.49 predates P2.1), inconclusive there,
-      no regression signal. **Remaining fork delta:** BN=96 / two-tile-height
-      route (`RoutedHalfKQuantKernel` kTile=96) — deferred behind 3.4/2.5.
+       no regression signal. **Remaining fork delta:** BN=96 / two-tile-height
+       route (`RoutedHalfKQuantKernel` kTile=96) — deferred behind 3.4/2.5.
+       Code audit (lever-5 era): exact top-8 confirmed — `RouterTopKKernel`
+       (`fused.hip.cpp:482`) is softmax + k argmax iterations, deterministic
+       lowest-index tie-break; down tiles are instantiated at 96 and 128
+       (`moe_prefill.hip.cpp:1232-1308`, superseding the "64-row" wording),
+       and one-launch decode-width grouped GEMVs exist for Q8_0/Q4_K/Q5_K
+       (`gemv.hip.cpp:134-266`). Real remaining delta is the fork's kTokTiles
+       streaming issue rate/LDS per the 3.2f lesson, plus the other quant
+       decodes tracked in 2.3.
 - [ ] 2.5 `attn/` prefill WMMA template: waves_per_eu, next-tile prefetch,
       rescale-skip, window staging, binary16 output, derived-keys hook.
 - [ ] 2.6 Fused half elementwise set, pinned reduction order.
@@ -312,6 +331,8 @@ it only pays together with the fork's register-frugal 2.5 template
       KL at 16 K gate. Attention budget at pp2048 timed pass: 91.9 ms vs fork
       46 ms — the largest remaining gap (dense FFN GEMM per-shape tiles is
       next at ~−38 ms: fork attn-out "two-block 8×1" 2013→1759 µs).
+      Superseded by the lever-5 re-budget below (attention 55.6 vs 51.9,
+      router SGEMM now the largest gap).
       **3.4a two-blocks-per-WGP WMMA attention port (fork `ccef541a` +
       `c96e2714` wave mapping, `half_store.hpp`)**: the fork's
       `WmmaPrefillAttentionKernel` (wave owns one row block × one 128-dim
@@ -398,9 +419,40 @@ it only pays together with the fork's register-frugal 2.5 template
         (`gufo_bench_lever4.log`, `lever4b`): kernels/forward pass; seven
         matched pp2048 pairs cand mean 3157.72 vs control 3121.76 (+1.15 %,
         cand won 6/7, pair deltas +2.06/+0.64/-1.87/+4.29/+1.02/+0.68/+1.34
-        %), pp8192 cand-first 2992.71 vs control 2965.48 (+0.92 %).
+         %), pp8192 cand-first 2992.71 vs control 2965.48 (+0.92 %).
+         **Lever-5 re-budget (pp2048 timed pass 709.5 vs fork 668.5 kernel
+         ms; profiles `/tmp/opencode/prof_pp2k_lv5` pass @20562.6 ms and
+         `/tmp/opencode/prof_fork` @21944.6 ms; fork source local at
+         `~/projects/llm/halo_forks/gufo_franzmoca`, tip `22341ae7`)**.
+         Ahead of fork: MoE routed GEMM 255.7 vs 271.1, DenseF16 family
+         incl. narrow 232.4 vs 231.1, MoeFinish 41.3 vs 44.8. Backlog by
+         estimated saving: (a) router `hipblasSgemm` `Cijk` 22.1 +
+         `RouterTopK` 3.3 vs fork fused `TopKKernel` 2.3/30 calls — port
+         task 3.5 −19 (grid MT32x32 4×64 = m128×n2048, router shape;
+         supersedes 3.2's ~7 ms/pass stake from the pre-3.2c lumped
+         profile); (b) fold the `RmsNormKernelAdd` residual pass (10.4)
+         into `RmsNormRowsTriple` as a 4th store loop (lever-2 fused-store
+         form, bit-exact candidate) −9; (c) `QkvPostWarpKernel` 29.6 vs
+         fork `QkvPostKernel<256/512>` 19.7 total (fork
+         `kernels.hip.cpp:405`) −10; (d) `NarrowHalf` is a scalar loop
+         (`gemm.hip.cpp:100`): vectorize −6, or remove per task 3.3 by
+         having producers emit f16/Q8_1 activations (fork `111ad652`,
+         `3f6ae2b7` run one 0.36 ms narrow per prefill) −7; (e)
+         full-layer attn_k/v (rows < `kDenseF16MinRows`) fall to
+         `mul_mat_q<8,80>` 16.2/4 calls vs fork `DenseF16<64,64,2,2>`
+         13.9 — small-tile `HalfPlan` entry −2.3; (f) GeGLU in the fused
+         gate/up GEMM epilogue like fork `18e8c220` (ours
+         `GegluSeparateHalf` 7.2 vs fork packed 5.7) −1.5; (g) attention
+         structural follow-ups per the 3.2g note −4. Caveat: fork's own
+         timed-pass kernel sum (668.5 ms) does not reconcile with its raw
+         3760 t/s wall (544.7 ms) — keep paired raw benches as the accept
+         criterion and re-verify fork profile config before quoting kernel
+         sums as the wall gap.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
-      top-8 gate.
+      top-8 gate. Now the largest kernel gap (lever-5 budget, top item):
+      fork computes router gemv+top-8 inside one `TopKKernel` (2.3 ms/prefill);
+      ours spends 22.1 ms (30 `hipblasSgemm` launches) + 3.3 on
+      `RouterTopKKernel`.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.
 - [ ] 3.7 Calibrated draft policy (+`draft_policy_bench.py` pattern).
 - [ ] 3.8 Re-measure `BENCHMARKS.md`; QUALITY.md MTP framing fixed.
