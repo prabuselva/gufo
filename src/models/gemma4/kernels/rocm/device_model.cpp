@@ -11,6 +11,7 @@
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/gemma4/kernels/rocm/gemv.hpp"
 
 namespace gufo::models::gemma4::rocm {
 namespace {
@@ -79,6 +80,69 @@ struct Uploader {
       *error = message;
     }
     ok = false;
+  }
+
+  // Dense projections uploaded as BF16 are retyped to binary16 and converted
+  // in place after the staged uploads finish. F16 gives the dense tier a
+  // native tensor-core route (no BF16 staging/conversion per call), and any
+  // weight magnitude outside the binary16 range fails the load rather than
+  // saturating silently.
+  struct HalfJob {
+    void* data;
+    std::size_t count;
+    std::string name;
+  };
+  std::vector<HalfJob> halves;
+
+  void Half(DeviceTensor& d, const std::string& name) {
+    if (!ok || d.empty() || d.type != core::GgmlType::kBF16) {
+      return;
+    }
+    halves.push_back(
+        {d.data, static_cast<std::size_t>(d.rows) * d.cols * d.experts, name});
+    d.type = core::GgmlType::kF16;
+  }
+
+  // Runs the queued in-place BF16 -> binary16 conversions. Must be called
+  // after the staging pipeline has flushed, so every source buffer holds its
+  // final bytes.
+  bool ConvertHalves() {
+    if (halves.empty() || !ok) {
+      return ok;
+    }
+    std::vector<std::uint32_t*> counters(halves.size(), nullptr);
+    for (std::size_t i = 0; i < halves.size(); ++i) {
+      if (hipMalloc(&counters[i], sizeof(std::uint32_t)) != hipSuccess ||
+          hipMemset(counters[i], 0, sizeof(std::uint32_t)) != hipSuccess) {
+        Fail("hipMalloc failed for BF16 conversion check of " + halves[i].name);
+        break;
+      }
+      ConvertBf16ToHalf(halves[i].data, halves[i].count, counters[i], nullptr);
+    }
+    if (ok && hipDeviceSynchronize() != hipSuccess) {
+      Fail("device sync failed during BF16 -> binary16 conversion");
+    }
+    for (std::size_t i = 0; ok && i < halves.size(); ++i) {
+      std::uint32_t overflow = 0;
+      if (counters[i] != nullptr) {
+        if (hipMemcpy(&overflow, counters[i], sizeof(overflow),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+          Fail("readback failed for BF16 conversion check of " +
+               halves[i].name);
+          break;
+        }
+      }
+      if (overflow > 0) {
+        Fail("tensor " + halves[i].name + " has " + std::to_string(overflow) +
+             " BF16 values outside the binary16 range");
+      }
+    }
+    for (std::uint32_t* c : counters) {
+      if (c != nullptr) {
+        (void)hipFree(c);
+      }
+    }
+    return ok;
   }
 
   DeviceTensor Copy(const TensorRef& t, bool expert = false) {
@@ -193,16 +257,23 @@ struct Uploader {
     d.swa = swa;
     d.attn_norm = Copy(l.attn_norm);
     d.attn_q = Copy(l.attn_q);
+    Half(d.attn_q, "attn_q");
     d.attn_k = Copy(l.attn_k);
+    Half(d.attn_k, "attn_k");
     d.attn_v = Copy(l.attn_v);
+    Half(d.attn_v, "attn_v");
     d.attn_q_norm = Copy(l.attn_q_norm);
     d.attn_k_norm = Copy(l.attn_k_norm);
     d.attn_output = Copy(l.attn_output);
+    Half(d.attn_output, "attn_output");
     d.post_attention_norm = Copy(l.post_attention_norm);
     d.ffn_norm = Copy(l.ffn_norm);
     d.ffn_gate = Copy(l.ffn_gate);
+    Half(d.ffn_gate, "ffn_gate");
     d.ffn_up = Copy(l.ffn_up);
+    Half(d.ffn_up, "ffn_up");
     d.ffn_down = Copy(l.ffn_down);
+    Half(d.ffn_down, "ffn_down");
     d.post_ffw_norm = Copy(l.post_ffw_norm);
     d.router = Copy(l.router);
     d.router_scale = Copy(l.router_scale);
@@ -241,8 +312,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   }
   Uploader up{*stager, m->allocations_, m->bytes_, error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
-  m->output_ =
-      w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
+  up.Half(m->token_embd_, "token_embd");
+  // The tied head shares the embedding buffer; retyping (and converting) it
+  // once covers both, so only an untied head gets its own job.
+  if (w.output.data == w.token_embd.data) {
+    m->output_ = m->token_embd_;
+  } else {
+    m->output_ = up.Copy(w.output);
+    up.Half(m->output_, "output");
+  }
   m->output_norm_ = up.Copy(w.output_norm);
 
   // The per-class inverse-frequency tables, computed in double exactly as the
@@ -276,7 +354,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
       return nullptr;
     }
   }
-  if (!up.ok || !stager->Finish(error_msg)) {
+  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves()) {
     return nullptr;
   }
   return m;
@@ -301,8 +379,11 @@ std::unique_ptr<DeviceDraft> DeviceDraft::Upload(const DraftWeights& w,
   }
   Uploader up{*stager, m->allocations_, m->bytes_, error_msg};
   m->pre_projection_ = up.Copy(w.pre_projection);
+  up.Half(m->pre_projection_, "draft_pre_projection");
   m->post_projection_ = up.Copy(w.post_projection);
+  up.Half(m->post_projection_, "draft_post_projection");
   m->token_embd_ = up.Copy(w.token_embd);
+  up.Half(m->token_embd_, "draft_token_embd");
   m->output_norm_ = up.Copy(w.output_norm);
 
   // The draft's own inverse-frequency tables, computed exactly as the trunk's
@@ -336,7 +417,7 @@ std::unique_ptr<DeviceDraft> DeviceDraft::Upload(const DraftWeights& w,
       return nullptr;
     }
   }
-  if (!up.ok || !stager->Finish(error_msg)) {
+  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves()) {
     return nullptr;
   }
   return m;

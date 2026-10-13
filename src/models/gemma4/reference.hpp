@@ -22,7 +22,17 @@ namespace gufo::models::gemma4 {
 /// itself validated against llama.cpp logits.
 class ReferenceModel {
 public:
-  ReferenceModel(const ModelWeights& weights, std::uint32_t max_context);
+  /// Storage/rounding modes the oracle can express, so a GPU lever's precision
+  /// cost is measurable before its kernel exists (report §4.2). kFloat32 keeps
+  /// K/V exact; kHalfKv rounds stored K/V through binary16, as the GPU cache
+  /// does and as every existing gate assumes. kQ8Activations additionally
+  /// rounds every non-F32 projection input to Q8_1 blocks (32 values,
+  /// binary16 scale), the format of the integer GEMM fallback paths; it
+  /// separates operator semantics from activation rounding.
+  enum class Storage { kFloat32, kHalfKv, kQ8Activations };
+
+  ReferenceModel(const ModelWeights& weights, std::uint32_t max_context,
+                 Storage storage = Storage::kHalfKv);
 
   /// Runs one token at the next position. `logits` (vocab floats) receives the
   /// softcapped output distribution when non-empty. `h_out` (hidden floats)
@@ -57,11 +67,19 @@ private:
                  std::uint32_t head_dim, std::uint32_t window,
                  std::span<float> out);
 
+  /// `cpu::MatVec` under `Storage::kFloat32`/`kHalfKv`; under
+  /// `kQ8Activations` the input row first makes a Q8_1 round trip whenever the
+  /// weight is not F32, exactly as the integer GEMM fallbacks see it.
+  void Proj(const TensorRef& t, std::uint64_t e, std::span<const float> x,
+            std::span<float> y);
+
   const ModelWeights& w_;
   const Config& c_;
+  Storage storage_;
   std::uint32_t max_context_;
   std::uint32_t position_{0};
   std::vector<AttentionState> attention_;
+  std::vector<float> rounded_;  ///< kQ8Activations input scratch
 };
 
 }  // namespace gufo::models::gemma4

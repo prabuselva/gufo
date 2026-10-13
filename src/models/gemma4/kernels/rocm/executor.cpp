@@ -9,6 +9,7 @@
 #include "src/models/gemma4/kernels/rocm/fused.hpp"
 #include "src/models/gemma4/kernels/rocm/gemm.hpp"
 #include "src/models/gemma4/kernels/rocm/gemv.hpp"
+#include "src/models/gemma4/kernels/rocm/moe_prefill.hpp"
 #include "src/models/gemma4/kernels/rocm/routed_f16.hpp"
 
 namespace gufo::models::gemma4::rocm {
@@ -25,6 +26,9 @@ bool GemvTypeOf(core::GgmlType t, GemvType* out) {
     case core::GgmlType::kBF16:
       *out = GemvType::kBF16;
       return true;
+    case core::GgmlType::kF16:
+      *out = GemvType::kF16;
+      return true;
     case core::GgmlType::kQ4_K:
       *out = GemvType::kQ4_K;
       return true;
@@ -38,6 +42,53 @@ bool GemvTypeOf(core::GgmlType t, GemvType* out) {
 
 WeightType RoutedTypeOf(core::GgmlType t) {
   return static_cast<WeightType>(static_cast<std::uint32_t>(t));
+}
+
+// Expert encodings the 96-row prefill kernels (moe_prefill.hip.cpp) decode
+// natively; false falls through to the shared RoutedF16Gemm route.
+bool PrefillFormatOf(core::GgmlType t, ExpertFormat* out) {
+  switch (t) {
+    case core::GgmlType::kQ4_K:
+      *out = ExpertFormat::kQ4_K;
+      return true;
+    case core::GgmlType::kQ5_K:
+      *out = ExpertFormat::kQ5_K;
+      return true;
+    case core::GgmlType::kQ6_K:
+      *out = ExpertFormat::kQ6_K;
+      return true;
+    case core::GgmlType::kQ8_0:
+      *out = ExpertFormat::kQ8_0;
+      return true;
+    case core::GgmlType::kQ5_1:
+      *out = ExpertFormat::kQ5_1;
+      return true;
+    case core::GgmlType::kF16:
+      *out = ExpertFormat::kF16;
+      return true;
+    case core::GgmlType::kQ4_0:
+      *out = ExpertFormat::kQ4_0;
+      return true;
+    case core::GgmlType::kQ5_0:
+      *out = ExpertFormat::kQ5_0;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The fused [gate | up] stack shapes the prefill kernels run at 96-row tiles;
+// the down stack likewise (the Q6_K high-nibble path only exists for gate).
+bool OwnGateUpFormat(ExpertFormat f) {
+  return f == ExpertFormat::kQ4_K || f == ExpertFormat::kQ5_K ||
+         f == ExpertFormat::kQ6_K || f == ExpertFormat::kQ8_0 ||
+         f == ExpertFormat::kF16 || f == ExpertFormat::kQ4_0;
+}
+
+bool OwnDownFormat(ExpertFormat f) {
+  return f == ExpertFormat::kQ5_1 || f == ExpertFormat::kQ8_0 ||
+         f == ExpertFormat::kF16 || f == ExpertFormat::kQ4_0 ||
+         f == ExpertFormat::kQ5_0;
 }
 
 bool Fail(std::string* error_msg, const std::string& message) {
@@ -161,9 +212,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   GUFO_ALLOC(pf_proj_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_attn_out_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_mlp_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_mlp1_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_moe_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_moe2_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_gate_, static_cast<std::size_t>(C) * ffn);
   GUFO_ALLOC(pf_up_, static_cast<std::size_t>(C) * ffn);
   GUFO_ALLOC(pf_act_, static_cast<std::size_t>(C) * ffn);
@@ -196,10 +244,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->AllocBytes(compact_rows * sizeof(std::int32_t), error_msg));
   if (e->pf_rows_slot_ == nullptr)
     return nullptr;
-  const std::size_t max_tiles =
-      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 64);
+  // Two tile maps (gate/up and down) live in one buffer. Capacity shrinks with
+  // tile height, so a cap(48) span per map covers every 96/64 combination the
+  // dispatch may choose; the down map starts at the second span.
+  const std::size_t tile_span =
+      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 48);
   e->pf_tiles_dev_ = reinterpret_cast<std::int32_t*>(
-      e->AllocBytes(max_tiles * sizeof(std::int32_t), error_msg));
+      e->AllocBytes(2 * tile_span * sizeof(std::int32_t), error_msg));
   if (e->pf_tiles_dev_ == nullptr)
     return nullptr;
   e->pf_x_half_ = reinterpret_cast<__half*>(e->AllocBytes(
@@ -581,8 +632,6 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
               hidden, c.rms_eps, nullptr);
   Add(pf_attn_out_, pf_cur_, rows * hidden, nullptr);
 
-  RmsNormRows(pf_attn_out_, l.ffn_norm.f32(), pf_normed_, tokens, hidden,
-              c.rms_eps, nullptr);
   GemvType ft{};
   if (!GemvTypeOf(l.ffn_gate.type, &ft) || !GemvTypeOf(l.ffn_up.type, &ft) ||
       !GemvTypeOf(l.ffn_down.type, &ft)) {
@@ -616,6 +665,8 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
       return Fail(error_msg, "shared FFN down GEMM failed");
     }
   } else {
+    RmsNormRows(pf_attn_out_, l.ffn_norm.f32(), pf_normed_, tokens, hidden,
+                c.rms_eps, nullptr);
     Gemm(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes,
          pf_normed_, pf_up_, tokens, nullptr);
     Gemm(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
@@ -624,9 +675,6 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes,
          pf_act_, pf_mlp_, tokens, nullptr);
   }
-  RmsNormRows(pf_mlp_, l.post_ffw_norm_1.f32(), pf_mlp1_, tokens, hidden,
-              c.rms_eps, nullptr);
-
   RmsNormRows(pf_attn_out_, nullptr, pf_router_in_, tokens, hidden, c.rms_eps,
               nullptr);
   MulInPlace(pf_router_in_, l.router_scale.f32(), rows * hidden, hidden,
@@ -642,77 +690,102 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   RouterTopK(pf_router_logits_, c.num_experts, pf_ids_, pf_weights_, tokens,
              c.num_experts, c.num_experts_used, nullptr);
 
-  RmsNormRows(pf_attn_out_, l.pre_ffw_norm_2.f32(), pf_normed_, tokens, hidden,
-              c.rms_eps, nullptr);
-  if (!MoeBatch(l, pf_normed_, pf_ids_, pf_weights_, pf_moe_, tokens,
-                error_msg)) {
+  // The routed input is written as binary16 directly by the norm (identical
+  // rounding to the old RmsNormRows + NarrowActivations pair), so MoeBatch
+  // consumes the half rows without a second full-width pass.
+  RmsNormRowsHalf(pf_attn_out_, l.pre_ffw_norm_2.f32(), pf_x_half_, tokens,
+                  hidden, c.rms_eps, nullptr);
+  if (!MoeBatch(l, pf_ids_, tokens, error_msg)) {
     return false;
   }
-  RmsNormRows(pf_moe_, l.post_ffw_norm_2.f32(), pf_moe2_, tokens, hidden,
-              c.rms_eps, nullptr);
-
-  if (hipMemcpyAsync(pf_next_, pf_mlp1_, rows * hidden * sizeof(float),
-                     hipMemcpyDeviceToDevice) != hipSuccess) {
-    return Fail(error_msg, "mlp copy failed");
-  }
-  Add(pf_next_, pf_moe2_, rows * hidden, nullptr);
-  RmsNormRows(pf_next_, l.post_ffw_norm.f32(), pf_normed_, tokens, hidden,
-              c.rms_eps, nullptr);
-  if (hipMemcpyAsync(pf_next_, pf_normed_, rows * hidden * sizeof(float),
-                     hipMemcpyDeviceToDevice) != hipSuccess) {
-    return Fail(error_msg, "residual copy failed");
-  }
-  Add(pf_next_, pf_attn_out_, rows * hidden, nullptr);
-  ScaleInPlace(pf_next_, l.layer_output_scale, rows * hidden, nullptr);
+  // The combine, the two expert/dense norms, their add, the post-FFN norm,
+  // the residual add and the layer-output scale in one launch.
+  MoeFinish(pf_mlp_, pf_expert_out_, pf_weights_, pf_ids_,
+            l.ffn_down_exps_scale.f32(), l.post_ffw_norm_1.f32(),
+            l.post_ffw_norm_2.f32(), l.post_ffw_norm.f32(),
+            l.layer_output_scale, pf_attn_out_, pf_next_, tokens,
+            c.num_experts_used, hidden, c.rms_eps, nullptr);
   std::swap(pf_cur_, pf_next_);
   return true;
 }
 
-bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
-                        const std::int32_t* ids, const float* weights,
-                        float* out, std::uint32_t tokens,
-                        std::string* error_msg) {
+bool Executor::MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
+                        std::uint32_t tokens, std::string* error_msg) {
   const Config& c = c_;
   const std::uint32_t used = c.num_experts_used;
   const std::size_t slots = static_cast<std::size_t>(tokens) * used;
 
-  NarrowActivations(x, pf_x_half_, false,
-                    static_cast<std::size_t>(tokens) * c.hidden_size, nullptr);
   ExpertCounts(ids, pf_counts_, tokens, c.num_experts, used, nullptr);
-  // The routed tile map is built on the device from the per-expert counts, so
-  // the host never downloads the histogram or uploads a tile map: the GEMM
-  // launches the map's capacity and skips the dead entries. This removes a
-  // synchronous device-to-host round-trip from every MoE layer.
-  const std::uint32_t n_tiles =
-      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 64);
-  BuildRoutedTiles(pf_counts_, c.num_experts, 64, n_tiles, pf_tiles_dev_,
-                   nullptr);
+  // Each stack runs either the 96-row prefill kernel (its format decodes
+  // natively) or the 64-row fused WMMA kernel. Both tile maps are built on the
+  // device from the per-expert counts in one pass, so the host never downloads
+  // the histogram or uploads a tile map: the GEMMs launch their map's capacity
+  // and skip the dead entries.
+  ExpertFormat fmt_gu{};
+  ExpertFormat fmt_down{};
+  const bool half_shape = c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+  const bool own_gu = half_shape &&
+                      PrefillFormatOf(l.ffn_gate_up_exps.type, &fmt_gu) &&
+                      OwnGateUpFormat(fmt_gu);
+  const bool own_down = half_shape &&
+                        PrefillFormatOf(l.ffn_down_exps.type, &fmt_down) &&
+                        OwnDownFormat(fmt_down);
+  const std::uint32_t rows_gu = own_gu ? 96 : 64;
+  const std::uint32_t rows_down = own_down ? 96 : 64;
+  const std::size_t tile_span =
+      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 48);
+  std::int32_t* tiles_gu = pf_tiles_dev_;
+  std::int32_t* tiles_down = pf_tiles_dev_ + tile_span;
+  const std::uint32_t n_tiles_gu =
+      static_cast<std::uint32_t>(RoutedTileCapacity(
+          static_cast<std::uint32_t>(slots), c.num_experts, rows_gu));
+  const std::uint32_t n_tiles_down =
+      static_cast<std::uint32_t>(RoutedTileCapacity(
+          static_cast<std::uint32_t>(slots), c.num_experts, rows_down));
+  BuildRoutedTiles(pf_counts_, c.num_experts, rows_gu, n_tiles_gu, tiles_gu,
+                   rows_down, n_tiles_down, tiles_down, nullptr);
   RoutedCompact(ids, pf_counts_, pf_pad_bounds_, pf_cursors_, pf_rows_token_,
                 pf_rows_slot_, tokens, used, c.num_experts, nullptr);
 
-  // gate/up and down are independent WMMA calls; a *_K_M artifact stores the
-  // gate/up stack as Q4_K and the down stack as Q8_0, so each GEMM dispatches
-  // on its own weight type (RoutedF16Gemm rejects an unsupported one below).
-  // The gate/up GEMM fuses Gemma-4's gelu-tanh activation into its epilogue and
-  // writes the expert_ff-wide act directly, so no wide gu buffer or separate
-  // GegluF16 pass is needed. Gemma-4's gate_up is always a 64-row tile over an
-  // even 2*expert_ff stack, which the fused epilogue always accepts.
-  const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
-  const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
-  if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, pf_tiles_dev_,
-                     n_tiles, 64, pf_pad_bounds_, pf_rows_token_, pf_rows_slot_,
-                     nullptr, pf_act_half_, 2 * c.expert_ff, c.hidden_size,
-                     nullptr, /*geglu=*/true)) {
-    return Fail(error_msg, "RoutedF16Gemm gate_up unsupported");
+  // gate/up and down are independent GEMMs; a *_K_M artifact stores the
+  // gate/up stack as Q4_K and the down stack as Q8_0, so each dispatches on
+  // its own weight type. Both fused paths write the expert_ff-wide act
+  // directly (gelu-tanh in the epilogue), so no wide gu buffer or separate
+  // GegluF16 pass is needed.
+  if (own_gu) {
+    if (!LaunchRoutedHalfGemm(fmt_gu, l.ffn_gate_up_exps.data, pf_x_half_,
+                              tiles_gu, n_tiles_gu, 96, pf_pad_bounds_,
+                              pf_rows_token_, pf_rows_slot_, nullptr,
+                              pf_act_half_, 2 * c.expert_ff, c.hidden_size,
+                              nullptr, /*geglu=*/true)) {
+      return Fail(error_msg, "LaunchRoutedHalfGemm gate_up unsupported");
+    }
+  } else {
+    const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
+    if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, tiles_gu,
+                       n_tiles_gu, rows_gu, pf_pad_bounds_, pf_rows_token_,
+                       pf_rows_slot_, nullptr, pf_act_half_, 2 * c.expert_ff,
+                       c.hidden_size, nullptr, /*geglu=*/true)) {
+      return Fail(error_msg, "RoutedF16Gemm gate_up unsupported");
+    }
   }
-  if (!RoutedF16Gemm(l.ffn_down_exps.data, wt_down, pf_act_half_, pf_tiles_dev_,
-                     n_tiles, 64, pf_pad_bounds_, pf_rows_slot_, pf_rows_slot_,
-                     pf_expert_out_, nullptr, c.hidden_size, c.expert_ff,
-                     nullptr)) {
-    return Fail(error_msg, "RoutedF16Gemm down unsupported");
+  if (own_down) {
+    if (!LaunchRoutedHalfGemm(fmt_down, l.ffn_down_exps.data, pf_act_half_,
+                              tiles_down, n_tiles_down, 96, pf_pad_bounds_,
+                              pf_rows_slot_, pf_rows_slot_, pf_expert_out_,
+                              nullptr, c.hidden_size, c.expert_ff, nullptr,
+                              /*geglu=*/false)) {
+      return Fail(error_msg, "LaunchRoutedHalfGemm down unsupported");
+    }
+  } else {
+    const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
+    if (!RoutedF16Gemm(l.ffn_down_exps.data, wt_down, pf_act_half_, tiles_down,
+                       n_tiles_down, rows_down, pf_pad_bounds_, pf_rows_slot_,
+                       pf_rows_slot_, pf_expert_out_, nullptr, c.hidden_size,
+                       c.expert_ff, nullptr)) {
+      return Fail(error_msg, "RoutedF16Gemm down unsupported");
+    }
   }
-  MoeEpilogue(pf_expert_out_, weights, ids, l.ffn_down_exps_scale.f32(), out,
-              tokens, used, c.hidden_size, nullptr);
   return true;
 }
 

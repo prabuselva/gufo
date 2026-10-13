@@ -73,6 +73,23 @@ void MoeEpilogue(const float* expert_out, const float* weights,
                  std::uint32_t tokens, std::uint32_t k, std::uint32_t dim,
                  hipStream_t stream);
 
+/// The expert layer's post-FFN chain in one launch, per row r:
+///   a = rms(mlp[r]) * norm1,
+///   b = rms(sum_s w_s * scale_s * expert_out[r * k + s]) * norm2,
+///   out[r] = (rms(a + b) * post_norm + residual[r]) * post_scale.
+/// Bit-identical to MoeEpilogue followed by the three RMSNorms, two adds,
+/// copy and output scale it replaces: the combine uses the same double
+/// accumulation per element, and every rms reduction runs with the same
+/// thread mapping, float4 float partials and double block reduce as
+/// RmsNormRows on that shape. `expert_scale` may be null (scale 1). dim is a
+/// multiple of 4 with dim / (4 * 256) <= 8 (every gemma4 projection row).
+void MoeFinish(const float* mlp, const float* expert_out, const float* weights,
+               const std::int32_t* ids, const float* expert_scale,
+               const float* norm1, const float* norm2, const float* post_norm,
+               float post_scale, const float* residual, float* out,
+               std::uint32_t tokens, std::uint32_t k, std::uint32_t dim,
+               float eps, hipStream_t stream);
+
 /// act[r][i] = gelu_tanh(gu[r][i]) * gu[r][ff + i] for the fused gate/up
 /// projection: `gu` is [rows][2 * ff] (gate rows first), `act` is [rows][ff].
 /// `count` is the number of act elements (rows * ff). F32 and F16 variants.

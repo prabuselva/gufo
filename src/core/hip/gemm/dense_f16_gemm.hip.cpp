@@ -1,11 +1,11 @@
-#include "src/models/gemma4/kernels/rocm/dense_f16_gemm.hpp"
+#include "src/core/hip/gemm/dense_f16_gemm.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 
-namespace gufo::models::gemma4::rocm {
+namespace gufo::core::hip::gemm {
 namespace {
 
 constexpr unsigned kThreads = 256;
@@ -36,15 +36,17 @@ __device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
   hi = __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), scale2, bias2);
 }
 
-// Dense F16 WMMA GEMM over Q8_0 weights: block = BM rows x BN tokens, BK
-// 32-element K blocks per LDS stage, waves = WM row groups x WN token groups.
-// The codes are dequantized to F16 once per stage as they are committed to LDS
-// (magic-number F16 construction, exact for a Q8_0 code), and the activations
-// are F16 rows [batch][k], so the matrix cores accumulate in F32 with no
-// per-block scaling. y is [batch][m]. Generic core: the only epilogue is the
-// transposed store, so every global store covers 32 consecutive rows of one
-// token (a full 128-byte line).
-template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1>
+// Dense F16 WMMA GEMM over Q8_0 or native binary16 weights: block = BM rows x
+// BN tokens, BK 32-element K blocks per LDS stage, waves = WM row groups x WN
+// token groups. For Q8_0 the codes are dequantized to F16 once per stage as
+// they are committed to LDS (magic-number F16 construction, exact for a Q8_0
+// code); with kW16 the weights are already F16 and are staged verbatim, like
+// the activations. Either way the activations are F16 rows [batch][k], so the
+// matrix cores accumulate in F32 with no per-block scaling. y is [batch][m].
+// Generic core: the only epilogue is the transposed store, so every global
+// store covers 32 consecutive rows of one token (a full 128-byte line).
+template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
+         bool kW16 = false>
 __launch_bounds__(256) __global__
     void DenseF16GEMMKernel(const void* __restrict__ w,
                             const __half* __restrict__ x, float* __restrict__ y,
@@ -95,8 +97,11 @@ __launch_bounds__(256) __global__
   const int t_block = (within / kRowGroup) * BN;
 
   // Weight fetch unit p of a thread: row (p * 256 + tid) / BK, K block
-  // (p * 256 + tid) % BK of the stage; rows past m read the last row with a
-  // zero scale.
+  // (p * 256 + tid) % BK of the stage; rows past m read the last row (with a
+  // zero scale for Q8_0, and masked out of the store anyway). A binary16 row
+  // is k halves (2 bytes each); a Q8_0 row is num_kb blocks of 34 bytes.
+  const std::size_t a_row_bytes =
+      kW16 ? k * 2 : static_cast<std::size_t>(num_kb) * 34;
   const std::uint8_t* a_ptr[kAPer];
   bool a_live[kAPer];
 #pragma unroll
@@ -105,7 +110,7 @@ __launch_bounds__(256) __global__
     const int r = r_block + (idx / BK);
     a_live[p] = idx < kAUnits && r < m_i;
     a_ptr[p] = w_bytes + static_cast<std::size_t>(a_live[p] ? r : (m_i - 1)) *
-                             static_cast<std::size_t>(num_kb) * 34;
+                             a_row_bytes;
   }
   const __half* b_ptr[kBPer];
 #pragma unroll
@@ -118,6 +123,7 @@ __launch_bounds__(256) __global__
   }
   uint4 a_codes[kAPer][2];
   std::uint32_t a_d[kAPer];
+  uint4 a_data[kAPer][4];
   uint4 b_data[kBPer][4];
 
   const auto fetch_stage = [&](int kb0) {
@@ -125,11 +131,21 @@ __launch_bounds__(256) __global__
     for (int p = 0; p < kAPer; ++p) {
       const int kb = kb0 + (((p * 256) + tid) % BK);
       const bool live = a_live[p] && kb < num_kb;
-      const std::uint8_t* blk =
-          a_ptr[p] + (static_cast<std::size_t>(live ? kb : (num_kb - 1)) * 34);
-      a_d[p] = live ? *reinterpret_cast<const std::uint16_t*>(blk) : 0U;
-      __builtin_memcpy(&a_codes[p][0], blk + 2, 16);
-      __builtin_memcpy(&a_codes[p][1], blk + 18, 16);
+      if constexpr (kW16) {
+        const auto* blk = reinterpret_cast<const uint4*>(
+            a_ptr[p] + static_cast<std::size_t>(live ? kb : (num_kb - 1)) * 64);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          a_data[p][c] = blk[c];
+        }
+      } else {
+        const std::uint8_t* blk =
+            a_ptr[p] +
+            (static_cast<std::size_t>(live ? kb : (num_kb - 1)) * 34);
+        a_d[p] = live ? *reinterpret_cast<const std::uint16_t*>(blk) : 0U;
+        __builtin_memcpy(&a_codes[p][0], blk + 2, 16);
+        __builtin_memcpy(&a_codes[p][1], blk + 18, 16);
+      }
     }
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
@@ -160,24 +176,32 @@ __launch_bounds__(256) __global__
       }
       const int row = idx / BK;
       const int kk = idx % BK;
-      // Q8_0 codes are signed; flipping the sign bit carries q + 128, which
-      // the 1152 magic takes back out.
-      const std::uint32_t words[8] = {
-          a_codes[p][0].x, a_codes[p][0].y, a_codes[p][0].z, a_codes[p][0].w,
-          a_codes[p][1].x, a_codes[p][1].y, a_codes[p][1].z, a_codes[p][1].w};
-      const __half2 scale2 = __half2half2(
-          __builtin_bit_cast(__half, static_cast<std::uint16_t>(a_d[p])));
-      __half2 h[16];
+      if constexpr (kW16) {
+        // Native binary16 weights: stage the fetched halves verbatim.
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        CodesToHalves(words[i] ^ 0x80808080U, magic, scale2, zero2, h[2 * i],
-                      h[2 * i + 1]);
-      }
+        for (int c = 0; c < 4; ++c) {
+          s_a[kk][row][swizzle(row, c)] = a_data[p][c];
+        }
+      } else {
+        // Q8_0 codes are signed; flipping the sign bit carries q + 128, which
+        // the 1152 magic takes back out.
+        const std::uint32_t words[8] = {
+            a_codes[p][0].x, a_codes[p][0].y, a_codes[p][0].z, a_codes[p][0].w,
+            a_codes[p][1].x, a_codes[p][1].y, a_codes[p][1].z, a_codes[p][1].w};
+        const __half2 scale2 = __half2half2(
+            __builtin_bit_cast(__half, static_cast<std::uint16_t>(a_d[p])));
+        __half2 h[16];
 #pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        uint4 v;
-        __builtin_memcpy(&v, &h[4 * c], 16);
-        s_a[kk][row][swizzle(row, c)] = v;
+        for (int i = 0; i < 8; ++i) {
+          CodesToHalves(words[i] ^ 0x80808080U, magic, scale2, zero2, h[2 * i],
+                        h[2 * i + 1]);
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          uint4 v;
+          __builtin_memcpy(&v, &h[4 * c], 16);
+          s_a[kk][row][swizzle(row, c)] = v;
+        }
       }
     }
 #pragma unroll
@@ -308,40 +332,57 @@ __launch_bounds__(256) __global__
   }
 }
 
+template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1>
+void LaunchDenseF16(const void* w, const __half* x, float* out,
+                    std::size_t batch, std::size_t m, std::size_t k,
+                    bool weights_f16, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned int>((batch + BN - 1) / BN),
+                  static_cast<unsigned int>((m + BM - 1) / BM));
+  if (weights_f16) {
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<BM, BN, BK, WM, WN, kRowGroup, true>), grid,
+        dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+  } else {
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<BM, BN, BK, WM, WN, kRowGroup, false>), grid,
+        dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+  }
+}
+
 }  // namespace
 
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
-                  std::size_t m, std::size_t k, hipStream_t stream) {
+                  std::size_t m, std::size_t k, hipStream_t stream,
+                  DenseF16Plan plan, bool weights_f16) {
   if (m == 0 || k == 0 || batch == 0 || k % 32 != 0) {
     return false;
   }
   // Tile plan: a 128-token macro tile for wide batches, 64-row tiles for the
   // narrow projections, and 64 tokens below 96.
-  constexpr int kBM = 128;
   if (m <= 512 && batch >= 96) {
-    constexpr int kBN = 128;
-    constexpr int kNarrowBM = 64;
-    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
-                    static_cast<unsigned int>((m + kNarrowBM - 1) / kNarrowBM));
-    hipLaunchKernelGGL((DenseF16GEMMKernel<kNarrowBM, kBN, 2, 2, 4>), grid,
-                       dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    LaunchDenseF16<64, 128, 2, 2, 4>(w, x, out, batch, m, k, weights_f16,
+                                     stream);
   } else if (batch >= 96) {
     // 64 x 64 wave tiles: half the LDS fragment bytes per matrix product of
-    // the 32 x 64 tile (the F16 fragments are twice the int8 ones).
-    constexpr int kWideBM = 256;
-    constexpr int kBN = 128;
-    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
-                    static_cast<unsigned int>((m + kWideBM - 1) / kWideBM));
-    hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2>), grid,
-                       dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    // the 32 x 64 tile (the F16 fragments are twice the int8 ones). All eight
+    // waves walk row tiles of one token tile; the planned variants only change
+    // the LDS stage depth and keep the K accumulation order.
+    const bool planned = plan != DenseF16Plan::kAuto && batch >= 1024;
+    if (planned && plan == DenseF16Plan::kStagedRowGroups8) {
+      LaunchDenseF16<256, 128, 2, 8, 1>(w, x, out, batch, m, k, weights_f16,
+                                        stream);
+    } else if (planned) {
+      LaunchDenseF16<256, 128, 1, 8, 1>(w, x, out, batch, m, k, weights_f16,
+                                        stream);
+    } else {
+      LaunchDenseF16<256, 128, 1, 4, 2>(w, x, out, batch, m, k, weights_f16,
+                                        stream);
+    }
   } else {
-    constexpr int kBN = 64;
-    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
-                    static_cast<unsigned int>((m + kBM - 1) / kBM));
-    hipLaunchKernelGGL((DenseF16GEMMKernel<kBM, kBN, 4, 4, 2>), grid,
-                       dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    LaunchDenseF16<128, 64, 4, 4, 2>(w, x, out, batch, m, k, weights_f16,
+                                     stream);
   }
   return true;
 }
 
-}  // namespace gufo::models::gemma4::rocm
+}  // namespace gufo::core::hip::gemm

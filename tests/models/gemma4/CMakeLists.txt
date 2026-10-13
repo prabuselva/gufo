@@ -58,6 +58,14 @@ add_test(NAME gemma4.reference COMMAND gemma4_reference_test)
 set_tests_properties(gemma4.reference PROPERTIES
   LABELS "gemma4;cpu;external-model;slow" SKIP_RETURN_CODE 77)
 
+# KL-harness probe: runs the scalar oracle over a prompt and writes tokens and
+# per-position logits (G4LG) for tools/gemma4/compare_logits.py, with
+# --half-kv/--q8-activations selecting the oracle rounding modes. Not a CTest
+# case; launched explicitly. See docs/build_optimized_kernels/PLAN.md.
+add_executable(gemma4_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
+target_link_libraries(gemma4_reference_probe PRIVATE gufo_gemma4_reference)
+set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+
 # Binds the real mmproj and runs the scalar vision oracle over a small image.
 # Skips (77) without GUFO_GEMMA4_MMPROJ_GGUF.
 add_executable(gemma4_vision_reference_test EXCLUDE_FROM_ALL
@@ -90,6 +98,14 @@ if (ENGINE_ENABLE_HIP)
   add_executable(gemma4_dense_f16_bench EXCLUDE_FROM_ALL dense_f16_bench.cpp)
   target_link_libraries(gemma4_dense_f16_bench PRIVATE
     gufo_gemma4_kernels gufo_qwen38_flash_next_mmq gufo_core)
+
+  # GPU-runtime G4LG logit capture for the KL harness: teacher-forced decode
+  # rows mirroring gemma4_reference_probe framing, or the single bulk-prefill
+  # last row with --bulk-final. Not a CTest case; run it explicitly under
+  # tools/bench/gpu_exclusive.sh. See docs/build_optimized_kernels/PLAN.md.
+  add_executable(gemma4_runtime_probe EXCLUDE_FROM_ALL runtime_probe.cpp)
+  target_link_libraries(gemma4_runtime_probe PRIVATE
+    gufo_gemma4_engine gufo_core)
 
   # End-to-end forward parity on the real artifact: prefill and decode logits
   # against the scalar oracle (<= 5e-3 abs, identical argmax). Skips (77)

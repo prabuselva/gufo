@@ -567,7 +567,68 @@ __global__ void EmbedRowBf16(const hip_bfloat16* __restrict__ w,
   }
 }
 
+__global__ void EmbedRowHalf(const __half* __restrict__ w,
+                             float* __restrict__ out, std::uint32_t cols) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < cols) {
+    out[idx] = __half2float(w[idx]);
+  }
+}
+
+__global__ void GemvHalf(const __half* __restrict__ w,
+                         const float* __restrict__ x, float* __restrict__ out,
+                         std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const __half* __restrict__ row = w + static_cast<std::size_t>(r) * cols;
+  const std::uint32_t lane = threadIdx.x;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t i = lane; i < cols; i += 32) {
+    acc += __half2float(row[i]) * x[i];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
+// In-place BF16 -> binary16 retype (round to nearest even). bf16 has the same
+// top two bytes as f32, so widening is a shift; __float2half_rn saturates to
+// inf on overflow, which the kernel counts instead of storing silently.
+__global__ void Bf16ToHalfKernel(std::uint16_t* __restrict__ data,
+                                 std::size_t count,
+                                 std::uint32_t* __restrict__ overflow) {
+  std::uint32_t outside = 0;
+  for (std::size_t i =
+           blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const float v = __uint_as_float(static_cast<std::uint32_t>(data[i]) << 16U);
+    const __half h = __float2half_rn(v);
+    outside += __hisinf(h) != 0 || __hisnan(h) ? 1U : 0U;
+    data[i] = __builtin_bit_cast(std::uint16_t, h);
+  }
+  if (outside != 0) {
+    atomicAdd(overflow, outside);
+  }
+}
+
 }  // namespace
+
+void ConvertBf16ToHalf(void* data, std::size_t count, std::uint32_t* overflow,
+                       hipStream_t stream) {
+  constexpr int kThreads = 256;
+  if (count == 0) {
+    return;
+  }
+  const std::size_t blocks =
+      std::min<std::size_t>((count + kThreads - 1) / kThreads, 4096);
+  Bf16ToHalfKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      static_cast<std::uint16_t*>(data), count, overflow);
+}
 
 void EmbedRow(const void* base, GemvType type, std::uint32_t row,
               std::uint32_t cols, float* out, hipStream_t stream) {
@@ -597,8 +658,18 @@ void EmbedRow(const void* base, GemvType type, std::uint32_t row,
       EmbedRowBf16<<<grid, block, 0, stream>>>(w, out, cols);
       break;
     }
+    case GemvType::kF16: {
+      const __half* w = static_cast<const __half*>(base) +
+                        static_cast<std::size_t>(row) * cols;
+      const std::size_t block = 256;
+      const std::size_t grid =
+          std::min<std::size_t>((cols + block - 1) / block, 65535);
+      EmbedRowHalf<<<grid, block, 0, stream>>>(w, out, cols);
+      break;
+    }
     // Q4_K/Q5_K are routed-expert encodings; ValidateTypes keeps them off the
-    // embedding lookup, which only ever sees the Q8_0/F32/BF16 token table.
+    // embedding lookup, which only ever sees the Q8_0/F32/BF16/kF16 token
+    // table.
     case GemvType::kQ4_K:
     case GemvType::kQ5_K:
       break;
@@ -626,6 +697,10 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
     case GemvType::kBF16:
       GemvBf16<<<grid, dim3(32), 0, stream>>>(
           static_cast<const hip_bfloat16*>(base), x, out, rows, cols);
+      break;
+    case GemvType::kF16:
+      GemvHalf<<<grid, dim3(32), 0, stream>>>(static_cast<const __half*>(base),
+                                              x, out, rows, cols);
       break;
     // Routed-expert encodings never reach the dense single-row GEMV; they are
     // decoded by GemvGrouped (decode) and the WMMA routed GEMM (prefill).
@@ -658,6 +733,11 @@ void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
         GemvRowsDense<hip_bfloat16, R><<<rows, dim3(32), 0, stream>>>(         \
             static_cast<const hip_bfloat16*>(base), x, x_stride, out,          \
             out_stride, rows, cols);                                           \
+        break;                                                                 \
+      case GemvType::kF16:                                                     \
+        GemvRowsDense<__half, R><<<rows, dim3(32), 0, stream>>>(               \
+            static_cast<const __half*>(base), x, x_stride, out, out_stride,    \
+            rows, cols);                                                       \
         break;                                                                 \
       /* Routed-expert encodings never reach the dense row GEMV. */            \
       case GemvType::kQ4_K:                                                    \
@@ -712,6 +792,11 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
           static_cast<const hip_bfloat16*>(base), ids,
           expert_stride / sizeof(hip_bfloat16), x, x_stride, out, used, rows,
           cols);
+      break;
+    case GemvType::kF16:
+      GemvGroupedDense<__half><<<grid, dim3(128), 0, stream>>>(
+          static_cast<const __half*>(base), ids, expert_stride / sizeof(__half),
+          x, x_stride, out, used, rows, cols);
       break;
   }
 }

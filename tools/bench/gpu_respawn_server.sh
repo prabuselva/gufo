@@ -68,6 +68,15 @@ done
 url="http://${host}:${port}/v1/models"
 log() { printf '\n=== [gpu_respawn] %s ===\n' "$*"; }
 
+# Idempotent: a caller racing another respawner across the respawn flock must
+# not start a second server on the port. If something already serves (and
+# matches --expect-model), return success without launching.
+body="$(curl -fsS --max-time 5 "$url" 2>/dev/null || true)"
+if [ -n "$body" ] && { [ -z "$expect_model" ] || printf '%s' "$body" | grep -q "$expect_model"; }; then
+  log "already serving at $url; nothing to do"
+  exit 0
+fi
+
 # Primary: replay the exact command line captured before the server was stopped
 # (absolute binary path), so respawn works from any directory. Fallback: the
 # launch script, only when nothing was captured (e.g. no server was running).

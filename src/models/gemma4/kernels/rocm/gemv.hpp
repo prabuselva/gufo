@@ -14,10 +14,18 @@ namespace gufo::models::gemma4::rocm {
 
 /// The quantized row formats the GEMV tier decodes. The executor maps the
 /// artifact's GGUF type onto this. Q8_0/F32/BF16 back the dense projections;
-/// Q4_K/Q5_K back the routed expert stacks of a Q4_K_XL artifact, which the
-/// grouped decode GEMV decodes on the fly (the fused pair kernel is Q8_0-only,
-/// so those experts fall back to the plain grouped GEMV).
-enum class GemvType { kQ8_0, kF32, kBF16, kQ4_K, kQ5_K };
+/// kF16 is the binary16 retype of the uploaded BF16 dense projections (see
+/// ConvertBf16ToHalf); Q4_K/Q5_K back the routed expert stacks of a Q4_K_XL
+/// artifact, which the grouped decode GEMV decodes on the fly (the fused pair
+/// kernel is Q8_0-only, so those experts fall back to the plain grouped GEMV).
+enum class GemvType { kQ8_0, kF32, kBF16, kF16, kQ4_K, kQ5_K };
+
+/// Rewrites `count` BF16 values as binary16 in place (round to nearest even)
+/// and adds the values that leave the binary16 range (or are not finite) to
+/// *overflow. Called once per retyped BF16 tensor during device-model upload;
+/// the load fails if *overflow ends up non-zero.
+void ConvertBf16ToHalf(void* data, std::size_t count, std::uint32_t* overflow,
+                       hipStream_t stream);
 
 /// out[r] = sum_k W[r][k] * x[k] for r in [0, rows). `base` points at the first
 /// row of a row-major [rows x cols] matrix stored in `type`; `row_bytes` is the

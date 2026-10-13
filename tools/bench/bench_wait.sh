@@ -26,6 +26,7 @@ log="${base}.log"
 status="${base}.status"
 pidfile="${base}.pid"
 pid="$(cat "$pidfile" 2>/dev/null || true)"
+echo "$$" > "${base}.watchdog.pid"
 start=$(date +%s)
 echo "WATCHDOG start name=$name pid=${pid:-?} total=${total}s $(date -Is)"
 while :; do
@@ -59,8 +60,16 @@ if [ "$code" = 200 ]; then
   echo "WATCHDOG server already serving; skipping respawn"
 else
   echo "WATCHDOG respawning resident server (foreground) $(date -Is)"
-  "$root/tools/bench/gpu_respawn_server.sh" --settle 30 \
-    || echo "WATCHDOG respawn reported failure (see /tmp/gufo_serve_respawn.log)"
+  # Serialize with bench_bg.sh's fallback respawner so a lost watchdog and this
+  # path can never launch two servers on the port.
+  if command -v flock >/dev/null 2>&1; then
+    flock "${state}/gufo_serve_respawn.lock" \
+      "$root/tools/bench/gpu_respawn_server.sh" --settle 30 \
+      || echo "WATCHDOG respawn reported failure (see /tmp/gufo_serve_respawn.log)"
+  else
+    "$root/tools/bench/gpu_respawn_server.sh" --settle 30 \
+      || echo "WATCHDOG respawn reported failure (see /tmp/gufo_serve_respawn.log)"
+  fi
   code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/v1/models 2>/dev/null || echo 000)"
 fi
 echo "WATCHDOG server /v1/models -> ${code}"

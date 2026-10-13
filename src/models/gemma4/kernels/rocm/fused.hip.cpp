@@ -368,6 +368,107 @@ __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
   }
 }
 
+// The expert layer's post-FFN chain in one launch, per row r:
+//   a = rms(mlp[r]) * norm1                                (float partials and
+//   b = combine[r]   rms-scaled by norm2                    double block reduce
+//   t = a + b                                               identical to the
+//   out[r] = (rms(t) * post_norm + residual[r]) * post_scale  separate chain)
+// where combine is MoeEpilogueKernel's weighted expert sum in the same order
+// (float per slot product, double accumulation). One block per row with the
+// block width RmsNormRows uses for the shape (`min(dim, 256)`), float4
+// striding over float partials, so every scale bit-matches a standalone
+// RmsNormRows over the same values. Rows are cached in registers between the
+// three reductions: the register holds cover dim / (4 * blockDim) float4s,
+// up to 8 per thread (dim <= 8192 at block 256).
+__global__ void MoeFinishKernel(
+    const float* __restrict__ mlp, const float* __restrict__ expert_out,
+    const float* __restrict__ weights, const std::int32_t* __restrict__ ids,
+    const float* __restrict__ expert_scale, const float* __restrict__ norm1,
+    const float* __restrict__ norm2, const float* __restrict__ post_norm,
+    float post_scale, const float* __restrict__ residual,
+    float* __restrict__ out, std::uint32_t dim, std::uint32_t used, float eps) {
+  __shared__ double red_a[32];
+  __shared__ double red_b[32];
+  const std::size_t row = blockIdx.x;
+  const std::size_t base = row * dim;
+  const float4* mlp4 = reinterpret_cast<const float4*>(mlp + base);
+  const float4* res4 = reinterpret_cast<const float4*>(residual + base);
+  const float4* norm1_4 = reinterpret_cast<const float4*>(norm1);
+  const float4* norm2_4 = reinterpret_cast<const float4*>(norm2);
+  const float4* post_4 = reinterpret_cast<const float4*>(post_norm);
+  float4* out4 = reinterpret_cast<float4*>(out + base);
+  const std::uint32_t n4 = dim / 4U;
+
+  float4 mv[8];
+  float4 cv[8];
+  float4 rv[8];
+  std::uint32_t held = 0;
+  float ss_m = 0.0F;
+  float ss_c = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+    const float4 m = mlp4[i];
+    mv[held] = m;
+    rv[held] = res4[i];
+    ss_m += m.x * m.x + m.y * m.y + m.z * m.z + m.w * m.w;
+    double acc_x = 0.0;
+    double acc_y = 0.0;
+    double acc_z = 0.0;
+    double acc_w = 0.0;
+    for (std::uint32_t s = 0; s < used; ++s) {
+      const std::size_t slot = row * used + s;
+      const float scale =
+          expert_scale != nullptr ? expert_scale[ids[slot]] : 1.0F;
+      const float4 e =
+          reinterpret_cast<const float4*>(expert_out + slot * dim)[i];
+      const double c = static_cast<double>(weights[slot]) * scale;
+      acc_x += c * e.x;
+      acc_y += c * e.y;
+      acc_z += c * e.z;
+      acc_w += c * e.w;
+    }
+    const float4 comb = {static_cast<float>(acc_x), static_cast<float>(acc_y),
+                         static_cast<float>(acc_z), static_cast<float>(acc_w)};
+    cv[held] = comb;
+    ss_c +=
+        comb.x * comb.x + comb.y * comb.y + comb.z * comb.z + comb.w * comb.w;
+    ++held;
+  }
+  // Consume the partials in ascending thread order exactly like
+  // BlockReduceSum; red_a is free again once both scales are formed.
+  const double d_m = BlockReduceSum(static_cast<double>(ss_m), red_a);
+  const double d_c = BlockReduceSum(static_cast<double>(ss_c), red_b);
+  const float scale_m =
+      1.0F / sqrtf(static_cast<float>(d_m / static_cast<double>(dim)) + eps);
+  const float scale_c =
+      1.0F / sqrtf(static_cast<float>(d_c / static_cast<double>(dim)) + eps);
+
+  float ss_t = 0.0F;
+  for (std::uint32_t j = 0; j < held; ++j) {
+    const std::uint32_t i = threadIdx.x + j * blockDim.x;
+    const float4 n1 = norm1_4[i];
+    const float4 n2 = norm2_4[i];
+    const float4 a = {mv[j].x * scale_m * n1.x, mv[j].y * scale_m * n1.y,
+                      mv[j].z * scale_m * n1.z, mv[j].w * scale_m * n1.w};
+    const float4 b = {cv[j].x * scale_c * n2.x, cv[j].y * scale_c * n2.y,
+                      cv[j].z * scale_c * n2.z, cv[j].w * scale_c * n2.w};
+    const float4 t = {a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w};
+    ss_t += t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w;
+    mv[j] = t;  // hold the summed row in registers for the final norm
+  }
+  const double d_t = BlockReduceSum(static_cast<double>(ss_t), red_a);
+  const float scale_t =
+      1.0F / sqrtf(static_cast<float>(d_t / static_cast<double>(dim)) + eps);
+  for (std::uint32_t j = 0; j < held; ++j) {
+    const std::uint32_t i = threadIdx.x + j * blockDim.x;
+    const float4 p = post_4[i];
+    const float4 u = {mv[j].x * scale_t * p.x, mv[j].y * scale_t * p.y,
+                      mv[j].z * scale_t * p.z, mv[j].w * scale_t * p.w};
+    const float4 r = rv[j];
+    out4[i] = {(u.x + r.x) * post_scale, (u.y + r.y) * post_scale,
+               (u.z + r.z) * post_scale, (u.w + r.w) * post_scale};
+  }
+}
+
 template<typename T>
 __device__ __forceinline__ T GegluPair(const T* gu, std::uint32_t ff);
 
@@ -568,6 +669,18 @@ void MoeEpilogue(const float* expert_out, const float* weights,
   const std::size_t grid = (count + block - 1) / block;
   MoeEpilogueKernel<<<grid, block, 0, stream>>>(
       expert_out, weights, ids, expert_scale, out, k, dim, count);
+}
+
+void MoeFinish(const float* mlp, const float* expert_out, const float* weights,
+               const std::int32_t* ids, const float* expert_scale,
+               const float* norm1, const float* norm2, const float* post_norm,
+               float post_scale, const float* residual, float* out,
+               std::uint32_t tokens, std::uint32_t k, std::uint32_t dim,
+               float eps, hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  MoeFinishKernel<<<tokens, block, 0, stream>>>(
+      mlp, expert_out, weights, ids, expert_scale, norm1, norm2, post_norm,
+      post_scale, residual, out, dim, k, eps);
 }
 
 void GegluF32(const float* gu, float* act, std::size_t count, std::uint32_t ff,

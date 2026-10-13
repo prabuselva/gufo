@@ -177,12 +177,11 @@ private:
   /// `start`; swaps pf_cur_/pf_next_ likewise.
   bool PrefillLayer(Session& session, std::uint32_t il, std::uint32_t start,
                     std::uint32_t tokens, std::string* error_msg);
-  /// Routed F16 WMMA MoE over `tokens` rows of `x` ([tokens][hidden]) into
-  /// `out`. Downloads the expert histogram once per layer to build the tile
-  /// map on the host (the qwen36 route).
-  bool MoeBatch(const DeviceLayer& l, const float* x, const std::int32_t* ids,
-                const float* weights, float* out, std::uint32_t tokens,
-                std::string* error_msg);
+  /// Routed F16 WMMA MoE over `tokens` rows: the gate/up half rows come from
+  /// pf_x_half_ and the slot rows land in pf_expert_out_ ([tokens * used]
+  /// [hidden]); the tile map is built on the device from the expert counts.
+  bool MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
+                std::uint32_t tokens, std::string* error_msg);
 
   float* AllocFloats(std::size_t n, std::string* error);
   void* AllocBytes(std::size_t bytes, std::string* error);
@@ -230,9 +229,6 @@ private:
   float* pf_proj_{nullptr};
   float* pf_attn_out_{nullptr};
   float* pf_mlp_{nullptr};
-  float* pf_mlp1_{nullptr};
-  float* pf_moe_{nullptr};
-  float* pf_moe2_{nullptr};
   float* pf_gate_{nullptr};
   float* pf_up_{nullptr};
   float* pf_act_{nullptr};

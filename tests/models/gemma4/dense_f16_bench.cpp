@@ -1,7 +1,7 @@
 // Standalone prefill-GEMM microbenchmark for Gemma-4-26B-A4B dense
 // projections: the production int8 path (`qfn_mmq_q8_0_dense`, FP32
 // activations requantized to Q8_1 in-kernel) against the binary16 WMMA path
-// (`gemma4::rocm::DenseF16Gemm`, Q8_0 weights dequantized to F16
+// (`gufo::core::hip::gemm::DenseF16Gemm`, Q8_0 weights dequantized to F16
 // in LDS, F16 activations). Both consume the same block_q8_0 weight bytes.
 //
 // For each dense shape the trunk runs at pp2048 it reports the median kernel
@@ -24,11 +24,11 @@
 #include <memory>
 #include <vector>
 
-#include "src/models/gemma4/kernels/rocm/dense_f16_gemm.hpp"
+#include "src/core/hip/gemm/dense_f16_gemm.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "tests/models/gemma4/hip_test.hpp"
 
-namespace fn = gufo::models::gemma4::rocm;
+namespace gemm = gufo::core::hip::gemm;
 namespace t = gufo::tests::gemma4;
 
 namespace {
@@ -88,6 +88,31 @@ constexpr int kWeightCopies = 4;  // rotate to exceed the 32 MiB MALL cache
 constexpr int kWarmup = 3;
 constexpr int kReps = 15;
 
+// Mirrors HalfPlan in src/models/gemma4/kernels/rocm/gemm.hip.cpp: the tile
+// plan production selects for this model's widths, measured alongside auto.
+gemm::DenseF16Plan HalfPlan(std::uint32_t m, std::uint32_t k) {
+  if (m != 2816) {
+    return gemm::DenseF16Plan::kAuto;
+  }
+  if (k >= 4096) {
+    return gemm::DenseF16Plan::kStagedRowGroups8;
+  }
+  return k == 2112 ? gemm::DenseF16Plan::kRowGroups8
+                   : gemm::DenseF16Plan::kAuto;
+}
+
+const char* PlanName(gemm::DenseF16Plan plan) {
+  switch (plan) {
+    case gemm::DenseF16Plan::kStagedRowGroups8:
+      return "staged8";
+    case gemm::DenseF16Plan::kRowGroups8:
+      return "rgroups8";
+    case gemm::DenseF16Plan::kAuto:
+      break;
+  }
+  return "auto";
+}
+
 double Median(std::vector<float> v) {
   std::sort(v.begin(), v.end());
   const std::size_t n = v.size();
@@ -100,9 +125,12 @@ double Median(std::vector<float> v) {
 struct Result {
   double int8_us = 0.0;
   double f16_us = 0.0;
+  double f16_plan_us = 0.0;
   double int8_err = 0.0;
   double f16_err = 0.0;
+  double f16_plan_err = 0.0;
   bool f16_supported = false;
+  const char* plan = "auto";
 };
 
 Result BenchShape(const Shape& s) {
@@ -166,26 +194,35 @@ Result BenchShape(const Shape& s) {
   r.int8_us = Median(int8_times);
 
   // --- binary16 WMMA path (F16 activations) ---
-  const bool ok = fn::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(),
-                                   kBatch, s.m, s.k, nullptr);
+  const bool ok = gemm::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(),
+                                     kBatch, s.m, s.k, nullptr);
   r.f16_supported = ok;
-  if (ok) {
+  const auto time_plan = [&](gemm::DenseF16Plan plan) {
     for (int i = 0; i < kWarmup; ++i) {
-      fn::DenseF16Gemm(weights[i % kWeightCopies]->get(), d_xh.get(),
-                       d_out.get(), kBatch, s.m, s.k, nullptr);
+      gemm::DenseF16Gemm(weights[i % kWeightCopies]->get(), d_xh.get(),
+                         d_out.get(), kBatch, s.m, s.k, nullptr, plan);
     }
-    std::vector<float> f16_times;
+    std::vector<float> times;
     for (int i = 0; i < kReps; ++i) {
       hipEventRecord(ev0);
-      fn::DenseF16Gemm(weights[i % kWeightCopies]->get(), d_xh.get(),
-                       d_out.get(), kBatch, s.m, s.k, nullptr);
+      gemm::DenseF16Gemm(weights[i % kWeightCopies]->get(), d_xh.get(),
+                         d_out.get(), kBatch, s.m, s.k, nullptr, plan);
       hipEventRecord(ev1);
       hipEventSynchronize(ev1);
       float ms = 0.0F;
       hipEventElapsedTime(&ms, ev0, ev1);
-      f16_times.push_back(ms * 1000.0F);
+      times.push_back(ms * 1000.0F);
     }
-    r.f16_us = Median(f16_times);
+    return Median(times);
+  };
+  if (ok) {
+    r.f16_us = time_plan(gemm::DenseF16Plan::kAuto);
+    // The production plan for this shape and its timing next to the default.
+    const gemm::DenseF16Plan plan = HalfPlan(s.m, s.k);
+    r.plan = PlanName(plan);
+    if (plan != gemm::DenseF16Plan::kAuto) {
+      r.f16_plan_us = time_plan(plan);
+    }
   }
 
   // --- correctness against a double reference on weight copy 0 ---
@@ -197,8 +234,8 @@ Result BenchShape(const Shape& s) {
   const std::vector<float> int8_out = t::Download(&d_out, ocount);
   // binary16 path output.
   if (ok) {
-    fn::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(), kBatch, s.m,
-                     s.k, nullptr);
+    gemm::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(), kBatch, s.m,
+                       s.k, nullptr);
     t::CheckHip(hipDeviceSynchronize(), "f16 sync");
   }
 
@@ -231,6 +268,18 @@ Result BenchShape(const Shape& s) {
     for (const std::size_t i : idxs) {
       f16_sub.push_back(f16_out[i]);
     }
+    if (r.f16_plan_us > 0.0) {
+      gemm::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(), kBatch,
+                         s.m, s.k, nullptr, HalfPlan(s.m, s.k));
+      t::CheckHip(hipDeviceSynchronize(), "f16 plan sync");
+      const std::vector<float> plan_out = t::Download(&d_out, ocount);
+      std::vector<float> plan_sub;
+      plan_sub.reserve(idxs.size());
+      for (const std::size_t i : idxs) {
+        plan_sub.push_back(plan_out[i]);
+      }
+      r.f16_plan_err = t::WorstRelativeToScale(ref, plan_sub);
+    }
   }
   r.int8_err = t::WorstRelativeToScale(ref, int8_sub);
   if (ok) {
@@ -253,17 +302,30 @@ int main() {
       "gemma4 dense prefill GEMM: int8 mmq vs binary16 WMMA "
       "(batch=%u, %d weight copies, median of %d reps)\n\n",
       kBatch, kWeightCopies, kReps);
-  std::printf("%-14s %10s %10s %8s %12s %12s\n", "shape", "int8_us", "f16_us",
-              "speedup", "int8_err", "f16_err");
+  std::printf("%-14s %10s %10s %8s %10s %9s %8s %11s %11s\n", "shape",
+              "int8_us", "f16_us", "speedup", "f16_plan", "plan", "plan_spd",
+              "int8_err", "f16_err");
   for (const Shape& s : kShapes) {
     const Result r = BenchShape(s);
     if (!r.f16_supported) {
-      std::printf("%-14s %10.1f %10s %8s %12.3e %12s\n", s.name, r.int8_us,
-                  "n/a", "n/a", r.int8_err, "unsupported");
+      std::printf("%-14s %10.1f %10s %8s %10s %9s %8s %12.3e %12s\n", s.name,
+                  r.int8_us, "n/a", "n/a", "n/a", "n/a", "n/a", r.int8_err,
+                  "unsupported");
       continue;
     }
-    std::printf("%-14s %10.1f %10.1f %7.2fx %12.3e %12.3e\n", s.name, r.int8_us,
-                r.f16_us, r.int8_us / r.f16_us, r.int8_err, r.f16_err);
+    std::printf("%-14s %10.1f %10.1f %7.2fx", s.name, r.int8_us, r.f16_us,
+                r.int8_us / r.f16_us);
+    if (r.f16_plan_us > 0.0) {
+      std::printf(" %10.1f %9s %7.2fx", r.f16_plan_us, r.plan,
+                  r.f16_us / r.f16_plan_us);
+    } else {
+      std::printf(" %10s %9s %8s", "-", r.plan, "-");
+    }
+    std::printf(" %11.3e %11.3e", r.int8_err, r.f16_err);
+    if (r.f16_plan_us > 0.0) {
+      std::printf("  plan_err=%.3e", r.f16_plan_err);
+    }
+    std::printf("\n");
   }
   return 0;
 }

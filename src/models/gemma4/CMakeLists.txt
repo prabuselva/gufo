@@ -33,16 +33,16 @@ if (ENGINE_ENABLE_HIP)
   # stay faithful to the scalar oracle.
   add_library(gufo_gemma4_kernels STATIC EXCLUDE_FROM_ALL
     kernels/rocm/attention.hip.cpp
-    kernels/rocm/dense_f16_gemm.hip.cpp
     kernels/rocm/fused.hip.cpp
     kernels/rocm/gemv.hip.cpp
     kernels/rocm/gemm.hip.cpp
+    kernels/rocm/moe_prefill.hip.cpp
     kernels/rocm/routed_f16.hip.cpp
     vision/kernels.hip.cpp)
   set_source_files_properties(kernels/rocm/attention.hip.cpp
-    kernels/rocm/dense_f16_gemm.hip.cpp
     kernels/rocm/fused.hip.cpp
     kernels/rocm/gemv.hip.cpp kernels/rocm/gemm.hip.cpp
+    kernels/rocm/moe_prefill.hip.cpp
     kernels/rocm/routed_f16.hip.cpp vision/kernels.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_gemma4_kernels PROPERTIES
@@ -55,9 +55,10 @@ if (ENGINE_ENABLE_HIP)
   # The batched GEMM tier reuses the Qwen3.8-Flash-Next mmq routed/dense path
   # (Q8_0) and hipBLAS (F32/BF16); the mmq target exports its header directory
   # and roc::hipblas transitively, so weights stay in their native encoding.
-  # The wide-prefill dense F16 WMMA GEMM is model-private (dense_f16_gemm.hip).
+  # The wide-prefill dense F16 WMMA GEMM is the shared core (src/core/hip/gemm);
+  # this model only selects its tile plan (HalfPlan in gemm.hip.cpp).
   target_link_libraries(gufo_gemma4_kernels PUBLIC
-    gufo_qwen38_flash_next_mmq hip::host)
+    gufo_core_hip_gemm gufo_qwen38_flash_next_mmq hip::host)
 
   # Host-side driver: streams the artifact to the GPU and runs the trunk one
   # token at a time. Built only by explicit GPU validation targets until the
