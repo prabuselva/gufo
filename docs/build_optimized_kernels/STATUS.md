@@ -536,6 +536,31 @@ it only pays together with the fork's register-frugal 2.5 template
           superseded as a gap reference: same ordering, lower fork
           absolute; treat older cross-window gap figures as noise until a
           dedicated multi-pair cross window re-establishes the level.)
+          **Lever 7 (REJECTED): fused residual-add + triple-norm launch**.
+          One kernel replacing `RmsNormKernelAdd` followed by
+          `RmsNormKernelTriple`: the sum s = fl(fl(x*s1*g)+a) is Add's exact
+          store (contract-off loop), the three slot loops run verbatim over
+          a per-thread float4 stash (hidden 2816 -> 3 float4/thread, no
+          spill; `RmsNormAddTripleRows` refuses out-of-shape dims without
+          touching memory), so all four outputs are bit-identical to the
+          two-stage chain (new `gemma4.rocm_kernels` check: 0 diffs on res
+          fp32 + all three slots, incl. refusal gate; gates run in the
+          exclusive window, `gufo_bench_lever7.log`). Bench: pp2048 paired
+          vs rebuilt HEAD control 3242.73: **-0.57 % (won 1/4,
+          +9.7/-26.2/-47.3/-9.5)**; pp8192 -0.59 % (0/2). Profile
+          (`prof_pp2k_lv7`, timed pass): fused line 24.03 ms vs Add
+          10.10 + Triple 15.35 = 25.45 -> only -1.4 ms of 693 and even
+          that not visible on wall time; dispatches 616 -> 586. REJECTED:
+          the norm pair is NOT DRAM-round-trip-bound (L2 absorbs the
+          intermediate), so the traffic model that ranked this ahead of
+          the fork's PostAttentionNorm (14.9 vs 25.5 ms/pass)
+          overestimated - that fork line does fewer/different outputs and
+          is not pure fusion headroom. Implementation reverted to HEAD.
+          INCIDENT recorded (protocol): two full machine reboots occurred
+          while `gemma4.rocm_forward` ran as a RESIDENT test next to the
+          VRAM-full server - model-loading GPU tests must run inside the
+          exclusive window like benchmarks, never resident; kernel-only
+          resident tests remain safe.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
