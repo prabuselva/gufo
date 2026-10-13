@@ -247,6 +247,22 @@ it only pays together with the fork's register-frugal 2.5 template
         attention 89, rope+norms ≈122 (now ≈90), router SGEMM 21,
         `mul_mat_q<8,80>` 18 — next levers: MoE gate/up GEMM (fork 123 vs
         our 259+finish) and attention (fork 46 vs 89).
+        **3.2f 128-row Q8_0 MoE tiles**: `gu_tile(fmt)` sends Q8_0 gate/up
+        and down through `RoutedHalfDownKernel<kQ8_0, 128>` (builder,
+        capacity and launcher made tile-size generic; 128 is rejected for
+        other formats so a mixed-format artifact cannot mis-execute). At
+        pp2048 the 16-padded buckets sit at 112–160 rows so `tile=96` spent
+        ~2 tiles/expert and 128 spends ~1.5, yet the kernel sum moved only
+        551→523 ms/trace (`/tmp/opencode/prof_moe128` vs `prof_rope` diff):
+        neighbouring y-tiles share an expert's weights concurrently and the
+        128 MB L3 already absorbs the re-read, so tile-count halving is not
+        DRAM halving. End-to-end pp2048 **2877.10/2875.09 (≈+0.1 %, within
+        noise)**, pp8192 2581.04 (+0.4 %), tg 41.4–42.3, KL **bit-identical
+        0.0100832073**; gates pass.         Kept as a small monotone win (−5 % MoE
+        kernel time, fewer dead tiles), NOT as the gate/up lever — closing
+        fork's 123 ms still needs the streaming-path itself (`kTokTiles`
+        issue rate/LDS), lesson: check cache-level traffic before tile
+        multiplicity.
 - [ ] 3.3 End-to-end binary16 activations (remove `NarrowActivations`); KL
       verified, not assumed.
 - [ ] 3.4 Attention occupancy + derived keys for global layers; per-position
