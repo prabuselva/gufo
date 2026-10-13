@@ -460,23 +460,40 @@ it only pays together with the fork's register-frugal 2.5 template
           (+15.6/+80.1/+178.6/+81.5); pp8192 cand 3017.9 vs 2969.7 (+1.6 %).
           Kernel line: QkvPost 29.6 -> 16.8 ms/pass (`/tmp/opencode/
           prof_pp2k_lv5c`) vs fork 20.9 — line CLOSED, now ahead.
-          **Budget re-measure (both sides re-profiled with the identical
-          windowing method, fork rebuilt at tip `22341ae7`; ours 685.3 vs
-          fork 735.4 kernel-ms/normal-pass)**: the earlier fork sum (668.5)
-          came from a narrower window and UNDERCOUNTED fork work — the
-          reconciliation caveat resolves in the opposite direction: fork
-          kernel time EXCEEDS its wall (544.7 ms) because prefill runs
-          pipelined on two big overlapping streams (dispatch stream split
-          1346+583) while ours sits ~serial on the default stream
-          (3195/~3260; wall 644.6 ≈ ksum 685). Per-kernel dispatch counts
-          differ across builds (different granularity); compare TIME lines
-          only. Consequence: we are already leaner per kernel and the
-          residual ~100 ms wall gap is STREAM-LEVEL CONCURRENCY —
-          fork-style dual-chunk/stream-interleaved prefill (or expert-side
-          multi-stream MoE) is the next lever, not more scalar kernel
-          shaving; single-kernel levers (norms fold, NarrowHalf via f16
-          producers, small-tile `HalfPlan`, GeGLU epilogue) stay valid but
-          now contribute headroom the schedule can absorb too
+          **Budget re-measure + CRITICAL gap correction (same-session
+          evidence supersedes all stale cross-session numbers)**:
+          (a) Both sides re-profiled with identical windowing (fork rebuilt
+          at tip `22341ae7`); cluster sums ours 1486.2/4 router-units vs
+          fork 1470.8/2: earlier window-derived per-line comparisons
+          (QkvPost 29.6->16.8 vs ~20, ...) stay valid as kernel lines.
+          (b) RETRACTION of this entry's first draft: the fork stream
+          overlap is `concurrent = moe && n <= kMaxGroupSlots(16)` —
+          GROUPED DECODE only (`gufo_franzmoca executor.cpp:842-847`), its
+          prefill runs serial too (measured union-busy overlap 45.7 ms per
+          2-pass cluster, not pipelining); there is no 100 ms scheduling
+          gap to port.
+          (c) PAIRED same-session wall A/B (`gufo_bench_forkab.log`, 4
+          alternating pp2048 pairs): fork 3250.0 mean (3279.88/3287.67/
+          3271.74/3160.66) vs candidate `86d1191d` 3208.0 (3186.30/
+          3197.37/3211.24/3237.06) — **gap now −1.3 %** (fork won 3/4,
+          pair deltas −93.6/−90.3/−60.5/+76.4). The historical "fork
+          3760" and "baseline 3157" were mismatched-condition numbers from
+          earlier sessions and are WITHDRAWN as gap references (lesson:
+          cross-session t/s is worthless for gap claims — same-session
+          paired only, thermals and harness included).
+          (d) Fork tg1 prints 16k-25k t/s on this model — physically
+          impossible; their decode timer is async-mis-measured (ours 42.5
+          is the honest baseline). Do not copy decode-timing comparisons
+          from fork bench output.
+          Remaining levers, still ranked by the per-line kernel gaps:
+          norms fold class (Add 9.6 into `RmsNormRowsTriple` ordering
+          study, pre-attn `RmsNormKernelHalf` 6.7 vs fork single
+          `PostAttentionNorm` 14.9), f16 producers to delete NarrowHalf
+          (6.4), small-row DenseF16/`HalfPlan` (ours `mul_mat_q<8,80>`
+          16.0 vs fork `DenseF16<64,64>` 14.8), GeGLU epilogue (6.9 vs
+          fork packed ~5). Decode-side expert-stream overlap is a tg lever
+          worth prototyping but its fork payoff CANNOT be read from fork
+          bench (see (d))
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
