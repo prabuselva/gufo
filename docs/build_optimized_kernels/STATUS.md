@@ -375,6 +375,30 @@ it only pays together with the fork's register-frugal 2.5 template
         control 3084.95 (+1.33 %, cand won 5/7, pair deltas
         +2.09/+4.20/-0.12/+0.20/-0.57/+0.67/+2.93 %), pp8192 cand-first
         2974.88 vs control 2955.60 (+0.65 %).
+        **QKV post-projection merge -> one launch (`QkvPost`, prefill warp
+        path, now default)**: one `QkvPostWarpKernel` (grid=tokens, block 512,
+        warp-per-head round-robin over the q heads then the kv heads) replaces
+        the `QknormRope` + `KvNormRopeWrite` warp launches; sincos computed
+        once per warp, verbatim load/reduce/store loops for both passes, and
+        the launcher falls back to the two standalone kernels outside the
+        warp gate (decode/draft untouched). Q and V are bit-identical to the
+        standalone launches (pinned at zero tolerance); K diverges only on
+        rope-store rounding ties (measured 2/81920 + 1/40960 elements, one
+        half ulp each) because FMA contraction is context-dependent and
+        neither contraction setting reproduces the standalone choice — the
+        merged store uses `#pragma clang fp contract(off)` for revision
+        stability and the unit check caps K at 1 half ulp. Quality: absolute
+        accuracy pinned by `gemma4.rocm_forward` (exact argmax at every
+        position, bounded logit error); the bulk-vs-sequential validator
+        fingerprint moves kl 0.0000930581 -> 0.0004176470 tv 0.0000874606 ->
+        0.0001160507 (deterministic, top-1 match, 120x below the recorded
+        FAIL bound — the kl is the bulk-vs-exact drift difference class, so
+        unbiased 1-ulp K flips legitimately re-randomize it; control
+        reproduces the old fingerprint exactly in the same window). Gates
+        (`gufo_bench_lever4.log`, `lever4b`): kernels/forward pass; seven
+        matched pp2048 pairs cand mean 3157.72 vs control 3121.76 (+1.15 %,
+        cand won 6/7, pair deltas +2.06/+0.64/-1.87/+4.29/+1.02/+0.68/+1.34
+        %), pp8192 cand-first 2992.71 vs control 2965.48 (+0.92 %).
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.

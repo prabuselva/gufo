@@ -992,6 +992,89 @@ bool TestAttention() {
       }
     }
 
+    // QkvPost at warp width: one launch reproduces the two standalone
+    // launches (q and V bit-identical, K within one half ulp on rope
+    // rounding ties; only the written cache slice is compared, the rest is
+    // uninitialized).
+    {
+      const std::uint32_t tokens = 40;
+      const std::uint32_t start = 9;
+      const std::size_t cache =
+          static_cast<std::size_t>(start + tokens) * kvh * hd;
+      const auto q = t::MakeValues(
+          static_cast<std::size_t>(tokens) * kHeads * hd, 71, 1.0F);
+      const auto k =
+          t::MakeValues(static_cast<std::size_t>(tokens) * kvh * hd, 73, 1.0F);
+      const auto v =
+          t::MakeValues(static_cast<std::size_t>(tokens) * kvh * hd, 79, 1.0F);
+      const auto gq = t::MakeValues(hd, 83, 1.0F);
+      const auto gk = t::MakeValues(hd, 89, 1.0F);
+      t::HipBuffer<float> d_q(q.size()), d_k(k.size()), d_v(v.size());
+      t::HipBuffer<float> d_gq(gq.size()), d_gk(gk.size());
+      t::Upload(&d_q, q);
+      t::Upload(&d_k, k);
+      t::Upload(&d_v, v);
+      t::Upload(&d_gq, gq);
+      t::Upload(&d_gk, gk);
+      t::HipBuffer<float> d_onew(q.size());
+      t::HipBuffer<__half> d_kcnew(cache), d_vcnew(cache);
+      const auto ref_q = [&](t::HipBuffer<float>* o) {
+        q::QknormRope(d_q.get(), d_gq.get(), o->get(), tokens, kHeads, hd,
+                      d_inv.get(), start, kHeads * hd, nullptr);
+      };
+      const auto ref_kv = [&](t::HipBuffer<__half>* kc,
+                              t::HipBuffer<__half>* vc) {
+        q::KvNormRopeWrite(d_k.get(), d_v.get(), d_gk.get(), kc->get(),
+                           vc->get(), start, tokens, kvh, hd, d_inv.get(),
+                           kvh * hd, nullptr);
+      };
+      // Reference outputs from the two standalone launches, candidate from
+      // the merged one.
+      t::HipBuffer<float> d_oref(q.size());
+      t::HipBuffer<__half> d_kcref(cache), d_vcref(cache);
+      ref_q(&d_oref);
+      ref_kv(&d_kcref, &d_vcref);
+      q::QkvPost(d_q.get(), d_gq.get(), d_onew.get(), d_k.get(), d_v.get(),
+                 d_gk.get(), d_kcnew.get(), d_vcnew.get(), tokens, kHeads, kvh,
+                 hd, d_inv.get(), start, kHeads * hd, kvh * hd, nullptr);
+      t::CheckHip(hipDeviceSynchronize(), "QkvPost synchronization");
+      const auto oref = t::Download(&d_oref, q.size());
+      const auto onew = t::Download(&d_onew, q.size());
+      std::vector<__half> kcref(cache), vcref(cache), kcnew(cache),
+          vcnew(cache);
+      t::CheckHip(hipMemcpy(kcref.data(), d_kcref.get(), d_kcref.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost reference K download");
+      t::CheckHip(hipMemcpy(vcref.data(), d_vcref.get(), d_vcref.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost reference V download");
+      t::CheckHip(hipMemcpy(kcnew.data(), d_kcnew.get(), d_kcnew.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost K download");
+      t::CheckHip(hipMemcpy(vcnew.data(), d_vcnew.get(), d_vcnew.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost V download");
+      const std::size_t lo = static_cast<std::size_t>(start) * kvh * hd;
+      const std::size_t hi = lo + static_cast<std::size_t>(tokens) * kvh * hd;
+      ok = Check(("QkvPost q-bits " + tag).c_str(),
+                 t::WorstAbsolute(oref, onew), 0.0) &&
+           ok;
+      // K rope stores may differ from the standalone kernel's compiler-chosen
+      // FMA shape on rounding ties: measured 2/81920 (swa) and 1/40960 (full)
+      // elements, each by exactly one half ulp. The prefill validator (task
+      // 3.4 gate) pins this as quality-neutral.
+      ok = Check(("QkvPost k-bits " + tag).c_str(),
+                 WorstAbsoluteHalf({kcref.begin() + lo, kcref.begin() + hi},
+                                   {kcnew.begin() + lo, kcnew.begin() + hi}),
+                 0.002F) &&
+           ok;
+      ok = Check(("QkvPost v-bits " + tag).c_str(),
+                 WorstAbsoluteHalf({vcref.begin() + lo, vcref.begin() + hi},
+                                   {vcnew.begin() + lo, vcnew.begin() + hi}),
+                 0.0F) &&
+           ok;
+    }
+
     // Decode attention over an F16 cache: dense and windowed.
     {
       const std::uint32_t n_keys = 1300;

@@ -221,6 +221,130 @@ __global__ void KvNormRopeWriteWarpKernel(
   }
 }
 
+// QKV post-processing in one launch: the q-head norm+RoPE jobs and the
+// kv-head norm+RoPE/cache-write jobs of the two warp kernels above, dispatched
+// round-robin over the block's warps (one block per token, one warp per head).
+// every head passes through the verbatim load/reduce/store loops of
+// QknormRopeWarpKernel and KvNormRopeWriteWarpKernel, so q and v are
+// bit-identical to running the two kernels back to back and K differs only on
+// rope rounding ties (see the store-loop note below). The RoPE sincos are
+// computed once per warp and shared by all of its heads.
+__global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
+                                  float* q_out, const float* k, const float* v,
+                                  const float* k_gamma, __half* k_cache,
+                                  __half* v_cache, std::uint32_t heads,
+                                  std::uint32_t kv_heads,
+                                  std::uint32_t head_dim, const float* inv_freq,
+                                  std::uint32_t start, std::uint32_t q_pitch,
+                                  std::uint32_t kv_pitch) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t warp = threadIdx.x / warpSize;
+  const std::uint32_t warps = blockDim.x / warpSize;
+  const std::uint32_t token = blockIdx.x;
+  const std::uint32_t total = heads + kv_heads;
+  if (warp >= total) {
+    return;
+  }
+  const std::uint32_t half = head_dim / 2U;
+  const std::uint32_t pairs = half / warpSize;
+  float cs[16];
+  float sn[16];
+  const float pos = static_cast<float>(start + token);
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = lane + warpSize * m;
+    sincosf(pos * inv_freq[i], &sn[m], &cs[m]);
+  }
+  const float* qrow = q + static_cast<std::size_t>(token) * q_pitch;
+  const float* krow = k + static_cast<std::size_t>(token) * kv_pitch;
+  const float* vrow = v + static_cast<std::size_t>(token) * kv_pitch;
+  float* orow0 = q_out + static_cast<std::size_t>(token) * heads * head_dim;
+  __half* kc0 =
+      k_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
+  __half* vc0 =
+      v_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
+  for (std::uint32_t h = warp; h < total; h += warps) {
+    if (h < heads) {
+      float a[16];
+      float b[16];
+      const float* row = qrow + h * head_dim;
+      float* orow = orow0 + h * head_dim;
+      double ss = 0.0;
+      for (std::uint32_t m = 0; m < pairs; ++m) {
+        const std::uint32_t i = lane + warpSize * m;
+        a[m] = row[i];
+        b[m] = row[half + i];
+        ss +=
+            static_cast<double>(a[m]) * a[m] + static_cast<double>(b[m]) * b[m];
+      }
+      const float scale =
+          1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(ss) /
+                                          static_cast<double>(head_dim)) +
+                       kRmsEps);
+      // Q rope stores: bit-identical to the standalone kernel's contraction
+      // choice at the pinned toolchain, pinned by the QkvPost unit test.
+      for (std::uint32_t m = 0; m < pairs; ++m) {
+        const std::uint32_t i = lane + warpSize * m;
+        const float ya =
+            a[m] * scale * (q_gamma != nullptr ? q_gamma[i] : 1.0F);
+        const float yb =
+            b[m] * scale * (q_gamma != nullptr ? q_gamma[half + i] : 1.0F);
+        orow[i] = ya * cs[m] - yb * sn[m];
+        orow[half + i] = ya * sn[m] + yb * cs[m];
+      }
+      continue;
+    }
+    const std::uint32_t hq = h - heads;
+    float ka[16];
+    float kb[16];
+    float va[16];
+    float vb[16];
+    const float* kr = krow + hq * head_dim;
+    const float* vr = vrow + hq * head_dim;
+    __half* kc = kc0 + hq * head_dim;
+    __half* vc = vc0 + hq * head_dim;
+    double kss = 0.0;
+    double vss = 0.0;
+    for (std::uint32_t m = 0; m < pairs; ++m) {
+      const std::uint32_t i = lane + warpSize * m;
+      ka[m] = kr[i];
+      kb[m] = kr[half + i];
+      va[m] = vr[i];
+      vb[m] = vr[half + i];
+      kss += static_cast<double>(ka[m]) * ka[m] +
+             static_cast<double>(kb[m]) * kb[m];
+      vss += static_cast<double>(va[m]) * va[m] +
+             static_cast<double>(vb[m]) * vb[m];
+    }
+    const float kscale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(kss) /
+                                        static_cast<double>(head_dim)) +
+                     kRmsEps);
+    const float vscale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(vss) /
+                                        static_cast<double>(head_dim)) +
+                     kRmsEps);
+    // contract(off): the RoPE store must not contract into an FMA so this
+    // kernel's arithmetic stays revision-stable. The standalone kernel's
+    // contraction here is compiler-chosen, so K can differ from it by one
+    // half ulp on rounding ties (measured 2/81920 and 1/40960 elements);
+    // the prefill validator confirms the level is numerically inconsequential.
+    {
+#pragma clang fp contract(off)
+      for (std::uint32_t m = 0; m < pairs; ++m) {
+        const std::uint32_t i = lane + warpSize * m;
+        const float ya =
+            ka[m] * kscale * (k_gamma != nullptr ? k_gamma[i] : 1.0F);
+        const float yb =
+            kb[m] * kscale * (k_gamma != nullptr ? k_gamma[half + i] : 1.0F);
+        kc[i] = __float2half(ya * cs[m] - yb * sn[m]);
+        kc[half + i] = __float2half(ya * sn[m] + yb * cs[m]);
+        vc[i] = __float2half(va[m] * vscale);
+        vc[half + i] = __float2half(vb[m] * vscale);
+      }
+    }
+  }
+}
+
 __global__ void QknormRopeKernel(const float* q, const float* gamma, float* out,
                                  std::uint32_t heads, std::uint32_t head_dim,
                                  const float* inv_freq, std::uint32_t start,
@@ -547,6 +671,24 @@ void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
     KvNormRopeWriteKernel<<<dim3(tokens, kv_heads), 256, 0, stream>>>(
         k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start,
         pitch);
+  }
+}
+
+void QkvPost(const float* q, const float* q_gamma, float* q_out, const float* k,
+             const float* v, const float* k_gamma, __half* k_cache,
+             __half* v_cache, std::uint32_t tokens, std::uint32_t heads,
+             std::uint32_t kv_heads, std::uint32_t head_dim,
+             const float* inv_freq, std::uint32_t start, std::uint32_t q_pitch,
+             std::uint32_t kv_pitch, hipStream_t stream) {
+  if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
+    QkvPostWarpKernel<<<tokens, 512, 0, stream>>>(
+        q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+        head_dim, inv_freq, start, q_pitch, kv_pitch);
+  } else {
+    QknormRope(q, q_gamma, q_out, tokens, heads, head_dim, inv_freq, start,
+               q_pitch, stream);
+    KvNormRopeWrite(k, v, k_gamma, k_cache, v_cache, start, tokens, kv_heads,
+                    head_dim, inv_freq, kv_pitch, stream);
   }
 }
 

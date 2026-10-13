@@ -679,11 +679,10 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     }
   }
 
-  QknormRope(pf_qkv_, l.attn_q_norm.f32(), pf_qn_, tokens, heads, head_dim,
-             inv_freq, start, q_pitch, nullptr);
-  KvNormRopeWrite(k_dst, l.attn_v.empty() ? k_dst : v_dst, l.attn_k_norm.f32(),
-                  session.k_cache_[il], session.v_cache_[il], start, tokens,
-                  kvh, head_dim, inv_freq, kv_pitch, nullptr);
+  QkvPost(pf_qkv_, l.attn_q_norm.f32(), pf_qn_, k_dst,
+          l.attn_v.empty() ? k_dst : v_dst, l.attn_k_norm.f32(),
+          session.k_cache_[il], session.v_cache_[il], tokens, heads, kvh,
+          head_dim, inv_freq, start, q_pitch, kv_pitch, nullptr);
 
   const std::uint32_t window = l.swa ? c.sliding_window : 0;
   AttentionPrefill(pf_qn_, session.k_cache_[il], session.v_cache_[il], pf_attn_,

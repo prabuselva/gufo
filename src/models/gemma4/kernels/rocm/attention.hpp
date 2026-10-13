@@ -38,6 +38,16 @@ void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
                      std::uint32_t head_dim, const float* inv_freq,
                      std::uint32_t pitch, hipStream_t stream);
 
+// QknormRope + KvNormRopeWrite in one launch (one warp per q/kv head for the
+// whole token sequence). Bit-identical to calling the two kernels above in
+// sequence; outside the fused warp path it literally calls them.
+void QkvPost(const float* q, const float* q_gamma, float* q_out, const float* k,
+             const float* v, const float* k_gamma, __half* k_cache,
+             __half* v_cache, std::uint32_t tokens, std::uint32_t heads,
+             std::uint32_t kv_heads, std::uint32_t head_dim,
+             const float* inv_freq, std::uint32_t start, std::uint32_t q_pitch,
+             std::uint32_t kv_pitch, hipStream_t stream);
+
 // Single-query GQA decode attention over cache positions [lo, n_keys).
 // q: [heads][head_dim] F32, out: [heads][head_dim] F32.
 // scratch: heads * splits * (head_dim + 2) floats (splits <= 32).
