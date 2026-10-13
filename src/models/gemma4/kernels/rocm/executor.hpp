@@ -227,6 +227,10 @@ private:
   float* pf_qkv_{nullptr};
   float* pf_qn_{nullptr};
   float* pf_attn_{nullptr};
+  // F16 twin of pf_attn_ written by the attention epilogue when the attention
+  // output projection runs on the binary16 dense path (replaces its FP32->F16
+  // narrowing pass; bit-identical to narrowing pf_attn_).
+  __half* pf_attn_half_{nullptr};
   float* pf_proj_{nullptr};
   float* pf_attn_out_{nullptr};
   float* pf_mlp_{nullptr};

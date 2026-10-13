@@ -1169,11 +1169,29 @@ bool TestAttention() {
                             hipMemcpyHostToDevice),
                   "prefill V upload");
       t::HipBuffer<float> d_out(q.size());
+      t::HipBuffer<__half> d_out_half(q.size());
       q::AttentionPrefillScalar(d_q.get(), d_kc.get(), d_vc.get(), d_out.get(),
                                 start, tokens, kHeads, kvh, hd, window,
-                                nullptr);
+                                d_out_half.get(), nullptr);
       t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
       const auto got = t::Download(&d_out, q.size());
+      // The F16 twin the epilogue writes must round bit-for-bit like a
+      // separate narrowing pass of the FP32 rows (the o_proj contract).
+      {
+        std::vector<__half> twin(q.size());
+        t::CheckHip(hipMemcpy(twin.data(), d_out_half.get(), d_out_half.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "prefill F16 twin download");
+        std::size_t twin_bad = 0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+          if (__half_raw(twin[i]).x != __half_raw(__float2half(got[i])).x) {
+            ++twin_bad;
+          }
+        }
+        ok = Check(("AttentionPrefillScalar HalfTwin " + tag).c_str(),
+                   static_cast<double>(twin_bad), 0.0) &&
+             ok;
+      }
       std::vector<float> ref(q.size());
       for (std::uint32_t tok = 0; tok < tokens; ++tok) {
         const std::uint32_t causal = start + tok + 1;
@@ -1221,14 +1239,32 @@ bool TestAttention() {
       // uniform fixture is ~2e-3. The same kernel reaches ~4e-4 on smooth data.
       // 3e-3 leaves margin.
       t::HipBuffer<float> d_out_wmma(q.size());
+      t::HipBuffer<__half> d_out_wmma_half(q.size());
       q::AttentionPrefill(d_q.get(), d_kc.get(), d_vc.get(), d_out_wmma.get(),
-                          start, tokens, kHeads, kvh, hd, window, nullptr);
+                          start, tokens, kHeads, kvh, hd, window,
+                          d_out_wmma_half.get(), nullptr);
       t::CheckHip(hipDeviceSynchronize(),
                   "AttentionPrefillWmma synchronization");
       const auto got_wmma = t::Download(&d_out_wmma, q.size());
       ok = Check(("AttentionPrefillWmma " + tag).c_str(),
                  t::WorstRelativeToScale(ref, got_wmma), 3e-3) &&
            ok;
+      {
+        std::vector<__half> twin(q.size());
+        t::CheckHip(hipMemcpy(twin.data(), d_out_wmma_half.get(),
+                              d_out_wmma_half.bytes(), hipMemcpyDeviceToHost),
+                    "prefill WMMA F16 twin download");
+        std::size_t twin_bad = 0;
+        for (std::size_t i = 0; i < got_wmma.size(); ++i) {
+          if (__half_raw(twin[i]).x !=
+              __half_raw(__float2half(got_wmma[i])).x) {
+            ++twin_bad;
+          }
+        }
+        ok = Check(("AttentionPrefillWmma HalfTwin " + tag).c_str(),
+                   static_cast<double>(twin_bad), 0.0) &&
+             ok;
+      }
     }
   }
   return ok;

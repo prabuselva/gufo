@@ -274,6 +274,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
   if (e->pf_qkv_half_ == nullptr)
     return nullptr;
+  e->pf_attn_half_ = reinterpret_cast<__half*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * q_dim * sizeof(__half), error_msg));
+  if (e->pf_attn_half_ == nullptr)
+    return nullptr;
   e->pf_act_ffn_half_ = reinterpret_cast<__half*>(e->AllocBytes(
       static_cast<std::size_t>(C) * ffn * sizeof(__half), error_msg));
   if (e->pf_act_ffn_half_ == nullptr)
@@ -684,16 +688,31 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
           session.k_cache_[il], session.v_cache_[il], tokens, heads, kvh,
           head_dim, inv_freq, start, q_pitch, kv_pitch, nullptr);
 
-  const std::uint32_t window = l.swa ? c.sliding_window : 0;
-  AttentionPrefill(pf_qn_, session.k_cache_[il], session.v_cache_[il], pf_attn_,
-                   start, tokens, heads, kvh, head_dim, window, nullptr);
-
   GemvType ot{};
   if (!GemvTypeOf(l.attn_output.type, &ot)) {
     return Fail(error_msg, "unsupported attn_output type");
   }
-  Gemm(l.attn_output.data, ot, hidden, heads * head_dim,
-       l.attn_output.row_bytes, pf_attn_, pf_proj_, tokens, nullptr);
+  // Wide-batch binary16 attention output projection: when the projection is
+  // inside the F16 dense window, the attention epilogue writes the F16 twin
+  // of the output rows directly, which is bit-identical to the FP32->F16
+  // narrowing pass `Gemm` would insert for exactly this window, and
+  // `GemmHalfIn` runs the identical dense GEMM on it. Outside the window
+  // (or on a rejected plan) the FP32 rows and `Gemm` run as before; both
+  // attention paths always produce the FP32 output, so the fallback is
+  // bit-for-bit the old path.
+  const std::uint32_t attn_out_cols = heads * head_dim;
+  const bool oproj_half =
+      ot == GemvType::kQ8_0 && HalfInWindow(ot, tokens, hidden, attn_out_cols);
+  const std::uint32_t window = l.swa ? c.sliding_window : 0;
+  AttentionPrefill(pf_qn_, session.k_cache_[il], session.v_cache_[il], pf_attn_,
+                   start, tokens, heads, kvh, head_dim, window,
+                   oproj_half ? pf_attn_half_ : nullptr, nullptr);
+
+  if (!oproj_half || !GemmHalfIn(l.attn_output.data, ot, hidden, attn_out_cols,
+                                 pf_attn_half_, pf_proj_, tokens, nullptr)) {
+    Gemm(l.attn_output.data, ot, hidden, attn_out_cols, l.attn_output.row_bytes,
+         pf_attn_, pf_proj_, tokens, nullptr);
+  }
   RmsNormAddRows(pf_proj_, l.post_attention_norm.f32(), pf_cur_, pf_attn_out_,
                  tokens, hidden, c.rms_eps, nullptr);
 

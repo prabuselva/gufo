@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "src/models/gemma4/kernels/rocm/attention_wmma.hpp"
+#include "src/models/gemma4/kernels/rocm/half_store.hpp"
 
 namespace gufo::models::gemma4::rocm {
 namespace {
@@ -533,8 +534,9 @@ __global__ void AttentionDecodeCombineKernel(const float* part, float* out,
 // first tile with a valid key rescales it away exactly.
 __global__ void AttentionPrefillTiledKernel(
     const float* q, const __half* k_cache, const __half* v_cache, float* out,
-    std::uint32_t start, std::uint32_t tokens, std::uint32_t heads,
-    std::uint32_t kv_heads, std::uint32_t head_dim, std::uint32_t window) {
+    __half* out_half, std::uint32_t start, std::uint32_t tokens,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t window) {
   constexpr std::uint32_t kQT = 32;
   constexpr std::uint32_t kKT = 8;
   constexpr std::uint32_t kMaxHD = 512;
@@ -642,7 +644,11 @@ __global__ void AttentionPrefillTiledKernel(
       }
       const std::size_t o =
           (static_cast<std::size_t>(token) * heads + h) * head_dim + d;
-      out[o] = acc[qi] / rsum[qi];
+      const float v = acc[qi] / rsum[qi];
+      out[o] = v;
+      if (out_half != nullptr) {
+        out_half[o] = HalfOf(v);
+      }
     }
   }
 }
@@ -744,7 +750,7 @@ void AttentionPrefillScalar(const float* q, const __half* k_cache,
                             std::uint32_t start, std::uint32_t tokens,
                             std::uint32_t heads, std::uint32_t kv_heads,
                             std::uint32_t head_dim, std::uint32_t window,
-                            hipStream_t stream) {
+                            __half* out_half, hipStream_t stream) {
   if (tokens == 0 || head_dim > 512U) {
     return;
   }
@@ -752,15 +758,16 @@ void AttentionPrefillScalar(const float* q, const __half* k_cache,
   // One workgroup thread per head dimension: the online accumulator is a
   // per-thread register, so blockDim.x must cover the whole head.
   AttentionPrefillTiledKernel<<<grid, head_dim, 0, stream>>>(
-      q, k_cache, v_cache, out, start, tokens, heads, kv_heads, head_dim,
-      window);
+      q, k_cache, v_cache, out, out_half, start, tokens, heads, kv_heads,
+      head_dim, window);
 }
 
 void AttentionPrefill(const float* q, const __half* k_cache,
                       const __half* v_cache, float* out, std::uint32_t start,
                       std::uint32_t tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t head_dim,
-                      std::uint32_t window, hipStream_t stream) {
+                      std::uint32_t window, __half* out_half,
+                      hipStream_t stream) {
   if (tokens == 0 || head_dim > 512U) {
     return;
   }
@@ -785,12 +792,12 @@ void AttentionPrefill(const float* q, const __half* k_cache,
   args.ring = 0;
   args.rope_pairs = 0;
   args.key_ends = nullptr;
-  args.out_half = nullptr;
+  args.out_half = out_half;
   if (LaunchWmmaPrefillAttention(args, stream)) {
     return;
   }
   AttentionPrefillScalar(q, k_cache, v_cache, out, start, tokens, heads,
-                         kv_heads, head_dim, window, stream);
+                         kv_heads, head_dim, window, out_half, stream);
 }
 
 }  // namespace gufo::models::gemma4::rocm

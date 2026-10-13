@@ -60,11 +60,18 @@ void AttentionDecode(const float* q, const __half* k_cache,
 // Causal windowed prefill attention over the F16 cache (the chunk's own K/V
 // must already be written). q/out: [tokens][heads][head_dim] F32.
 // `window == 0` is the exact dense pass.
+// When `out_half != nullptr` the same result is additionally stored as an
+// F16 row in [tokens][heads][head_dim], rounded exactly as a separate
+// narrowing pass of `out` would round it (HalfOf): the producer-side f16
+// twin for the binary16 prefill GEMMs, so they skip that pass. Both the
+// WMMA fast path and the scalar oracle write it, so a requested twin is
+// always produced.
 void AttentionPrefill(const float* q, const __half* k_cache,
                       const __half* v_cache, float* out, std::uint32_t start,
                       std::uint32_t tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t head_dim,
-                      std::uint32_t window, hipStream_t stream);
+                      std::uint32_t window, __half* out_half,
+                      hipStream_t stream);
 
 // Scalar tiled reference for the same contract. Kept as the numerical oracle
 // for the WMMA fast path above; production uses AttentionPrefill.
@@ -73,6 +80,6 @@ void AttentionPrefillScalar(const float* q, const __half* k_cache,
                             std::uint32_t start, std::uint32_t tokens,
                             std::uint32_t heads, std::uint32_t kv_heads,
                             std::uint32_t head_dim, std::uint32_t window,
-                            hipStream_t stream);
+                            __half* out_half, hipStream_t stream);
 
 }  // namespace gufo::models::gemma4::rocm

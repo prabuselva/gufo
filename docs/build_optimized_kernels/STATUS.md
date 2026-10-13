@@ -494,6 +494,44 @@ it only pays together with the fork's register-frugal 2.5 template
           fork packed ~5). Decode-side expert-stream overlap is a tg lever
           worth prototyping but its fork payoff CANNOT be read from fork
           bench (see (d))
+          **Lever 6 (accepted, same-session): attention epilogue F16 twin
+          deletes the last `NarrowHalf` (task 3.3)** — o_proj was the only
+          remaining `Gemm(kQ8_0)` DenseF16-window call fed FP32 rows
+          (29.5 calls/pass = one per layer). The WMMA prefill kernel
+          already carried a guarded `out_half` store (`attention_wmma.
+          hip.cpp:501-509`, `HalfOf` = the pinned-RN twin contract);
+          `AttentionPrefill` now forwards a caller pointer (and the scalar
+          oracle twin-stores `v` identically), the executor allocates
+          `pf_attn_half_` [chunk][heads*head_dim] and runs o_proj through
+          `GemmHalfIn` inside exactly the window `Gemm` would pick, with the
+          unchanged FP32 `Gemm` as the sole fallback (both attention paths
+          always write FP32, so out-of-window shapes are bit-for-bit the
+          old path). By construction the twin is the RN narrowing of the
+          exact value stored, so the validator fingerprint reproduces HEAD
+          (kl 0.0004176470 tv 0.0001160507, top-1 match) and
+          `gemma4.rocm_kernels` (+2 new bit-exact HalfTwin equality checks)
+          and `gemma4.rocm_forward` pass. Gates (`gufo_bench_lever6.log`):
+          four matched pp2048 pairs vs control (`gufo_ctrl_v6`, = `86d1191d`
+          build) 3122.44 (3070.49/3165.41/3181.13/3072.73) — **cand 3188.69
+          (3207.59/3189.10/3224.35/3133.73), +2.12 %, won 4/4**
+          (+137.1/+23.7/+43.2/+61.0); validator-run pair +0.2 %. pp8192
+          first window −0.5 % (2/2 negative) but the follow-up
+          (`gufo_bench_lever6_8k.log`) is neutral: 3 pairs +13.3/−14.3/+8.8;
+          pooled 5-pair mean −0.16 % — NEUTRAL at 8192, win scales at
+          2048. Kernel line: NarrowHalf 6.4 -> 0 ms/pass; attention gains
+          an F16 store inside an already-bound output epilogue.
+          **Gap re-measure vs fork — ORDER BIAS SUSPECTED (unresolved)**:
+          direct pp2048 A/B same session (`gufo_bench_lever6_fork.log`,
+          3 fork-FIRST pairs): fork 3276.22 (3291.42/3279.17/3258.07) vs
+          lever-6 candidate 3185.45 (3210.50/3208.73/3137.12) = −2.8 %.
+          This contradicts the composition of the two same-window
+          measurements (forkab −1.3 % + this lever +2.1 % ≈ +0.8 %) and
+          both fork windows used FORK-FIRST ordering while the fork
+          absolute also drifted +0.8 % vs forkab; the candidate absolute
+          stayed put. Protocol fix for the next cross window: include
+          CAND-FIRST pairs alternating with fork-first ones before
+          trusting any gap claim; current honest bracket: fork ahead by
+          ~0–3 % on pp2048.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
