@@ -587,6 +587,36 @@ it only pays together with the fork's register-frugal 2.5 template
           exception is reverted. The residual fork prefill gap IS this
           fast-math codegen class (attention ~11 % per call, norms/GeGLU
           class a few ms) - closed on quality grounds, not reproduced.
+          **Lever 10/11 (REJECTED): gate-safe fast-math subset and the
+          oracle re-gate of fast-math attention** - the fast-math class
+          is now fully closed. Lever 10 applied fast-math only to the
+          tolerance-gated TUs (`gemm`, `gemv`, `moe_prefill`,
+          `routed_f16`, `vision`, plus the shared
+          `gufo_core_hip_gemm`): every quality gate passed -
+          `rocm_kernels` bit-exact PASS, `rocm_forward` oracle PASS
+          (10.4 s real run), validator **status=PASS**
+          (kl=3.0411e-5 - better bulk-vs-exactness than the control's
+          recorded 4.176e-4 drift) - yet paired bench was neutral/negative:
+          pp2048 +0.31/-0.14/+0.30 %, pp8192 **-1.50**/-0.34 %
+          (`gufo_bench_lever10.log`). Not adopted (no proven win; the
+          shared DenseF16 target would also have shifted
+          qwen36/qwen38 prefill bits with no measured gain). Lever 11
+          re-gated attention-TU-only fast-math: `rocm_forward` oracle
+          PASSED (10.44 s) but the bulk-vs-exact validator reproduced
+          lever-8's failure verbatim (kl=2.2732417830, tv=0.2664549,
+          top1 no, `gufo_bench_lever11.log`). Gate lesson recorded:
+          `--validate-prefill` is bulk-vs-SEQUENTIAL consistency on one
+          binary, so its verdict is codegen-context dependent - the
+          target-wide probe (lever 9) passed kl at 3.86e-5 with fast-math
+          attention because every path shifted together; the oracle
+          forward test alone is blind to the tiled-bulk corruption.
+          Production bulk prefill diverging 2.27 nats from exact is
+          disqualifying on its own. CONCLUSION: the fork's residual
+          prefill edge is only reachable through fast-math attention
+          codegen, which reproducibly breaks bulk-vs-exact accuracy; no
+          quality-safe configuration retains the remaining ~3 %. Both
+          experiment patches reverted; HEAD (no fast-math on gemma4)
+          stands.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
