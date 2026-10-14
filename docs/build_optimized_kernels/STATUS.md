@@ -932,8 +932,14 @@ it only pays together with the fork's register-frugal 2.5 template
       pp2048, +1.01/+2.11/−1.19 pp8192, the negative pair order-correlated)
       then three candidate-first pairs 6/6 positive (+1.03/+0.13/+0.98
       pp2048, +0.51/+0.89/+0.44 pp8192). 10/12 pairs, mean +0.79/+0.63 %.
-      The gemma4 F16 route still plans staged/rgroups8 (priv 80–144 B);
-      giving it the kStaged128 rule is a gemma4-owned follow-up.
+       The gemma4 F16 route follow-up closed without a change: its
+       `weights_f16=true` route is inactive on every local artifact —
+       UD-Q8_K_XL stores dense projections as Q8_0, qat-UD-Q4_K_XL as
+       Q4_0, E4B-UD-Q6_K_XL as Q6_K/Q8_0, and gemma4 `Half()` retypes
+       only BF16 sources, so no dispatch ever reaches the spilling `true`
+       instantiation there. The live gemma4 F16 window route plans
+       staged/rgroups8 on spill-free `false` templates (priv 0) and stays
+       as measured. Re-open only if a BF16-dense gemma4 checkpoint lands.
 
 ## Phase 5 — ling3_flash fan-out (nodes 1,3,5,6,7,8; full-attn occupancy)
 

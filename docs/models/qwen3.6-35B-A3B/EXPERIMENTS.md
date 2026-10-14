@@ -935,3 +935,11 @@ eight `qwen36_a3b.rocm_*` gates pass and greedy pp512/tg128
 binary (`gufo_bench_ab19.log`, `gufo_bench_ab19b.log`): 10/12 alternating
 pairs positive (three order-correlated negatives in the first round), mean
 +0.79 % at pp2048 and +0.63 % at pp8192.
+
+**Follow-up (closed, no change).** Porting the rule to gemma4's shared
+planner was checked and abandoned: that route is dead on every local
+artifact. GGUF dumps (pygguf) show UD-Q8_K_XL dense projections are
+Q8_0, qat-UD-Q4_K_XL Q4_0 and E4B-UD-Q6_K_XL Q6_K/Q8_0 — never BF16 —
+and gemma4's uploader retypes only BF16 sources to binary16, so no
+gemma4 dispatch reaches the spilling `weights_f16=true` instantiation.
+Qwen3.6 keeps the only live hot path.
