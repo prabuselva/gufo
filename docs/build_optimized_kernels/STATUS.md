@@ -755,7 +755,29 @@ it only pays together with the fork's register-frugal 2.5 template
       neutral (45.07/45.00 vs 45.10/44.90); `gufo_bench_q36ab41b32.log`
       pp32768 +1.53/−0.28 %, pp100352 +2.87/−0.25 % (single-rep pairs where
       the control held the second slot; short-context evidence 4/4 wins is
-      the qualified signal). Remaining 4.1: the GDN α/β SGEMM tier only.
+       the qualified signal). Remaining 4.1: the GDN α/β SGEMM tier only.
+       **Lever 4.1c (REJECTED): GDN α/β retyped to binary16 at upload**.
+       `ConvertRouterHalves` widened to `ConvertF32GemmHalves` also retyped
+       `ssm_alpha`/`ssm_beta` (layers + MTP) to binary16 with the same
+       out-of-range fail-stop, and `ValidateTypes` grew a `check_gemm`
+       rejecting resident kF32 GEMM-tier tensors while `ToGemvType` dropped
+       its `kF32` case — production could no longer reach SGEMM. The
+       `Cijk_Alik_Bljk_SB` attribution (171 ms/540 dispatches in
+       `prof42_ctrl`, two per layer ahead of `GdnConvNormQk`) predicted a
+       ~0.8 % pp win. Quality was fine — all eight `qwen36_a3b.rocm_*` gates
+       pass and greedy tg128 `output_sha256` was bit-identical to the control
+       (`006361da…`) — but timing was not: paired same-revision window with a
+       fresh c5d1ba03 control        (`gufo_bench_ab41c.log`, reps 3,
+       `--speculative off`) won 0/6 pairs: pp2048
+       2436.70/2450.58/2444.52 vs 2488.31/2464.63/2462.04
+       (−2.07/−0.57/−0.71 %) and pp8192 2384.00/2358.60/2354.29 vs
+       2396.26/2391.27/2394.09 (−0.51/−1.37/−1.66 %). The F16 routes are
+       slower than the direct SGEMM for these 32-row projections at prefill
+       widths on gfx1151, so the remaining kF32 tier stays: after 4.1b the
+       router/shexp F32 GEMMs are already gone from production dispatch and
+       the α/β SGEMMs are the measured optimum, leaving 4.1's kill-kF32
+       ambition closed as not-improvable rather than achieved. Implementation
+       reverted to HEAD; kernel suites keep their kF32 contract branches.
 - [ ] 4.2 Half producers + elementwise/router fusion.
       **Lever 4.2a (REJECTED): RMSNorm half-output producers**.
       `RmsNormRows` emits a bit-identical `__float2half_rn` copy of each
