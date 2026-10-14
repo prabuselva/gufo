@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/gemm/dense_f16_gemm.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/dense_f16_gemm.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {
@@ -168,6 +169,37 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
           BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(rows),
           static_cast<int>(batch), static_cast<int>(cols), &alpha, base,
           HIP_R_16BF, static_cast<int>(cols), xb, HIP_R_16BF,
+          static_cast<int>(cols), &beta, out, HIP_R_32F, static_cast<int>(rows),
+          HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+      break;
+    }
+    case GemvType::kF16: {
+      // A BF16 dense projection retyped to binary16 at upload time (see
+      // ConvertBf16ToHalf): the weights already live in F16, so the wide
+      // prefill batches feed the shared dense F16 GEMM directly with native
+      // F16 weights, no dequantize and no per-call staging. Shapes outside
+      // the measured winning window narrow the activations and take the
+      // hipBLAS half gemm with F32 accumulation.
+      const std::size_t n = static_cast<std::size_t>(batch) * cols;
+      __half* xh = HalfScratch(n);
+      const std::size_t block = 256;
+      const std::size_t grid = (n + block - 1) / block;
+      NarrowHalf<<<grid, block, 0, stream>>>(x, xh, n);
+      if (batch >= kDenseF16MinBatch && rows >= kDenseF16MinRows &&
+          cols <= kDenseF16MaxCols &&
+          core::hip::gemm::DenseF16Gemm(base, xh, out, batch, rows, cols,
+                                        stream,
+                                        core::hip::gemm::DenseF16Plan::kAuto,
+                                        /*weights_f16=*/true)) {
+        break;
+      }
+      const float alpha = 1.0F;
+      const float beta = 0.0F;
+      (void)hipblasSetStream(BlasHandle(), stream);
+      (void)hipblasGemmEx(
+          BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(rows),
+          static_cast<int>(batch), static_cast<int>(cols), &alpha, base,
+          HIP_R_16F, static_cast<int>(cols), xh, HIP_R_16F,
           static_cast<int>(cols), &beta, out, HIP_R_32F, static_cast<int>(rows),
           HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
       break;

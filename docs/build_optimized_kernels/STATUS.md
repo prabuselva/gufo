@@ -706,6 +706,31 @@ it only pays together with the fork's register-frugal 2.5 template
 ## Phase 4 — qwen36_a3b fan-out (nodes 1,2,3,5,6,7,8; GDN: producers only)
 
 - [ ] 4.1 Shared-core dispatch + plan table; kill `kF32`/SGEMM tier.
+      **BF16 dense projections retyped to binary16 at upload (lever 4.1a, now
+      default)**: the gemma4 3.2a port. A GGUF dtype audit of the Q8_K_XL
+      artifact found BF16 stored only on the head-tier `blk.39` attention
+      q/k/v/out + shared-expert gate/up/down and the `blk.40` MTP group; bf16
+      routed experts stay out (WMMA tier reads BF16 natively) and the router
+      keeps its precision. Each layer's attention projections and
+      shexp gate/up/down are retyped `kBF16`→`kF16` at upload and converted by
+      a device-wide `Bf16ToHalfKernel` with out-of-range fail-stop after the
+      staging flush; the new `kF16` gemm branch feeds the shared-core
+      `core::hip::gemm::DenseF16Gemm` with `weights_f16` inside the measured
+      dense window and hipBLAS F16 outside it (512-row attn_k/v and shexp
+      gate/up); decode gets F16 via `Gemv`/`GemvRows`/`GemvGrouped`. Gates
+      (`gufo_bench_q36gate.log`): `qwen36_a3b.{rocm_ops,rocm_gdn,rocm_attention,
+      rocm_gemv,rocm_gemm}` pass; `rocm_forward` on Q8_K_XL trunk worst-rel
+      0.0108/0.0040/0.0030 and mtp 0.0043 (pre-lever levels); `rocm_inference`
+      CPU/GPU tokens matched. Paired same-revision windows against a fresh
+      26ea9fbb control (`/tmp/opencode/gufo_ctrl_wt`, flags verified
+      identical): `gufo_bench_q36ab.log` pp2048 +1.44/+0.46 %, pp8192
+      **2400.46/2401.04 vs 2349.40/2350.89 (+2.17/+2.13 %)**;
+      `gufo_bench_q36ab32.log` pp32768 +0.37/+2.06 %, pp100352 +1.18/+0.62 % —
+      candidate won 8/8 pairs in both orders; tg128 within 1σ
+      (45.06/44.97 vs 45.13/45.12). Remaining 4.1 is the F32→half tier for
+      the FP32 `Cijk` SGEMMs (303 ms of the timed pp8192 pass: router
+      256×2048, shexp gate_inp, GDN α/β; 8.3 %) — needs router top-k-flip and
+      KL evidence before retyping.
 - [ ] 4.2 Half producers + elementwise/router fusion.
 - [ ] 4.3 MTP width-invariance + hash gate; draft policy.
 - [ ] 4.4 Oracle KL suite + benchmarks.

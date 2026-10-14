@@ -46,8 +46,10 @@ if (ENGINE_ENABLE_HIP)
   # The batched GEMM tier reuses the Qwen3.8-Flash-Next mmq routed/dense path
   # (Q8_0) and hipBLAS (F32/BF16); the mmq target exports its header directory
   # and roc::hipblas transitively, so weights stay in their native encoding.
+  # BF16-retyped dense projections use the shared binary16 prefill GEMM with
+  # native F16 weights (src/core/hip/gemm/dense_f16_gemm.hpp).
   target_link_libraries(gufo_qwen36_a3b_kernels PUBLIC
-    gufo_qwen38_flash_next_mmq hip::host)
+    gufo_core_hip_gemm gufo_qwen38_flash_next_mmq hip::host)
 
   # Host-side driver: streams the artifact to the GPU and runs the trunk and
   # MTP draft one token at a time. Built only by explicit GPU validation

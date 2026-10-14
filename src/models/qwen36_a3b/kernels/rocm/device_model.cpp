@@ -11,6 +11,7 @@
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen36_a3b/kernels/rocm/gemv.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {
 namespace {
@@ -66,6 +67,71 @@ struct Uploader {
       *error = message;
     }
     ok = false;
+  }
+
+  // Dense projections uploaded as BF16 are retyped to binary16 and converted
+  // in place after the staged uploads finish. F16 gives the dense tier a
+  // native tensor-core route (no BF16 staging/conversion per call), and any
+  // weight magnitude outside the binary16 range fails the load rather than
+  // saturating silently. The router keeps its precision (bf16 rounding could
+  // flip the top-k expert selection) and the routed experts stay on the WMMA
+  // tier, which reads BF16 natively.
+  struct HalfJob {
+    void* data;
+    std::size_t count;
+    std::string name;
+  };
+  std::vector<HalfJob> halves;
+
+  void Half(DeviceTensor& d, const std::string& name) {
+    if (!ok || d.empty() || d.type != core::GgmlType::kBF16) {
+      return;
+    }
+    halves.push_back(
+        {d.data, static_cast<std::size_t>(d.rows) * d.cols * d.experts, name});
+    d.type = core::GgmlType::kF16;
+  }
+
+  // Runs the queued in-place BF16 -> binary16 conversions. Must be called
+  // after the staging pipeline has flushed, so every source buffer holds its
+  // final bytes.
+  bool ConvertHalves() {
+    if (halves.empty() || !ok) {
+      return ok;
+    }
+    std::vector<std::uint32_t*> counters(halves.size(), nullptr);
+    for (std::size_t i = 0; i < halves.size(); ++i) {
+      if (hipMalloc(&counters[i], sizeof(std::uint32_t)) != hipSuccess ||
+          hipMemset(counters[i], 0, sizeof(std::uint32_t)) != hipSuccess) {
+        Fail("hipMalloc failed for BF16 conversion check of " + halves[i].name);
+        break;
+      }
+      ConvertBf16ToHalf(halves[i].data, halves[i].count, counters[i], nullptr);
+    }
+    if (ok && hipDeviceSynchronize() != hipSuccess) {
+      Fail("device sync failed during BF16 -> binary16 conversion");
+    }
+    for (std::size_t i = 0; ok && i < halves.size(); ++i) {
+      std::uint32_t overflow = 0;
+      if (counters[i] != nullptr) {
+        if (hipMemcpy(&overflow, counters[i], sizeof(overflow),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+          Fail("readback failed for BF16 conversion check of " +
+               halves[i].name);
+          break;
+        }
+      }
+      if (overflow > 0) {
+        Fail("tensor " + halves[i].name + " has " + std::to_string(overflow) +
+             " BF16 values outside the binary16 range");
+      }
+    }
+    for (std::uint32_t* c : counters) {
+      if (c != nullptr) {
+        (void)hipFree(c);
+      }
+    }
+    return ok;
   }
 
   DeviceTensor Copy(const TensorRef& t) {
@@ -161,9 +227,13 @@ struct Uploader {
       d.ssm_out = Copy(l.ssm_out);
     } else {
       d.attn_q = Copy(l.attn_q);
+      Half(d.attn_q, "attn_q");
       d.attn_k = Copy(l.attn_k);
+      Half(d.attn_k, "attn_k");
       d.attn_v = Copy(l.attn_v);
+      Half(d.attn_v, "attn_v");
       d.attn_out = Copy(l.attn_out);
+      Half(d.attn_out, "attn_out");
       d.attn_q_norm = Copy(l.attn_q_norm);
       d.attn_k_norm = Copy(l.attn_k_norm);
     }
@@ -173,8 +243,11 @@ struct Uploader {
     d.ffn_down_exps = Copy(l.ffn_down_exps);
     d.shexp_gate_inp = Copy(l.shexp_gate_inp);
     d.shexp_gate = Copy(l.shexp_gate);
+    Half(d.shexp_gate, "shexp_gate");
     d.shexp_up = Copy(l.shexp_up);
+    Half(d.shexp_up, "shexp_up");
     d.shexp_down = Copy(l.shexp_down);
+    Half(d.shexp_down, "shexp_down");
     d.nextn_enorm = Copy(l.nextn_enorm);
     d.nextn_hnorm = Copy(l.nextn_hnorm);
     d.nextn_eh_proj = Copy(l.nextn_eh_proj);
@@ -219,7 +292,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
     m->mtp_ = up.Layer(mtp->block);
     m->has_mtp_ = true;
   }
-  if (!up.ok || !stager->Finish(error_msg)) {
+  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves()) {
     return nullptr;
   }
   return m;
