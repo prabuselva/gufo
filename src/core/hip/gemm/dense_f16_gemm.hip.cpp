@@ -377,6 +377,12 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
     } else if (planned && plan == DenseF16Plan::kTile128) {
       LaunchDenseF16<128, 128, 1, 4, 2>(w, x, out, batch, m, k, weights_f16,
                                         stream);
+    } else if (planned && plan == DenseF16Plan::kStaged128) {
+      LaunchDenseF16<128, 128, 2, 2, 4>(w, x, out, batch, m, k, weights_f16,
+                                        stream);
+    } else if (planned && plan == DenseF16Plan::kTile64) {
+      LaunchDenseF16<64, 128, 2, 2, 4>(w, x, out, batch, m, k, weights_f16,
+                                       stream);
     } else if (planned) {
       LaunchDenseF16<256, 128, 1, 8, 1>(w, x, out, batch, m, k, weights_f16,
                                         stream);

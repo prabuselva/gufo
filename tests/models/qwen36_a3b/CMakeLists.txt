@@ -51,6 +51,13 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen36_a3b_dense_f16_bench PRIVATE
     gufo_qwen36_a3b_kernels gufo_qwen38_flash_next_mmq gufo_core)
 
+  # Tile-plan comparison for the core kernel's native-F16 weight route (the
+  # wide attention projections) against its Q8_0 dequant ceiling.
+  add_executable(qwen36_a3b_dense_f16_w16_bench EXCLUDE_FROM_ALL
+    dense_f16_w16_bench.cpp)
+  target_link_libraries(qwen36_a3b_dense_f16_w16_bench PRIVATE
+    gufo_qwen36_a3b_kernels gufo_core)
+
   # End-to-end forward pass: the GPU executor's trunk and MTP logits must agree
   # with the scalar oracle over the real artifact. Skips (77) without the GGUF.
   add_executable(qwen36_a3b_rocm_forward_test EXCLUDE_FROM_ALL

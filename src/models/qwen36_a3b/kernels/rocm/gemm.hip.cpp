@@ -187,10 +187,13 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
       NarrowHalf<<<grid, block, 0, stream>>>(x, xh, n);
       if (batch >= kDenseF16MinBatch && rows >= kDenseF16MinRows &&
           cols <= kDenseF16MaxCols &&
-          core::hip::gemm::DenseF16Gemm(base, xh, out, batch, rows, cols,
-                                        stream,
-                                        core::hip::gemm::DenseF16Plan::kAuto,
-                                        /*weights_f16=*/true)) {
+          core::hip::gemm::DenseF16Gemm(
+              base, xh, out, batch, rows, cols, stream,
+              // The 256-row tiles spill their accumulators on native-F16
+              // weights (160 B to scratch); the half-row staged tile runs the
+              // trunk's projections 1.9-2.2x faster (dense_f16_w16_bench).
+              core::hip::gemm::DenseF16Plan::kStaged128,
+              /*weights_f16=*/true)) {
         break;
       }
       const float alpha = 1.0F;

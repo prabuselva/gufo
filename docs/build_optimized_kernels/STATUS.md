@@ -906,6 +906,34 @@ it only pays together with the fork's register-frugal 2.5 template
       2468.58/2497.82/2481.41 (+2.03/+0.20/+2.08 %), pp8192
       2438.88/2424.39/2433.34 vs 2402.52/2392.36/2409.61
       (+1.51/+1.34/+0.98 %) — 6/6 pairs, mean ~+1.3 %.
+- [x] 4.6 Native-F16 weight route: spill-free kStaged128 plan. The same
+      `prof45` capture showed the core `DenseF16GEMMKernel<256,128,1,4,2,1,
+      true>` (the kF16 route Qwen3.6 attention takes on binary16 weights)
+      spilling 160 B of registers per lane to scratch and running 3.2× the
+      Q8_0-dequant ceiling for the same tiles (attn_q 7686 vs 2217 µs at
+      grid-Y 32; ~155 ms/11037 ms busy). Root cause is register pressure:
+      the verbatim half fetch holds 16 VGPR per unit (four uint4) where the
+      Q8_0 fetch holds 9, and the doubled prefetch buffer pushes the 128
+      accumulator tiles over the cap. New measured plans `kStaged128`
+      `<128,128,2,2,4>` and `kTile64` `<64,128,2,2,4>` halve the live
+      accumulators to 64 F32; the new `qwen36_a3b_dense_f16_w16_bench`
+      raced all seven plans × {F16 true, Q8 ceiling} over the three window
+      shapes (`gufo_bench_w16plan.log`, `gufo_bench_w16plan2.log`):
+      kStaged128 wins the production batch-2048 chunks — attn_q
+      6998→3705 µs (0.53×), attn_out 4083→1860 (0.46×), shexp_down 369→
+      248 (0.67×; the single-stage staged micro-wins there by 10 %, not
+      worth a per-shape rule). kF16 now passes `kStaged128` (core applies
+      planned tiles at batch ≥ 1024, small batches keep kAuto). Quality:
+      K order per output unchanged, all eight `qwen36_a3b.rocm_*` gates
+      pass and greedy pp512/tg128 `output_sha256` `006361da…190ab3` is
+      bitwise the control (`gufo_bench_gate20.log`). Accepted lever —
+      paired A/B vs the `5b5a16c7` binary (`gufo_bench_ab19.log`,
+      `gufo_bench_ab19b.log`): three alternating pairs (+1.21/+1.55/−0.14
+      pp2048, +1.01/+2.11/−1.19 pp8192, the negative pair order-correlated)
+      then three candidate-first pairs 6/6 positive (+1.03/+0.13/+0.98
+      pp2048, +0.51/+0.89/+0.44 pp8192). 10/12 pairs, mean +0.79/+0.63 %.
+      The gemma4 F16 route still plans staged/rgroups8 (priv 80–144 B);
+      giving it the kStaged128 rule is a gemma4-owned follow-up.
 
 ## Phase 5 — ling3_flash fan-out (nodes 1,3,5,6,7,8; full-attn occupancy)
 

@@ -903,3 +903,35 @@ alternating pairs each depth (`gufo_bench_ab18.log`): pp2048 +2.03/+0.20/
 +2.08 %, pp8192 +1.51/+1.34/+0.98 % — 6/6 pairs, mean ~+1.3 %. Staged-
 through-LDS (two K blocks committed per barrier) is the new production
 default for wide dense shapes.
+
+## Native-F16 weight route: spill-free kStaged128 tile (retained)
+
+**Problem.** The wide-batch kF16 route (attention q/out and shared-expert
+down on their binary16 weights) ran the core kernel's auto 256×128 4×2-wave
+instantiation, which spills 160 B of registers per lane to scratch on this
+route: `prof45` timed it at 7686 µs per attn_q chunk (batch 2048) against
+2217 µs for the same tiles on Q8_0 bytes — half the route's speed budget
+gone to scratch traffic. The F16 fetch keeps 16 VGPR per unit (four verbatim
+uint4) where the dequant fetch keeps 9, so the 128 live accumulators plus
+the prefetch buffers break the 256-VGPR cap.
+
+**Candidate tiles.** `kStaged128` `<128,128,2,2,4>` and `kTile64`
+`<64,128,2,2,4>` (both spill-shaped: 64 live accumulators; kStaged128
+stagings two K blocks per barrier). New harness
+`tests/models/qwen36_a3b/dense_f16_w16_bench.cpp` uploads each weight twice
+(Q8_0 bytes and binary16) and races all seven plans against the Q8_0
+dequant ceiling on one double reference.
+
+**Measurement (exclusive, median of 15 per launch, batch 2048).** kStaged128
+wins the production chunk shape on both attention projections: attn_q
+6998→3705 µs (0.53×), attn_out 4083→1860 (0.46×); shexp_down 369→248
+(0.67×, the single-stage 8×1 plan micro-wins by 10 % — not worth a
+per-shape rule). At a hypothetical 8192-token chunk kStaged128 still beats
+kAuto 0.62–0.65×. Every plan's error matched the reference to 2.4e-4.
+
+**Verdict: retained.** K accumulation order per output is unchanged; all
+eight `qwen36_a3b.rocm_*` gates pass and greedy pp512/tg128
+`output_sha256` is bit-for-bit the control. Paired A/B vs the previous
+binary (`gufo_bench_ab19.log`, `gufo_bench_ab19b.log`): 10/12 alternating
+pairs positive (three order-correlated negatives in the first round), mean
++0.79 % at pp2048 and +0.63 % at pp8192.
