@@ -685,7 +685,8 @@ void PrintServeHelp(std::string_view program_name,
                      "Speculative", &mtp_model_path);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
-        "Maximum speculative draft tokens evaluated per step (default: 7)",
+        "Maximum speculative draft tokens evaluated per step (default: 7, "
+        "or 2 for the measured MTP optimum on models that calibrate it)",
         "Speculative", &draft_tokens);
 
     parser.AddOption("", "--min-draft-tokens", "N",
@@ -1151,6 +1152,7 @@ int RunServe(std::span<const char* const> args) {
     std::string mtp_model_path;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
+    bool draft_tokens_specified = false;
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
@@ -1231,10 +1233,28 @@ int RunServe(std::span<const char* const> args) {
         "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
         "mtp-...-shared-*.gguf sidecar)",
         "Speculative", &mtp_model_path);
-    llm_parser.AddOption(
+    llm_parser.AddCustomOption(
         "-d", "--draft-tokens", "N",
-        "Maximum speculative draft tokens evaluated per step (default: 7)",
-        "Speculative", &draft_tokens);
+        "Maximum speculative draft tokens evaluated per step (default: 7, "
+        "or 2 for the measured MTP optimum on models that calibrate it)",
+        "Speculative",
+        [&draft_tokens, &draft_tokens_specified](std::string_view flag_name,
+                                                 std::string_view value,
+                                                 std::string* error) -> bool {
+          std::size_t count = 0;
+          const auto [ptr, ec] =
+              std::from_chars(value.data(), value.data() + value.size(), count);
+          if (ec != std::errc{} || ptr != value.data() + value.size() ||
+              count == 0) {
+            if (error != nullptr) {
+              *error = "Invalid argument for " + std::string(flag_name);
+            }
+            return false;
+          }
+          draft_tokens = count;
+          draft_tokens_specified = true;
+          return true;
+        });
 
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
@@ -1405,6 +1425,7 @@ int RunServe(std::span<const char* const> args) {
             : dflash_model_path;
     speculative_config.max_draft_tokens =
         static_cast<std::uint32_t>(draft_tokens);
+    speculative_config.max_draft_tokens_specified = draft_tokens_specified;
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
     if (model.empty()) {

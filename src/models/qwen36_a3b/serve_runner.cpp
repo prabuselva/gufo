@@ -495,9 +495,15 @@ std::shared_ptr<TextModelRunner> CreateTextRunner(
              "Qwen3.6-35B-A3B HTTP models do not support the disk cache");
     return nullptr;
   }
+  // Without an explicit --draft-tokens the server uses the measured MTP
+  // draft-count optimum for this model; a given value still reaches
+  // SetDraftLimits unchanged.
+  const auto max_drafts = speculative_config.max_draft_tokens_specified
+                              ? speculative_config.max_draft_tokens
+                              : kMtpCalibratedMaxDrafts;
   return std::make_shared<Qwen36A3BTextRunner>(
       std::move(model), per_session_context, use_mtp,
-      speculative_config.min_draft_tokens, speculative_config.max_draft_tokens);
+      speculative_config.min_draft_tokens, max_drafts);
 }
 
 }  // namespace gufo::models::qwen36_a3b

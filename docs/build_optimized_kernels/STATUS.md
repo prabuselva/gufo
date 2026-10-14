@@ -792,7 +792,41 @@ it only pays together with the fork's register-frugal 2.5 template
       be paired-timed before any consumer fusion is trusted; the profiler
       systematically mis-reads these as wins. Implementation reverted to
       HEAD; 4.2 stays open for the elementwise/router half.
-- [ ] 4.3 MTP width-invariance + hash gate; draft policy.
+- [x] 4.3 MTP width-invariance + hash gate; draft policy.
+    - Width-invariance (kernel side): closed by existing shape coverage plus
+      gemma4 evidence. `GemvRowsQ8_0<N>` already walks Q8_0 weights once for
+      any verify width N <= `kMaxVerifyRows`, and the decode-GEMV
+      byte-efficiency levers were measured closed (DRAM optimum) in lever 12/13
+      there; a `wmma_gemv`-style rewrite was therefore not retried here. The
+      profiled spec-decode line mix (`prof43_spec`: `GemvRowsQ8_0<5u>`
+      606.6 ms/12688 calls alongside the width-1 GEMVs) matches that shape set.
+    - Hash gate: `qwen36_a3b.rocm_mtp_spec`
+      (`tests/models/qwen36_a3b/rocm_mtp_spec_test.cpp`) runs greedy AR and
+      greedy MTP verify (pinned 4 drafts, `drafted > 0` guards a vacuous pass)
+      over the same session and stream-hashes both token streams; passes
+      32.5 s on the Q8_K_XL artifact. Every bench sweep point below emitted an
+      identical `output_sha256`, confirming stream invariance across draft
+      widths on the bench path too.
+    - Draft policy (window `q36g43`, pinned-k sweep pp2048/tg256 greedy,
+      `gufo_bench_q36g43.log`): off 45.04, k=1 59.02, **k=2 61.99**, k=3 61.27,
+      k=4 53.99 tok/s; per-draft acceptance 0.875/0.774/0.676/0.531 — position
+      >=3 accepts rarely pay for the extra verify rows, and the pre-
+      calibrated adaptive default (ceiling 4, shrink only at zero accepts)
+      parked at k=3-4 for 55.05, worse than every pinned width 1-3.
+    - Change: `kMtpCalibratedMaxDrafts = 2` in `engine.hpp` becomes the
+      unspecified-default ceiling in bench (`BenchOptions.draft_tokens_specified`)
+      and serve (`TextSpeculativeConfig.max_draft_tokens_specified`, plumbed
+      from a presence-tracking `--draft-tokens`); explicit requests still
+      reach `SetDraftLimits` (verified by the gate pinning 4). Floor stays 1
+      so the adaptive path still shortens bad rounds.
+    - Accepted lever — same-window paired A/B (`gufo_bench_q36ab43.log`),
+      control = `9a4af6a3` binary, candidate = calibrated default, greedy
+      `--speculative mtp` with no draft flags: pp2048/tg256 three alternating
+      pairs 55.04/55.08/55.10 → **65.17/65.22/65.17 (+18.4 %, 3/3)**;
+      pp8192/tg256 54.57 → **64.72 (+18.6 %)**; beats even pinned k=2 because
+      the floor still adapts down; `output_sha256` identical ctrl/cand
+      everywhere; gates `rocm_forward`/`rocm_inference`/`rocm_mtp_spec` all
+      pass on the candidate.
 - [ ] 4.4 Oracle KL suite + benchmarks.
 
 ## Phase 5 — ling3_flash fan-out (nodes 1,3,5,6,7,8; full-attn occupancy)

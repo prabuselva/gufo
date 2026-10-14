@@ -42,6 +42,13 @@ struct ModelOptions {
 
 class Session;
 
+// Draft count calibrated for MTP speculative decoding on gfx1151: a pinned
+// k-sweep over greedy generation (pp2048/tg256) peaks at 2 drafts per verify
+// round; wider chains rarely advance past position 2 and spend more verify
+// rows than the accepted drafts save (docs/build_optimized_kernels/STATUS.md,
+// item 4.3). Explicit --draft-tokens requests still reach SetDraftLimits.
+inline constexpr std::uint32_t kMtpCalibratedMaxDrafts = 2U;
+
 /// Gufo-owned API over the ROCm runtime: one resident model and one session
 /// with independent context state. The Qwen3.6-35B-A3B executor is a single
 /// shared object, so the model supports exactly one session.
@@ -166,8 +173,8 @@ private:
   std::vector<float> draft_logits_;
   std::vector<float> verify_rows_;
   std::uint32_t draft_min_{1};
-  std::uint32_t draft_max_{4};
-  std::uint32_t draft_k_{4};
+  std::uint32_t draft_max_{kMtpCalibratedMaxDrafts};
+  std::uint32_t draft_k_{kMtpCalibratedMaxDrafts};
   bool valid_{true};
   // cache_identity of the vision prompt currently installed, so a switch to a
   // different (or empty) image set resets the session instead of reusing stale

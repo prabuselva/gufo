@@ -259,7 +259,9 @@ int RunQwen36A3BBenchmark(
           // it off so plain prefill skips the draft block.
           session->SetMtpEnabled(true);
           session->SetDraftLimits(options.min_draft_tokens,
-                                  options.draft_tokens);
+                                  options.draft_tokens_specified
+                                      ? options.draft_tokens
+                                      : kMtpCalibratedMaxDrafts);
         }
         if (!session->Sync(std::span(tokens).first(prefix_length), &error)) {
           std::cerr << "Error preparing generation: " << error << '\n';

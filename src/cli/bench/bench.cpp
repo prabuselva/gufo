@@ -224,6 +224,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
           return false;
         }
         opt.draft_tokens = count;
+        opt.draft_tokens_specified = true;
         return true;
       });
 

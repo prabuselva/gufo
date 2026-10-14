@@ -55,6 +55,9 @@ struct TextSpeculativeConfig {
   TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
+  // False when the server default was kept, true when --draft-tokens was
+  // given; models with a measured draft limit apply their own in that case.
+  bool max_draft_tokens_specified{false};
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
