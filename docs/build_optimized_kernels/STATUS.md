@@ -561,6 +561,32 @@ it only pays together with the fork's register-frugal 2.5 template
           VRAM-full server - model-loading GPU tests must run inside the
           exclusive window like benchmarks, never resident; kernel-only
           resident tests remain safe.
+          **Lever 8 (REJECTED): `-ffast-math` on the WMMA prefill
+          attention**. Full attribution of the residual per-line fork
+          leads: the attention kernel source is semantically identical
+          (the lone text diff, a `key_stride` `size_t` cast in
+          attention_wmma.hip.cpp, stores into a `std::uint32_t` array and
+          truncates identically - it is not the edge), launchers/flags are
+          doc-only diffs, same clang binary, same RelWithDebInfo; the
+          fork compiles `gemma4_kernels` with `-O3 -ffast-math
+          -fno-finite-math-only` while gufo omits fast-math by policy
+          (scalar-oracle fidelity, see src/models/gemma4/CMakeLists.txt).
+          Scoped the exception to attention_wmma.hip.cpp only (source
+          COMPILE_OPTIONS emit after the target's; flag order verified in
+          compile_commands). Gates: `rocm_kernels` and `rocm_forward`
+          (tolerance + determinism) PASSED, but the prefill validator
+          caught corruption - `top1_match=no kl=2.2732 tv=0.2665` vs the
+          control's `kl=0.0004176` at 1024-token validate
+          (`gufo_bench_lever8.log`). Confirmation window
+          (`gufo_bench_lever8b.log`): the fork CLI parses
+          `--validate-prefill` but never executes it, so the fork's own
+          fast-math accuracy is unmeasured on our gate; paired pp2048 of
+          the candidate vs control was within noise (avg 3226.7 vs
+          3194.5). REJECTED: fast-math online softmax corrupts bulk
+          prefill for a gain not visible on wall time; the CMake
+          exception is reverted. The residual fork prefill gap IS this
+          fast-math codegen class (attention ~11 % per call, norms/GeGLU
+          class a few ms) - closed on quality grounds, not reproduced.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
