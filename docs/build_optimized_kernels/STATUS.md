@@ -757,6 +757,41 @@ it only pays together with the fork's register-frugal 2.5 template
       the control held the second slot; short-context evidence 4/4 wins is
       the qualified signal). Remaining 4.1: the GDN α/β SGEMM tier only.
 - [ ] 4.2 Half producers + elementwise/router fusion.
+      **Lever 4.2a (REJECTED): RMSNorm half-output producers**.
+      `RmsNormRows` emits a bit-identical `__float2half_rn` copy of each
+      normalized row into the chunk-resident `pf_x_half_`; `Gemm` and the
+      prefill batch functions take that `x_half` and skip their per-call
+      `NarrowHalf`/`NarrowActivations` staging (window `kQ8_0` + `kF16`
+      tiers, hipBLAS `HIP_R_16F` `GemmEx`, router/shared-expert, attention
+      q/k/v, GDN qkv/gate). Quality gate clean
+      (`gufo_bench_q36gate42.log`): five kernel suites pass, `rocm_forward`
+      worst-rel 0.0082/0.0038/0.0030 + mtp 0.0037 - exactly the 4.1b
+      values, and `rocm_inference` CPU/GPU matched, so all three timed
+      variants below are numerically the control. Timed as three variants
+      against a fresh 9a4af6a3 control, reps 3, `--speculative off`
+      (candidate first in both windows unless noted): full feed
+      (`gufo_bench_q36ab42.log`) pp2048 2437.80/2430.17 vs 2481.47/
+      2476.15 (-1.76/-1.86 %), pp8192 2360.71/2358.17 vs 2390.84/2390.54
+      (-1.26/-1.35 %); feed only the immediate q/k/v/GDN consumers and
+      re-narrow for MoE (`gufo_bench_q36ab42p.log`) pp8192 2347.65/
+      2345.63 vs 2400.81/2415.08 (-2.21/-2.88 %); dead store - producer
+      store only, every consumer the untouched control staging path,
+      control placed in slots 1/3 (`gufo_bench_q36ab42d.log`) pp2048
+      -1.4 %, pp8192 -0.8 % pair-consistent in BOTH run positions; tg128
+      neutral throughout. Profile forensics (pp8192, rocprofv3,
+      `prof42_cand`/`prof42_ctrl`) says the opposite: kernel sum -2.5 %
+      (NarrowHalf -148.0, NarrowKernel<__half> -29.3, dispatches
+      -1677) while `DenseF16GEMMKernel` +73.0 and hipBLAS HSS `GemmEx`
+      +47/+31 ms; that single-pass regime lost in every steady window
+      and is not authoritative here. Mechanism: on shared LPDDR the norm
+      kernel is bandwidth-bound and pays for the extra 8 MB/chunk/layer
+      half write immediately (dead-store loss), while GEMM consumers of
+      a just-written narrow scratch ride L2 write residency the producer
+      cannot reproduce at any distance. Lesson for 4.2b/4.2 elementwise
+      and 5.1 half producers: added stores inside bandwidth kernels must
+      be paired-timed before any consumer fusion is trusted; the profiler
+      systematically mis-reads these as wins. Implementation reverted to
+      HEAD; 4.2 stays open for the elementwise/router half.
 - [ ] 4.3 MTP width-invariance + hash gate; draft policy.
 - [ ] 4.4 Oracle KL suite + benchmarks.
 
