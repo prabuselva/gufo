@@ -669,6 +669,32 @@ it only pays together with the fork's register-frugal 2.5 template
           the 1e-4 grouped/down lines at 183/180 GB/s, and the
           186 GB/s o_proj) can move decode; launch-count levers are
           exhausted (idle was already 7.9 %).
+          **Lever 13 (REJECTED): order-preserving u16+shuffle Q8_0
+          GEMV for the short-row decode lines.** Ported the
+          bit-identical shfl siblings (per-lane FMA chain in exact
+          scalar block order, `__shfl` u16 halves) for the 704-column
+          grouped down and the 64-multiple non-128 dense lines (2112
+          FFN). Standalone cold-pool bench (`gpu_bench_gemvdec4`,
+          128 MB reuse-distance rotation, bitwise == scalar across
+          all outputs) predicted -5 % grouped-down and -16 % ffn
+          down; validator/forward reproduce exactly (bit-identical).
+          But three alternating matched pairs in ONE exclusive window
+          (`prof_ffshfl_{ctrl,cand}{1,2,3}`, 80-tok steady tables)
+          show the lines regress: grouped-down 91.6/91.8/92.5 ->
+          92.8/93.2/92.7 us (+1.2 %, all 3 pairs), 2112 dense
+          35.1/35.1/35.4 -> 36.1/36.3/36.2 us (+2.9 %, all 3 pairs).
+          The cold-pool protocol MISPREDICTS production: production
+          scalars run at 35 us vs the bench's 44.3 us - the in-model
+          interleave warms L2 differently, where 1-byte/lane loads
+          stream better than half-coalesced u16; the pool's forced
+          DRAM re-reads flipped the sign. Dispatch, kernels and their
+          unit test reverted; gu (88-block) would have kept scalar
+          anyway. LEVERS 2.2-BYTE-EFFICIENCY ARE NOW ALSO CLOSED by
+          in-vivo evidence: every retained Q8_0 GEMV shape sits at
+          its DRAM/prefetch optimum, and only same-binary in-model
+          paired tables may decide kernel swaps - standalone
+          micro-benches (cold OR warm) are hypothesis generators,
+          never accept evidence.
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
