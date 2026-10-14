@@ -285,7 +285,8 @@ add_library(gufo_http STATIC
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_gemma4 gufo_qwen3_tts
+  gufo_qwen3_asr gufo_qwen_image_21)
 
 add_executable(gufo
   src/cli/main.cpp

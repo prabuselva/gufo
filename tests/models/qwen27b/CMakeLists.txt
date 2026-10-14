@@ -39,10 +39,14 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/gemma4/serve_runner.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/ling3_flash/serve_runner.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen36_a3b/serve_runner.cpp)
   target_link_libraries(qwen_serving_test_support PUBLIC gufo_logging
     gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next
-    gufo_qwen36_a3b_engine hip::host)
+    gufo_gemma4_engine gufo_ling3_flash_engine gufo_qwen36_a3b_engine
+    hip::host)
   add_executable(inference_backend_gpu_test serving_test.cpp)
   target_link_libraries(inference_backend_gpu_test PRIVATE qwen_serving_test_support)
   add_executable(qwen_vision_serving_test ../qwen/vision_serving_test.cpp)
