@@ -827,7 +827,25 @@ it only pays together with the fork's register-frugal 2.5 template
       the floor still adapts down; `output_sha256` identical ctrl/cand
       everywhere; gates `rocm_forward`/`rocm_inference`/`rocm_mtp_spec` all
       pass on the candidate.
-- [ ] 4.4 Oracle KL suite + benchmarks.
+- [x] 4.4 Oracle KL suite + benchmarks. `rocm_forward_test` now scores every
+      teacher-forced position with the gemma4 1.4 metric family (softmax
+      log-sum-exp `KlDivergence`, top-1) and the tiered classification
+      (PASS ≤3.7e-5 nats with top-1 match, RECORDED ≤5e-2, FAIL above or
+      non-finite). Q8_K_XL (`/tmp/opencode/gufo_bench_kl44b.log`): all four
+      positions **PASS** — trunk 1.5e-8/−6.7e-8/4.3e-14, mtp draft 1.6e-9
+      nats, top-1 4/4 (the tiny negative is double-precision rounding of a
+      ~1e-14 true KL); worst-relative margins unchanged (0.0082/0.0038/0.0030
+      /0.0037). The qwen36 oracle needs no gemma4 `Storage`-mode/probe-file
+      port for this gate class; per-lever KL is measured in-gate. Benchmarks:
+      fresh-process-per-depth gufo sweep in the same session
+      (`/tmp/opencode/gufo_bench_kl44.log`) refreshed the Q8_K_XL table in
+      `docs/models/qwen3.6-35B-A3B/BENCHMARKS.md` — pp +0.7–3.3 % at every
+      depth (pp4096 2484.8, 102 % of reference; pp16384 back to 100 %),
+      tg128 no-MTP 45.20 (neutral), and the calibrated hash-gated MTP default
+      adds tg128 62.46 ± 0.04 (+38 % over no-MTP); the October-3 reference
+      column is unchanged per the 2026-10-08 reuse precedent (reference tree
+      untouched). QUALITY.md MTP-framing rewrite is gemma4-only (no qwen36
+      QUALITY.md exists).
 
 ## Phase 5 — ling3_flash fan-out (nodes 1,3,5,6,7,8; full-attn occupancy)
 

@@ -42,23 +42,37 @@ timed repetitions. Measuring the reference on this machine rather than quoting
 its own numbers matters: the reference runs faster here than on its origin
 machine, so the same-machine ratios are lower than its self-reported ones.
 
+The **gufo** column was re-measured 2026-10-14 on `573a8bd4` with the
+build-optimized-kernels phase-4 levers (Q8_0 five-warp GEMV tier
+`GemvRowsQ8_0<5u>` and the fused dense-route staging), again
+fresh-process-per-depth in one exclusive GPU window (`/tmp/opencode/gufo_bench_kl44.log`).
+Prefill gained 0.7–3.3 % at every depth over the 2026-10-08 column; the gain is
+largest at 2–8 K where the expert GEMV is DRAM-issue-limited. The **reference**
+column is unchanged (the reference tree carries none of these levers). The same
+window adds the MTP speculative-decode row: `--speculative mtp` with the
+calibrated draft ceiling (≤2, hash-gated greedy-identical to autoregressive,
+see [docs/build_optimized_kernels/STATUS.md](../../build_optimized_kernels/STATUS.md)
+phase 4.3) decodes +38 % over the no-MTP row; the reference column predates
+MTP calibration and is not comparable, so no ratio is quoted.
+
 ## Qwen3.6-35B-A3B, UD-Q8_K_XL
 
 | Prefill prompt (tokens) | gufo (t/s) | reference (t/s) | ratio |
 | ---: | ---: | ---: | ---: |
-| 512 | 1696.8 ± 8.8 | 1648.1 ± 10.0 | 103 % |
-| 1024 | 2219.7 ± 8.1 | 2201.6 ± 6.1 | 101 % |
-| 2048 | 2421.1 ± 2.5 | 2403.3 ± 4.1 | 101 % |
-| 4096 | 2404.6 ± 4.4 | 2425.1 ± 2.2 | 99 % |
-| 8192 | 2349.5 ± 2.1 | 2341.1 ± 4.2 | 100 % |
-| 16384 | 2144.1 ± 29.2 | 2217.8 ± 1.7 | 97 % |
-| 32768 | 1854.5 ± 2.3 | 1941.7 ± 15.1 | 96 % |
-| 65536 | 1491.5 ± 5.0 | 1592.3 ± 1.1 | 94 % |
-| 102400 | 1180.1 ± 4.1 | 1331.4 ± 2.3 | 89 % |
+| 512 | 1743.8 ± 8.2 | 1648.1 ± 10.0 | 106 % |
+| 1024 | 2259.5 ± 9.3 | 2201.6 ± 6.1 | 103 % |
+| 2048 | 2476.7 ± 4.8 | 2403.3 ± 4.1 | 103 % |
+| 4096 | 2484.8 ± 3.0 | 2425.1 ± 2.2 | 102 % |
+| 8192 | 2397.9 ± 4.6 | 2341.1 ± 4.2 | 102 % |
+| 16384 | 2212.3 ± 31.0 | 2217.8 ± 1.7 | 100 % |
+| 32768 | 1909.1 ± 3.5 | 1941.7 ± 15.1 | 98 % |
+| 65536 | 1506.9 ± 4.4 | 1592.3 ± 1.1 | 95 % |
+| 102400 | 1200.8 ± 6.5 | 1331.4 ± 2.3 | 90 % |
 
 | Workload | gufo (t/s) | reference (t/s) | ratio |
 | --- | ---: | ---: | ---: |
-| tg128 (greedy, no MTP) | 45.09 ± 0.12 | 50.80 ± 0.04 | 89 % |
+| tg128 (greedy, no MTP) | 45.20 ± 0.19 | 50.80 ± 0.04 | 89 % |
+| tg128 (greedy, `--speculative mtp`, draft ≤2) | 62.46 ± 0.04 | — | — |
 
 ## Qwen3.6-35B-A3B, UD-Q4_K_XL
 

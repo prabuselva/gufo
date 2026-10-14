@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,76 @@ std::vector<float> Download(const float* device, std::size_t count) {
   return values;
 }
 
+struct KlReport {
+  bool finite{true};
+  bool top1_match{true};
+  double kl{0.0};
+};
+
+// Same metric family as the gemma4 oracle-KL harness (cli_runner KlDivergence
+// and tools/gemma4/compare_logits.py): KL of the GPU distribution against the
+// scalar oracle, sum_v p·(log p − log q) in nats per position.
+KlReport KlDivergence(const std::vector<float>& reference,
+                      const std::vector<float>& candidate) {
+  KlReport report;
+  if (reference.size() != candidate.size() || reference.empty()) {
+    report.finite = false;
+    return report;
+  }
+  double ref_max = -std::numeric_limits<double>::infinity();
+  double cand_max = -std::numeric_limits<double>::infinity();
+  for (const float value : reference) {
+    if (!std::isfinite(value)) {
+      report.finite = false;
+    }
+    ref_max = std::max(ref_max, static_cast<double>(value));
+  }
+  for (const float value : candidate) {
+    if (!std::isfinite(value)) {
+      report.finite = false;
+    }
+    cand_max = std::max(cand_max, static_cast<double>(value));
+  }
+  if (!report.finite) {
+    return report;
+  }
+  report.top1_match = ArgMax(reference) == ArgMax(candidate);
+  double log_z_ref = 0.0;
+  double log_z_cand = 0.0;
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    log_z_ref += std::exp(static_cast<double>(reference[i]) - ref_max);
+    log_z_cand += std::exp(static_cast<double>(candidate[i]) - cand_max);
+  }
+  log_z_ref += ref_max;
+  log_z_cand += cand_max;
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    const double log_p = static_cast<double>(reference[i]) - log_z_ref;
+    const double log_q = static_cast<double>(candidate[i]) - log_z_cand;
+    report.kl += std::exp(log_p) * (log_p - log_q);
+  }
+  return report;
+}
+
+// Tiered oracle-KL classification shared with the gemma4 1.4 gate: PASS is
+// the exactness class, drift inside the recorded class is reported but not a
+// run failure, anything above (or non-finite) means the path broke.
+double kl_sum = 0.0;
+double kl_max = 0.0;
+int kl_positions = 0;
+int kl_top1_matches = 0;
+
+const char* OracleKlTier(const KlReport& report) {
+  constexpr double kExactKl = 3.7e-5;
+  constexpr double kRecordedKl = 5e-2;
+  if (!report.finite || report.kl > kRecordedKl) {
+    return "FAIL";
+  }
+  if (report.kl <= kExactKl && report.top1_match) {
+    return "PASS";
+  }
+  return "RECORDED";
+}
+
 // The GPU GEMV accumulates in float32 (one warp per row) while the scalar
 // oracle accumulates in double. With cancellation in the 2048-term dot product
 // the float partial sums can drift by ~1e-2 relative on the largest logits, so
@@ -68,6 +139,17 @@ void CheckLogits(const std::vector<float>& reference,
   std::cout << tag << ": worst relative " << worst << "\n";
   Expect(worst <= 2e-2, tag + " logits match the reference");
   Expect(ArgMax(reference) == ArgMax(candidate), tag + " argmax matches");
+  const KlReport kl = KlDivergence(reference, candidate);
+  const char* tier = OracleKlTier(kl);
+  std::cout << tag << ": oracle KL " << kl.kl << " nats, top-1 "
+            << (kl.top1_match ? "match" : "flip") << " -> " << tier << "\n";
+  Expect(std::string(tier) != "FAIL", tag + " oracle KL inside recorded class");
+  kl_sum += kl.kl;
+  kl_max = std::max(kl_max, kl.kl);
+  ++kl_positions;
+  if (kl.top1_match) {
+    ++kl_top1_matches;
+  }
 }
 
 // Prefill-throughput sweep over the real executor. Drives Executor::Prefill at
@@ -234,6 +316,10 @@ int main() {
   const std::vector<float> gpu_mtp =
       Download(executor->mtp_logits(), c.vocab_size);
   CheckLogits(ref_logits, gpu_mtp, "mtp draft");
+
+  std::cout << "oracle KL summary: mean " << kl_sum / kl_positions << " max "
+            << kl_max << " nats, top-1 " << kl_top1_matches << "/"
+            << kl_positions << "\n";
 
   if (failures != 0) {
     std::cerr << failures << " forward checks failed\n";
