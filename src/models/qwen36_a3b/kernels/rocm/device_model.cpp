@@ -3,6 +3,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -73,9 +74,9 @@ struct Uploader {
   // in place after the staged uploads finish. F16 gives the dense tier a
   // native tensor-core route (no BF16 staging/conversion per call), and any
   // weight magnitude outside the binary16 range fails the load rather than
-  // saturating silently. The router keeps its precision (bf16 rounding could
-  // flip the top-k expert selection) and the routed experts stay on the WMMA
-  // tier, which reads BF16 natively.
+  // saturating silently. The routed experts stay on the WMMA tier, which
+  // reads BF16 natively. The F32 router and shared-expert gate projections
+  // are retyped by ConvertRouterHalves (out of place, after the flush).
   struct HalfJob {
     void* data;
     std::size_t count;
@@ -130,6 +131,96 @@ struct Uploader {
       if (c != nullptr) {
         (void)hipFree(c);
       }
+    }
+    return ok;
+  }
+
+  // Retypes the resident F32 router and shared-expert gate projections to
+  // binary16 after the staged uploads finish (called once the layers are
+  // final, so the DeviceTensor addresses are stable). The 4-byte source
+  // shrinks to 2 bytes, so each retype converts out of place, swaps the
+  // tensor over and frees the original buffer. F32 SGEMM on these skinny
+  // row-major shapes is the prefill/decode router cost the F16 route
+  // halves; any weight magnitude outside the binary16 range fails the load.
+  bool ConvertRouterHalves(std::vector<DeviceLayer>& layers, DeviceLayer* mtp) {
+    struct Job {
+      DeviceTensor* tensor;
+      void* src;
+      std::size_t src_size;
+      void* dst;
+      std::uint32_t* counter;
+      std::string name;
+    };
+    std::vector<Job> jobs;
+    auto want = [&](DeviceTensor& t, const std::string& name) {
+      if (t.empty() || t.type != core::GgmlType::kF32 || !ok) {
+        return;
+      }
+      Job job{
+          &t,
+          t.data,
+          static_cast<std::size_t>(t.rows) * t.cols * t.experts * sizeof(float),
+          nullptr,
+          nullptr,
+          name};
+      const std::size_t count =
+          static_cast<std::size_t>(t.rows) * t.cols * t.experts;
+      if (hipMalloc(&job.dst, count * sizeof(__half)) != hipSuccess) {
+        Fail("hipMalloc failed for F32 retype of " + name);
+        return;
+      }
+      allocations.push_back(job.dst);
+      bytes += count * sizeof(__half);
+      if (hipMalloc(&job.counter, sizeof(std::uint32_t)) != hipSuccess ||
+          hipMemset(job.counter, 0, sizeof(std::uint32_t)) != hipSuccess) {
+        Fail("hipMalloc failed for F32 conversion check of " + name);
+        (void)hipFree(job.dst);
+        allocations.erase(
+            std::find(allocations.begin(), allocations.end(), job.dst));
+        return;
+      }
+      ConvertF32ToHalf(static_cast<const float*>(t.data),
+                       static_cast<__half*>(job.dst), count, job.counter,
+                       nullptr);
+      jobs.push_back(job);
+    };
+    for (std::size_t i = 0; i < layers.size() && ok; ++i) {
+      want(layers[i].router, "layer " + std::to_string(i) + " router");
+      want(layers[i].shexp_gate_inp,
+           "layer " + std::to_string(i) + " shexp_gate_inp");
+    }
+    if (mtp != nullptr && ok) {
+      want(mtp->router, "mtp router");
+      want(mtp->shexp_gate_inp, "mtp shexp_gate_inp");
+    }
+    if (ok && hipDeviceSynchronize() != hipSuccess) {
+      Fail("device sync failed during F32 -> binary16 router retype");
+    }
+    for (Job& job : jobs) {
+      std::uint32_t overflow = 0;
+      if (hipMemcpy(&overflow, job.counter, sizeof(overflow),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        Fail("readback failed for F32 conversion check of " + job.name);
+        break;
+      }
+      if (overflow > 0) {
+        Fail("tensor " + job.name + " has " + std::to_string(overflow) +
+             " F32 values outside the binary16 range");
+        break;
+      }
+      DeviceTensor* t = job.tensor;
+      bytes -= job.src_size;
+      auto slot = std::find(allocations.begin(), allocations.end(), job.src);
+      if (slot != allocations.end()) {
+        allocations.erase(slot);
+      }
+      t->data = job.dst;
+      t->type = core::GgmlType::kF16;
+      t->row_bytes = static_cast<std::size_t>(t->cols) * sizeof(__half);
+      (void)hipFree(job.src);
+    }
+    for (Job& job : jobs) {
+      (void)hipFree(job.counter);
     }
     return ok;
   }
@@ -292,7 +383,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
     m->mtp_ = up.Layer(mtp->block);
     m->has_mtp_ = true;
   }
-  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves()) {
+  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves() ||
+      !up.ConvertRouterHalves(m->layers_, m->has_mtp_ ? &m->mtp_ : nullptr)) {
     return nullptr;
   }
   return m;

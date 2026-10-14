@@ -569,6 +569,26 @@ __global__ void Bf16ToHalfKernel(std::uint16_t* __restrict__ data,
   }
 }
 
+// Out-of-place F32 -> binary16 retype (round to nearest even). Used for the
+// router/gate projections, which the artifact stores as F32; 4 bytes shrink
+// to 2 so the conversion cannot be in place. Overflow is counted exactly as
+// in Bf16ToHalfKernel.
+__global__ void F32ToHalfKernel(const float* __restrict__ src,
+                                __half* __restrict__ dst, std::size_t count,
+                                std::uint32_t* __restrict__ overflow) {
+  std::uint32_t outside = 0;
+  for (std::size_t i =
+           blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const __half h = __float2half_rn(src[i]);
+    outside += __hisinf(h) != 0 || __hisnan(h) ? 1U : 0U;
+    dst[i] = h;
+  }
+  if (outside != 0) {
+    atomicAdd(overflow, outside);
+  }
+}
+
 }  // namespace
 
 void ConvertBf16ToHalf(void* data, std::size_t count, std::uint32_t* overflow,
@@ -581,6 +601,18 @@ void ConvertBf16ToHalf(void* data, std::size_t count, std::uint32_t* overflow,
       std::min<std::size_t>((count + kThreads - 1) / kThreads, 4096);
   Bf16ToHalfKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
       static_cast<std::uint16_t*>(data), count, overflow);
+}
+
+void ConvertF32ToHalf(const float* src, __half* dst, std::size_t count,
+                      std::uint32_t* overflow, hipStream_t stream) {
+  constexpr int kThreads = 256;
+  if (count == 0) {
+    return;
+  }
+  const std::size_t blocks =
+      std::min<std::size_t>((count + kThreads - 1) / kThreads, 4096);
+  F32ToHalfKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      src, dst, count, overflow);
 }
 
 void EmbedRow(const void* base, GemvType type, std::uint32_t row,

@@ -727,10 +727,35 @@ it only pays together with the fork's register-frugal 2.5 template
       **2400.46/2401.04 vs 2349.40/2350.89 (+2.17/+2.13 %)**;
       `gufo_bench_q36ab32.log` pp32768 +0.37/+2.06 %, pp100352 +1.18/+0.62 % —
       candidate won 8/8 pairs in both orders; tg128 within 1σ
-      (45.06/44.97 vs 45.13/45.12). Remaining 4.1 is the F32→half tier for
-      the FP32 `Cijk` SGEMMs (303 ms of the timed pp8192 pass: router
-      256×2048, shexp gate_inp, GDN α/β; 8.3 %) — needs router top-k-flip and
-      KL evidence before retyping.
+       (45.06/44.97 vs 45.13/45.12). Remaining 4.1 is the F32→half tier for
+       the FP32 `Cijk` SGEMMs (303 ms of the timed pp8192 pass: router
+       256×2048, shexp gate_inp, GDN α/β; 8.3 %) — needs router top-k-flip and
+       KL evidence before retyping.
+      **F32 router + shexp gate_inp retyped to binary16 at upload (lever
+      4.1b, now default)**: the router/gate `Cijk_SB` SGEMMs cost 304 ms of
+      the timed pp8192 pass (per-grid split of the profile DB: shapes
+      (2048,64) and (256,64) at 162/143 ms). `ConvertF32ToHalf` (+
+      `F32ToHalfKernel`, out-of-range fail-stop) converts the resident F32
+      `blk.N.ffn_gate` router tensors and `ffn_gate_inp_shexp` to a fresh
+      half buffer after the staging flush (`ConvertRouterHalves`, walking the
+      now-final `layers_`/`mtp_` so `DeviceTensor` addresses are stable),
+      swaps pointer/type/row_bytes and frees the 4-byte original (−83 MB net
+      on this artifact); GDN α/β deliberately stay F32 (long-decay gate drift
+      risk, <1 % stake). Runtime needs no executor change: prefill GEMM takes
+      the existing `kF16` hipBLAS `HIP_R_16F` route (256 rows is below the
+      `DenseF16Gemm` window) and decode the existing `Gemv`/`GemvRows` kF16
+      branches, halving the per-token router bytes too. Gates
+      (`gufo_bench_q36gate41b.log`): the five `qwen36_a3b.rocm_*` kernel
+      suites pass; `rocm_forward` on Q8_K_XL trunk worst-rel
+      0.0082/0.0038/0.0030 and mtp 0.0037 (at or below pre-lever levels —
+      no expert-selection flips); `rocm_inference` CPU/GPU tokens matched.
+      Paired same-revision windows against a fresh 743c2a89 control (worktree
+      rebuilt for isolation): `gufo_bench_q36ab41b.log` pp2048 +0.30/+0.68 %,
+      pp8192 **2391.27/2394.69 vs 2370.08/2378.77 (+0.89/+0.67 %)**, tg128
+      neutral (45.07/45.00 vs 45.10/44.90); `gufo_bench_q36ab41b32.log`
+      pp32768 +1.53/−0.28 %, pp100352 +2.87/−0.25 % (single-rep pairs where
+      the control held the second slot; short-context evidence 4/4 wins is
+      the qualified signal). Remaining 4.1: the GDN α/β SGEMM tier only.
 - [ ] 4.2 Half producers + elementwise/router fusion.
 - [ ] 4.3 MTP width-invariance + hash gate; draft policy.
 - [ ] 4.4 Oracle KL suite + benchmarks.

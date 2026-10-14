@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_GEMV_HPP_
 #define GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_GEMV_HPP_
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -27,6 +28,14 @@ enum class GemvType { kQ8_0, kF32, kBF16, kF16, kQ4_K, kQ5_K };
 /// tensor with a non-zero count at load rather than saturating silently.
 void ConvertBf16ToHalf(void* data, std::size_t count, std::uint32_t* overflow,
                        hipStream_t stream);
+
+/// Converts the resident `count` single-precision values into a freshly
+/// allocated binary16 buffer (out-of-place: the source stays intact for the
+/// caller to free after the conversion syncs), counting values outside the
+/// binary16 range into `overflow` (device uint32, caller-read). `dst` must
+/// hold count * 2 bytes. Same overflow contract as ConvertBf16ToHalf.
+void ConvertF32ToHalf(const float* src, __half* dst, std::size_t count,
+                      std::uint32_t* overflow, hipStream_t stream);
 
 /// out[r] = sum_k W[r][k] * x[k] for r in [0, rows). `base` points at the first
 /// row of a row-major [rows x cols] matrix stored in `type`; `row_bytes` is the
