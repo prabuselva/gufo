@@ -617,6 +617,33 @@ it only pays together with the fork's register-frugal 2.5 template
           quality-safe configuration retains the remaining ~3 %. Both
           experiment patches reverted; HEAD (no fast-math on gemma4)
           stands.
+          **Decode A/B vs fork (measurement only, no code; supersedes
+          lever-5c(d)'s "expert-stream overlap is a tg lever worth
+          prototyping")**: honest same-session per-token walls by the
+          wall-delta method `(T(n-gen 449) - T(n-gen 1))/448` - immune
+          to fork's broken tg timer (`gufo_bench_decab.log`, 3
+          alternating pairs, pp256): **ours 45.36/42.14/42.65 t/s vs
+          fork 21.16/30.41/20.71 t/s - we lead 1.39-2.14x**; fork's
+          inflated tg print was wrong in the flattering-to-them
+          direction. Kernel attribution (`prof.py diff prof_dec_own
+          prof_dec_fork`, same exclusive window): our decode token pass
+          is 87 dispatches, 20.5 ms kernel inside a 21.2 ms span
+          (**96.7 % busy, 0.7 ms idle**) - neither launch- nor
+          sync-bound; the token cost IS the GEMV streaming lines
+          (`GemvQ8_0Vec4`/`GemvGroupedQ8_0`/`GemvQ8_0Multi4Vec4` means
+          90/125/112 us, 222 ms combined in the trace). Fork decode is
+          strictly heavier: 691 ms kernel sum for our 651, an extra
+          exact-Q8 verification stage (`SmallBatchQ8_0ExactFp32VecGEMM`
+          56.9 ms), an extra `RouteGroupedKernel` (25.5) and a generic
+          `KQuantGemvKernel` (123.5); its grouped-decode stream overlap
+          shows on the timeline (busy union 602 vs sum 691) yet the
+          per-token wall degrades - the sync structure costs more than
+          the overlap hides. Stream-overlap decode is therefore NOT a
+          lever and this direction is CLOSED. Remaining decode gains are
+          byte/micro work from the backlog (2.2 width-invariant GEMV +
+          split-K tail, 2.3 quant variants), independent of the fork;
+          separately, the recorded sequential-chain KL drift (1.x/2.2)
+          is the decode item with the largest upside (MTP acceptance).
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —
