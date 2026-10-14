@@ -644,6 +644,31 @@ it only pays together with the fork's register-frugal 2.5 template
           split-K tail, 2.3 quant variants), independent of the fork;
           separately, the recorded sequential-chain KL drift (1.x/2.2)
           is the decode item with the largest upside (MTP acceptance).
+          **Lever 12 (ACCEPTED): dense-FFN up+gate fused into one
+          `GemvMulti` decode launch** (main + draft StepLayer; the qkv
+          fusion pattern applied to `ffn_up`+`ffn_gate`, same input
+          `normed_`, 58→29 launches/token). Bit-identical by
+          construction (`GemvQ8_0Multi4Vec4` per-row body is the same
+          FMA order as `GemvQ8_0Vec4`), confirmed on the candidate:
+          validator lines reproduce the control EXACTLY
+          (kl=0.0004176470 tv=0.0001160507 top1 yes),
+          `gemma4.rocm_kernels` and `rocm_forward` (Passed 24.11 s)
+          green. Paired profiles, same exclusive window, n-gen 96
+          x2/side (`prof_ffnf_{ctrl,cand}{1,2}`): the FFN line moves
+          58x30.6 us = 1.774/1.770 -> 29x59.7 us = 1.732/1.718 ms/tok
+          (**-2.7 % on the line, reproducible**); total decode busy is
+          unchanged within noise (22.23/22.15 ctrl vs 22.34/22.13
+          cand) and paired walls were neutral (session showed ±20 %
+          run-to-run wall noise, same-binary spread 19.8-24.0 ms/tok,
+          so no wall claim is made). Retained for the reproducible
+          line-level win and 30 fewer launches/token with zero
+          numerical risk. KEY MEASUREMENT LESSON: decode GEMV lines
+          are pure-DRAM-bound - merging launches of identical bytes
+          changes nothing beyond per-launch overhead, so only
+          byte-efficiency changes (order-preserving wider loads for
+          the 1e-4 grouped/down lines at 183/180 GB/s, and the
+          186 GB/s o_proj) can move decode; launch-count levers are
+          exhausted (idle was already 7.9 %).
 - [ ] 3.5 Router fused into one GEMM prologue; router-logit rel-err + exact
       top-8 gate. Low priority now: the fork runs the identical
       `hipblasSgemm` + `TopKKernel` (router SGEMM 22.1 ms on both sides —

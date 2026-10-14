@@ -440,10 +440,15 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
       !GemvTypeOf(l.ffn_down.type, &ft)) {
     return Fail(error_msg, "unsupported shared FFN type");
   }
-  Gemv(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes, normed_,
-       up_, nullptr);
-  Gemv(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes, normed_,
-       gate_, nullptr);
+  GemvMultiProj ffn_projs[2] = {
+      {l.ffn_up.data, ft, c.ffn_length, hidden, up_},
+      {l.ffn_gate.data, ft, c.ffn_length, hidden, gate_}};
+  if (!GemvMulti(ffn_projs, 2, normed_, nullptr)) {
+    Gemv(ffn_projs[0].base, ft, c.ffn_length, hidden, l.ffn_up.row_bytes,
+         normed_, up_, nullptr);
+    Gemv(ffn_projs[1].base, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
+         normed_, gate_, nullptr);
+  }
   GegluF32Separate(gate_, up_, act_, c.ffn_length, c.ffn_length, c.ffn_length,
                    nullptr);
   Gemv(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes, act_,
@@ -1039,10 +1044,15 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
         !GemvTypeOf(l.ffn_down.type, &ft)) {
       return Fail(error_msg, "unsupported draft FFN type");
     }
-    Gemv(l.ffn_up.data, ft, dffn, hidden, l.ffn_up.row_bytes, d_normed_, d_up_,
-         nullptr);
-    Gemv(l.ffn_gate.data, ft, dffn, hidden, l.ffn_gate.row_bytes, d_normed_,
-         d_gate_, nullptr);
+    GemvMultiProj dffn_projs[2] = {
+        {l.ffn_up.data, ft, dffn, hidden, d_up_},
+        {l.ffn_gate.data, ft, dffn, hidden, d_gate_}};
+    if (!GemvMulti(dffn_projs, 2, d_normed_, nullptr)) {
+      Gemv(dffn_projs[0].base, ft, dffn, hidden, l.ffn_up.row_bytes, d_normed_,
+           d_up_, nullptr);
+      Gemv(dffn_projs[1].base, ft, dffn, hidden, l.ffn_gate.row_bytes,
+           d_normed_, d_gate_, nullptr);
+    }
     GegluF32Separate(d_gate_, d_up_, d_act_, dffn, dffn, dffn, nullptr);
     Gemv(l.ffn_down.data, ft, hidden, dffn, l.ffn_down.row_bytes, d_act_,
          d_proj_, nullptr);
