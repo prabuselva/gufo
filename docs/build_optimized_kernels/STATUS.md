@@ -705,7 +705,7 @@ it only pays together with the fork's register-frugal 2.5 template
 
 ## Phase 4 — qwen36_a3b fan-out (nodes 1,2,3,5,6,7,8; GDN: producers only)
 
-- [ ] 4.1 Shared-core dispatch + plan table; kill `kF32`/SGEMM tier.
+- [x] 4.1 Shared-core dispatch + plan table; kill `kF32`/SGEMM tier.
       **BF16 dense projections retyped to binary16 at upload (lever 4.1a, now
       default)**: the gemma4 3.2a port. A GGUF dtype audit of the Q8_K_XL
       artifact found BF16 stored only on the head-tier `blk.39` attention
@@ -778,7 +778,10 @@ it only pays together with the fork's register-frugal 2.5 template
        the α/β SGEMMs are the measured optimum, leaving 4.1's kill-kF32
        ambition closed as not-improvable rather than achieved. Implementation
        reverted to HEAD; kernel suites keep their kF32 contract branches.
-- [ ] 4.2 Half producers + elementwise/router fusion.
+       Closed: the F32 tier surviving in production dispatch is exactly the
+       α/β pair measured as optimal; every other GEMM reaches the model
+       through the shared `kF16`/plan dispatch.
+- [x] 4.2 Half producers + elementwise/router fusion.
       **Lever 4.2a (REJECTED): RMSNorm half-output producers**.
       `RmsNormRows` emits a bit-identical `__float2half_rn` copy of each
       normalized row into the chunk-resident `pf_x_half_`; `Gemm` and the
@@ -813,7 +816,18 @@ it only pays together with the fork's register-frugal 2.5 template
       and 5.1 half producers: added stores inside bandwidth kernels must
       be paired-timed before any consumer fusion is trusted; the profiler
       systematically mis-reads these as wins. Implementation reverted to
-      HEAD; 4.2 stays open for the elementwise/router half.
+      HEAD.
+      **Closure (measured optimum).** With the half producers closed by
+      4.2a, the control profile (`prof42_ctrl`, mixed-capture basis) leaves
+      every remaining elementwise/router candidate below the paired-window
+      noise floor: `RmsNormKernel` 233 ms, `NarrowHalf` 230 ms (its producer
+      fusion is exactly the rejected 4.2a mechanism), residual `AddKernel`
+      113 ms, `RouterTopKKernel` 47 ms, `SplitQGateKernel` + `RopeKernel`
+      67 ms. The largest fusion available without an added producer store -
+      residual add into RMSNorm - projects ~0.7 % of prefill, under the 1 %
+      band both 4.2a and 4.1c proved the profiler cannot be trusted over.
+      4.2 closes as measured optimum; traffic reductions reopen only with a
+      producer that removes bytes rather than relaying them.
 - [x] 4.3 MTP width-invariance + hash gate; draft policy.
     - Width-invariance (kernel side): closed by existing shape coverage plus
       gemma4 evidence. `GemvRowsQ8_0<N>` already walks Q8_0 weights once for
