@@ -23,10 +23,15 @@ namespace gufo::core::hip::gemm {
 /// generic shape heuristic; the two planned variants reuse each weight or
 /// activation tile across a strip of row tiles so fewer fragments stay live:
 /// kRowGroups8 stages a single K block per step, kStagedRowGroups8 two.
+/// kStaged256 keeps the kAuto 4x2 waves and doubles the K-block stage, and
+/// kTile128 halves the row tile (more blocks per launch); both are measured
+/// selections for the model-private copies of the kernel.
 enum class DenseF16Plan : std::uint8_t {
   kAuto,
   kRowGroups8,
   kStagedRowGroups8,
+  kStaged256,
+  kTile128,
 };
 
 /// out[t][r] = sum_k W[r][k] * x[t][k] for t in [0, batch), r in [0, m), with

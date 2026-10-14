@@ -867,3 +867,39 @@ per-block int32→float scale chain). Recovering it would require changing the
 numerics, which the optimize-kernel contract forbids. The dense-GEMM hunt is
 closed; the remaining prefill gap is the reference's cheaper non-bit-exact
 arithmetic, not a kernel-efficiency gap we can close bit-exactly.
+
+## Retained DenseF16 tier re-budget: staged BK=2, 8×1-wave plan (retained)
+
+**Hypothesis.** The retained wide DenseF16 window (the F16-WMMA route that
+survived as production for `batch >= 96`, dense rows and `cols <= 4096`) runs
+its auto plan `DenseF16GEMMKernel<256,128,1,4,2>` at ~31 TF/s against the
+measured 55.2 TF/s WMMA ceiling, and a clean pp8192 capture put this kernel
+tier at ~3300 ms of 11037 ms busy (30 % of prefill) — enough headroom to re-
+open plan tuning even though the *arithmetic* question stayed closed.
+
+**Change.** `tests/models/qwen36_a3b/dense_f16_bench.cpp` now races five wide
+tile plans over the six production shapes (attn q/o, GDN qkv/gate/out,
+shared-expert down) at batch 2048 against a strided double reference:
+the auto 4×2-wave single-stage, `<256,128,2,4,2>`, and `<128,128,1,4,2>`
+(both kept as explicit `DenseF16Plan` enum values), plus two 8×1-wave
+variants — single-stage and staged (`BK=2`, two K blocks per `__syncthreads`).
+kAuto now selects the staged 8×1 plan when `k >= 2048` and keeps the old
+plan below that; no new switches.
+
+**Measurement (exclusive, median of 15 per launch).** Staged wins every
+`k >= 2048` shape: attn_q 2275.4→2167.9 µs, GDN qkv 2252.9→2196.1,
+GDN gate 1185.9→1163.9, attn_out 1332.5→1199.9, GDN out 1284.0→1201.1
+(0.90–0.98×; 1.02–1.11× speedup) and loses only the `k = 512` shared-expert
+down-projection (185.7→202.9). The two other staged/tile candidates were
+neutral-to-worse and were rejected from kAuto by the bench, not by argument.
+
+**Quality.** Identical per-output K accumulation order in the harness:
+max F16 error matches the auto plan on every shape. All eight
+`qwen36_a3b.rocm_*` gates pass and greedy pp512/tg128 `output_sha256` is
+bit-for-bit the `c5d1ba03` control.
+
+**Verdict: retained.** Same-window paired A/B vs the control binary, three
+alternating pairs each depth (`gufo_bench_ab18.log`): pp2048 +2.03/+0.20/
++2.08 %, pp8192 +1.51/+1.34/+0.98 % — 6/6 pairs, mean ~+1.3 %. Staged-
+through-LDS (two K blocks committed per barrier) is the new production
+default for wide dense shapes.

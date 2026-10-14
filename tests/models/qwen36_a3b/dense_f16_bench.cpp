@@ -101,11 +101,24 @@ double Median(std::vector<float> v) {
   return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+// The wide-batch tile plans under comparison: kAuto (the trunk's measured
+// selection), the single-stage row-groups plan (waves 8x1), the two-K-block
+// staged row-groups plan now kept by kAuto for k >= 2048, the 4x2 waves
+// with a two-K-block stage and a half-row tile.
+constexpr gufo::core::hip::gemm::DenseF16Plan kPlans[] = {
+    gufo::core::hip::gemm::DenseF16Plan::kAuto,
+    gufo::core::hip::gemm::DenseF16Plan::kRowGroups8,
+    gufo::core::hip::gemm::DenseF16Plan::kStagedRowGroups8,
+    gufo::core::hip::gemm::DenseF16Plan::kStaged256,
+    gufo::core::hip::gemm::DenseF16Plan::kTile128,
+};
+constexpr int kNumPlans = 5;
+
 struct Result {
   double int8_us = 0.0;
-  double f16_us = 0.0;
+  double f16_us[kNumPlans] = {0.0};
   double int8_err = 0.0;
-  double f16_err = 0.0;
+  double f16_err[kNumPlans] = {0.0};
   bool f16_supported = false;
 };
 
@@ -169,27 +182,32 @@ Result BenchShape(const Shape& s) {
   }
   r.int8_us = Median(int8_times);
 
-  // --- binary16 WMMA path (F16 activations) ---
-  const bool ok = fn::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(),
-                                   kBatch, s.m, s.k, nullptr);
-  r.f16_supported = ok;
-  if (ok) {
+  // --- binary16 WMMA path (F16 activations), one plan at a time ---
+  bool plan_ok[kNumPlans] = {false};
+  for (int p = 0; p < kNumPlans; ++p) {
+    const bool ok = fn::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(),
+                                     kBatch, s.m, s.k, nullptr, kPlans[p]);
+    plan_ok[p] = ok;
+    r.f16_supported = r.f16_supported || ok;
+    if (!ok) {
+      continue;
+    }
     for (int i = 0; i < kWarmup; ++i) {
       fn::DenseF16Gemm(weights[i % kWeightCopies]->get(), d_xh.get(),
-                       d_out.get(), kBatch, s.m, s.k, nullptr);
+                       d_out.get(), kBatch, s.m, s.k, nullptr, kPlans[p]);
     }
     std::vector<float> f16_times;
     for (int i = 0; i < kReps; ++i) {
       hipEventRecord(ev0);
       fn::DenseF16Gemm(weights[i % kWeightCopies]->get(), d_xh.get(),
-                       d_out.get(), kBatch, s.m, s.k, nullptr);
+                       d_out.get(), kBatch, s.m, s.k, nullptr, kPlans[p]);
       hipEventRecord(ev1);
       hipEventSynchronize(ev1);
       float ms = 0.0F;
       hipEventElapsedTime(&ms, ev0, ev1);
       f16_times.push_back(ms * 1000.0F);
     }
-    r.f16_us = Median(f16_times);
+    r.f16_us[p] = Median(f16_times);
   }
 
   // --- correctness against a double reference on weight copy 0 ---
@@ -199,10 +217,10 @@ Result BenchShape(const Shape& s) {
                      static_cast<int>(s.k), nullptr);
   t::CheckHip(hipDeviceSynchronize(), "int8 sync");
   const std::vector<float> int8_out = t::Download(&d_out, ocount);
-  // binary16 path output.
-  if (ok) {
+  // binary16 path output (plan 0 below, alongside its reference compare).
+  if (plan_ok[0]) {
     fn::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(), kBatch, s.m,
-                     s.k, nullptr);
+                     s.k, nullptr, kPlans[0]);
     t::CheckHip(hipDeviceSynchronize(), "f16 sync");
   }
 
@@ -224,21 +242,28 @@ Result BenchShape(const Shape& s) {
     ref.push_back(static_cast<float>(acc));
     idxs.push_back(i);
   }
-  std::vector<float> int8_sub, f16_sub;
+  std::vector<float> int8_sub;
   int8_sub.reserve(idxs.size());
-  f16_sub.reserve(idxs.size());
   for (const std::size_t i : idxs) {
     int8_sub.push_back(int8_out[i]);
   }
-  if (ok) {
-    const std::vector<float> f16_out = t::Download(&d_out, ocount);
-    for (const std::size_t i : idxs) {
-      f16_sub.push_back(f16_out[i]);
-    }
-  }
   r.int8_err = t::WorstRelativeToScale(ref, int8_sub);
-  if (ok) {
-    r.f16_err = t::WorstRelativeToScale(ref, f16_sub);
+  for (int p = 0; p < kNumPlans; ++p) {
+    if (!plan_ok[p]) {
+      continue;
+    }
+    if (p > 0) {
+      fn::DenseF16Gemm(weights[0]->get(), d_xh.get(), d_out.get(), kBatch, s.m,
+                       s.k, nullptr, kPlans[p]);
+      t::CheckHip(hipDeviceSynchronize(), "f16 plan sync");
+    }
+    const std::vector<float> f16_plan_out = t::Download(&d_out, ocount);
+    std::vector<float> f16_sub;
+    f16_sub.reserve(idxs.size());
+    for (const std::size_t i : idxs) {
+      f16_sub.push_back(f16_plan_out[i]);
+    }
+    r.f16_err[p] = t::WorstRelativeToScale(ref, f16_sub);
   }
 
   hipEventDestroy(ev0);
@@ -257,17 +282,42 @@ int main() {
       "qwen36_a3b dense prefill GEMM: int8 mmq vs binary16 WMMA "
       "(batch=%u, %d weight copies, median of %d reps)\n\n",
       kBatch, kWeightCopies, kReps);
-  std::printf("%-14s %10s %10s %8s %12s %12s\n", "shape", "int8_us", "f16_us",
-              "speedup", "int8_err", "f16_err");
+  static const char* const kPlanNames[kNumPlans] = {"auto", "rg8", "staged",
+                                                    "staged256", "tile128"};
+  std::printf("%-14s %9s", "shape", "int8_us");
+  for (const char* name : kPlanNames) {
+    std::printf("%11s_us", name);
+  }
+  for (int p = 0; p < kNumPlans; ++p) {
+    std::printf("%10s", (p == 0) ? "auto/int8" : "ratio/auto");
+  }
+  std::printf("%12s%12s\n", "int8_err", "f16_err");
   for (const Shape& s : kShapes) {
     const Result r = BenchShape(s);
     if (!r.f16_supported) {
-      std::printf("%-14s %10.1f %10s %8s %12.3e %12s\n", s.name, r.int8_us,
-                  "n/a", "n/a", r.int8_err, "unsupported");
+      std::printf("%-14s %9.1f", s.name, r.int8_us);
+      for (int p = 0; p < kNumPlans; ++p) {
+        std::printf("%11s", "n/a");
+      }
+      for (int p = 0; p < kNumPlans; ++p) {
+        std::printf("%10s", "n/a");
+      }
+      std::printf(" %11.3e %11s\n", r.int8_err, "unsupported");
       continue;
     }
-    std::printf("%-14s %10.1f %10.1f %7.2fx %12.3e %12.3e\n", s.name, r.int8_us,
-                r.f16_us, r.int8_us / r.f16_us, r.int8_err, r.f16_err);
+    double worst_err = 0.0;
+    for (double e : r.f16_err) {
+      worst_err = std::max(worst_err, e);
+    }
+    std::printf("%-14s %9.1f", s.name, r.int8_us);
+    for (int p = 0; p < kNumPlans; ++p) {
+      std::printf("%11.1f", r.f16_us[p]);
+    }
+    for (int p = 0; p < kNumPlans; ++p) {
+      std::printf("%9.2fx", (p == 0) ? r.int8_us / r.f16_us[0]
+                                     : r.f16_us[p] / r.f16_us[0]);
+    }
+    std::printf(" %11.3e %11.3e\n", r.int8_err, worst_err);
   }
   return 0;
 }

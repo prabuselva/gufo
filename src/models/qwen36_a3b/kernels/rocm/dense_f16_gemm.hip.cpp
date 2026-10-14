@@ -311,7 +311,8 @@ __launch_bounds__(256) __global__
 }  // namespace
 
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
-                  std::size_t m, std::size_t k, hipStream_t stream) {
+                  std::size_t m, std::size_t k, hipStream_t stream,
+                  core::hip::gemm::DenseF16Plan plan) {
   if (m == 0 || k == 0 || batch == 0 || k % 32 != 0) {
     return false;
   }
@@ -328,12 +329,32 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
   } else if (batch >= 96) {
     // 64 x 64 wave tiles: half the LDS fragment bytes per matrix product of
     // the 32 x 64 tile (the F16 fragments are twice the int8 ones).
-    constexpr int kWideBM = 256;
     constexpr int kBN = 128;
-    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
-                    static_cast<unsigned int>((m + kWideBM - 1) / kWideBM));
-    hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2>), grid,
-                       dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    const auto grid_for = [&](int bm) {
+      return dim3(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                  static_cast<unsigned int>((m + bm - 1) / bm));
+    };
+    using Plan = core::hip::gemm::DenseF16Plan;
+    // Tuned default: two staged K blocks with the 8x1 waves beat the 4x2
+    // waves on every wide projection with k >= 2048 (1.02x-1.11x in
+    // qwen36_a3b_dense_f16_bench at batch 2048) and lose on the short-K
+    // shared-expert down (k = 512), which keeps the single-stage 4x2 plan.
+    if ((plan == Plan::kAuto && k >= 2048) || plan == Plan::kStagedRowGroups8) {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, kBN, 2, 8, 1>), grid_for(256),
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (plan == Plan::kStaged256) {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, kBN, 2, 4, 2>), grid_for(256),
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (plan == Plan::kTile128) {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<128, kBN, 1, 4, 2>), grid_for(128),
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (plan == Plan::kRowGroups8) {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, kBN, 1, 8, 1>), grid_for(256),
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, kBN, 1, 4, 2>), grid_for(256),
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    }
   } else {
     constexpr int kBN = 64;
     const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),

@@ -882,6 +882,30 @@ it only pays together with the fork's register-frugal 2.5 template
       column is unchanged per the 2026-10-08 reuse precedent (reference tree
       untouched). QUALITY.md MTP-framing rewrite is gemma4-only (no qwen36
       QUALITY.md exists).
+- [x] 4.5 DenseF16 tier plan re-budget — staged 8×1-wave accepted. Clean
+      pp8192 capture (`prof45`) re-budgeted the retained wide DenseF16 route:
+      ~3300 ms/11037 ms busy (30 % of prefill) running ~31 TF/s against the
+      55.2 TF/s WMMA ceiling, so plan tuning reopened (arithmetic unchanged,
+      per-output K order preserved). The bench harness
+      (`tests/models/qwen36_a3b/dense_f16_bench.cpp`, `gufo_bench_plan17.log`)
+      raced five wide tile plans over the six production shapes at batch
+      2048: auto 4×2 single-stage, `<256,128,2,4,2>`, `<128,128,1,4,2>`
+      (both now explicit enum values), and 8×1-wave single-stage vs staged
+      (`BK=2`). kStagedRowGroups8 wins every `k >= 2048` shape
+      (0.90–0.98× of auto; attn_out 1332.5→1199.9 µs best) and loses only
+      `k = 512` (shexp_down 1.09×); the alternate staged-256 and tile-128
+      variants measure neutral-to-worse and stay out of kAuto.
+      kAuto = staged for `k >= 2048`, else the old plan — production default,
+      no switches. Quality: per-shape max F16 error identical across plans;
+      all eight `qwen36_a3b.rocm_*` gates pass (`gufo_bench_gate18.log`,
+      `gufo_bench_gate19.log`) and greedy pp512/tg128 `output_sha256`
+      `006361da…190ab3` is bitwise the `c5d1ba03` control.
+      Accepted lever — same-window paired A/B (`gufo_bench_ab18.log`),
+      control = `c5d1ba03` binary, three alternating pairs per depth,
+      `--speculative off`: pp2048 2518.77/2502.84/2533.09 vs
+      2468.58/2497.82/2481.41 (+2.03/+0.20/+2.08 %), pp8192
+      2438.88/2424.39/2433.34 vs 2402.52/2392.36/2409.61
+      (+1.51/+1.34/+0.98 %) — 6/6 pairs, mean ~+1.3 %.
 
 ## Phase 5 — ling3_flash fan-out (nodes 1,3,5,6,7,8; full-attn occupancy)
 
