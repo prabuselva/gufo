@@ -1,5 +1,6 @@
 #include "src/models/ling3_flash/kernels/rocm/attention.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -693,8 +694,432 @@ __global__ void MlaPrefillKernel(const float* __restrict__ q_abs,
   }
 }
 
-}  // namespace
+// WMMA absorbed-MLA prefill (port of the gemma4 3.4a WMMA attention
+// skeleton, tools/bench/ling3_mla_prefill_bench candidate 4): 16-key tiles,
+// two heads x 16 queries per row block, four waves slicing the 512-dim
+// latent (128 dims + 16 rope each), three-term hi/lo fp16 QK with fp32
+// accumulation (5.1a contract), fp16-P WMMA projection over the same tile's
+// v^T staged from the K rows in registers -- no second KV pass.
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
+__device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+__device__ __forceinline__ v16h LoadFrag(const __half* p) {
+  union {
+    v16h f;
+    uint4 u[2];
+  } cvt;
+  cvt.u[0] = *reinterpret_cast<const uint4*>(p);
+  cvt.u[1] = *reinterpret_cast<const uint4*>(p + 8);
+  return cvt.f;
+}
+
+constexpr std::uint32_t kKeys = 16;
+constexpr std::uint32_t kSlice = 128;  // latent dims per wave
+constexpr std::uint32_t kSliceSteps = kSlice / 16;
+constexpr std::uint32_t kWavesPerRow = 4;  // 512 / kSlice
+constexpr std::uint32_t kLatStride = 520;  // K latent halves rows (pad 8)
+constexpr std::uint32_t kRopeStride = 72;  // K rope halves rows (pad 8)
+constexpr std::uint32_t kVtStride = 16;    // V^T rows, exact (4-way LDS)
+constexpr std::uint32_t kPStride = 24;     // P rows (16B-aligned)
+
+constexpr std::uint32_t cdiv(std::uint32_t a, std::uint32_t b) {
+  return (a + b - 1U) / b;
+}
+
+template<std::uint32_t kHeads>
+__global__ void __launch_bounds__(32U * kWavesPerRow * kHeads)
+    WmmaMlaPrefill(const float* __restrict__ q_abs,
+                   const float* __restrict__ q_rope,
+                   const float* __restrict__ kv, const float* __restrict__ kpe,
+                   float* __restrict__ latent, std::uint32_t start_pos,
+                   std::uint32_t tokens, std::uint32_t heads,
+                   std::uint32_t kv_rank, std::uint32_t rotary, float scale) {
+  constexpr std::uint32_t kRowBlocks = kHeads;
+  constexpr std::uint32_t kThreads = 32U * kWavesPerRow * kHeads;
+  __shared__ __align__(16) __half k_lat[kKeys][kLatStride];
+  __shared__ __align__(16) __half k_lat_lo[kKeys][kLatStride];
+  __shared__ __align__(16) __half k_rope[kKeys][kRopeStride];
+  __shared__ __align__(16) __half k_rope_lo[kKeys][kRopeStride];
+  __shared__ float s_lds[kRowBlocks][kWavesPerRow][16][16];
+  __shared__ __align__(16) __half p_lds[kRowBlocks][2][16][kPStride];
+  __shared__ float row_scale[kRowBlocks][16];
+  __shared__ float row_sum[kRowBlocks][16];
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t wave = __builtin_amdgcn_readfirstlane(tid >> 5U);
+  const std::uint32_t sub = lane & 15U;
+  const std::uint32_t half_id = lane >> 4U;
+  const std::uint32_t rb = wave / kWavesPerRow;
+  const std::uint32_t part = wave % kWavesPerRow;
+  const std::uint32_t dim0 = part * kSlice;
+  const std::uint32_t rdim0 = part * 16U;
+
+  const std::uint32_t q0 = blockIdx.x * 16U;
+  const std::uint32_t head = blockIdx.y * kHeads + rb;
+  const std::uint32_t q_last = min(q0 + 16U, tokens);
+  const std::uint32_t causal_max = start_pos + q_last;
+
+  uint4 q_hi_lat[kSliceSteps], q_lo_lat[kSliceSteps], q_hi_rope, q_lo_rope;
+
+  const std::uint32_t row = q0 + sub;
+  {
+    const bool live = row < tokens;
+    const std::size_t qo =
+        (static_cast<std::size_t>(live ? row : q0) * heads + head) * kv_rank;
+    const std::size_t ro =
+        (static_cast<std::size_t>(live ? row : q0) * heads + head) * rotary;
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kSliceSteps; ++ks) {
+      const float* src = q_abs + qo + dim0 + ks * 16U + half_id * 8U;
+      const float4 f0 = live ? *reinterpret_cast<const float4*>(src)
+                             : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      const float4 f1 = live ? *reinterpret_cast<const float4*>(src + 4)
+                             : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      const __half2 h[4] = {
+          __floats2half2_rn(f0.x, f0.y), __floats2half2_rn(f0.z, f0.w),
+          __floats2half2_rn(f1.x, f1.y), __floats2half2_rn(f1.z, f1.w)};
+      __builtin_memcpy(&q_hi_lat[ks], h, 16);
+      const float2 d0 = __half22float2(h[0]);
+      const float2 d1 = __half22float2(h[1]);
+      const float2 d2 = __half22float2(h[2]);
+      const float2 d3 = __half22float2(h[3]);
+      const __half2 l[4] = {__floats2half2_rn(f0.x - d0.x, f0.y - d0.y),
+                            __floats2half2_rn(f0.z - d1.x, f0.w - d1.y),
+                            __floats2half2_rn(f1.x - d2.x, f1.y - d2.y),
+                            __floats2half2_rn(f1.z - d3.x, f1.w - d3.y)};
+      __builtin_memcpy(&q_lo_lat[ks], l, 16);
+    }
+    {
+      const float* src = q_rope + ro + rdim0 + half_id * 8U;
+      const float4 f0 = live ? *reinterpret_cast<const float4*>(src)
+                             : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      const float4 f1 = live ? *reinterpret_cast<const float4*>(src + 4)
+                             : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      const __half2 h[4] = {
+          __floats2half2_rn(f0.x, f0.y), __floats2half2_rn(f0.z, f0.w),
+          __floats2half2_rn(f1.x, f1.y), __floats2half2_rn(f1.z, f1.w)};
+      __builtin_memcpy(&q_hi_rope, h, 16);
+      const float2 d0 = __half22float2(h[0]);
+      const float2 d1 = __half22float2(h[1]);
+      const float2 d2 = __half22float2(h[2]);
+      const float2 d3 = __half22float2(h[3]);
+      const __half2 l[4] = {__floats2half2_rn(f0.x - d0.x, f0.y - d0.y),
+                            __floats2half2_rn(f0.z - d1.x, f0.w - d1.y),
+                            __floats2half2_rn(f1.x - d2.x, f1.y - d2.y),
+                            __floats2half2_rn(f1.z - d3.x, f1.w - d3.y)};
+      __builtin_memcpy(&q_lo_rope, l, 16);
+    }
+  }
+
+  // Rebuild the duplicated-operand fragment from the owning 8 dims per lane
+  // (gemma4 3.4a kGlobal trick, attention_wmma.hip.cpp:172).
+  const auto q_frag = [&](const uint4& own) -> v16h {
+    const auto swap = [](std::uint32_t v) {
+      return static_cast<std::uint32_t>(__builtin_amdgcn_permlanex16(
+          v, v, 0x76543210U, 0xFEDCBA98U, false, false));
+    };
+    const uint4 other =
+        make_uint4(swap(own.x), swap(own.y), swap(own.z), swap(own.w));
+    union {
+      v16h f;
+      uint4 u[2];
+    } cvt;
+    cvt.u[0] = half_id == 0 ? own : other;
+    cvt.u[1] = half_id == 0 ? other : own;
+    return cvt.f;
+  };
+
+  v8f o_acc[kSliceSteps] = {};
+
+  // Online softmax: every wave runs its kWavesPerRow-th rows of the block.
+  constexpr std::uint32_t kRowsPerPart = 16 / kWavesPerRow;
+  constexpr std::uint32_t kSegLanes = 32 / kRowsPerPart;
+  constexpr std::uint32_t kSegKeys = kKeys / kSegLanes;
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+  const std::uint32_t sm_row = part * kRowsPerPart + lane / kSegLanes;
+  const std::uint32_t sm_seg = lane % kSegLanes;
+  const std::uint32_t sm_query = q0 + sm_row;
+  const std::uint32_t sm_keys = start_pos + min(sm_query, tokens - 1U) + 1U;
+
+  // Staging (one global pass per tile): a thread owns dims [d4, d4+4) of two
+  // consecutive keys, so the transposed V word packs locally with the same
+  // f32x2 -> f16x2 conversion as the K hi/lo split; no cross-lane transpose.
+  // Latent chunk c = tid + j*kThreads maps pair = c % 8, dg = c / 8: the v^T
+  // word at [dim][pair] keeps banks split 4-deep across the warp, while each
+  // 32-byte sector is consumed whole by a lane pair. Rope: one chunk per
+  // lane, key = tid % 16, float4 slot = (tid / 16).
+  constexpr std::uint32_t kLatStage = 4;      // latent chunks per thread-tile
+  float4 a_lat[kLatStage], b_lat[kLatStage];  // keys 2p and 2p+1, dims d4
+  float4 r_own;                               // rope float4, key tid % 16
+
+  const auto fetch = [&](std::uint32_t key0) {
+#pragma unroll
+    for (std::uint32_t j = 0; j < kLatStage; ++j) {
+      const std::uint32_t c = tid + j * kThreads;
+      const std::uint32_t p = c % 8U;   // key pair
+      const std::uint32_t dg = c / 8U;  // float4 group within the row
+      const std::uint32_t base_key = key0 + 2U * p;
+      const bool v0 = base_key < causal_max;
+      const bool v1 = base_key + 1U < causal_max;
+      const std::size_t o0 =
+          static_cast<std::size_t>(v0 ? base_key : 0) * kv_rank + dg * 4U;
+      const std::size_t o1 =
+          static_cast<std::size_t>(v1 ? base_key + 1U : 0) * kv_rank + dg * 4U;
+      a_lat[j] = v0 ? *reinterpret_cast<const float4*>(kv + o0)
+                    : make_float4(0, 0, 0, 0);
+      b_lat[j] = v1 ? *reinterpret_cast<const float4*>(kv + o1)
+                    : make_float4(0, 0, 0, 0);
+    }
+    const std::uint32_t rk = tid % 16U;
+    const std::uint32_t rd = (tid / 16U) * 4U;  // 16 float4 slots over 64 dims
+    const bool v = key0 + rk < causal_max;
+    r_own = v ? *reinterpret_cast<const float4*>(
+                    kpe + static_cast<std::size_t>(key0 + rk) * rotary + rd)
+              : make_float4(0, 0, 0, 0);
+  };
+
+  const auto h2u = [](__half2 v) {
+    return *reinterpret_cast<const std::uint32_t*>(&v);
+  };
+  const auto store_k = [&] {
+#pragma unroll
+    for (std::uint32_t j = 0; j < kLatStage; ++j) {
+      const std::uint32_t c = tid + j * kThreads;
+      const std::uint32_t keyp = 2U * (c % 8U);
+      const std::uint32_t d4 = (c / 8U) * 4U;
+      const __half2 ha[2] = {__floats2half2_rn(a_lat[j].x, a_lat[j].y),
+                             __floats2half2_rn(a_lat[j].z, a_lat[j].w)};
+      const __half2 hb[2] = {__floats2half2_rn(b_lat[j].x, b_lat[j].y),
+                             __floats2half2_rn(b_lat[j].z, b_lat[j].w)};
+      const float2 da0 = __half22float2(ha[0]);
+      const float2 da1 = __half22float2(ha[1]);
+      const float2 db0 = __half22float2(hb[0]);
+      const float2 db1 = __half22float2(hb[1]);
+      const __half2 la[2] = {
+          __floats2half2_rn(a_lat[j].x - da0.x, a_lat[j].y - da0.y),
+          __floats2half2_rn(a_lat[j].z - da1.x, a_lat[j].w - da1.y)};
+      const __half2 lb[2] = {
+          __floats2half2_rn(b_lat[j].x - db0.x, b_lat[j].y - db0.y),
+          __floats2half2_rn(b_lat[j].z - db1.x, b_lat[j].w - db1.y)};
+      *reinterpret_cast<uint2*>(&k_lat[keyp][d4]) =
+          *reinterpret_cast<const uint2*>(ha);
+      *reinterpret_cast<uint2*>(&k_lat_lo[keyp][d4]) =
+          *reinterpret_cast<const uint2*>(la);
+      *reinterpret_cast<uint2*>(&k_lat[keyp + 1][d4]) =
+          *reinterpret_cast<const uint2*>(hb);
+      *reinterpret_cast<uint2*>(&k_lat_lo[keyp + 1][d4]) =
+          *reinterpret_cast<const uint2*>(lb);
+    }
+    const std::uint32_t rk = tid % 16U;
+    const std::uint32_t rd = (tid / 16U) * 4U;
+    const __half2 h[2] = {__floats2half2_rn(r_own.x, r_own.y),
+                          __floats2half2_rn(r_own.z, r_own.w)};
+    const float2 d0 = __half22float2(h[0]);
+    const float2 d1 = __half22float2(h[1]);
+    const __half2 l[2] = {__floats2half2_rn(r_own.x - d0.x, r_own.y - d0.y),
+                          __floats2half2_rn(r_own.z - d1.x, r_own.w - d1.y)};
+    *reinterpret_cast<uint2*>(&k_rope[rk][rd]) =
+        *reinterpret_cast<const uint2*>(h);
+    *reinterpret_cast<uint2*>(&k_rope_lo[rk][rd]) =
+        *reinterpret_cast<const uint2*>(l);
+  };
+  // Scores (bar 1) retire the K region, so it doubles as hi/lo V^T staging
+  // for the CURRENT tile straight from the registers; PV then reads it below.
+  const auto store_vt = [&] {
+    auto* vw_hi = reinterpret_cast<std::uint32_t*>(&k_lat[0][0]);
+    auto* vw_lo = reinterpret_cast<std::uint32_t*>(&k_lat_lo[0][0]);
+#pragma unroll
+    for (std::uint32_t j = 0; j < kLatStage; ++j) {
+      const std::uint32_t c = tid + j * kThreads;
+      const std::uint32_t p = c % 8U;
+      const std::uint32_t d4 = (c / 8U) * 4U;
+      const __half2 ha0 = __floats2half2_rn(a_lat[j].x, b_lat[j].x);
+      const __half2 ha1 = __floats2half2_rn(a_lat[j].y, b_lat[j].y);
+      const __half2 ha2 = __floats2half2_rn(a_lat[j].z, b_lat[j].z);
+      const __half2 ha3 = __floats2half2_rn(a_lat[j].w, b_lat[j].w);
+      const float2 fa0 = __half22float2(ha0);
+      const float2 fa1 = __half22float2(ha1);
+      const float2 fa2 = __half22float2(ha2);
+      const float2 fa3 = __half22float2(ha3);
+      vw_hi[(d4 + 0U) * (kVtStride / 2U) + p] = h2u(ha0);
+      vw_hi[(d4 + 1U) * (kVtStride / 2U) + p] = h2u(ha1);
+      vw_hi[(d4 + 2U) * (kVtStride / 2U) + p] = h2u(ha2);
+      vw_hi[(d4 + 3U) * (kVtStride / 2U) + p] = h2u(ha3);
+      vw_lo[(d4 + 0U) * (kVtStride / 2U) + p] =
+          h2u(__floats2half2_rn(a_lat[j].x - fa0.x, b_lat[j].x - fa0.y));
+      vw_lo[(d4 + 1U) * (kVtStride / 2U) + p] =
+          h2u(__floats2half2_rn(a_lat[j].y - fa1.x, b_lat[j].y - fa1.y));
+      vw_lo[(d4 + 2U) * (kVtStride / 2U) + p] =
+          h2u(__floats2half2_rn(a_lat[j].z - fa2.x, b_lat[j].z - fa2.y));
+      vw_lo[(d4 + 3U) * (kVtStride / 2U) + p] =
+          h2u(__floats2half2_rn(a_lat[j].w - fa3.x, b_lat[j].w - fa3.y));
+    }
+  };
+
+  fetch(0);
+  store_k();
+  __syncthreads();
+
+  for (std::uint32_t key0 = 0; key0 < causal_max; key0 += kKeys) {
+    const bool more = key0 + kKeys < causal_max;
+
+    // Scores over this wave's 9 slices: three terms per 16-dim step, one
+    // accumulator per operand class so the tiny hi*lo and lo*hi corrections
+    // never round against the large hi*hi running sum, then a two-add tree.
+    {
+      v8f acc_hh = {};
+      v8f acc_hl = {};
+      v8f acc_lh = {};
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kSliceSteps; ++ks) {
+        const v16h bh = LoadFrag(&k_lat[sub][dim0 + ks * 16U]);
+        const v16h bl = LoadFrag(&k_lat_lo[sub][dim0 + ks * 16U]);
+        const v16h ah = q_frag(q_hi_lat[ks]);
+        const v16h al = q_frag(q_lo_lat[ks]);
+        acc_hh = Wmma(ah, bh, acc_hh);
+        acc_hl = Wmma(ah, bl, acc_hl);
+        acc_lh = Wmma(al, bh, acc_lh);
+      }
+      {
+        const v16h bh = LoadFrag(&k_rope[sub][rdim0]);
+        const v16h bl = LoadFrag(&k_rope_lo[sub][rdim0]);
+        const v16h ah = q_frag(q_hi_rope);
+        const v16h al = q_frag(q_lo_rope);
+        acc_hh = Wmma(ah, bh, acc_hh);
+        acc_hl = Wmma(ah, bl, acc_hl);
+        acc_lh = Wmma(al, bh, acc_lh);
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        s_lds[rb][part][2 * i + half_id][sub] =
+            (acc_hh[i] + acc_hl[i]) + acc_lh[i];
+      }
+    }
+    __syncthreads();
+
+    // Online softmax for this wave's rows; P goes to p_lds in half.
+    {
+      float vals[kSegKeys];
+      float tile_max = -INFINITY;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kSegKeys; ++m) {
+        const std::uint32_t col = sm_seg * kSegKeys + m;
+        const std::uint32_t key = key0 + col;
+        float s = 0.0F;
+#pragma unroll
+        for (std::uint32_t p = 0; p < kWavesPerRow; ++p) {
+          s += s_lds[rb][p][sm_row][col];
+        }
+        const bool valid = sm_query < q_last && key < sm_keys;
+        vals[m] = valid ? s * scale : -INFINITY;
+        tile_max = fmaxf(tile_max, vals[m]);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSegLanes; off <<= 1) {
+        tile_max =
+            fmaxf(tile_max, __shfl_xor(tile_max, static_cast<int>(off), 32));
+      }
+      const float next_max = fmaxf(running_max, tile_max);
+      const float corr =
+          next_max == -INFINITY ? 1.0F : expf(running_max - next_max);
+      float tile_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kSegKeys; ++m) {
+        const float e = vals[m] == -INFINITY ? 0.0F : expf(vals[m] - next_max);
+        tile_sum += e;
+        const __half eh = __float2half(e);
+        const float ef = __half2float(eh);
+        p_lds[rb][0][sm_row][sm_seg * kSegKeys + m] = eh;
+        p_lds[rb][1][sm_row][sm_seg * kSegKeys + m] = __float2half(e - ef);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSegLanes; off <<= 1) {
+        tile_sum += __shfl_xor(tile_sum, static_cast<int>(off), 32);
+      }
+      running_max = next_max;
+      running_sum = running_sum * corr + tile_sum;
+      if (sm_seg == 0) {
+        row_scale[rb][sm_row] = corr;
+      }
+    }
+    // Scores (barrier above) retired the K region: V^T of the CURRENT tile
+    // stages hi/lo from the registers into it, read after the next barrier.
+    store_vt();
+    if (more) {
+      fetch(key0 + kKeys);
+    }
+    __syncthreads();
+
+    float rsc[8];
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      rsc[i] = row_scale[rb][2 * i + half_id];
+    }
+    bool unchanged = true;
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      unchanged = unchanged && (rsc[i] == 1.0F);
+    }
+    if (!__all(unchanged)) {
+#pragma unroll
+      for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          o_acc[t][i] *= rsc[i];
+        }
+      }
+    }
+    const v16h p_hi = LoadFrag(&p_lds[rb][0][sub][0]);
+    const v16h p_lo = LoadFrag(&p_lds[rb][1][sub][0]);
+#pragma unroll 4
+    for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+      const v16h vh = LoadFrag(reinterpret_cast<const __half*>(&k_lat[0][0]) +
+                               (dim0 + t * 16U + sub) * kVtStride);
+      const v16h vl =
+          LoadFrag(reinterpret_cast<const __half*>(&k_lat_lo[0][0]) +
+                   (dim0 + t * 16U + sub) * kVtStride);
+      o_acc[t] = Wmma(p_hi, vh, o_acc[t]);
+      o_acc[t] = Wmma(p_lo, vh, o_acc[t]);
+      o_acc[t] = Wmma(p_hi, vl, o_acc[t]);
+    }
+    __syncthreads();
+    // PV retired this tile's V; the registers retired at store_vt above.
+    // Prefetch, K-stage and barrier complete the 4-sync cadence.
+    if (more) {
+      store_k();
+      __syncthreads();
+    }
+  }
+
+  if (sm_seg == 0) {
+    row_sum[rb][sm_row] = running_sum;
+  }
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t i = 0; i < 8; ++i) {
+    const std::uint32_t r = 2 * i + half_id;
+    const std::uint32_t token = q0 + r;
+    if (token >= tokens) {
+      continue;
+    }
+    const float l = row_sum[rb][r];
+    const float inv = l > 0.0F ? 1.0F / l : 0.0F;
+    const std::size_t at =
+        (static_cast<std::size_t>(token) * heads + head) * kv_rank + dim0 + sub;
+#pragma unroll
+    for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+      latent[at + t * 16U] = o_acc[t][i] * inv;
+    }
+  }
+}
+
+}  // namespace
 std::uint32_t MlaDecodeTiles(std::uint32_t n_pos, std::uint32_t tile) {
   return (n_pos + tile - 1U) / tile;
 }
@@ -730,6 +1155,14 @@ void MlaPrefill(const float* q_abs, const float* q_rope, const float* kv,
                 std::uint32_t kv_rank, std::uint32_t rotary, float scale,
                 hipStream_t stream) {
   if (tokens == 0U || kv_rank > kPrefillMaxKv || rotary > kPrefillMaxRot) {
+    return;
+  }
+  if (kv_rank == kPrefillFusedKv && rotary == 2U * 32U && heads >= 2U &&
+      (heads & 1U) == 0U) {
+    WmmaMlaPrefill<2U>
+        <<<dim3((tokens + 15U) / 16U, heads / 2U), 256U, 0, stream>>>(
+            q_abs, q_rope, kv, kpe, latent, start_pos, tokens, heads, kv_rank,
+            rotary, scale);
     return;
   }
   if (kv_rank == kPrefillFusedKv && rotary == 2U * 32U) {

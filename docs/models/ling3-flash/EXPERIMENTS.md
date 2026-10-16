@@ -342,3 +342,61 @@ pp4096 1065.16, pp8192 798.14, pp16384 529.77) moves the reference
 crossing past 16K — Gufo now leads the 16K cell too (+4.4 % vs the
 ROCm reference). The quadratic `MlaPrefillFusedKernel` remains the
 depth bottleneck (entry above).
+
+WMMA hi/lo MLA prefill attention (`5.3c`) — ACCEPTED (October 16,
+`docs/build_optimized_kernels/STATUS.md` lever 5.3c). Reopens the 5.1
+WMMA attention ruling by removing its root cause instead of repeating
+its design: the 5.1 attempt fetched each `(row, dim-group)` thread's V
+values as 256 scattered global loads per lane per 16-key tile and died
+LSU-issue-bound (7.6× slower than fused at unit-scale activations,
+`gufo_bench_rp51.log`). `WmmaMlaPrefill` keeps every dot — QK *and*
+P·V — on `v_wmma_f32_16x16_16_f16_w32` and stages the K and transposed
+V blocks into the *same* LDS tile, filled by the coalesced float2
+loads the K region already performs: zero extra global traffic, one
+4-barrier staging block, no per-lane V fetch. Q and K enter as hi/lo
+`__half` pairs (5.1a contract) over the 512 latent + 64 rope dims, one
+wave-pair per 32 rows, online softmax, P re-staged as its own hi/lo
+pair (hi plane + largest-remainder residual). Dispatch: `MlaPrefill`
+routes `kv_rank == 512, rotary == 64`, even heads ≥ 2 to
+`WmmaMlaPrefill<2U>`; everything else keeps fused.
+
+The quality contract nearly killed it before the timing did: ctest
+failed at 5.6e-4/6.2e-4 against the 5e-4 element-wise criterion
+(0/37, 5/32) and a bisect with a ctest-metric mode in the bench
+(`wmma` gate prints both `WorstRelative` worsts with the 1e-3 floor
+from `hip_test.hpp`) showed the failing elements sit at `|ref| ≈ 1e-3`
+(absolute budget ≈ 4e-7), candidate 7.2e-7 vs fused 6e-8 — a real
+12× accuracy gap, not floor inflation. Null probes, each *bit-identical*
+in the metric: the 4th QK term `ql·kl`, the 4th PV term `pl·vl`, fp64
+`o_acc` rescale, fp64 `running_sum`, bypassing the wmma C-operand
+chain into fp32 adds, and full P+V triple-plane (hi+lo+residual)
+representation — the representation and the accumulation width were
+not the source. The decisive probe (per-`(row,key)` scalar fp32 score
+dot replacing the wmma sum) halved the metric to 3.798e-4: the score
+accumulator chain was the fingerprint, specifically the tiny hi·lo
+correction products being rounded away as they entered the large
+|Σ| ≈ 22 hi·hi running sum across 30 serial `Wmma` steps. The fix is
+to stop mixing operand classes: `acc_hh`, `acc_hl`, `acc_lh`
+accumulate separately and meet as `(hh + hl) + lh` on the way to
+`s_lds` — one rounding step each, corrections never quantized against
+a partial sum 4 orders larger. Bench worst fell to 2.45e-4/2.91e-4/
+2.04e-4/2.84e-4 on 7/32/64/512-token shapes (fused 5.7e-5–9.3e-5),
+and ctest passes all five prefill shapes at the unmodified 5e-4
+contract; VGPR 237, spill 0, LDS 49408, `expf` softmax (the `__expf`
+swap probed neutral to a bit). Standalone `cand` 1.44× vs shipped
+fused at tok2048/ctx16384 unit scale — the regime the 5.1 replay
+showed is the production one. Re-adding the register-hungry correctness
+scaffolds later (PV-side 3-chain `o_acc` split alone costs +72 VGPR on
+9 tiles and spills) is unnecessary given that margin at this error
+level — the shipped kernel is the measured minimum.
+
+Matched BAAB pair, twice, exclusive, control = the 5.3b build
+bd269b0b (`gufo_bench_53cpair.log`, `gufo_bench_53c16k.log`): pp2048
+1253.04/1258.16 → 1330.17/1333.09 (**+6.2 %/+5.9 %**), pp8192
+803.16/805.29 → **952.95/954.40** (**+18.7 %/+18.5 %**), pp16384
+533.04/533.61 → **668.54/668.67** (**+25.4 %/+25.3 %**), fully
+separated, and tg128 neutral (36.12–36.24 both sides) — the gain
+grows with the quadratic the fused kernel was paying, exactly the
+depth-decay signature this lever existed to fix.
+`--compare` vs the 5.3b control: 0 worse, 1 one-side-only (the new
+kernel, scratch 0).

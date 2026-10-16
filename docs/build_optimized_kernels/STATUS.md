@@ -1096,7 +1096,10 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         only viable if the design keeps each lane's V slice as a
         register byproduct of the score computation (fused's
         PV-for-free property) with the QK dots still on WMMA.
-        Reverted; no 5.1b code landed.
+        Reverted; no 5.1b code landed. (Reopening did land October 16
+        as lever 5.3c: V^T staged in the K region's LDS removes the
+        per-lane fetch, and all dots — scores included — run on WMMA;
+        measured +18–25 % at pp8192/pp16384, see 5.3c.)
 - [~] 5.2 Decode-frontier depth cost. Profiling attribution done
       (`/tmp/opencode/prof52_d{0,2048,8192}`, decode windows time-split
       from the rep-2 prep prefill): the depth scaling is entirely
@@ -1249,6 +1252,41 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             m/k macro-tiles (512×128 and 128×512 over padded 64-row
             tiles), well off the tier peak yet clearly ahead of the
             scalar GEMV rate.
+    - [x] 5.3c ACCEPTED — WMMA hi/lo MLA prefill attention
+            (`MlaPrefillWmma` route realized): `WmmaMlaPrefill<2U>`
+            dispatches from `MlaPrefill` for `kv_rank == 512`,
+            `rotary == 64`, even heads ≥ 2; all other shapes keep
+            fused. One wave-pair per 32 query rows scores 512 latent
+            + 64 rope dims on `v_wmma_f32_16x16x16_f16_w32` with
+            hi/lo `__half` pairs on both sides of every QK *and* PV
+            dot, online softmax to a hi/lo P pair, and V^T staged in
+            the *same* LDS block as K via the coalesced loads K
+            already performs — the 5.1 ruling's per-lane 256-load
+            global V fetch is gone, which is what the production
+            replay had blamed (unit-scale 7.6× regression). Quality:
+            a bench ctest-metric bisect localized the contract fail
+            (5.6e-4/6.2e-4 vs 5e-4, worst elements at the 1e-3
+            `WorstRelative` floor) to the *score accumulator chain*,
+            not the representation: null bit-identical probes were
+            the 4th QK/PV terms, fp64 rescale, fp64 `running_sum`,
+            wmma C-chain bypass and full triple-plane P+V; a scalar
+            fp32 score dot halved the metric, proving the hi·lo
+            corrections rounded away against the |Σ| ≈ 22 hi·hi
+            partial. Splitting the score into per-operand-class
+            accumulators (`acc_hh`/`acc_hl`/`acc_lh`, two-add tree
+            into `s_lds`) passes all five prefill shapes at the
+            unmodified 5e-4 contract (bench worst 2.45e-4–2.91e-4
+            vs fused 6e-5–9.3e-5); VGPR 237, spill 0, `expf`
+            softmax (`__expf` probe neutral). Standalone replay-
+            regime gain 1.44× at tok2048/ctx16384 unit scale.
+            Matched BAAB ×2, exclusive, control = 5.3b bd269b0b
+            (`gufo_bench_53cpair.log`, `gufo_bench_53c16k.log`):
+            pp2048 1253.04/1258.16 → 1330.17/1333.09
+            (**+6.2 %/+5.9 %**), pp8192 803.16/805.29 →
+            952.95/954.40 (**+18.7 %/+18.5 %**), pp16384
+            533.04/533.61 → 668.54/668.67 (**+25.4 %/+25.3 %**),
+            tg128 neutral; `--compare` 0 worse, new kernel
+            scratch-0.
       - Remaining toward 5.3: the shared
         `DenseF16Plan`/staged-barrier work (4.5 donor), and the
         producer fusion only behind the recorded 4.2a dead-store

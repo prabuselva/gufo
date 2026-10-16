@@ -9,9 +9,10 @@ AMD Strix Halo `gfx1151`, 128 GB unified memory.
 backends: ROCm (`GGML_HIP=ON`, gfx1151 fatbin, HIP 7.15.26333, `GGML_NATIVE=OFF`)
 and Vulkan (`GGML_VULKAN=ON`, Release, RADV `STRIX_HALO`). Prefill and
 decode Gufo columns refreshed October 16, 2026 on HEAD `0554f35f` + the
-accepted `__expf` fused-softmax, `5.3a` binary16 router/WMMA and `5.3b`
-head-bucket MLA route (see `EXPERIMENTS.md`) as `build/release/gufo`,
-log `gufo_bench_53bgrid.log`. The model loads on
+accepted `__expf` fused-softmax, `5.3a` binary16 router/WMMA, `5.3b`
+head-bucket MLA route and `5.3c` WMMA hi/lo MLA prefill attention (see
+`EXPERIMENTS.md`) as `build/release/gufo`,
+log `gufo_bench_53cgrid.log`. The model loads on
 llama.cpp as arch `bailingmoe3 124B.A5.1B`. Positive gain favors Gufo; all
 cells are single same-session matched runs (Gufo `-r 2`/`-r 3`, llama-bench
 `-r 2`/`-r 3`), except the refreshed Gufo columns (noted below). [Quality evidence](QUALITY.md) ·
@@ -23,30 +24,36 @@ Same prompt length, fresh context, timed prefill phase only on both sides.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| pp2048 | 1248.54 | 659.34 | **+89.4%** | 618.64 | **+101.8%** |
-| pp4096 | 1065.16 | 633.69 | **+68.1%** | 590.35 | **+80.4%** |
-| pp8192 | 798.14 | 583.71 | **+36.7%** | 559.02 | **+42.8%** |
-| pp16384 | 529.77 | 507.39 | **+4.4%** | 504.40 | **+5.0%** |
+| pp2048 | 1334.23 | 659.34 | **+102.4%** | 618.64 | **+115.7%** |
+| pp4096 | 1191.96 | 633.69 | **+88.1%** | 590.35 | **+101.9%** |
+| pp8192 | 928.43 | 583.71 | **+59.1%** | 559.02 | **+66.1%** |
+| pp16384 | 670.12 | 507.39 | **+32.1%** | 504.40 | **+32.9%** |
 
 Gufo now wins at every measured depth, but still decays faster with
-depth than the references: 1249→530 (−58%) across the 8× range against
-659→507 (−23%) on both llama.cpp backends, so the 16K lead is only
-+4.4%. After the October 15 `__expf` online-softmax lever the column
+depth than the references: 1334→670 (−50%) across the 8× range against
+659→507 (−23%) on both llama.cpp backends; after the `5.3c` WMMA hi/lo
+MLA prefill attention the 16K lead is **+32%**. After the October 15
+`__expf` online-softmax lever the column
 read 868→446 with a −12% 16K gap; the binary16 router retype and WMMA
 route (`5.3a`, `EXPERIMENTS.md`) lifted every depth to 1074→496 with
 the crossing landing exactly at 16K, and the head-bucket WMMA route for
 the absorbed MLA `k_b`/`v_b` projections (`5.3b`, same doc — heads as
 virtual experts on the routed F16 tier) lifted it again to 1249→530
 (+16/+13/+9/+7% over the 5.3a cells at 2048/4096/8192/16384; matched
-BAAB against the 5.3a build +14.5/+9.9% at pp2048/pp8192). The depth
-decay remains attributed to the non-WMMA fp32 MLA prefill kernel:
+BAAB against the 5.3a build +14.5/+9.9% at pp2048/pp8192). The decay
+that remained was the non-WMMA fp32 MLA prefill kernel:
 61.5 % of device time at 16K at ≈ 3.2 TF/s against a 55.25 TFLOPS WMMA
 ceiling, while the reference engines cross the same shape in WMMA tiers
 (`EXPERIMENTS.md`; the ROCm reference is not special — Vulkan matches
-it here). The October 16 Gufo column is the standard-grid run
-`gufo_bench_53bgrid.log` on the `5.3b` build; its paired evidence
-against the rebuilt `5.3a` control is `gufo_bench_53bpair2.log`, the
-earlier `5.3a` refresh `gufo_bench_bench53ab.log` (control `5.4b`,
+it here). `5.3c` puts that kernel — scores and P·V — on the tensor
+cores (matched BAAB against the `5.3b` build: +6.2/+18.7/+25.4 % at
+pp2048/pp8192/pp16384, `gufo_bench_53cpair.log`,
+`gufo_bench_53c16k.log`); the residual −50 % vs −23 % decay is not yet
+attributed to a single kernel. The October 16 Gufo column is the standard-grid run
+`gufo_bench_53cgrid.log` on the `5.3c` build; paired evidence for
+earlier refreshes is `gufo_bench_53bpair2.log` (`5.3b` vs the rebuilt
+`5.3a` control), the earlier `5.3a` refresh `gufo_bench_bench53ab.log`
+(control `5.4b`,
 `gufo_bench_ba53a.log`), and the `__expf`-window refresh used
 `gufo_bench_expf_ab.log`, `gufo_bench_pp4096ab.log` (control drift
 ≤0.7%, gains +3.0/+5.0/+8.4/+10.9%).
