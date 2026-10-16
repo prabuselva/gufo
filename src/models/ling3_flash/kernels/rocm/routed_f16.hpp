@@ -48,6 +48,20 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::uint32_t n_tokens, std::uint32_t k,
                    std::uint32_t n_experts, hipStream_t stream);
 
+/// Tile list for head-grouped buckets (the absorbed MLA per-head projections,
+/// where every token visits every head). The histograms are uniform, so the
+/// list `[e | (j << 16)]` for e < heads and j < ceil(tokens / tile_rows)
+/// builds on the device with no host fetch; `tiles` needs that many entries.
+void HeadTiles(std::int32_t* tiles, std::uint32_t heads, std::uint32_t tokens,
+               std::uint32_t tile_rows, hipStream_t stream);
+
+/// Narrows the first `cols` halves of each of `rows` strided F32 rows to F16
+/// packed rows: out[r * cols + c] = half(x[r * x_stride + c]). The k_b query
+/// projection contracts over the nope part of the raw query row only.
+void NarrowRowsStripped(const float* x, __half* out, std::size_t rows,
+                        std::uint32_t x_stride, std::uint32_t cols,
+                        hipStream_t stream);
+
 /// Routed F16 WMMA expert GEMM. `w` is the [n_experts][m][k] weight tensor in
 /// `type`; `x` is the F16 activation rows indexed by `rows_in`; `tiles`
 /// [n_tiles] packs the expert in the low 16 bits and the token macro-tile

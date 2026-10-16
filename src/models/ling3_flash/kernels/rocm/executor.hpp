@@ -321,7 +321,12 @@ private:
   std::int32_t* pf_cursors_{nullptr};   ///< [num_experts] scatter scratch.
   std::int32_t* pf_rows_tok_{nullptr};  ///< compact row -> token / slot.
   std::int32_t* pf_rows_slot_{nullptr};
-  std::int32_t* pf_tiles_{nullptr};     ///< compacted (expert, tile) list.
+  std::int32_t* pf_tiles_{nullptr};  ///< compacted (expert, tile) list.
+  __half* pf_qnc_{nullptr};  ///< [rows * heads][nope] slot-major F16 queries.
+  std::int32_t* pf_hbounds_{nullptr};  ///< head-bucket starts [heads + 1].
+  std::int32_t* pf_hcursors_{
+      nullptr};                       ///< [heads] head-bucket scatter scratch.
+  std::int32_t* pf_htiles_{nullptr};  ///< head-bucket (head, tile) list.
   std::int32_t* pf_zero_ids_{nullptr};  ///< [rows] zeros (F32 router grouping).
   std::int32_t* pf_head_ids_{nullptr};  ///< [rows * heads] slot -> head id.
   std::int32_t* pf_drows_{nullptr};     ///< dense identity row map for a chunk.

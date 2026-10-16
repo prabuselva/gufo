@@ -1,11 +1,15 @@
 #include "src/models/ling3_flash/kernels/rocm/device_model.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/models/ling3_flash/kernels/rocm/gemv.hpp"
 
 namespace gufo::models::ling3_flash::rocm {
 namespace {
@@ -101,6 +105,93 @@ struct Uploader {
     d.nextn_shared_head_norm = Copy(l.nextn_shared_head_norm);
     return d;
   }
+
+  // Retypes the resident F32 router matrices to binary16 out of place (the
+  // port of qwen36 lever 4.1b): 4 bytes shrink to 2 so each router is
+  // converted into a fresh buffer, swapped over and freed, halving both the
+  // prefill router GEMM's weight traffic and the per-token decode read.
+  // Runs after the staging flush, when layers_ / mtp_ are final and the
+  // DeviceTensor addresses are stable; any weight magnitude outside the
+  // binary16 range fails the load.
+  bool ConvertRouters(std::vector<DeviceLayer>& layers, DeviceLayer* mtp) {
+    struct Job {
+      DeviceTensor* tensor;
+      void* src;
+      std::size_t src_size;
+      void* dst;
+      std::uint32_t* counter;
+      std::string name;
+    };
+    std::vector<Job> jobs;
+    auto want = [&](DeviceTensor& t, const std::string& name) {
+      if (t.empty() || t.type != core::GgmlType::kF32 || !ok) {
+        return;
+      }
+      Job job{
+          &t,
+          t.data,
+          static_cast<std::size_t>(t.rows) * t.cols * t.experts * sizeof(float),
+          nullptr,
+          nullptr,
+          name};
+      const std::size_t count =
+          static_cast<std::size_t>(t.rows) * t.cols * t.experts;
+      if (hipMalloc(&job.dst, count * sizeof(__half)) != hipSuccess) {
+        Fail("hipMalloc failed for F32 retype of " + name);
+        return;
+      }
+      allocations.push_back(job.dst);
+      bytes += count * sizeof(__half);
+      if (hipMalloc(&job.counter, sizeof(std::uint32_t)) != hipSuccess ||
+          hipMemset(job.counter, 0, sizeof(std::uint32_t)) != hipSuccess) {
+        Fail("hipMalloc failed for F32 conversion check of " + name);
+        (void)hipFree(job.dst);
+        allocations.erase(
+            std::find(allocations.begin(), allocations.end(), job.dst));
+        return;
+      }
+      ConvertF32ToHalf(static_cast<const float*>(t.data),
+                       static_cast<__half*>(job.dst), count, job.counter,
+                       nullptr);
+      jobs.push_back(job);
+    };
+    for (std::size_t i = 0; i < layers.size() && ok; ++i) {
+      want(layers[i].router, "layer " + std::to_string(i) + " router");
+    }
+    if (mtp != nullptr && ok) {
+      want(mtp->router, "mtp router");
+    }
+    if (ok && hipDeviceSynchronize() != hipSuccess) {
+      Fail("device sync failed during F32 -> binary16 router retype");
+    }
+    for (Job& job : jobs) {
+      std::uint32_t overflow = 0;
+      if (hipMemcpy(&overflow, job.counter, sizeof(overflow),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        Fail("readback failed for F32 conversion check of " + job.name);
+        break;
+      }
+      if (overflow > 0) {
+        Fail("tensor " + job.name + " has " + std::to_string(overflow) +
+             " F32 values outside the binary16 range");
+        break;
+      }
+      DeviceTensor* t = job.tensor;
+      bytes -= job.src_size;
+      auto slot = std::find(allocations.begin(), allocations.end(), job.src);
+      if (slot != allocations.end()) {
+        allocations.erase(slot);
+      }
+      t->data = job.dst;
+      t->type = core::GgmlType::kF16;
+      t->row_bytes = static_cast<std::size_t>(t->cols) * sizeof(__half);
+      (void)hipFree(job.src);
+    }
+    for (Job& job : jobs) {
+      (void)hipFree(job.counter);
+    }
+    return ok;
+  }
 };
 
 }  // namespace
@@ -140,6 +231,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
     m->has_mtp_ = true;
   }
   if (!up.ok || !stager->Finish(error_msg)) {
+    return nullptr;
+  }
+  if (!up.ConvertRouters(m->layers_, m->has_mtp_ ? &m->mtp_ : nullptr)) {
     return nullptr;
   }
   return m;

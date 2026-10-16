@@ -301,19 +301,46 @@ __global__ void GemvQ6K(const Q6KBlock* __restrict__ w,
   }
 }
 
+// F32 output row dot for the router logits and the F32 stack weights. One
+// wave owns one output row in the same strided chain as the CPU contract;
+// four waves share a dispatch, mirroring the quantized Gemv tiers, so the
+// router's thousands of tiny rows cost fewer blocks to schedule.
 __global__ void GemvF32(const float* __restrict__ w,
                         const float* __restrict__ x, float* __restrict__ out,
                         std::uint32_t rows, std::uint32_t cols) {
-  const std::uint32_t r = blockIdx.x;
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
   if (r >= rows) {
     return;
   }
   const float* __restrict__ row = w + static_cast<std::size_t>(r) * cols;
-  const std::uint32_t lane = threadIdx.x;
+  const std::uint32_t lane = threadIdx.x & 31U;
   float acc = 0.0f;
 #pragma unroll 4
   for (std::uint32_t i = lane; i < cols; i += 32) {
     acc += row[i] * x[i];
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
+// Binary16 clone of GemvF32 for the upload-retyped router: the same strided
+// per-lane chain (weights widened with the exact half -> float conversion),
+// so the logits differ from the F32 tier only by the stored weight rounding.
+__global__ void GemvF16(const __half* __restrict__ w,
+                        const float* __restrict__ x, float* __restrict__ out,
+                        std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const __half* __restrict__ row = w + static_cast<std::size_t>(r) * cols;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+#pragma unroll 4
+  for (std::uint32_t i = lane; i < cols; i += 32) {
+    acc += static_cast<float>(row[i]) * x[i];
   }
   acc = WarpReduceSum(acc);
   if (lane == 0) {
@@ -649,8 +676,13 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
   }
 }
 
-// Grouped expert GEMV for the Q4_K routed gate/up stacks. Same (slot, row)
-// pairing as GemvGroupedQ8_0, walking 256-element super-blocks per wave.
+// Grouped expert GEMV for the Q4_K routed gate/up stacks. A wave walks
+// `Rows` consecutive output rows of one slot together (Rows=1 is the old
+// single (slot, row) pairing). Each row keeps the exact super-block/j
+// chain of the single-pair walk — same block order, same quant unpack,
+// same x elements — so results are bit-identical while two weight streams
+// interleave and the group costs half the blocks to schedule.
+template<std::uint32_t Rows>
 __global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
                                const std::int32_t* __restrict__ ids,
                                std::size_t expert_stride_blocks,
@@ -659,12 +691,14 @@ __global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
                                std::uint32_t x_stride, float* __restrict__ out,
                                std::uint32_t used, std::uint32_t rows,
                                std::uint32_t cols) {
-  const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
-  if (pair >= used * rows) {
+  static_assert(Rows == 1U || Rows == 2U, "one or two rows per wave");
+  const std::uint32_t rows_per_slot = rows / Rows;
+  const std::uint32_t g = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (g >= used * rows_per_slot) {
     return;
   }
-  const std::uint32_t s = pair / rows;
-  const std::uint32_t r = pair - s * rows;
+  const std::uint32_t s = g / rows_per_slot;
+  const std::uint32_t r = (g - s * rows_per_slot) * Rows;
   const std::uint32_t nblocks = cols / 256;
   const Q4KBlock* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
@@ -672,31 +706,47 @@ __global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
   const float* __restrict__ xs =
       x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
-  float acc = 0.0f;
+  float acc[Rows] = {};
   for (std::uint32_t b = 0; b < nblocks; ++b) {
-    const Q4KBlock& blk = row[b];
-    const float d = __half2float(blk.d);
-    const float dmin = __half2float(blk.dmin);
-    const float* xb = xs + b * 256 + lane;
+    const float* __restrict__ xb = xs + b * 256 + lane;
+    float xv[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
-      const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
-      int sc = 0;
-      int mn = 0;
-      Q4ScaleMin(j, blk.scales, sc, mn);
-      acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
-              dmin * static_cast<float>(mn)) *
-             xb[32 * j];
+      xv[j] = xb[32 * j];
+    }
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      const Q4KBlock& blk = row[o * nblocks + b];
+      const float d = __half2float(blk.d);
+      const float dmin = __half2float(blk.dmin);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
+        const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
+        int sc = 0;
+        int mn = 0;
+        Q4ScaleMin(j, blk.scales, sc, mn);
+        acc[o] += (d * static_cast<float>(sc) * static_cast<float>(quant) -
+                   dmin * static_cast<float>(mn)) *
+                  xv[j];
+      }
     }
   }
-  acc = WarpReduceSum(acc);
+#pragma unroll
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    acc[o] = WarpReduceSum(acc[o]);
+  }
   if (lane == 0) {
-    out[pair] = acc;
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      out[s * rows + r + o] = acc[o];
+    }
   }
 }
 
-// Grouped expert GEMV for the Q6_K routed down stacks.
+// Grouped expert GEMV for the Q6_K routed down stacks; same templated
+// consecutive-row walk and per-row bit-exactness as GemvGroupedQ4K.
+template<std::uint32_t Rows>
 __global__ void GemvGroupedQ6K(const Q6KBlock* __restrict__ w,
                                const std::int32_t* __restrict__ ids,
                                std::size_t expert_stride_blocks,
@@ -705,12 +755,14 @@ __global__ void GemvGroupedQ6K(const Q6KBlock* __restrict__ w,
                                std::uint32_t x_stride, float* __restrict__ out,
                                std::uint32_t used, std::uint32_t rows,
                                std::uint32_t cols) {
-  const std::uint32_t pair = blockIdx.x * 4U + (threadIdx.x >> 5);
-  if (pair >= used * rows) {
+  static_assert(Rows == 1U || Rows == 2U, "one or two rows per wave");
+  const std::uint32_t rows_per_slot = rows / Rows;
+  const std::uint32_t g = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (g >= used * rows_per_slot) {
     return;
   }
-  const std::uint32_t s = pair / rows;
-  const std::uint32_t r = pair - s * rows;
+  const std::uint32_t s = g / rows_per_slot;
+  const std::uint32_t r = (g - s * rows_per_slot) * Rows;
   const std::uint32_t nblocks = cols / 256;
   const Q6KBlock* __restrict__ row =
       w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
@@ -718,31 +770,48 @@ __global__ void GemvGroupedQ6K(const Q6KBlock* __restrict__ w,
   const float* __restrict__ xs =
       x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
   const std::uint32_t lane = threadIdx.x & 31U;
-  float acc = 0.0f;
+  float acc[Rows] = {};
   for (std::uint32_t b = 0; b < nblocks; ++b) {
-    const Q6KBlock& blk = row[b];
-    const float d = __half2float(blk.d);
-    const float* xb = xs + b * 256 + lane;
+    const float* __restrict__ xb = xs + b * 256 + lane;
+    float xv[8];
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-      const std::uint8_t qhb = blk.qh[half * 32 + lane];
-      const std::uint8_t q0 = blk.ql[half * 64 + lane];
-      const std::uint8_t q1 = blk.ql[half * 64 + 32 + lane];
 #pragma unroll
       for (int seg = 0; seg < 4; ++seg) {
-        const std::uint8_t byte = (seg & 1) ? q1 : q0;
-        const int low = (seg < 2) ? (byte & 0xF) : (byte >> 4);
-        const int high = (qhb >> (2 * seg)) & 0x3;
-        const auto quant = static_cast<std::int8_t>((high << 4) | low) - 32;
-        const int scale = blk.scales[half * 8 + (lane >> 4) + seg * 2];
-        acc += d * static_cast<float>(scale) * static_cast<float>(quant) *
-               xb[128 * half + 32 * seg];
+        xv[4 * half + seg] = xb[128 * half + 32 * seg];
+      }
+    }
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      const Q6KBlock& blk = row[o * nblocks + b];
+      const float d = __half2float(blk.d);
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const std::uint8_t qhb = blk.qh[half * 32 + lane];
+        const std::uint8_t q0 = blk.ql[half * 64 + lane];
+        const std::uint8_t q1 = blk.ql[half * 64 + 32 + lane];
+#pragma unroll
+        for (int seg = 0; seg < 4; ++seg) {
+          const std::uint8_t byte = (seg & 1) ? q1 : q0;
+          const int low = (seg < 2) ? (byte & 0xF) : (byte >> 4);
+          const int high = (qhb >> (2 * seg)) & 0x3;
+          const auto quant = static_cast<std::int8_t>((high << 4) | low) - 32;
+          const int scale = blk.scales[half * 8 + (lane >> 4) + seg * 2];
+          acc[o] += d * static_cast<float>(scale) * static_cast<float>(quant) *
+                    xv[4 * half + seg];
+        }
       }
     }
   }
-  acc = WarpReduceSum(acc);
+#pragma unroll
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    acc[o] = WarpReduceSum(acc[o]);
+  }
   if (lane == 0) {
-    out[pair] = acc;
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      out[s * rows + r + o] = acc[o];
+    }
   }
 }
 
@@ -873,7 +942,49 @@ __global__ void EmbedRowF32(const float* __restrict__ w,
   }
 }
 
+__global__ void EmbedRowF16(const __half* __restrict__ w,
+                            float* __restrict__ out, std::uint32_t cols) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < cols) {
+    out[idx] = static_cast<float>(w[idx]);
+  }
+}
+
+// Out-of-place F32 -> binary16 retype (round to nearest even) for the
+// upload-time router conversion; 4 bytes shrink to 2 so it cannot be in
+// place. Overflow (inf/NaN in the half result) is counted on the device and
+// read back by the uploader, which fails the load on any hit.
+__global__ void F32ToHalfKernel(const float* __restrict__ src,
+                                __half* __restrict__ dst, std::size_t count,
+                                std::uint32_t* __restrict__ overflow) {
+  std::uint32_t outside = 0;
+  for (std::size_t i =
+           blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const __half h = __float2half_rn(src[i]);
+    outside += __hisinf(h) != 0 || __hisnan(h) ? 1U : 0U;
+    dst[i] = h;
+  }
+  if (outside != 0) {
+    atomicAdd(overflow, outside);
+  }
+}
+
 }  // namespace
+
+void ConvertF32ToHalf(const float* src, __half* dst, std::size_t count,
+                      std::uint32_t* overflow, hipStream_t stream) {
+  constexpr int kThreads = 256;
+  if (count == 0) {
+    return;
+  }
+  const std::size_t blocks = (count + kThreads - 1) / kThreads < 4096
+                                 ? (count + kThreads - 1) / kThreads
+                                 : 4096;
+  F32ToHalfKernel<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      src, dst, count, overflow);
+}
 
 void EmbedRow(const void* base, GemvType type, std::uint32_t row,
               std::uint32_t cols, float* out, hipStream_t stream) {
@@ -923,6 +1034,16 @@ void EmbedRow(const void* base, GemvType type, std::uint32_t row,
       EmbedRowF32<<<grid, block, 0, stream>>>(w, out, cols);
       break;
     }
+    case GemvType::kF16: {
+      const __half* w = static_cast<const __half*>(base) +
+                        static_cast<std::size_t>(row) * cols;
+      const std::size_t block = 256;
+      const std::size_t grid = (cols + block - 1) / block < 65535
+                                   ? (cols + block - 1) / block
+                                   : 65535;
+      EmbedRowF16<<<grid, block, 0, stream>>>(w, out, cols);
+      break;
+    }
   }
 }
 
@@ -957,8 +1078,12 @@ void Gemv(const void* base, GemvType type, std::uint32_t rows,
           static_cast<const Q6KBlock*>(base), x, out, rows, cols);
       break;
     case GemvType::kF32:
-      GemvF32<<<rows, dim3(32), 0, stream>>>(static_cast<const float*>(base), x,
-                                             out, rows, cols);
+      GemvF32<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+          static_cast<const float*>(base), x, out, rows, cols);
+      break;
+    case GemvType::kF16:
+      GemvF16<<<(rows + 3U) / 4U, dim3(128), 0, stream>>>(
+          static_cast<const __half*>(base), x, out, rows, cols);
       break;
   }
 }
@@ -1002,6 +1127,11 @@ void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
             static_cast<const float*>(base), x, x_stride, out, out_stride,     \
             rows, cols);                                                       \
         break;                                                                 \
+      case GemvType::kF16:                                                     \
+        GemvRowsDense<__half, R><<<rows, dim3(32), 0, stream>>>(               \
+            static_cast<const __half*>(base), x, x_stride, out, out_stride,    \
+            rows, cols);                                                       \
+        break;                                                                 \
     }                                                                          \
     break;
   switch (tokens) {
@@ -1036,20 +1166,42 @@ void GemvGrouped(const void* base, GemvType type, std::size_t expert_stride,
           used, rows, cols);
       break;
     case GemvType::kQ4_K:
-      GemvGroupedQ4K<<<grid, dim3(128), 0, stream>>>(
-          static_cast<const Q4KBlock*>(base), ids,
-          expert_stride / sizeof(Q4KBlock), x, slots_per_row, x_stride, out,
-          used, rows, cols);
+      // Two rows per wave whenever the row count allows: the consecutive
+      // pair shares one slot and halves the scheduled blocks; every row
+      // keeps its single-pair chain, so the fold is bit-exact.
+      if (rows % 2U == 0U) {
+        GemvGroupedQ4K<2U><<<(pairs / 2U + 3U) / 4U, dim3(128), 0, stream>>>(
+            static_cast<const Q4KBlock*>(base), ids,
+            expert_stride / sizeof(Q4KBlock), x, slots_per_row, x_stride, out,
+            used, rows, cols);
+      } else {
+        GemvGroupedQ4K<1U><<<grid, dim3(128), 0, stream>>>(
+            static_cast<const Q4KBlock*>(base), ids,
+            expert_stride / sizeof(Q4KBlock), x, slots_per_row, x_stride, out,
+            used, rows, cols);
+      }
       break;
     case GemvType::kQ6_K:
-      GemvGroupedQ6K<<<grid, dim3(128), 0, stream>>>(
-          static_cast<const Q6KBlock*>(base), ids,
-          expert_stride / sizeof(Q6KBlock), x, slots_per_row, x_stride, out,
-          used, rows, cols);
+      if (rows % 2U == 0U) {
+        GemvGroupedQ6K<2U><<<(pairs / 2U + 3U) / 4U, dim3(128), 0, stream>>>(
+            static_cast<const Q6KBlock*>(base), ids,
+            expert_stride / sizeof(Q6KBlock), x, slots_per_row, x_stride, out,
+            used, rows, cols);
+      } else {
+        GemvGroupedQ6K<1U><<<grid, dim3(128), 0, stream>>>(
+            static_cast<const Q6KBlock*>(base), ids,
+            expert_stride / sizeof(Q6KBlock), x, slots_per_row, x_stride, out,
+            used, rows, cols);
+      }
       break;
     case GemvType::kF32:
       GemvGroupedDense<float><<<grid, dim3(128), 0, stream>>>(
           static_cast<const float*>(base), ids, expert_stride / sizeof(float),
+          x, slots_per_row, x_stride, out, used, rows, cols);
+      break;
+    case GemvType::kF16:
+      GemvGroupedDense<__half><<<grid, dim3(128), 0, stream>>>(
+          static_cast<const __half*>(base), ids, expert_stride / sizeof(__half),
           x, slots_per_row, x_stride, out, used, rows, cols);
       break;
     // Q5_K only backs the dense attention-output projections; the routed

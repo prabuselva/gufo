@@ -130,6 +130,7 @@ __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
          : kType == WeightType::kQ6_K ? (k / 256) * kQ6KBlockBytes
          : kType == WeightType::kQ5_1 ? (k / 32) * sizeof(Q5_1Block)
          : kType == WeightType::kBF16 ? k * 2
+         : kType == WeightType::kF16  ? k * 2
                                       : (k / 32) * sizeof(Q8_0Block);
 }
 
@@ -195,12 +196,15 @@ __launch_bounds__(256) __global__
   constexpr bool kQ8 = kType == WeightType::kQ8_0;
   constexpr bool kQ6K = kType == WeightType::kQ6_K;
   constexpr bool kBF16 = kType == WeightType::kBF16;
+  constexpr bool kF16 = kType == WeightType::kF16;
   constexpr bool kKQuant = kType == WeightType::kQ4_K || kQ5K;
   static_assert(!kQ6K || !kPair, "Q6_K gate/up runs as two plain GEMMs");
   // 16-byte code chunks per row and stage: Q4_K's nibble pair and Q5_1's
   // two nibble blocks are two, Q8_0's two byte blocks and Q6_K's merged
-  // byte codes are four, and BF16's 64-byte K block is four.
-  constexpr int kChunks = kBF16 ? 4 * BK : ((kQ8 || kQ6K) ? 2 * BK : BK);
+  // byte codes are four, and the 2-byte dense (BF16/F16) 64-byte K block
+  // is four.
+  constexpr int kChunks =
+      kBF16 || kF16 ? 4 * BK : ((kQ8 || kQ6K) ? 2 * BK : BK);
 
   // LDS plan (bytes): the code plane holds BM rows x kChunks 16-byte chunks
   // with the chunks of nearby rows permuted so a fragment read (one row per
@@ -360,8 +364,8 @@ __launch_bounds__(256) __global__
         __builtin_memcpy(&f_q6d[u], blk + kQ6KDOffset, 2);
         f_q6ns[u] = (seg >= 2) ? 4 : 0;
         f_q6bs[u] = 2 * seg;
-      } else if constexpr (kBF16) {
-        // A BF16 K block is 32 lanes = 64 bytes = four 16-byte chunks.
+      } else if constexpr (kBF16 || kF16) {
+        // A BF16/F16 K block is 32 lanes = 64 bytes = four 16-byte chunks.
         const auto* u4 =
             reinterpret_cast<const uint4*>(f_ptr[u]) + ((kb0 + f_c) * 4);
         f_bf16[u][0] = u4[0];
@@ -424,7 +428,7 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int u = 0; u < kWaveRowTiles; ++u) {
       const int row = (tid >> 1) + (u * 128);
-      if constexpr (kBF16) {
+      if constexpr (kBF16 || kF16) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           s_codes[swizzle(row, (4 * f_c) + q)] = f_bf16[u][q];
@@ -525,7 +529,7 @@ __launch_bounds__(256) __global__
       __floats2half2_rn(kQ8 ? -1152.0F : -1024.0F, kQ8 ? -1152.0F : -1024.0F);
   const auto compute_stage = [&]() {
     uint4 raw[kWaveRowTiles][BK];
-    if constexpr (!kQ8 && !kQ6K && !kBF16) {
+    if constexpr (!kQ8 && !kQ6K && !kBF16 && !kF16) {
 #pragma unroll
       for (int u = 0; u < kWaveRowTiles; ++u) {
         const int row = (wave_id * 16) + (u * 128) + sub_lane;
@@ -542,8 +546,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
       for (int u = 0; u < kWaveRowTiles; ++u) {
         const int row = (wave_id * 16) + (u * 128) + sub_lane;
-        if constexpr (kBF16) {
-          // BF16: K block kb is chunks 4 kb .. 4 kb + 3 (32 lanes). The
+        if constexpr (kBF16 || kF16) {
+          // BF16/F16: K block kb is chunks 4 kb .. 4 kb + 3 (32 lanes). The
           // first 16 elements feed a_lo, the next 16 a_hi, matching the
           // element order the quantized paths hand to the WMMA fragments.
           const uint4 c0 = s_codes[swizzle(row, (4 * kb) + 0)];
@@ -556,12 +560,16 @@ __launch_bounds__(256) __global__
           __half2 h[8];
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
-            h[i] = Bf16x2ToF16x2(words[i]);
+            // F16 words are already exact binary16 pairs; BF16 carries the
+            // top 16 bits of an F32 and needs the widening.
+            h[i] = kF16 ? __builtin_bit_cast(__half2, words[i])
+                        : Bf16x2ToF16x2(words[i]);
           }
           __builtin_memcpy(&a_lo[u], &h[0], 32);
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
-            h[i] = Bf16x2ToF16x2(words[8 + i]);
+            h[i] = kF16 ? __builtin_bit_cast(__half2, words[8 + i])
+                        : Bf16x2ToF16x2(words[8 + i]);
           }
           __builtin_memcpy(&a_hi[u], &h[0], 32);
         } else if constexpr (kQ6K) {
@@ -930,6 +938,34 @@ __global__ void DenseRowPrepareKernel(std::int32_t* __restrict__ rows_out,
   }
 }
 
+/// Head-grouped tile list: uniform histograms make the expert/tile pair a
+/// pure function of the tile index, so the list needs no host fetch.
+__global__ void HeadTilesKernel(std::int32_t* __restrict__ tiles,
+                                std::uint32_t count,
+                                std::uint32_t tiles_per_head) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const std::uint32_t e = i / tiles_per_head;
+  const std::uint32_t j = i - e * tiles_per_head;
+  tiles[i] = static_cast<std::int32_t>(e | (j << 16U));
+}
+
+/// out[r * cols + c] = half(x[r * x_stride + c]): the packed first `cols`
+/// halves of each strided F32 row (the nope part of a raw MLA query row).
+__global__ void NarrowRowsStrippedKernel(const float* __restrict__ x,
+                                         __half* __restrict__ out,
+                                         std::uint32_t rows, std::uint32_t cols,
+                                         std::uint32_t x_stride) {
+  const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t r = blockIdx.y;
+  if (r < rows && c < cols) {
+    out[static_cast<std::size_t>(r) * cols + c] =
+        __half(x[static_cast<std::size_t>(r) * x_stride + c]);
+  }
+}
+
 inline unsigned Blocks(std::size_t count) {
   return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
@@ -967,6 +1003,23 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
   hipLaunchKernelGGL(RoutedScatterKernel, dim3(Blocks(slots)), dim3(kThreads),
                      0, stream, ids, pad_bounds, cursors, rows_token, rows_slot,
                      static_cast<std::uint32_t>(slots), k);
+}
+
+void HeadTiles(std::int32_t* tiles, std::uint32_t heads, std::uint32_t tokens,
+               std::uint32_t tile_rows, hipStream_t stream) {
+  const std::uint32_t per = (tokens + tile_rows - 1U) / tile_rows;
+  const std::size_t count = static_cast<std::size_t>(heads) * per;
+  hipLaunchKernelGGL(HeadTilesKernel, dim3(Blocks(count)), dim3(kThreads), 0,
+                     stream, tiles, static_cast<std::uint32_t>(count), per);
+}
+
+void NarrowRowsStripped(const float* x, __half* out, std::size_t rows,
+                        std::uint32_t x_stride, std::uint32_t cols,
+                        hipStream_t stream) {
+  hipLaunchKernelGGL(NarrowRowsStrippedKernel,
+                     dim3((cols + 127U) / 128U, static_cast<unsigned>(rows)),
+                     dim3(128), 0, stream, x, out,
+                     static_cast<std::uint32_t>(rows), cols, x_stride);
 }
 
 void DenseRowPrepare(std::int32_t* rows_out, std::int32_t* pad_bounds,
@@ -1031,6 +1084,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, swiglu_limit, out, out_half, m, k, out_stride, nullptr);
       return true;
+    case WeightType::kF16:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kF16, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, swiglu_limit, out, out_half, m, k, out_stride, nullptr);
+      return true;
     case WeightType::kQ5_K:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>), grid,
@@ -1059,7 +1118,7 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       (type == WeightType::kQ4_K || type == WeightType::kQ5_K ||
        type == WeightType::kQ6_K)
           ? 256
-          : (type == WeightType::kBF16 ? 32 : 64);
+          : (type == WeightType::kBF16 || type == WeightType::kF16 ? 32 : 64);
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
       (out_half == nullptr) == (out == nullptr)) {
     return false;
@@ -1132,7 +1191,7 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
       (type == WeightType::kQ4_K || type == WeightType::kQ5_K ||
        type == WeightType::kQ6_K)
           ? 256
-          : (type == WeightType::kBF16 ? 32 : 64);
+          : (type == WeightType::kBF16 || type == WeightType::kF16 ? 32 : 64);
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
       out_half == nullptr) {
     return false;

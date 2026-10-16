@@ -3,15 +3,18 @@
 AMD Strix Halo `gfx1151`, 128 GB unified memory.
 `Ling-3.0-flash-Q4_K_M` (two-shard GGUF). Gufo `bench` and llama.cpp
 `llama-bench`, exclusive GPU (`tools/bench/gpu_exclusive.sh` /
-`tools/bench/bench_bg.sh` + watchdog), greedy. Latest columns: October 11–12,
-2026, Gufo HEAD `b25c42ed` (with direct MLA cache-row writes) as
-`build/release/gufo`, against llama.cpp **b11557** (build `5c8854fd8`,
+`tools/bench/bench_bg.sh` + watchdog), greedy. Reference columns: October
+11–12, 2026, llama.cpp **b11557** (build `5c8854fd8`,
 `-ngl 999`, flash-attn auto), freshly built clean on this host for both
 backends: ROCm (`GGML_HIP=ON`, gfx1151 fatbin, HIP 7.15.26333, `GGML_NATIVE=OFF`)
-and Vulkan (`GGML_VULKAN=ON`, Release, RADV `STRIX_HALO`). The model loads on
+and Vulkan (`GGML_VULKAN=ON`, Release, RADV `STRIX_HALO`). Prefill and
+decode Gufo columns refreshed October 16, 2026 on HEAD `0554f35f` + the
+accepted `__expf` fused-softmax, `5.3a` binary16 router/WMMA and `5.3b`
+head-bucket MLA route (see `EXPERIMENTS.md`) as `build/release/gufo`,
+log `gufo_bench_53bgrid.log`. The model loads on
 llama.cpp as arch `bailingmoe3 124B.A5.1B`. Positive gain favors Gufo; all
 cells are single same-session matched runs (Gufo `-r 2`/`-r 3`, llama-bench
-`-r 2`/`-r 3`). [Quality evidence](QUALITY.md) ·
+`-r 2`/`-r 3`), except the refreshed Gufo columns (noted below). [Quality evidence](QUALITY.md) ·
 [Experiment history](EXPERIMENTS.md)
 
 ## Prefill
@@ -20,17 +23,33 @@ Same prompt length, fresh context, timed prefill phase only on both sides.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| pp2048 | 840.25 | 659.34 | **+27.4%** | 618.64 | **+35.8%** |
-| pp4096 | 732.80 | 633.69 | +15.6% | 590.35 | +24.1% |
-| pp8192 | 576.11 | 583.71 | −1.3% | 559.02 | +3.1% |
-| pp16384 | 402.21 | 507.39 | −20.7% | 504.40 | −20.3% |
+| pp2048 | 1248.54 | 659.34 | **+89.4%** | 618.64 | **+101.8%** |
+| pp4096 | 1065.16 | 633.69 | **+68.1%** | 590.35 | **+80.4%** |
+| pp8192 | 798.14 | 583.71 | **+36.7%** | 559.02 | **+42.8%** |
+| pp16384 | 529.77 | 507.39 | **+4.4%** | 504.40 | **+5.0%** |
 
-Gufo wins short-context prefill decisively but the engines cross between 4K
-and 8K: Gufo decays 840→402 (−52%) with depth while llama.cpp holds
-659→507 (−23%) on both backends, so at 16K Gufo trails by about 20%. This is
-the same prefill-attention decay tracked in `EXPERIMENTS.md`; the reference
-now quantifies how much of it is hardware-ceiling and how much is kernel
-shape (the ROCm reference is not special — Vulkan matches it here).
+Gufo now wins at every measured depth, but still decays faster with
+depth than the references: 1249→530 (−58%) across the 8× range against
+659→507 (−23%) on both llama.cpp backends, so the 16K lead is only
++4.4%. After the October 15 `__expf` online-softmax lever the column
+read 868→446 with a −12% 16K gap; the binary16 router retype and WMMA
+route (`5.3a`, `EXPERIMENTS.md`) lifted every depth to 1074→496 with
+the crossing landing exactly at 16K, and the head-bucket WMMA route for
+the absorbed MLA `k_b`/`v_b` projections (`5.3b`, same doc — heads as
+virtual experts on the routed F16 tier) lifted it again to 1249→530
+(+16/+13/+9/+7% over the 5.3a cells at 2048/4096/8192/16384; matched
+BAAB against the 5.3a build +14.5/+9.9% at pp2048/pp8192). The depth
+decay remains attributed to the non-WMMA fp32 MLA prefill kernel:
+61.5 % of device time at 16K at ≈ 3.2 TF/s against a 55.25 TFLOPS WMMA
+ceiling, while the reference engines cross the same shape in WMMA tiers
+(`EXPERIMENTS.md`; the ROCm reference is not special — Vulkan matches
+it here). The October 16 Gufo column is the standard-grid run
+`gufo_bench_53bgrid.log` on the `5.3b` build; its paired evidence
+against the rebuilt `5.3a` control is `gufo_bench_53bpair2.log`, the
+earlier `5.3a` refresh `gufo_bench_bench53ab.log` (control `5.4b`,
+`gufo_bench_ba53a.log`), and the `__expf`-window refresh used
+`gufo_bench_expf_ab.log`, `gufo_bench_pp4096ab.log` (control drift
+≤0.7%, gains +3.0/+5.0/+8.4/+10.9%).
 llama.cpp ROCm pp2048 repeats agreed within 0.5 tok/s across two exclusive
 sessions (659.30 / 659.34; the run-1 standard deviation reflects one
 clock-ramp rep).
@@ -45,21 +64,49 @@ so pairs are kept as evidence notes rather than table cells.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128 | 33.57 | 33.78 | −0.6% | 41.42 | −19.0% |
-| tg1024 | 32.41 | 34.59 | −6.3% | 41.59 | −22.1% |
+| tg128 | 35.88 | 33.78 | **+6.2%** | 41.42 | −13.4% |
+| tg1024 | 34.92 | 34.59 | **+1.0%** | 41.59 | −16.0% |
 
-Gufo cold decode is on par with the ROCm backend at tg128, 6% behind at
-tg1024, and about 20% behind llama.cpp **Vulkan**, whose decode (41.4–41.6)
-is the strongest decode path measured on this host for the model. llama
+Gufo cold decode now leads the ROCm backend at tg128 and is at parity at
+tg1024, about 15% behind llama.cpp **Vulkan**, whose decode (41.4–41.6)
+is still the strongest decode path measured on this host for the model
+(the column cells are the October 16 `5.3b`-build grid refresh
+`gufo_bench_53bgrid.log`, `-r 3`, against the retained reference runs;
+cumulative 5.2a→5.4b lever
+gains per depth are in the paragraph below). llama
 decode does not slow as it generates (its tg1024 ≥ tg128 on both backends);
-Gufo loses 3.5% from tg128→tg1024. Preparing a 2048-token frontier before
+Gufo loses 2.4% from tg128→tg1024. Preparing a 2048-token frontier before
 timed generation (`gufo bench --n-prompt 0 --n-gen 128,1024 -d 2048`) costs
 Gufo a further ~4–6% (31.40 / 31.35), and the retained `pp2048+tg` blends
 (Gufo `--n-prompt 2048` runs: 33.62 / 32.51 in-pipeline; llama ROCm 93.30,
 Vulkan 108.25 per combined test) indicate llama.cpp's decode is nearly flat
 with cache depth — consistent with its slower depth decay in prefill. The
 decode-frontier depth cost is a concrete Gufo-side follow-up (see
-`EXPERIMENTS.md` open items).
+`EXPERIMENTS.md` open items). After 5.2a (row-broadcast decode scoring,
+October 15, matched BAAB pair in one exclusive window,
+`gufo_bench_ba52a.log`), frontier decode moves tg128 @ d2048
+30.33/30.39 → 31.08/31.17 (**+2.5 %**) and tg128 @ d8192 23.47/23.59 →
+25.69/25.75 (**+9.4 %**), with cold tg128 neutral (+0.7 %); depth
+prefill shares the path (`pp8 @ d8192` 67.56/68.42 → 72.82/72.42,
++7.0 %). The residual @d2048 frontier gap is −7.0 % vs cold, still open.
+5.4a (four rows per block in the F32 GEMV tier, October 15,
+bit-identical, matched BAAB pair `gufo_bench_ba54.log`) lifts decode at
+every depth: tg128 cold 33.71/33.83 → 33.80/34.10 (+0.5 %), @d2048
+32.02/31.99 → 32.60/32.65 (**+1.9 %**), @d8192 27.50/27.75 →
+27.91/27.91 (**+1.0 %**), with `pp8` within noise. 5.4b (two rows per
+wave in the grouped Q4_K/Q6_K tiers, also bit-identical — grouped worst
+errors unchanged to the digit) extends it: matched BAAB pair, twice
+against the same pre-5.4 control (`gufo_bench_ba54b.log`), tg128 cold
+33.39/33.64 → 34.88/35.26 (**+4.7 %** cumulative), @d2048 32.36/31.74 →
+33.51/33.15 (**+3.9 %**), @d8192 27.98/27.31 → 28.92/28.53
+(**+3.9 %**), `pp8` still within noise. 5.3a (binary16 router retype,
+matched BAAB pair, twice, `gufo_bench_ba53a.log`) adds cold tg128
+35.35/35.57 → 35.91/36.04 (+1.6 %/+1.3 %) from the halved decode router
+read on top. 5.3b (head-bucket WMMA route for the absorbed MLA
+prefill projections, October 16) changes no decode path; its dedicated
+decode BAABs are neutral (cold d0 `gufo_bench_53btg.log`,
+`tg128 @ d8192` `gufo_bench_53btgd2.log`) and the cells above are the
+`5.3b` grid refresh.
 
 ## MTP speculative decode
 

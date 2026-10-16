@@ -65,3 +65,280 @@ depth (b11557 reports only blended pair rates), while Gufo loses a further ~4–
 -d 2048`: 31.40/31.35). The decode-frontier depth cost (`MlaDecodePartial`
 scan shape, `KdaDeltaKernel` state readout) is the concrete follow-up; the
 prefill decay remains the biggest known gap to the reference.
+
+`__expf` online softmax — ACCEPTED (October 15, `docs/build_optimized_`
+`kernels/STATUS.md` lever 5.1a). Both `::expf` calls in the fused MLA
+prefill softmax (`MlaPrefillFusedKernel`) became `__expf`. Kernel probe at
+depth (`tools/bench/ling3_mla_prefill_bench.hip`, tok=2048 start=14336):
+836.7 → 705.7 ms (1.19×) at 3.5e-8 maxabs vs the exact-clone probe —
+~4 orders under the 5e-4 error contract. End-to-end paired exclusive
+windows (control = HEAD `0554f35f` without the change, alternating reps):
+pp2048 +3.0%, pp4096 +5.0%, pp8192 +8.4%, pp16384 +10.9% (grid refreshed
+in `BENCHMARKS.md`; 16K gap to llama ROCm −20.7% → −12.0%); gates
+`ling3_flash.rocm_attention/forward/inference/quality` pass (the
+`rocm_mtp_accept` failure reproduces identically on the control binary —
+pre-existing at HEAD, tracked under STATUS 5.6). The same probe pins QK
+dots + softmax at ≈61% of kernel time (PV-only bound 2.57×) and a
+×24-scaled fp64-oracle run rules out single-rounded fp16 QK scores at
+real activation magnitudes (fp16 ULP on a ±1e4 raw score ≈0.4 nats after
+scaling), so the WMMA follow-up (STATUS 5.1b) must accumulate the 3-term
+hi/lo split (`Qh·Kh + Qh·Kl + Ql·Kh`, fp32 accumulate) — this supersedes
+the earlier blanket "WMMA/fp16 attention scores" rejection for the score
+path.
+
+WMMA hi/lo MLA score kernel — REJECTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.1b, reverted). The
+3-term hi/lo-split score route the 5.1a oracle sketch called for was
+built end-to-end (hi/lo fp16 slab pack on the append path,
+`MlaPrefillWmmaKernel` — 8-wave blocks, 32 queries × 512 dims,
+16-key tiles, online softmax, `p == 0` PV skip) and passed the
+numerics gates (`ling3_flash.rocm_attention` 5e-4 contract on the
+full Q4_K_M artifact). The standalone `wmma2` bench win
+(1.66×/1.77× vs shipped fused) was a synthetic-data artifact: at
+×24-scaled random activations the online softmax flushes almost every
+`exp(score − max)` to zero, so both kernels skip nearly all P·V and
+the timing compares QK alone. Paired end-to-end exclusive depths all
+regressed vs the 5.1a control (tok/s): pp2048 541.6 vs 831.7, pp4096
+329.7 vs 739.4, pp8192 188.3 vs 576.0, pp16384 103.3 vs 392.5
+(`gufo_bench_ta51.log`). Paired dispatch profiles
+(`prof51_{cand,ctrl}/prof_results.db`): WMMA averaged 1364.5 ms per
+dispatch vs fused 220.1 ms; at one identical shallow shape fused
+cost 13.66 ms and WMMA 242 ms. ISA dumps ruled out codegen (the
+release-build kernel matches the fast bench build instruction-for-
+instruction; flag bisection found only a 1-register spill toggled by
+`-DNDEBUG`). The decisive probe was bench `replay` mode at production
+cadence (tokens=1024, rows=4096): deep chunk 71.5 ms fused vs 47.6 ms
+wmma at ×24, flipping to 74.0 ms vs 562 ms (7.6×) at unit scale —
+matching production dispatch times, because real MLA activations
+never fire the skip. Mechanism: the fused kernel stages the V
+dimension slice into registers for the QK dot, so the PV update
+adds ~2.5 ms total; a tensor-core score kernel must fetch V
+separately — 256 scattered `float4` global loads per lane per
+16-key tile — and stays LSU-issue-bound (~15× the fused PV). Fixing
+PV with `v_wmma` costs 5–7× the QK tensor work plus hi/lo P
+rounding, capping the route at parity. Ruling: the blanket rejection
+of WMMA/fp16 attention scores stands for this kernel family — a
+tensor-core MLA route is only viable if it keeps PV-for-free (each
+lane's V slice remains a register byproduct of the score dots).
+
+Decode-frontier Pass-A row broadcast — ACCEPTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.2a). The prefill-decay
+follow-up (deep-dive entry above) first needed attribution. Dispatch
+profiles at frontier depths {0, 2048, 8192} (`bench --n-prompt 8
+--n-gen 128 -d $D`, decode windows split from the second-rep prep
+prefill, `/tmp/opencode/prof52_d*`): the depth cost is entirely
+`MlaDecodePartialGroupKernel` (79.4 → 332.8 → 1126.0 µs per call,
+grid 8×{1,9,33}); `KdaDeltaKernel` is depth-flat (41.8–43.4 µs ×
+35 calls/token) and the apparent `KdaDeltaLoopRowSplit` growth is prefill
+router contamination (its only call site is the prefill executor,
+`executor.cpp:1037`). The kernel's Pass A had assigned one warp per
+(staged row, head), so each 256-key tile chunk re-read every row from
+shared memory four times — LDS-issue-bound at ≈34 µs/tile. The fix
+scores one row against all four group queries per warp, holding each
+lane's stripe of the four binary32 query vectors in registers
+(predicated `float4` loads, ≤5/lane): one shared-memory `float4` chain
+per row, exact same term order per score (bit-identical), 34 → 102
+VGPR with no spills and scratch 0. Matched BAAB pair, run twice in one
+exclusive window (control = the 5.1a build, `gufo_bench_ba52a.log`):
+tg128 d0 33.11/33.32 → 33.37/33.52 (cold neutral, launch-bound), d2048
+30.33/30.39 → 31.08/31.17 (+2.5 %), d8192 23.47/23.59 → 25.69/25.75
+(**+9.4 %**); depth-shared prefill piggybacks (`pp8 @ d8192`
+67.56/68.42 → 72.82/72.42, +7.0 %). Quality gates (`rocm_attention`
+incl. the 5e-4 contract, `rocm_forward`, `rocm_inference`,
+`rocm_quality`) pass in the same session (`gufo_bench_q52a.log`, rc 8 =
+the two pre-existing failures only). The frontier gap is narrowed, not
+closed (−7.0 % vs cold at d2048), and cold decode remains launch-bound
+(46–79 % idle in the decode span) — tracked as STATUS 5.2/5.4.
+
+Decode staging double-buffer — REJECTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.2b). After 5.2a, a
+re-profile at d8192 (`/tmp/opencode/prof52b_d8192`) put
+`MlaDecodePartialGroupKernel` at 896.7 µs per call (from 1126.0), ≈27 µs
+per 256-key tile, and the per-chunk cadence looked like one exposed
+global-load latency per 8-key staging step. The candidate staged
+consecutive chunks into alternating shared-memory halves so chunk c+1's
+global loads were in flight during chunk c's Pass A dots and Pass B
+latent mix, replacing the two `__syncthreads()` per chunk with one
+(contents bit-identical; `rocm_attention` passed on the candidate). It
+regressed consistently in a matched BAAB pair, twice, exclusive
+(control = the 5.2a build, `gufo_bench_ba52b.log`): tg128 d0
+34.19/33.62 → 33.64/34.10 (neutral), d2048 32.42/31.98 → 30.52/30.72
+(−4.5 %), d8192 27.98/27.30 → **24.18/23.33 (−15.0 %)**, prefill
+neutral. The doubled LDS (≈25 → 46 kB) leaves room for one 256-thread
+block per CU instead of two: the kernel is LDS-issue/barrier-bound, not
+exposed-load-bound, so removing inter-block overlap costs more than the
+staging latency hides, and the d2048 loss carries the predicted tail
+(72 blocks can no longer co-reside over 54 CUs). Reverted to the 5.2a
+form; the remaining depth cost belongs to vectorizing Pass B's scalar
+re-reads or widening the head group, not to staging pipelining.
+
+Decode Pass-B direct-cache latent mix — REJECTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.2c). The follow-up to
+the staging double-buffer rejection tested the other halving of shared
+traffic: pass B's latent mix reads the KV columns straight from cache
+(fully coalesced along the latent index, per-thread accumulation chains
+and values identical to the staged copy) instead of re-staging every
+chunk into shared memory, with one extra barrier after the score
+exponentials to publish scores and metadata. `rocm_attention` passed and
+global traffic halved, but the matched BAAB pair, twice, exclusive
+(control = the 5.2a build, `gufo_bench_ba52c.log`) was net neutral:
+tg128 d0 34.32/34.11 → 34.11/33.98, d2048 32.35/32.59 → 32.40/32.44,
+d8192 27.99/28.19 → 28.17/28.43 (≤ +1 %), while `pp8 @ d2048` fell
+107.95/107.96 → 105.91/107.47. With 5.2b this brackets the kernel:
+at 2-blocks/CU occupancy the staging sweeps are neither latency- nor
+bandwidth-exposed, so decode-frontier work moves on to checking the
+`kDecodeGroup` 8 register tile or to the launch-side levers (5.4), and
+5.2 stays at its 5.2a gain (−7 % frontier residual at d2048).
+
+F32 GEMV tier — four rows per block — ACCEPTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.4a). The decode-window
+dispatch table (`/tmp/opencode/prof52b_d8192`) attributes 1.67 ms/token
+to `GemvF32`: the F32 router logit GEMV (grid=16384 single-wave blocks,
+40/token, 34.6 µs) and `ssm_beta` (grid=1024, 35/token, 8.4 µs). Both
+launched one output row per 32-thread block; the tier now mirrors the
+quantized launches — `<<<(rows+3)/4, 128>>>` with row `blockIdx.x*4 +
+warp` and a wave-local lane — so each row's strided dot and `__shfl_down`
+reduction chain run unchanged and results are bit-identical (the
+`rocm_gemv` failure set is exactly the parked `GemvRowsQ8` baseline with
+`GemvRowsF32 bit-exact yes`; the full `ling3_flash` suite shows only the
+two known parked fails, `gufo_bench_gemv54`/`gufo_bench_suite54`). The
+matched BAAB pair, twice, exclusive (control = the 5.2a build,
+`gufo_bench_ba54.log`): tg128 d0 33.71/33.83 → 33.80/34.10 (+0.5 %),
+d2048 32.02/31.99 → 32.60/32.65 (+1.9 %), d8192 27.50/27.75 →
+27.91/27.91 (+1.0 %), `pp8` within noise at all depths: the saving is
+block scheduling on thousands of tiny GEMVs, which shows up per token
+rather than in throughput-bound prefill. The grouped Q4_K/Q6_K row
+pairing (≈ 60 % of decode GEMV time, needs paired shared ids) remains
+the open 5.4 piece.
+
+Grouped Q4_K/Q6_K tiers — two rows per wave — ACCEPTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.4b). The routed MoE and
+per-head projections walked one `(slot, row)` pair per wave: decode's
+grouped launches are thousands of short row dots (a handful of
+256-element super-blocks each), where block scheduling and load latency,
+not weight bandwidth, dominated. The two kernels are now templated on
+rows-per-wave and the launcher folds two *consecutive output rows of the
+same slot* per wave (`<2>` whenever `rows` is even, which it always is
+for `expert_ff`, `hidden_size`, `kv_rank` and `v_dim`; odd counts keep
+the old `<1>` walk). Each row keeps the exact super-block/j accumulation
+chain — the x values are loaded once and shared, the two rows only
+interleave their independent weight-stream decodes — so every output is
+bit-identical to the single-pair launch: the gemv test's grouped worst
+errors match the previous run byte-for-byte and the full `ling3_flash`
+suite fails only the two known parked tests
+(`gufo_bench_suite54b`). Matched BAAB pair, twice, exclusive (control =
+the 5.2a build, cumulative with 5.4a, `gufo_bench_ba54b.log`): tg128 d0
+33.39/33.64 → 34.88/35.26 (+4.7 %), d2048 32.36/31.74 → 33.51/33.15
+(+3.9 %), d8192 27.98/27.31 → 28.92/28.53 (+3.9 %), `pp8` within noise.
+Decode is now +4.7 % over the pre-5.4 build at cold context and +3.9 %
+at both frontier depths from the two launch-side levers together; the
+same fold for the MTP-draft grouped tiers (Q4_0/Q8_0) and lever 5.5's
+router/elementwise fusion are the follow-ups.
+
+Head group 4→8 for decode MLA (`kDecodeGroup`) — REJECTED (October 15,
+`docs/build_optimized_kernels/STATUS.md` lever 5.2d). The last frontier
+lever from 5.2 was checked directly: doubling the group to eight heads
+halves the head grid and the cross-group KV re-staging, and the kernel
+built clean (189 VGPR, no spills — the register tile was never the
+blocker), but residency fell from 12 to 8 waves per CU.
+`rocm_attention` passed — the group split changes no accumulation order
+— and the matched BAAB pair, twice, exclusive (control = the accepted
+5.4b build, `gufo_bench_ba52d.log`) split by depth: tg128 d8192
+28.23/28.62 → 29.17/29.46 (**+2.3 %**), where 33 tile-blocks amortize
+over the 54 CUs and halved staging traffic pays, but d2048
+33.74/33.10 → 32.69/33.10 (−1.5 ±1.6 %) and, decisively, cold d0
+35.31/35.09 → 34.79/34.80 (−1.1 % on *both* passes with σ ≤ 0.1): with
+only four blocks in the head dimension a launch has neither
+inter-block nor adequate wave overlap. Reverted to group 4. Combined
+with 5.2b (occupancy via LDS) and 5.2c (traffic removal), the decode
+kernel's frontier cost is now bracketed from three directions: after
+5.2a's row broadcast the remaining depth cost is structural tile work,
+not something staging width, staging locality or group width can
+recover. 5.2 closes at its 5.2a gain.
+
+Binary16 router retype + WMMA prefill route (`5.3a`) — ACCEPTED (October
+15, `docs/build_optimized_kernels/STATUS.md` lever 5.3a). pp-attribution
+on the 5.4b control showed the F32 router `GemvGroupedDense<float>` chain
+consuming 486 ms of the 2514 ms timed pp2048 pass (19.3 %, 80 dispatches
+over 512 × 2560 expert rows). The qwen36 4.1b port removes it: after the
+upload staging flush, `Uploader::ConvertRouters` copies every resident F32
+router into a fresh binary16 buffer and frees the original (−113 MB),
+failing the load outright if any value leaves the binary16 range; prefill
+projects the chunk's router logits through the existing `DenseF16Gemm`
+tier (the kF16 dequant is a word `bit_cast` of the kBF16 fetch path), and
+decode keeps its scalar chain via new `GemvF16`/`EmbedRowF16` kernels on
+half rows, halving the per-token router footprints too. The new WMMA
+instantiations land at 95–103 VGPR with 0 spill (`--compare` vs the 5.4b
+control: no kernel worse); the exclusive `ling3_flash` suite shows only
+the two known parked fails and `rocm_forward`/`rocm_inference`/
+`rocm_quality` pass — no expert-selection flips. Matched BAAB pair,
+twice, exclusive (control = the 5.4b build, `gufo_bench_ba53a.log`):
+pp2048 874.10/872.64 → 1077.77/1078.65 (**+23.3 %/+23.6 %**), pp8192
+631.22/630.66 → 730.76/727.66 (**+15.8 %/+15.4 %**), cold tg128 d0
+35.35/35.57 → 35.91/36.04 (+1.6 %/+1.3 %). The −440 ms/pass at pp2048
+matches the attribution, and the gain dwarfs the donor's +0.9 % because
+Gufo still ran this projection as expert-grouped GEMV. The grouped
+`k_b`/`v_b` MLA GEMV (345 ms) is the next prefill target.
+
+16K depth-decay attribution (measurement-only, October 15). The
+remaining −2.3 % pp16384 cell was attributed with rocpd windows of timed
+pp2048 and pp16384 runs on the same 5.3a build
+(`gufo_bench_prof53b.log`). The MLA prefill kernel is 15.6 % of device
+time at 2048 but 61.5 % at 16384 — attention launches average 17.5 ms at
+2048 while the deepest chunk launches run 370 ms at the end of a 16K
+pass — and every other 16K kernel (routed WMMA GEMM 19.0 %, absorbed
+`k_b`/`v_b` grouped GEMV 6.1 %, the KDA chain) stays linear.
+`MlaPrefillFusedKernel` is pure fp32 VALU: scalar `fmaf` over the shared
+512-wide latent plus 64 rope dims in 16-key tiles with 16-warp blocks,
+no tensor cores. A causal 16384 pass through absorbed MLA costs
+2 · (576+512) · 32 · N(N+1)/2 ≈ 9.35 TFLOP per MLA layer, ≈ 65 TFLOP
+over the seven MLA layers, so the measured ≈ 20.3 s of attention per pass
+is ≈ 3.2 TF/s — 13 % of the measured 23.95 TFLOPS fp32 VALU peak and 6 %
+of the 55.25 TFLOPS WMMA fp16 ceiling; per pair-lane it spends roughly
+48 useful FMAs against a comparable number of shuffle, exp2, causal-mask
+and staging ops, and fp32 shared-memory key staging halves the traffic
+again. llama.cpp crosses the same quadratic in its WMMA tiers, which is
+why both reference backends decay only 23 % across the 8× depth and the
+crossover now lands exactly at 16K. No code changed here: the fix is the
+planned gemma4 3.4a WMMA prefill-attention port, recorded as the
+remaining item of lever 5.3 in `docs/build_optimized_kernels/STATUS.md`.
+
+Head-bucket WMMA route for the absorbed MLA `k_b`/`v_b` (`5.3b`) —
+ACCEPTED (October 16, `docs/build_optimized_kernels/STATUS.md` lever
+5.3b). The 345 ms grouped GEMV left after 5.3a is the two per-head
+projections, whose GGML types (read with the `gguf` Python package:
+`attn_k_b.weight` Q8_0 (128, 512, 32), `attn_v_b.weight` Q6_K
+(512, 128, 32)) both already exist as routed-F16 WMMA
+instantiations, and whose routing is trivial: every token visits
+every head, so the histograms are uniform. The heads become virtual
+experts — one device-built `ExpertCounts` + `RoutedCompact` map per
+MLA layer serves both GEMMs: the slot-indexed scatter rows address
+the [slot][nope] query plane narrowed by the new
+`NarrowRowsStripped` and the [slot][kv_rank] absorbed query plane for
+`k_b`, and the token-indexed gather rows feed the token-major
+attention latent to `v_b`, whose output scatters back by slot. A
+uniform histogram makes the tile list closed-form, `[e | (j << 16)]`,
+so a 12-instruction `HeadTiles` kernel removes the only host fetch.
+The rope tail of the query row is untouched (the attention kernel
+consumes only the stripped nope half) and decode/verify keep their
+bit-identical `GemvGrouped` chains: `rocm_forward`,
+`rocm_inference` and `rocm_quality` pass with only the two parked
+fails (`gufo_bench_53bq.log`), and `--compare` vs the rebuilt 5.3a
+control shows no kernel worse and the two additions scratch-0.
+Matched BAAB pair, twice, exclusive (`gufo_bench_53bpair2.log`):
+pp2048 1083.27/1082.12 → 1240.14/1225.72 (**+14.5 %/+13.3 %**),
+pp8192 731.88/729.66 → 804.45/797.21 (**+9.9 %/+9.3 %**), fully
+separated. The realized −231 ms/pass at pp2048 is about two thirds of
+the 345 ms attribution — per-head buckets run small m/k (512×128 and
+128×512 on padded 64-row tiles), so the tier beats the scalar rate
+without saturating it; at 16384 the realized −2.1 s/pass exactly
+recovers the recorded 6.1 % linear GEMV share (33.0 s → 30.9 s).
+Dedicated decode BAABs are neutral — cold d0 tg128 35.96/35.95 →
+35.89/36.01 (`gufo_bench_53btg.log`), d8192 28.54/28.79 →
+28.54/29.11 (`gufo_bench_53btgd2.log`); the −0.8 % in-pipeline tg128
+after pp8192 is pipeline context, not the untouched decode path. The
+standard grid refresh (`gufo_bench_53bgrid.log`: pp2048 1248.54,
+pp4096 1065.16, pp8192 798.14, pp16384 529.77) moves the reference
+crossing past 16K — Gufo now leads the 16K cell too (+4.4 % vs the
+ROCm reference). The quadratic `MlaPrefillFusedKernel` remains the
+depth bottleneck (entry above).

@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_GEMV_HPP_
 #define GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_GEMV_HPP_
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -16,9 +17,18 @@ namespace gufo::models::ling3_flash::rocm {
 /// The quantized row formats the GEMV tier decodes. The executor maps the
 /// artifact's GGUF type onto this. Q4_K backs most projections; Q5_K the
 /// attention outputs; Q6_K the down projections and v_b stacks; Q8_0 the k_b
-/// and shared-expert stacks; F32 the router, convolutions and side vectors;
-/// Q4_0 the whole MTP draft block.
-enum class GemvType { kQ4_0, kQ8_0, kQ4_K, kQ5_K, kQ6_K, kF32 };
+/// and shared-expert stacks; F16 the router (retyped from F32 at upload by
+/// the device model's ConvertRouterHalves); F32 the convolutions and side
+/// vectors; Q4_0 the whole MTP draft block.
+enum class GemvType { kQ4_0, kQ8_0, kQ4_K, kQ5_K, kQ6_K, kF32, kF16 };
+
+/// Out-of-place F32 -> binary16 retype (round to nearest even) for the
+/// resident router matrices; 4 bytes shrink to 2, so it cannot be in place.
+/// `overflow` receives a device-side count of values outside the binary16
+/// range; the caller fails the load when it is non-zero. Asynchronous on
+/// `stream` (null uses the default stream).
+void ConvertF32ToHalf(const float* src, __half* dst, std::size_t count,
+                      std::uint32_t* overflow, hipStream_t stream);
 
 /// out[r] = sum_k W[r][k] * x[k] for r in [0, rows). `base` points at the first
 /// row of a row-major [rows x cols] matrix stored in `type`; `row_bytes` is the

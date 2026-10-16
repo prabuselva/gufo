@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -41,6 +42,9 @@ bool WeightTypeOf(core::GgmlType t, WeightType* out) {
     case core::GgmlType::kBF16:
       *out = WeightType::kBF16;
       return true;
+    case core::GgmlType::kF16:
+      *out = WeightType::kF16;
+      return true;
     default:
       return false;
   }
@@ -50,15 +54,16 @@ bool WeightTypeOf(core::GgmlType t, WeightType* out) {
 /// can be decoded by the F16 WMMA tier; a trunk format it cannot decode
 /// falls back to the per-token path in Prefill instead of failing Create.
 /// Only the projections this layer kind actually uses are checked: KDA
-/// layers hold no MLA tensors and vice versa, and ssm_beta (F32) plus the
-/// router run on the GEMV tier. The swiglu gate variant only instantiates
-/// three decoders.
+/// layers hold no MLA tensors and vice versa, and ssm_beta (F32) runs on
+/// the GEMV tier while the router (converted to binary16 at upload) projects
+/// through the WMMA tier. The swiglu gate variant only instantiates three
+/// decoders.
 bool DenseTierCovers(const Config& c, std::uint32_t il, const DeviceLayer& l) {
   WeightType w;
   std::vector<core::GgmlType> types;
   if (c.IsMlaLayer(il)) {
-    types = {l.attn_q.type, l.attn_kv_a.type, l.attn_gate.type,
-             l.attn_out.type};
+    types = {l.attn_q.type,   l.attn_kv_a.type, l.attn_gate.type,
+             l.attn_out.type, l.attn_k_b.type,  l.attn_v_b.type};
   } else {
     types = {l.ssm_q.type, l.ssm_k.type, l.ssm_v.type,
              l.ssm_f.type, l.ssm_g.type, l.ssm_out.type};
@@ -109,6 +114,9 @@ bool GemvTypeOf(core::GgmlType t, GemvType* out) {
       return true;
     case core::GgmlType::kF32:
       *out = GemvType::kF32;
+      return true;
+    case core::GgmlType::kF16:
+      *out = GemvType::kF16;
       return true;
     default:
       return false;
@@ -328,7 +336,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   // projections) grow from kMaxVerifyRows to this row count.
   const std::size_t cap = Executor::kPrefillChunkRows;
   const std::size_t slots = cap * used;
-  const std::size_t compact_rows = RoutedCompactRows(slots, c.num_experts);
+  const std::size_t compact_rows =
+      std::max(RoutedCompactRows(slots, c.num_experts),
+               RoutedCompactRows(cap * heads, heads));
   const std::size_t shared_ff = c.shared_expert_ff;
   float** cf[] = {
       &e->pf_x_,           &e->pf_normed_,   &e->pf_attn_,     &e->pf_ffn_,
@@ -398,6 +408,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->pf_drows_ = e->AllocInts(cap, err);
   e->pf_dbounds_ = e->AllocInts(2U, err);
   e->pf_dtiles_ = e->AllocInts(cap / 16U, err);
+  // Head-grouped (uniform-bucket) scratch for the absorbed MLA projections.
+  e->pf_qnc_ = reinterpret_cast<__half*>(
+      e->AllocFloats((cap * heads * c.MlaNopeDim() + 1U) / 2U, err));
+  e->pf_hbounds_ = e->AllocInts(heads + 1U, err);
+  e->pf_hcursors_ = e->AllocInts(heads, err);
+  e->pf_htiles_ = e->AllocInts(heads * (cap / 64U + 1U) + 8U, err);
   if (e->pf_xh_ == nullptr || e->pf_interh_ == nullptr ||
       e->pf_kda_beta_ == nullptr || e->pf_bpre_ == nullptr ||
       e->pf_kq_ == nullptr || e->pf_mla_pgate_ == nullptr ||
@@ -409,7 +425,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->pf_rows_slot_ == nullptr || e->pf_tiles_ == nullptr ||
       e->pf_zero_ids_ == nullptr || e->pf_head_ids_ == nullptr ||
       e->pf_drows_ == nullptr || e->pf_dbounds_ == nullptr ||
-      e->pf_dtiles_ == nullptr) {
+      e->pf_dtiles_ == nullptr || e->pf_qnc_ == nullptr ||
+      e->pf_hbounds_ == nullptr || e->pf_hcursors_ == nullptr ||
+      e->pf_htiles_ == nullptr) {
     return nullptr;
   }
   // Constant index vectors for the grouped per-head GEMVs and the F32 router.
@@ -1057,7 +1075,6 @@ void Executor::PrefillMla(const DeviceLayer& l, float* kv_cache,
   const std::size_t hid = c_.hidden_size;
   const float scale = 1.0F / std::sqrt(static_cast<float>(c_.mla_head_dim));
   WeightType w;
-  GemvType type;
 
   NarrowActivations(pf_normed_, pf_xh_, false, tokens * hid, nullptr);
   (void)WeightTypeOf(l.attn_q.type, &w);
@@ -1080,16 +1097,39 @@ void Executor::PrefillMla(const DeviceLayer& l, float* kv_cache,
   MlaKvANormRopeRows(pf_mla_a_, l.attn_kv_a_norm.f32(), c_.rms_eps, kv_cache,
                      kpe_cache, base_pos, tokens, kv_rank, rot, c_.rope_theta,
                      nullptr);
-  (void)GemvTypeOf(l.attn_k_b.type, &type);
-  GemvGrouped(l.attn_k_b.data, type, l.attn_k_b.row_bytes * kv_rank,
-              pf_head_ids_, tokens * heads, 1U, kv_rank, nope, pf_mla_q_,
-              c_.mla_head_dim, pf_mla_pabs_, nullptr);
+  // The absorbed per-head projections run on the F16 WMMA tier with the
+  // heads as virtual experts: every token of the chunk visits every head,
+  // so the buckets are uniform, one compact map serves both GEMMs and the
+  // tile list builds on the device (no host fetch of the histogram).
+  const std::uint32_t head_tile_rows = 64U;
+  const std::uint32_t n_head_tiles =
+      heads * ((tokens + head_tile_rows - 1U) / head_tile_rows);
+  ExpertCounts(pf_head_ids_, reinterpret_cast<std::uint32_t*>(pf_counts_),
+               tokens * heads, heads, nullptr);
+  RoutedCompact(pf_head_ids_, reinterpret_cast<std::uint32_t*>(pf_counts_),
+                pf_hbounds_, pf_hcursors_, pf_rows_tok_, pf_rows_slot_, tokens,
+                heads, heads, nullptr);
+  HeadTiles(pf_htiles_, heads, tokens, head_tile_rows, nullptr);
+  // k_b contracts over the nope part of each raw query row; the gathered
+  // and scattered rows are indexed by slot, matching both the [slot][nope]
+  // narrowed query plane and the [slot][kv_rank] absorbed query plane.
+  NarrowRowsStripped(pf_mla_q_, pf_qnc_, tokens * heads, c_.mla_head_dim, nope,
+                     nullptr);
+  (void)WeightTypeOf(l.attn_k_b.type, &w);
+  tier_failure_ |= !RoutedF16Gemm(
+      l.attn_k_b.data, w, pf_qnc_, pf_htiles_, n_head_tiles, head_tile_rows,
+      pf_hbounds_, pf_rows_slot_, pf_rows_slot_, nullptr, 0.0F, pf_mla_pabs_,
+      nullptr, kv_rank, nope, 0U, nullptr);
   MlaPrefill(pf_mla_pabs_, pf_mla_qrp_, kv_cache, kpe_cache, pf_mla_qlatent_,
              base_pos, tokens, heads, kv_rank, rot, scale, nullptr);
-  (void)GemvTypeOf(l.attn_v_b.type, &type);
-  GemvGrouped(l.attn_v_b.data, type, l.attn_v_b.row_bytes * v_dim, pf_head_ids_,
-              tokens * heads, 1U, v_dim, kv_rank, pf_mla_qlatent_, kv_rank,
-              pf_mla_head_, nullptr);
+  // v_b contracts over the [token][kv_rank] attention latent through the
+  // token gather rows of the same head-bucket map.
+  NarrowActivations(pf_mla_qlatent_, pf_xh_, false, tokens * kv_rank, nullptr);
+  (void)WeightTypeOf(l.attn_v_b.type, &w);
+  tier_failure_ |= !RoutedF16Gemm(
+      l.attn_v_b.data, w, pf_xh_, pf_htiles_, n_head_tiles, head_tile_rows,
+      pf_hbounds_, pf_rows_tok_, pf_rows_slot_, nullptr, 0.0F, pf_mla_head_,
+      nullptr, v_dim, kv_rank, 0U, nullptr);
   SigmoidInPlace(pf_mla_pgate_, tokens * heads, nullptr);
   RowScale(pf_mla_head_, pf_mla_pgate_, tokens * heads, v_dim, nullptr);
 
@@ -1132,12 +1172,13 @@ void Executor::PrefillFfn(const DeviceLayer& l, std::uint32_t il,
     return;
   }
 
-  // Router over the chunk; the F32 router matrix reads identity expert 0
-  // with a zero expert stride, so one grouped launch covers every token.
-  GemvType type;
-  (void)GemvTypeOf(l.router.type, &type);
-  GemvGrouped(l.router.data, type, 0U, pf_zero_ids_, tokens, 1U, c_.num_experts,
-              hid, pf_normed_, hid, pf_moe_log_, nullptr);
+  // Router over the chunk: the [num_experts x hid] matrix was retyped to
+  // binary16 at upload, so the dense WMMA tier reads the chunk's F16 rows
+  // (same row/tile maps as the dense FFN path) and writes F32 logits.
+  (void)WeightTypeOf(l.router.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.router.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, tokens, pf_moe_log_,
+                                 nullptr, c_.num_experts, hid, 0U, nullptr);
   RouterTopKRows(pf_moe_log_, l.exp_probs_b.f32(), c_.num_experts,
                  c_.expert_groups, c_.expert_groups_used, used,
                  c_.expert_weights_scale, pf_moe_ids_, pf_moe_weights_, tokens,

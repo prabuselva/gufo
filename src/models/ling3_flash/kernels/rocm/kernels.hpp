@@ -177,7 +177,8 @@ void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
                   std::uint32_t n, std::uint32_t n_exp, hipStream_t stream);
 
 /// ids[i] = i % pattern for i in [0, n) (the identity stack index vector for
-/// the per-head attn_k_b/attn_v_b grouped GEMVs, pattern = num heads).
+/// the per-head attn_k_b/attn_v_b grouped GEMVs and their head-bucketed WMMA
+/// prefill compact, pattern = num heads).
 void FillModuloIds(std::int32_t* ids, std::uint32_t n, std::uint32_t pattern,
                    hipStream_t stream);
 
