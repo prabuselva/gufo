@@ -113,7 +113,12 @@ read on top. 5.3b (head-bucket WMMA route for the absorbed MLA
 prefill projections, October 16) changes no decode path; its dedicated
 decode BAABs are neutral (cold d0 `gufo_bench_53btg.log`,
 `tg128 @ d8192` `gufo_bench_53btgd2.log`) and the cells above are the
-`5.3b` grid refresh.
+`5.3b` grid refresh. 5.4c (October 16) extends the 5.4b fold to the
+MTP-draft grouped Q4_0/Q8_0 tiers — bit-identical, +8.6 % on the
+cold-L2 down-shape microbench — but it covers only the single draft
+layer, so the matched `--speculative mtp` BAAB tg1024 pair is neutral
+(40.51/40.56 → 40.50/40.49, `gufo_bench_mo54tgm.log`) and no cell
+above moves.
 
 ## MTP speculative decode
 

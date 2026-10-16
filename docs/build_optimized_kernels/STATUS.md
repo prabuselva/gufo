@@ -1334,10 +1334,26 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             build, cumulative with 5.4a, `gufo_bench_ba54b.log`),
             tg128: d0 33.39/33.64 → 34.88/35.26 (+4.7 %), d2048
             32.36/31.74 → 33.51/33.15 (+3.9 %), d8192 27.98/27.31 →
-            28.92/28.53 (+3.9 %); `pp8` within noise at every depth.
-      - Remaining toward 5.4: the same fold for the Q4_0/Q8_0 grouped
-        tiers (MTP-draft path), and 5.5's router/elementwise launch
-        fusion for what is left of the launch-gap share.
+             28.92/28.53 (+3.9 %); `pp8` within noise at every depth.
+    - [x] 5.4c ACCEPTED — the same fold for the grouped Q4_0/Q8_0
+            tiers (MTP-draft path, `gemv.hip.cpp`):
+            `GemvGroupedQ4_0`/`GemvGroupedQ8_0` are templated on
+            rows-per-wave with the even-rows `<2>` launcher, per-row
+            `(d*q)*x` chains and block order untouched → bit-identical
+            (microbench memcmp PASS, `gufo_bench_mofold1.log`; suite
+            fails only the two parked gates with a byte-identical
+            block, grouped worst errors unchanged: 8.52457e-06 /
+            3.35717e-06, `gufo_bench_mo54suite.log`; `--compare`
+            against a control build: 0 worse, new instantiations
+            scratch-free). Cold-L2 down-shape microbench
+            (2048×512, 8 experts): 185.6 → 201.6 GB/s (**+8.6 %**).
+            In model the fold covers only the single MTP draft layer,
+            so matched BAAB tg is neutral within noise
+            (`--speculative mtp` tg1024, control 40.51/40.56 vs
+            candidate 40.50/40.49, `gufo_bench_mo54tgm.log`); landed
+            as a strictly-faster kernel, not a measured model gain.
+      - Remaining toward 5.4: 5.5's router/elementwise launch fusion
+        for what is left of the launch-gap share.
 - [ ] 5.5 Router/elementwise fusion (nodes 5+6): remaining tier launches
       after the `RouterTopKKernel` win (+8.2/+7.6 % tg); launch-count-bound.
 - [ ] 5.6 MTP width-invariance, hash gate, draft policy (nodes 7+8): park —

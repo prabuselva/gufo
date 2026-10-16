@@ -232,8 +232,28 @@ the 5.2a build, cumulative with 5.4a, `gufo_bench_ba54b.log`): tg128 d0
 (+3.9 %), d8192 27.98/27.31 → 28.92/28.53 (+3.9 %), `pp8` within noise.
 Decode is now +4.7 % over the pre-5.4 build at cold context and +3.9 %
 at both frontier depths from the two launch-side levers together; the
-same fold for the MTP-draft grouped tiers (Q4_0/Q8_0) and lever 5.5's
-router/elementwise fusion are the follow-ups.
+same fold for the MTP-draft grouped tiers (Q4_0/Q8_0, 5.4c below) and
+lever 5.5's router/elementwise fusion are the follow-ups.
+
+Grouped Q4_0/Q8_0 tiers — two rows per wave — ACCEPTED (October 16,
+`docs/build_optimized_kernels/STATUS.md` lever 5.4c). The artifact's MTP
+draft block keeps Q4_0 rows, so the remaining un-folded grouped tiers
+run once per drafted token. `GemvGroupedQ4_0`/`GemvGroupedQ8_0` are now
+templated exactly like the 5.4b pair — two consecutive output rows per
+wave with independent per-row `(d*q)*x` chains, hoisted shared x values
+and unchanged block order, `<2>` when `rows` is even — so outputs are
+bit-identical: the fold is a bit-exact PASS in the standalone microbench
+(`gufo_bench_mofold1.log`), and the exclusive suite fails only the two
+parked gates with a byte-identical failure block, the grouped worst
+errors unchanged at 8.52457e-06 / 3.35717e-06
+(`gufo_bench_mo54suite.log`); `--compare` against a control build shows
+zero scratch increase and the new instantiations scratch-free. Cold-L2
+down-shape replay (2048×512, 8 experts): 185.6 → 201.6 GB/s (**+8.6
+%**). In model the fold touches only the single MTP draft layer, so a
+matched BAAB tg pair with `--speculative mtp` is neutral within noise
+(tg1024 40.51/40.56 → 40.50/40.49, `gufo_bench_mo54tgm.log`) — landed
+as a strictly-faster kernel and draft-heavy serving head-room, not as a
+measured model gain.
 
 Head group 4→8 for decode MLA (`kDecodeGroup`) — REJECTED (October 15,
 `docs/build_optimized_kernels/STATUS.md` lever 5.2d). The last frontier

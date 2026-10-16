@@ -83,6 +83,48 @@ __global__ void GemvGroupedQ8_0(const Q8_0Block* __restrict__ w,
   }
 }
 
+// Production consecutive-row fold (gemv.hip.cpp GemvGroupedQ8_0<2>): one
+// wave walks two consecutive rows of the same slot, sharing x; each row
+// keeps its single-pair chain so results are bit-identical.
+__global__ void GemvGroupedQ8_0Fold2(const Q8_0Block* __restrict__ w,
+                                     const std::int32_t* __restrict__ ids,
+                                     std::size_t expert_stride_blocks,
+                                     const float* __restrict__ x,
+                                     std::uint32_t slots_per_row,
+                                     std::uint32_t x_stride,
+                                     float* __restrict__ out,
+                                     std::uint32_t used, std::uint32_t rows,
+                                     std::uint32_t cols) {
+  const std::uint32_t rows_per_slot = rows / 2U;
+  const std::uint32_t g = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (g >= used * rows_per_slot) {
+    return;
+  }
+  const std::uint32_t s = g / rows_per_slot;
+  const std::uint32_t r = (g - s * rows_per_slot) * 2U;
+  const std::uint32_t nblocks = cols / 32;
+  const Q8_0Block* __restrict__ row =
+      w + static_cast<std::size_t>(ids[s]) * expert_stride_blocks +
+      static_cast<std::size_t>(r) * nblocks;
+  const float* __restrict__ xs =
+      x + static_cast<std::size_t>(s / slots_per_row) * x_stride;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc[2] = {};
+#pragma unroll 4
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const float xv = xs[b * 32 + lane];
+    acc[0] += __half2float(row[b].d) * static_cast<float>(row[b].qs[lane]) * xv;
+    acc[1] += __half2float(row[nblocks + b].d) *
+              static_cast<float>(row[nblocks + b].qs[lane]) * xv;
+  }
+  acc[0] = WarpReduceSum(acc[0]);
+  acc[1] = WarpReduceSum(acc[1]);
+  if (lane == 0) {
+    out[s * rows + r] = acc[0];
+    out[s * rows + r + 1U] = acc[1];
+  }
+}
+
 __global__ void GemvGroupedQ8_0Pair(const Q8_0Block* __restrict__ wa,
                                     const Q8_0Block* __restrict__ wb,
                                     const std::int32_t* __restrict__ ids,
@@ -657,6 +699,65 @@ int main() {
                      w.get<Q8_0Block>(), dslots.get<std::int32_t>() + c * kUsed,
                      stride, x.get<float>(), cols, o.get<float>(), kUsed, rows,
                      cols);
+               },
+               kSlots),
+           bytes);
+  }
+
+  std::printf("=== COLD-L2: consecutive-row fold, down shape ===\n");
+  {
+    const std::uint32_t rows = kHidden, cols = kExpertFf;
+    const double bytes = static_cast<double>(kUsed) * rows * cols * kQ8;
+    constexpr int kSlots = 8;
+    Dev w(static_cast<std::size_t>(kExperts) * rows * cols * kQ8);
+    auto bw = MakeQ8(static_cast<std::size_t>(kExperts) * rows * cols, 9);
+    w.Upload(bw.data(), bw.size() * sizeof(Q8_0Block));
+    Dev o(kUsed * rows * 4), of(kUsed * rows * 4);
+    std::int32_t slot_ids[kSlots * kUsed];
+    for (int c = 0; c < kSlots; ++c) {
+      for (std::uint32_t i = 0; i < kUsed; ++i) {
+        slot_ids[c * kUsed + i] =
+            static_cast<std::int32_t>((c * kUsed + i * 31 + 3) % kExperts);
+      }
+    }
+    Dev dslots(sizeof(slot_ids));
+    dslots.Upload(slot_ids, sizeof(slot_ids));
+    const std::size_t stride = static_cast<std::size_t>(rows) * cols / 32;
+    const std::uint32_t grid = (kUsed * rows + 3) / 4;
+    const std::uint32_t grid2 = (kUsed * rows / 2U + 3) / 4;
+    GemvGroupedQ8_0<<<grid, 128>>>(w.get<Q8_0Block>(),
+                                   dslots.get<std::int32_t>(), stride,
+                                   x.get<float>(), cols, o.get<float>(), kUsed,
+                                   rows, cols);
+    GemvGroupedQ8_0Fold2<<<grid2, 128>>>(w.get<Q8_0Block>(),
+                                         dslots.get<std::int32_t>(), stride,
+                                         x.get<float>(), 1U, cols,
+                                         of.get<float>(), kUsed, rows, cols);
+    std::vector<float> ho(kUsed * rows), hf(kUsed * rows);
+    Check(hipMemcpy(ho.data(), o.get<float>(), ho.size() * 4,
+                    hipMemcpyDeviceToHost),
+          "read out");
+    Check(hipMemcpy(hf.data(), of.get<float>(), hf.size() * 4,
+                    hipMemcpyDeviceToHost),
+          "read fold out");
+    std::printf("fold2 bit-exact: %s\n", ho == hf ? "PASS" : "FAIL");
+    Report("scalar cold",
+           TimeCold(
+               [&](int c) {
+                 GemvGroupedQ8_0<<<grid, 128>>>(
+                     w.get<Q8_0Block>(), dslots.get<std::int32_t>() + c * kUsed,
+                     stride, x.get<float>(), cols, o.get<float>(), kUsed, rows,
+                     cols);
+               },
+               kSlots),
+           bytes);
+    Report("fold2 cold",
+           TimeCold(
+               [&](int c) {
+                 GemvGroupedQ8_0Fold2<<<grid2, 128>>>(
+                     w.get<Q8_0Block>(), dslots.get<std::int32_t>() + c * kUsed,
+                     stride, x.get<float>(), 1U, cols, of.get<float>(), kUsed,
+                     rows, cols);
                },
                kSlots),
            bytes);
