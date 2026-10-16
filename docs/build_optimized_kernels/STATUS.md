@@ -1390,6 +1390,38 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             serializes selection to the 128-thread tail block (B lost
             every d0/d2048 pair). Reverted; revisit only if the
             selection tail can run alongside, not after, the GEMV.
+    - [x] 5.5b REJECTED — one-launch `AddRmsNormKernel` fusing each
+            residual `Add` with the `RmsNorm` that consumes it (92
+            sites/token in decode + 2 in the MTP draft step,
+            `kernels.hip.cpp`/`executor.cpp`): bit-identical by
+            construction (same grid-stride double sum, same
+            `BlockSumDouble`, then `res_out = res + x`,
+            `y = res_out * scale * w`) and bit-exact vs the separate
+            pair over 300 randomized rounds × n ∈ {2560, 2048, 2551}
+            (`tools/bench/ling3_add_rmsnorm_bench.hip`, retained; its
+            fused launch wall was −1.6…−2.4 µs under contention).
+            Full suite fails exactly the three parked gates with
+            byte-identical signatures (`divergence at step 1:
+            cpu 220 gpu 2538`; 25/32 draft agreement, matching every
+            HEAD log); `--compare` kernel-resources 0 worse, fused
+            kernel scratch-free. Matched BAAB ×2 plus a
+            `--speculative mtp` tg1024 pair (control = HEAD release
+            binary, `gufo_bench_ba55b.log`): tg128 d0 36.05 → 36.06,
+            d2048 34.26 → 34.22, d8192 29.41 → 29.43, spec d0 40.19 →
+            40.27 / d2048 37.03 → 36.96 (all ≤ 0.2 % noise), pp8
+            +0.0/−0.3/−0.9 % (d0/d2048/d8192). The mechanism: an
+            exclusive decode profile of the fused binary
+            (`/tmp/opencode/prof55b_fused`) shows
+            `AddRmsNormKernel` averaging 10.78 µs against the old
+            pair's 9.58 µs (`Add` 1.30 + `RmsNorm` 8.28) — the fused
+            1×256 block serializes its second read+write phase behind
+            the same-latency barrier, while the tiny `Add`'s time was
+            already hidden in the pipelined stream, so the
+            contention-microbench launch saving never lands (the 5.5a
+            lesson, now quantified per kernel). Reverted. Elementwise
+            fusions here must remove work from the latency-bound
+            single-block kernels, not launches the pipeline already
+            hides.
 - [ ] 5.6 MTP width-invariance, hash gate, draft policy (nodes 7+8): park —
       draft-token sweeps were flat (36.46–36.72) and the MLA copy removal
       already cleared +2.5 %; keep the width-invariance gate and re-check

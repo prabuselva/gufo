@@ -459,3 +459,36 @@ the elementwise fusions (Add→RmsNorm, Swiglu-in-down-GEMV) first,
 which touch comparable launch counts without extending the critical
 path.
 
+Residual Add fused with the consuming RmsNorm (STATUS.md lever 5.5b):
+the decode attribution profiled 92 `RmsNormKernel` launches (8.28 µs
+avg) plus 160 `AddKernel` launches (1.30 µs avg) per token, and every
+decode/draft norm consumes an immediately preceding full-row residual
+`Add` (`Step()` layer tail → next-layer norm, MTP draft head), so one
+fused launch removes ~94 dispatches/token. `AddRmsNormKernel` keeps the
+exact grid-stride double sum, the exact `BlockSumDouble` and the exact
+scale chain, writing `res_out = res + x` and then `y = res_out * scale
+* w` — bit-exact by construction against the separate pair across 300
+randomized rounds × n ∈ {2560, 2048, 2551} incl. a ragged tail
+(`tools/bench/ling3_add_rmsnorm_bench.hip`, retained), with the fused
+launch wall −1.6…−2.4 µs per pair under contention. Gate parity held:
+the full suite failed exactly the three parked gates with byte-identical
+signatures (`divergence at step 1: cpu 220 gpu 2538` at gap 0.0990877;
+25/32 draft agreement, the number in every HEAD-era log), and
+kernel-resources `--compare` showed 0 worse with the fused kernel
+scratch-free (127 kernels vs 126, no new allowance). Matched BAAB ×2
+plus an `--speculative mtp` tg1024 pair, exclusive, control = the HEAD
+release binary (`gufo_bench_ba55b.log`): tg128 d0 36.05 → 36.06, d2048
+34.26 → 34.22, d8192 29.41 → 29.43, spec d0 40.19 → 40.27 and d2048
+37.03 → 36.96 — every cell ≤ 0.2 % — while pp8 ran +0.0/−0.3/−0.9 %
+across depths. An exclusive decode profile of the fused binary
+(`/tmp/opencode/prof55b_fused`) explains it: `AddRmsNormKernel`
+averages 10.78 µs, more than the separate pair's 9.58 µs, because the
+1×256 block serializes the second read+write phase behind its own
+barrier while the tiny `Add` ran its 1.3 µs hidden inside the
+pipelined stream. Rejected and reverted: at this node the launch
+budget is already behind the GPU and per-kernel cost, not launch count,
+is what a fused latency-bound single-block kernel can only pay, not
+save; future elementwise work must reduce the latency-bound kernels'
+own duration (e.g. wider blocks or removing reads), not their dispatch
+count.
+
