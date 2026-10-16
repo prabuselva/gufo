@@ -398,5 +398,7 @@ bd269b0b (`gufo_bench_53cpair.log`, `gufo_bench_53c16k.log`): pp2048
 separated, and tg128 neutral (36.12–36.24 both sides) — the gain
 grows with the quadratic the fused kernel was paying, exactly the
 depth-decay signature this lever existed to fix.
-`--compare` vs the 5.3b control: 0 worse, 1 one-side-only (the new
-kernel, scratch 0).
+`--compare` vs the 5.3b control: 0 worse, 1 one-side-only — the new
+kernel stages its WMMA fragments in 288 B of private scratch with zero
+spills (allowance added to `tools/ci/kernel-resources.json`), the same
+by-design pattern as the `AttentionPrefillWmma` donor.

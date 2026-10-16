@@ -459,6 +459,9 @@
   "_ZN4gufo3hip41Wave32FusedSSMInputProjectionsKernel_1RowILj4EEEvPKvNS_4core8GgmlTypeES3_S5_S3_S5_S3_S5_PKfPfS8_S8_S8_mmmm": {
    "max_scratch": 8
   },
+  "_ZN4gufo6models11ling3_flash4rocm12_GLOBAL__N_114WmmaMlaPrefillILj2EEEvPKfS6_S6_S6_Pfjjjjjf": {
+   "max_scratch": 288
+  },
   "_ZN4gufo6models9qwen3_asr3hip12_GLOBAL__N_120TextQkNormRoPEKernelILj128EEEvPfS5_S5_PKfS7_mjjjjffS5_S5_jj": {
    "max_scratch": 8
   },

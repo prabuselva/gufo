@@ -1286,7 +1286,8 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             952.95/954.40 (**+18.7 %/+18.5 %**), pp16384
             533.04/533.61 → 668.54/668.67 (**+25.4 %/+25.3 %**),
             tg128 neutral; `--compare` 0 worse, new kernel
-            scratch-0.
+            288 B fragment scratch (allowance landed in
+            `tools/ci/kernel-resources.json`), spill 0.
       - Remaining toward 5.3: the shared
         `DenseF16Plan`/staged-barrier work (4.5 donor), and the
         producer fusion only behind the recorded 4.2a dead-store
