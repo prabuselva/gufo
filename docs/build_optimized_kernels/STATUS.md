@@ -963,7 +963,10 @@ ALU/latency, not bytes: the tensor-core route is the lever.
 (After 5.1a the refreshed pp2048/4096/8192/16384 grid is 868/775/628/446
 t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
 
-- [~] 5.1 MLA prefill attention depth recovery (headline). Revisit the
+- [x] 5.1 MLA prefill attention depth recovery (headline) — CLOSED: the
+      WMMA route this lever asked for was realized by 5.3c's
+      `WmmaMlaPrefill` (+6.2/+18.7/+25.4 % at pp2048/8192/16384), with
+      the fused kernel kept for the odd shapes. Revisit the
       deferred "WMMA/fp16 attention scores" decision from
       `docs/models/ling3-flash/EXPERIMENTS.md`. `MlaPrefillFusedKernel`
       (`attention.hip.cpp:421`) is ALU/latency-bound: after 5.1a the
