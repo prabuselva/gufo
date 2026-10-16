@@ -536,3 +536,32 @@ tg1024 @ d2048 37.04 → 37.50 (+1.2 %), each consistent across both
 pairs — the multi-row verify GEMV is in the draft loop's hot path, so
 the exactness fix is also a small speculative-decode win, and it is
 kept.
+
+Batched MTP draft-cache prefill (STATUS.md lever 5.6b): the repaired
+gate documented *why* spec prefill was sequential — production fed the
+draft cache one `Step`+`MtpStep` pair per token, which pins serving spec
+TTFT to decode speed (~32 t/s: 2048 prompt ≈ 63 s, 8192 ≈ 4 min). The
+bench hid this because its pp loop deliberately left MTP disabled, so
+every recorded `--speculative` pp row was actually plain prefill.
+`Executor::MtpPrefill` runs the chunked WMMA trunk prefill and, after
+each chunk, walks its hidden rows to write the draft cache with the same
+pair semantics as the sequential feed — hidden row `r` at position
+`done+r` paired through the head-free `MtpAdvance` with `token[done+r+1]`
+— leaving `mtp_position_`, `h_out_` and the logits exactly where the
+per-token loop left them; `Session::Sync` routes common-prefix-zero spec
+syncs there, while resume (`common > 0`) tails keep the sequential loop.
+The accept test's phase-2 oracle moved with the contract: batched spec
+Sync must agree greedily with a batched plain feed. The bench pp loop
+now enables MTP under `--speculative mtp` so the SPEC pp cells measure
+the serve path. Matched BAAB ×2 and an 8K pair against a HEAD+bench-fix
+control, which syncs sequentially (`gufo_bench_p3h`): spec pp2048
+32.35 → 604.8 t/s (**18.7×**) and pp8192 29.53 → 445.3 (**15.1×**),
+with B still paying the draft-layer cost per token (~0.9 ms vs plain).
+The draft rows are now built from WMMA batch hiddens instead of exact
+per-token GEMV hiddens, and that drift costs accept rate: spec tg1024
+40.28 → 39.25 (−2.6 %) and 39.75 → 39.20 (−1.4 %), tg256 after pp8192
+39.79 → 38.83 (−2.4 %), consistent across every pair; output tokens
+remain bit-exact because greedy verification owns the final tokens.
+Plain cells unchanged; exclusive suite 11/12 with only the byte-identical
+parked `rocm_inference` fail; kernel-resources 0 worse. Accepted: a
+−2 % accept-rate slice buys 15–19× speculative prefill.

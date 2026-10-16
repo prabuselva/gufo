@@ -203,32 +203,44 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
     common = 0;
   }
   valid_ = false;
-  // With a speculative session, the draft cache must cover every prompt
-  // position, so feed the tail through the Step path paired with MtpStep:
-  // after Step(prompt[i]), prompt[i+1] is the token its hidden state must
-  // predict in the draft block. A plain session keeps the Prefill fast path.
+  // A speculative session must pair every prompt position with its draft
+  // cache row. A full sync runs the batch prefill with the MtpAdvance
+  // pairs interleaved after each chunk (MtpPrefill keeps the exact pair
+  // layout the per-token Step/MtpStep loop produced). An extension keeps
+  // the per-token feed: the trunk state after the last committed token is
+  // a decode hidden, not a prefill chunk, so the tail is fed through the
+  // Step path paired with MtpStep - after Step(prompt[i]), prompt[i+1]
+  // is the token its hidden state must predict in the draft block. A
+  // plain session keeps the Prefill fast path.
   const bool spec = mtp_enabled_ && model_->HasMtp();
-  if (spec && common > 0U && common < prompt.size() &&
-      !executor_->MtpStep(*session_, prompt[common], error_msg)) {
-    return false;
-  }
-  for (std::size_t i = common; i < prompt.size(); ++i) {
-    if (!spec) {
-      break;
+  if (spec) {
+    if (common == 0U) {
+      if (!executor_->MtpPrefill(*session_, prompt.data(),
+                                 static_cast<std::uint32_t>(prompt.size()),
+                                 error_msg)) {
+        return false;
+      }
+    } else {
+      if (common < prompt.size() &&
+          !executor_->MtpStep(*session_, prompt[common], error_msg)) {
+        return false;
+      }
+      for (std::size_t i = common; i < prompt.size(); ++i) {
+        if (!executor_->Step(*session_, prompt[i], error_msg)) {
+          return false;
+        }
+        if (i + 1U < prompt.size() &&
+            !executor_->MtpStep(*session_, prompt[i + 1], error_msg)) {
+          return false;
+        }
+      }
     }
-    if (!executor_->Step(*session_, prompt[i], error_msg)) {
+  } else {
+    if (!executor_->Prefill(*session_, prompt.data() + common,
+                            static_cast<std::uint32_t>(prompt.size() - common),
+                            error_msg)) {
       return false;
     }
-    if (i + 1U < prompt.size() &&
-        !executor_->MtpStep(*session_, prompt[i + 1], error_msg)) {
-      return false;
-    }
-  }
-  if (!spec &&
-      !executor_->Prefill(*session_, prompt.data() + common,
-                          static_cast<std::uint32_t>(prompt.size() - common),
-                          error_msg)) {
-    return false;
   }
   for (std::size_t i = common; i < prompt.size(); ++i) {
     tokens_.push_back(prompt[i]);

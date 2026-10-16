@@ -1334,6 +1334,83 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
   return true;
 }
 
+bool Executor::MtpPrefill(Session& session, const std::int32_t* tokens,
+                          std::uint32_t count, std::string* error_msg) {
+  const auto fail = [&](const char* msg) {
+    if (error_msg != nullptr) {
+      *error_msg = msg;
+    }
+    return false;
+  };
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (tokens[i] < 0 ||
+        static_cast<std::uint32_t>(tokens[i]) >= c_.vocab_size) {
+      return fail("token id out of range");
+    }
+  }
+  if (count > 0U && session.position() + count > session.max_context()) {
+    return fail("context exhausted");
+  }
+  if (count == 0U) {
+    return true;
+  }
+  if (!prefill_ready_) {
+    // Same reference-shaped fallback as Prefill, interleaved with the
+    // per-token draft pairs the spec session needs. Draft logits are not
+    // needed mid-prefill, so the pairs run the head-free MtpAdvance.
+    if (!Step(session, tokens[0], error_msg)) {
+      return false;
+    }
+    for (std::uint32_t i = 0U; i + 1U < count; ++i) {
+      if (!MtpAdvance(session, tokens[i + 1U], h_out_, error_msg) ||
+          !Step(session, tokens[i + 1U], error_msg)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const std::uint32_t hid = c_.hidden_size;
+  GemvType type;
+  (void)GemvTypeOf(model_.token_embd().type, &type);
+  std::uint32_t done = 0U;
+  while (done < count) {
+    const std::uint32_t rows =
+        count - done > kPrefillChunkRows ? kPrefillChunkRows : count - done;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      EmbedRow(model_.token_embd().data, type,
+               static_cast<std::uint32_t>(tokens[done + r]),
+               static_cast<std::uint32_t>(hid),
+               pf_x_ + static_cast<std::size_t>(r) * hid, nullptr);
+    }
+    PrefillChunk(session, rows, session.position_);
+    session.position_ += rows;
+    if (tier_failure_) {
+      return fail("chunked prefill tier rejected a projection");
+    }
+    // Pair the draft block with every trunk position except the final
+    // prompt token: row r of pf_x_ is the hidden of tokens[done + r],
+    // which the per-token loop exposes as h_out_ to MtpStep(tokens[i + 1]).
+    for (std::uint32_t r = 0U; r < rows && done + r + 1U < count; ++r) {
+      RmsNorm(pf_x_ + static_cast<std::size_t>(r) * hid,
+              model_.output_norm().f32(), c_.rms_eps, h_out_, hid, nullptr);
+      if (!MtpAdvance(session, tokens[done + r + 1U], h_out_, error_msg)) {
+        return false;
+      }
+    }
+    done += rows;
+  }
+
+  // Final token hidden and logits, identical to Prefill's tail.
+  const std::uint32_t last = (count - 1U) % kPrefillChunkRows;
+  RmsNorm(pf_x_ + static_cast<std::size_t>(last) * hid,
+          model_.output_norm().f32(), c_.rms_eps, h_out_, hid, nullptr);
+  (void)GemvTypeOf(model_.output().type, &type);
+  Gemv(model_.output().data, type, model_.output().rows, model_.output().cols,
+       model_.output().row_bytes, h_out_, logits_, nullptr);
+  return true;
+}
+
 bool Executor::MtpForward(Session& session, std::int32_t token,
                           const float* hidden, bool with_logits,
                           std::string* error_msg) {

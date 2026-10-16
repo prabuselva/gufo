@@ -141,6 +141,20 @@ rose 39.67 → 40.34 (+1.7 %, `tg1024`) and 37.04 → 37.50 (+1.2 %,
 stayed inside ±0.4 % (`gufo_bench_q8baab`). The after-pp2048 table above
 is a different prefill prefix and was not re-measured; it stands.
 
+5.6b (October 16) batched the spec prefill (`Executor::MtpPrefill`) and
+made the bench pp rows honour `--speculative mtp` — every `--speculative`
+pp figure recorded before this change was measured with MTP disabled and
+was plain prefill. Re-recorded on the serve path's spec Sync, matched
+BAAB ×2 plus an 8K pair against a sequential-sync control carrying the
+same bench fix (`gufo_bench_p3h`): pp2048 32.35 → 604.8 t/s (**18.7×**)
+and pp8192 29.53 → 445.3 (**15.1×**). The draft rows now come from WMMA
+batch hidden states instead of per-token GEMV ones, which trims accept
+rate: the same pairs move spec tg1024 40.28 → 39.25 (−2.6 %) and 39.75 →
+39.20 (−1.4 %), and tg256 after pp8192 39.79 → 38.83 (−2.4 %), every
+pair consistent; outputs stay bit-exact under greedy verification. Plain
+cells unchanged. The tg rows quoted above stand as the sequential-sync
+pipeline's history.
+
 ## Measurement detail
 
 ```sh

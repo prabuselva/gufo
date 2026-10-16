@@ -135,6 +135,15 @@ public:
   /// hold the final token's result, exactly as `count` Step() calls would.
   bool Prefill(Session& session, const std::int32_t* tokens,
                std::uint32_t count, std::string* error_msg = nullptr);
+  /// Batched Prefill for a speculative session: the trunk runs the chunk
+  /// tier while every prompt position keeps its draft pair on the MTP
+  /// caches, exactly the pairs one MtpStep call after `Step`(tokens[i])
+  /// would produce for `tokens[i + 1]`. The final prompt token sets no
+  /// draft row; the draft cache and mtp_position() end at the same state
+  /// the per-token Step/MtpStep loop reaches. Without the batch tier this
+  /// runs that loop itself.
+  bool MtpPrefill(Session& session, const std::int32_t* tokens,
+                  std::uint32_t count, std::string* error_msg = nullptr);
   /// Runs the MTP draft block for `token` using the trunk hidden state from
   /// the most recent Step; the result is in mtp_logits().
   bool MtpStep(Session& session, std::int32_t token,

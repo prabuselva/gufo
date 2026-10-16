@@ -432,6 +432,12 @@ int RunLing3FlashBenchmark(
         // each timed prefill starts at position 0 (the serve path does the same
         // in Invalidate()).
         session->Reset();
+        if (mtp) {
+          // Under --speculative mtp this row must measure the same spec Sync
+          // the serve path runs (batched draft-cache prefill), not a plain
+          // prefill with the draft block skipped.
+          session->SetMtpEnabled(true);
+        }
         if (depth > 0 &&
             !session->Sync(std::span(tokens).first(depth), &error)) {
           std::cerr << "Error preparing depth: " << error << '\n';
@@ -472,8 +478,9 @@ int RunLing3FlashBenchmark(
         session->Reset();
         if (mtp) {
           // Speculative decode consumes the draft cache, so it must be filled
-          // during the prefill below; enable it before Sync. The pp loop leaves
-          // it off so plain prefill skips the draft block.
+          // during the prefill below; enable it before Sync. The pp loop
+          // enables it too, so every --speculative row measures the serve
+          // path's spec Sync.
           session->SetMtpEnabled(true);
           session->SetDraftLimits(options.min_draft_tokens,
                                   options.draft_tokens);

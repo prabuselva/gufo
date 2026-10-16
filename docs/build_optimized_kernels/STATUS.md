@@ -1474,6 +1474,28 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             (+1.7 %) and d2048 37.04 → 37.50 (+1.2 %), both pairs
             consistent — the verify rows route through the fixed rows
             GEMV.
+    - [x] 5.6b ACCEPTED — batched MTP draft-cache prefill. Production
+            spec sessions synced with a sequential per-token
+            `Step`+`MtpStep` loop (≈32 t/s, serving spec TTFT at decode
+            speed), and the bench hid it: the pp loop never enabled MTP,
+            so every recorded `--speculative` pp row was plain prefill.
+            `Executor::MtpPrefill` writes the draft rows in the chunked
+            WMMA prefill, pairing row `r`'s hidden with `token[r+1]`
+            through the head-free `MtpAdvance`, and `Session::Sync`
+            routes common-prefix-zero spec syncs there; the `rocm_mtp_accept`
+            oracle now mirrors that (batched spec sync == batched plain
+            feed, greedy parity). `cli_runner` now honours
+            `--speculative mtp` for pp rows, so the SPEC pp cells measure
+            the serve path. Matched BAAB ×2 + 8K pair against a
+            HEAD+bench-fix control (`gufo_bench_p3h`): spec pp2048
+            32.35 → 604.8 (**18.7×**), pp8192 29.53 → 445.3 (**15.1×**),
+            while draft rows built from WMMA hiddens (vs per-token GEMV)
+            cost accept rate: spec tg1024 −2.6 %/−1.4 % (pair-consistent),
+            tg256@pp8192 −2.4 %; outputs stay bit-exact under greedy
+            verify. Plain cells unchanged; exclusive suite 11/12 (only
+            the parked `rocm_inference` fail, byte-identical),
+            kernel-resources 0 worse, resume (`common > 0`) tails still
+            sequential.
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
