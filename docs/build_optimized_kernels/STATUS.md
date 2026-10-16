@@ -1422,6 +1422,23 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             fusions here must remove work from the latency-bound
             single-block kernels, not launches the pipeline already
             hides.
+    - [x] 5.5c REJECTED — bit-exact latency trims of the standalone
+            decode `RmsNormKernel` (never entered the model): staging
+            `x` in LDS during the accumulate pass, and additionally
+            prefetching `w` into registers, keep the exact double
+            accumulation and are bit-exact over 300 randomized rounds
+            × {2560, 2048, 2551} × 96 buffer slots
+            (`tools/bench/ling3_rms_norm_bench.hip`, retained).
+            Exclusive per-launch time: baseline 7.37 µs, LDS-cache
+            6.98, LDS+reg-w 7.03 — a 0.40 µs (5 %) floor, so
+            × 92/token is +0.13 %, inside the BAAB noise the 5.5a/5.5b
+            levers could not clear. `RmsNorm`'s 7.37 µs for a 20 KiB
+            row is one CU's fixed single-block latency (a 30 KiB
+            10-block `Add` runs 1.3 µs); the exact-ordering contract
+            pins it to that block, so no bit-exact staging reaches the
+            floor. The elementwise slack (~1.2 ms/token) is
+            unreachable without changing the reduction contract;
+            5.6 MTP gate work is the next lever.
 - [ ] 5.6 MTP width-invariance, hash gate, draft policy (nodes 7+8): park —
       draft-token sweeps were flat (36.46–36.72) and the MLA copy removal
       already cleared +2.5 %; keep the width-invariance gate and re-check

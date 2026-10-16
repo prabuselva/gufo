@@ -492,3 +492,17 @@ save; future elementwise work must reduce the latency-bound kernels'
 own duration (e.g. wider blocks or removing reads), not their dispatch
 count.
 
+Bit-exact RmsNorm latency trims (STATUS.md lever 5.5c, microbench
+only): staging `x` into LDS in the accumulate pass (and additionally
+prefetching `w` into registers) preserves the exact double
+accumulation order and is bit-exact over 300 randomized rounds ×
+{2560, 2048, 2551} × 96 slots (`tools/bench/ling3_rms_norm_bench.hip`),
+but exclusive per-launch time only falls 7.37 → 6.98 µs (LDS+reg-w
+7.03): × 92/token = +0.13 %, under the BAAB noise floor. The 7.37 µs
+for a 20 KiB row is the fixed single-CU cost of the `<<<1,256>>>`
+contract (a 10-block `Add` moves 30 KiB in 1.3 µs), and exact ordering
+pins that launch shape. Rejected without an in-model run; the decode
+elementwise budget is only movable by changing the reduction contract,
+which the model does not — next lever is the parked rocm_mtp_accept
+gate under STATUS 5.6.
+
