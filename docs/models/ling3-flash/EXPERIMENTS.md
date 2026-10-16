@@ -506,3 +506,33 @@ elementwise budget is only movable by changing the reduction contract,
 which the model does not — next lever is the parked rocm_mtp_accept
 gate under STATUS 5.6.
 
+Repairing the parked MTP-accept gate (STATUS.md lever 5.6a): the gate
+bisect started from two suspects — batched `Verify` rows differing from
+sequential `Step`, and draft agreement stuck at 25/32. The first suspect
+was a phantom: every `rows 0/4` / `126692-float row delta` log came from
+stale or experiment-modified pre-session binaries; a clean control build
+of HEAD verifies bit-exactly (rows 4/4, 22/22 steps across the bisect,
+3/3 deterministic runs). The real kernel bug was in `GemvRows`: the
+Q8_0 Vec4 multi-row path accumulated its dot product in a different
+order than the per-row `GemvQ8_0Vec4`, so draft rows diverged as soon as
+a column block spanned more than one accumulation round. The
+`GemvRowsQ8_0Vec4` kernel now mirrors the per-row accumulation order and
+`rocm_gemv` rows 2–5 are bit-exact. The residual phase-2 parity failure
+was structural, not numerical: the oracle built its reference sequence
+with the batched WMMA `Prefill`, while every production spec session
+feeds the MTP draft cache sequentially per token (`Step` + `MtpStep`);
+oracle and spec bits therefore differed from token 3 regardless of
+kernels. The oracle now replays the production sequential feed, which
+also makes draft-chain non-perturbation by the interleaved `MtpStep`
+part of the enforced contract. Evidence: `rocm_mtp_accept` passes
+standalone (29.10 s) and the exclusive ling3 suite is 11/12 (only the
+parked `rocm_inference` cpu-vs-gpu step-1 divergence fails);
+kernel-resources `--compare` against a freshly built HEAD release
+reports 0 worse with 4 one-side kernels (the new rows variants).
+Exclusive BAAB ×2 plus matched `--speculative mtp` pairs
+(`gufo_bench_q8baab`): plain pp/tg cells all ±0.4 % with mixed signs at
+d0/2048/8192, while spec tg1024 ran 39.67 → 40.34 (+1.7 %) and spec
+tg1024 @ d2048 37.04 → 37.50 (+1.2 %), each consistent across both
+pairs — the multi-row verify GEMV is in the draft loop's hot path, so
+the exactness fix is also a small speculative-decode win, and it is
+kept.

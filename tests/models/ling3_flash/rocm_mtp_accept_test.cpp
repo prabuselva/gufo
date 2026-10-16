@@ -178,6 +178,13 @@ int main() {
   // and RollbackVerify has to restore the recurrent trunk state to the
   // committed prefix. Any position, snapshot or cache misalignment shows
   // up as the first mismatching greedy token.
+  //
+  // A spec session keeps its MTP draft cache aligned one pair per prompt
+  // token, so production feeds the prompt through sequential Step/MtpStep
+  // calls instead of the batched prefill kernel. The batched kernel
+  // accumulates in a different order, so parity is claimed against the
+  // same sequential prompt prefill the spec session performs - interleaved
+  // MtpStep draft-cache writes must not perturb the trunk either.
   constexpr int kParityTokens = 48;
   constexpr std::size_t kK = 3;
   std::vector<std::int32_t> oracle;
@@ -187,10 +194,15 @@ int main() {
       std::cerr << "parity oracle session failed: " << error << "\n";
       return 1;
     }
-    if (!executor->Prefill(*plain, prompt.data(),
-                           static_cast<std::uint32_t>(prompt.size()), &error)) {
+    if (!executor->Step(*plain, prompt[0], &error)) {
       std::cerr << "parity oracle prefill failed: " << error << "\n";
       return 1;
+    }
+    for (std::size_t i = 1; i < prompt.size(); ++i) {
+      if (!executor->Step(*plain, prompt[i], &error)) {
+        std::cerr << "parity oracle prefill step failed: " << error << "\n";
+        return 1;
+      }
     }
     for (int i = 0; i < kParityTokens; ++i) {
       const auto logits = Download(executor->logits(), vocab);

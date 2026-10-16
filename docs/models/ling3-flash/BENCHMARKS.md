@@ -133,6 +133,14 @@ above; llama.cpp b11557 has no accepted path for this model's MTP head, and
 no speculative reference cells are claimed. Prefill paths are untouched
 (prefill already wrote cache rows directly).
 
+5.6a (October 16) made the Q8_0 Vec4 multi-row GEMV bit-exact with the
+per-row kernel (`GemvRowsQ8_0Vec4`); the verify rows route through it in
+the draft loop, so the matched `--speculative mtp` BAAB pair after pp8
+rose 39.67 → 40.34 (+1.7 %, `tg1024`) and 37.04 → 37.50 (+1.2 %,
+`tg1024 @ d2048`), both pairs consistent, while every plain pp/tg cell
+stayed inside ±0.4 % (`gufo_bench_q8baab`). The after-pp2048 table above
+is a different prefill prefix and was not re-measured; it stands.
+
 ## Measurement detail
 
 ```sh

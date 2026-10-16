@@ -1449,6 +1449,31 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
       without the 5.1a change, so it is pre-existing, not lever-caused —
       first action under 5.6 is repairing this gate, and until then do
       not blame it on new levers (verify against a control binary).
+    - [x] 5.6a ACCEPTED — gate repair landed; `ling3_flash.rocm_mtp_accept`
+            is green (29.10 s standalone; exclusive suite 11/12, only the
+            parked `rocm_inference` step-1 divergence fails). Two real
+            causes, one kernel: `GemvRows` Q8_0 Vec4 accumulated the
+            dot-product in a different order than per-row `GemvQ8_0Vec4`,
+            so draft rows diverged once columns spanned >1 round; the new
+            `GemvRowsQ8_0Vec4` mirrors the per-row order and `rocm_gemv`
+            rows 2–5 are bit-exact. The batched-`Verify` culprit from an
+            earlier bisect was a phantom — stale pre-session binaries;
+            HEAD's `MlaBatch`/`KdaBatch`/`FfnBatch` verify is bit-exact
+            (rows 4/4, 22/22 steps, 3/3 deterministic on control
+            builds). The residual parity failure was test-side: the
+            phase-2 oracle prefilled with WMMA `Prefill` while
+            production spec sessions feed the MTP draft cache
+            sequentially per token, so oracle and spec bits differed
+            from token 3 for any kernels; the oracle now mirrors the
+            production sequential feed and keeps the interleaved
+            `MtpStep` draft-chain non-perturbation in the contract.
+            Kernel-resources `--compare` on HEAD release: 0 worse, 4
+            one-side (new rows kernels). Exclusive BAAB ×2 +
+            `--speculative mtp` pairs (`gufo_bench_q8baab`): plain
+            cells ±0.4 % or noise-signed; spec tg1024 39.67 → 40.34
+            (+1.7 %) and d2048 37.04 → 37.50 (+1.2 %), both pairs
+            consistent — the verify rows route through the fixed rows
+            GEMV.
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +

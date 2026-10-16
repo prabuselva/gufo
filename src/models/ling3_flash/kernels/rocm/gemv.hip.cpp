@@ -425,6 +425,69 @@ __global__ void GemvRowsQ8_0(const Q8_0Block* __restrict__ w,
   }
 }
 
+// Vec4 multi-row variant, mirroring the host-side kernel selection of the
+// single-row dispatcher: Q8_0 launches the vectorized walk whenever
+// cols % 128 == 0, so the verify pass must use the same per-row summation
+// order or verify rows drift from sequential steps (1e-5 per token, enough
+// to break the bit-parity contract on near-tie logits). Each row keeps the
+// exact GemvQ8_0Vec4 chain; the weight row and dequantized codes are shared
+// by the Rows activation rows.
+template<std::uint32_t Rows>
+__global__ void GemvRowsQ8_0Vec4(const Q8_0Block* __restrict__ w,
+                                 const float* __restrict__ x,
+                                 std::uint32_t x_stride,
+                                 float* __restrict__ out,
+                                 std::uint32_t out_stride, std::uint32_t rows,
+                                 std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t groups = cols / 128U;
+  const Q8_0Block* __restrict__ row =
+      w + static_cast<std::size_t>(r) * (cols / 32U);
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc[Rows] = {};
+#pragma unroll 4
+  for (std::uint32_t g = 0; g < groups; ++g) {
+    const std::uint32_t blk = g * 4U + lane / 8U;
+    const std::uint32_t word = (4U * lane) % 32U;
+    std::int32_t packed;
+    __builtin_memcpy(&packed, &row[blk].qs[word], 4);
+    const float d = __half2float(row[blk].d);
+    const std::uint32_t k = blk * 32U + word;
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      const float* __restrict__ xr = x + static_cast<std::size_t>(o) * x_stride;
+      acc[o] += d *
+                static_cast<float>(static_cast<std::int8_t>(packed & 0xFF)) *
+                xr[k];
+      acc[o] +=
+          d *
+          static_cast<float>(static_cast<std::int8_t>((packed >> 8) & 0xFF)) *
+          xr[k + 1];
+      acc[o] +=
+          d *
+          static_cast<float>(static_cast<std::int8_t>((packed >> 16) & 0xFF)) *
+          xr[k + 2];
+      acc[o] +=
+          d *
+          static_cast<float>(static_cast<std::int8_t>((packed >> 24) & 0xFF)) *
+          xr[k + 3];
+    }
+  }
+#pragma unroll
+  for (std::uint32_t o = 0; o < Rows; ++o) {
+    acc[o] = WarpReduceSum(acc[o]);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (std::uint32_t o = 0; o < Rows; ++o) {
+      out[static_cast<std::size_t>(o) * out_stride + r] = acc[o];
+    }
+  }
+}
+
 template<std::uint32_t Rows>
 __global__ void GemvRowsQ4K(const Q4KBlock* __restrict__ w,
                             const float* __restrict__ x, std::uint32_t x_stride,
@@ -1134,9 +1197,15 @@ void GemvRows(const void* base, GemvType type, std::uint32_t tokens,
             rows, cols);                                                       \
         break;                                                                 \
       case GemvType::kQ8_0:                                                    \
-        GemvRowsQ8_0<R><<<grid, dim3(128), 0, stream>>>(                       \
-            static_cast<const Q8_0Block*>(base), x, x_stride, out, out_stride, \
-            rows, cols);                                                       \
+        if (cols % 128U == 0U) {                                               \
+          GemvRowsQ8_0Vec4<R><<<grid, dim3(128), 0, stream>>>(                 \
+              static_cast<const Q8_0Block*>(base), x, x_stride, out,           \
+              out_stride, rows, cols);                                         \
+        } else {                                                               \
+          GemvRowsQ8_0<R><<<grid, dim3(128), 0, stream>>>(                     \
+              static_cast<const Q8_0Block*>(base), x, x_stride, out,           \
+              out_stride, rows, cols);                                         \
+        }                                                                      \
         break;                                                                 \
       case GemvType::kQ4_K:                                                    \
         GemvRowsQ4K<R><<<grid, dim3(128), 0, stream>>>(                        \
