@@ -422,3 +422,40 @@ depth-decay signature this lever existed to fix.
 kernel stages its WMMA fragments in 288 B of private scratch with zero
 spills (allowance added to `tools/ci/kernel-resources.json`), the same
 by-design pattern as the `AttentionPrefillWmma` donor.
+
+Router GEMV/fused top-k selection in one launch (STATUS.md lever 5.5a):
+`RouterTopKFusedF16Kernel` extends the f16 router logits GEMV grid
+(128×128, 512 experts × 2560 cols) so the last wave performs the
+existing greedy `RouterSelectRow` selection from global logits after a
+ticket barrier, saving the separate 512-thread `RouterTopKKernel`
+launch per MoE layer per token. Selection correctness needed two
+findings: plain `__threadfence()` + ticket + plain global loads is
+sufficient on gfx1151 (L1 is invalidation-coherent; atomics and
+`__ldcg`/`__stcg` unneeded — the latter have no float overloads in
+ROCm 10), and the winner-retirement test must be `threadIdx.x ==
+best_e % blockDim.x`, not `== best_e` — the standalone `<<<1,512>>>`
+launch only hides the identity because blockDim equals `n_exp` (at 128
+threads winners were never retired: all 8 ids repeated the first
+winner with flat 2.5/8 weights). Bit-exact ids/weights over 900
+randomized rounds across three shapes
+(`tools/bench/ling3_router_fused_bench.hip`, retained with the
+rejection), full-suite parity with HEAD `6af0f594` on the three parked
+gates (`rocm_gemv`, `rocm_inference` step-1 greedy parity `cpu 220 gpu
+2538` at top-2 gap 0.0990877 — reproduced 6/6 on a HEAD control binary
+and in the HEAD full-gate baseline, so pre-existing, not lever-caused —
+and `rocm_mtp_accept`), `--compare` 0 worse / 0 better / 126 same, and
+the standalone launch-pair wall −0.15…−0.66 µs (~2 %) per router pair.
+
+Matched BAAB pair, twice, exclusive, control = the HEAD release binary
+(`gufo_bench_ba55a.log`): tg128 d0 36.09 → 35.84 (**−0.7 %**), d2048
+34.28 → 34.00 (**−0.8 %**), d8192 29.39 → 29.48 (+0.3 %, noise), pp8
+neutral — the candidate lost every d0/d2048 pair. The router pair is
+≈36.8 µs of the 27.8 ms/token decode step (0.14 %), and the launches
+were already pipelined behind GPU work, so the savings ceiling was
+below noise while fusion serializes the selection into a 128-thread
+tail block after the GEMV. Rejected and reverted; any revisit must run
+the selection alongside, not after, the GEMV tail — and should target
+the elementwise fusions (Add→RmsNorm, Swiglu-in-down-GEMV) first,
+which touch comparable launch counts without extending the critical
+path.
+

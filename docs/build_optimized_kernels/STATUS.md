@@ -1355,10 +1355,41 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             (`--speculative mtp` tg1024, control 40.51/40.56 vs
             candidate 40.50/40.49, `gufo_bench_mo54tgm.log`); landed
             as a strictly-faster kernel, not a measured model gain.
-      - Remaining toward 5.4: 5.5's router/elementwise launch fusion
-        for what is left of the launch-gap share.
+      - Remaining toward 5.4: 5.5's elementwise launch fusion for what
+        is left of the launch-gap share (the router-fusion tier drew the
+        5.5a rejection below).
 - [ ] 5.5 Router/elementwise fusion (nodes 5+6): remaining tier launches
       after the `RouterTopKKernel` win (+8.2/+7.6 % tg); launch-count-bound.
+    - [x] 5.5a REJECTED — one-launch fusion of the f16 router logits
+            GEMV with top-k selection (512 experts, 8 used, 4 groups):
+            `RouterTopKFusedF16Kernel` extends `LogitsGEMVKernel16`'s
+            grid (128×128) so the last wave runs the selection from
+            global logits after a ticket barrier (plain
+            `__threadfence` + ticket + plain loads proved correct on
+            gfx1151; no atomics needed; the row-owner retirement must
+            key on `best_e % blockDim.x`, not `best_e` — the standalone
+            `<<<1,512>>>` launch only hides this because blockDim ==
+            n_exp). Bit-exact ids/weights over 900 randomized rounds
+            (`tools/bench/ling3_router_fused_bench.hip`, retained with
+            the rejection), and the retained bench's paired-launch wall
+            was −0.15…−0.66 µs (~2 %) per router pair. Gate parity:
+            the full `ling3_flash` suite fails exactly THREE
+            pre-existing parked tests — `rocm_gemv`, `rocm_inference`
+            (step-1 greedy parity, `cpu 220 gpu 2538`, top-2 gap
+            0.0990877; reproduced 6/6 on a HEAD-`6af0f594` control
+            binary and in the HEAD full-gate baseline, so it is a
+            parked gate, not lever-caused) and `rocm_mtp_accept` —
+            `--compare` kernel-resources 0 worse / 0 better / 126
+            same. Matched BAAB ×2 (control = HEAD release binary,
+            `gufo_bench_ba55a.log`): tg128 d0 36.09 → 35.84
+            (**−0.7 %**), d2048 34.28 → 34.00 (**−0.8 %**), d8192
+            29.39 → 29.48 (+0.3 %, noise); pp8 neutral. The router
+            pair is ≈36.8 µs = 0.14 % of the 27.8 ms/token decode
+            step and the launches are already pipelined behind GPU
+            work, so the ceiling was below noise while fusing
+            serializes selection to the 128-thread tail block (B lost
+            every d0/d2048 pair). Reverted; revisit only if the
+            selection tail can run alongside, not after, the GEMV.
 - [ ] 5.6 MTP width-invariance, hash gate, draft policy (nodes 7+8): park —
       draft-token sweeps were flat (36.46–36.72) and the MLA copy removal
       already cleared +2.5 %; keep the width-invariance gate and re-check
