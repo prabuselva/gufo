@@ -1630,6 +1630,46 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         production partial-sum bug (per-block reinit of the second
         accumulator) was caught by `rocm_gemv` before any E2E ran.
 
+- [x] 6.3 VOID — decode launch-gap audit (pre-close-out investigation).
+        The profiled "62.2 % idle in span" was a profiler artifact: the
+        ≥50 µs gap bucket (n=829, 20.5 s) sits before `copyBuffer` D2H
+        syncs at ~24.6 ms each — host stalls, not inter-kernel gaps.
+        Inside one 14.7 s dense decode run (841 k dispatches) gaps
+        >20 µs total 51.9 ms and the histogram is 0–4 µs scheduling
+        noise: decode is ~99 % GPU-busy. No launch-overhead/fusion
+        headroom exists; further work must reduce busy time, confirmed
+        per-dispatch-shape against the decode run. Replaces the
+        open "launch gap" investigation in the close-out list.
+
+- [x] 6.4 VOID — Q8_0 / Router GEMV audit (pre-close-out investigation).
+        `GemvQ8_0Vec4` (16 % of decode busy time) serves the KDA attn K/V
+        projections (Q8_0 [2560→4096], 34 B stride) plus shared-expert
+        walks. Probe `tools/bench/ling3_q8attn_bench.hip` at a 272 MB
+        (DRAM-resident) shape: production already streams 228 GB/s, the
+        scale-load removal is ±0.1 % (hidden behind DRAM), and two-row
+        pairing is +0.5/+0.7 % (worse at the L3-hot exact shapes from
+        occupancy loss). In-situ 198 GB/s vs 228 GB/s standalone is
+        contention with the rest of the decode working set, not a kernel
+        flaw — no bit-exact micro-lever exists. `RouterTopKKernel` reads
+        5.2 MB F32 router weights at ~232 GB/s: at the bandwidth ceiling;
+        the only headroom is quantizing router weights (not bit-exact).
+        GEMV-tier micro-optimization is finished; remaining levers must
+        reduce DRAM traffic, not per-kernel efficiency.
+
+- [x] 6.5 NO-GO — structural re-entry audit (pre-close-out investigation).
+        With decode ~99 % busy and the decode kernels at the DRAM
+        bandwidth ceiling (6.3, 6.4), the only remaining gain class is
+        DRAM-traffic reduction. `2.2`/`3.6` (wmma width-invariant decode
+        GEMV) would not cut weight traffic: verify/MTP rows (<16) are far
+        below the tile width, masked/wide tiles do not beat traffic-bound
+        one-pass walks, and their original driver — the gemma4 MTP-vs-AR
+        hash/KL divergence (1.5/1.6) — is not present for Ling3 (accept-
+        ance gate green, spec cells +0.5…+1.2 % after 6.0/6.1). `3.3`
+        binary16 activations do not reduce DRAM traffic either (activity
+        vectors are L2-resident; weights dominate). No further decode
+        optimization levers retained: proceed to close-out. 2.2/3.6/3.3
+        stay open as gemma4-numeric items outside this Ling3 line.
+
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
 cold/frontier tg grid; gates `ctest --preset gpu-full -R '^ling3_flash\.'`
