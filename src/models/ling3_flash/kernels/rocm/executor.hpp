@@ -213,6 +213,16 @@ private:
                   std::uint32_t base_pos, std::uint32_t tokens);
   void PrefillFfn(const DeviceLayer& l, std::uint32_t il, std::uint32_t tokens);
 
+  /// One batched MTP draft layer over the chunk rows the trunk just
+  /// produced: row r embeds `next_tokens[r]` with the normalized trunk row
+  /// pf_x_[r] as the hidden input and writes the draft KV rows and residual
+  /// state for draft positions [session.mtp_position_,
+  /// session.mtp_position_ + rows). Reuses the trunk tier scratch, which
+  /// the chunk no longer needs; pf_x_ itself stays intact for the next
+  /// chunk's residual stream and the prefill tail.
+  void PrefillMtpDraft(Session& session, const std::int32_t* next_tokens,
+                       std::uint32_t rows);
+
   float* AllocFloats(std::size_t n, std::string* error);
   std::int32_t* AllocInts(std::size_t n, std::string* error);
 
@@ -269,6 +279,12 @@ private:
   float* mtp_cat_{nullptr};
   float* mtp_x_{nullptr};
   float* mtp_chain_{nullptr};  ///< Unnormalized draft output for MtpDraft.
+
+  // Batched MTP draft-layer tier (up to kPrefillChunkRows rows, allocated
+  // when the model has an MTP block; the trunk tier scratch serves the rest).
+  float* mtp_pf_e_{nullptr};  ///< [rows][hidden] normalized embedding rows.
+  float* mtp_pf_h_{nullptr};  ///< [rows][hidden] normalized hidden rows.
+  float* mtp_pf_x_{nullptr};  ///< [rows][hidden] draft residual stream.
 
   // Multi-row block scratch, shared by the speculative verify block (up to
   // kMaxVerifyRows rows, allocated when the model has an MTP block) and the
@@ -342,7 +358,9 @@ private:
   std::int32_t* pf_dbounds_{nullptr};
   std::int32_t* pf_dtiles_{nullptr};
   bool prefill_ready_{false};  ///< The dense tier can run every trunk layer.
-  bool tier_failure_{false};   ///< A chunked-tier launch was rejected.
+  ///< The dense tier can also run the draft layer's projections.
+  bool mtp_draft_tier_ready_{false};
+  bool tier_failure_{false};  ///< A chunked-tier launch was rejected.
 
   std::uint32_t scratch_context_{0};
   std::vector<void*> allocations_;

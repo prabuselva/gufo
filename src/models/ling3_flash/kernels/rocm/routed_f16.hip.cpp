@@ -123,12 +123,16 @@ constexpr std::size_t kQ6KDOffset = 208;
 /// sub before scaling: bits 1024 + q, q in [0, 64), are exact in F16.
 constexpr float kQ6KUnpackBase = 1056.0F;
 
+/// block_q4_0: an F16 scale followed by 16 nibble bytes.
+constexpr std::size_t kQ4_0BlockBytes = 18;
+
 template<WeightType kType>
 __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
   return kType == WeightType::kQ4_K   ? (k / 256) * sizeof(Q4KBlock)
          : kType == WeightType::kQ5_K ? (k / 256) * kQ5KBlockBytes
          : kType == WeightType::kQ6_K ? (k / 256) * kQ6KBlockBytes
          : kType == WeightType::kQ5_1 ? (k / 32) * sizeof(Q5_1Block)
+         : kType == WeightType::kQ4_0 ? (k / 32) * kQ4_0BlockBytes
          : kType == WeightType::kBF16 ? k * 2
          : kType == WeightType::kF16  ? k * 2
                                       : (k / 32) * sizeof(Q8_0Block);
@@ -192,6 +196,7 @@ __launch_bounds__(256) __global__
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
+  constexpr bool kQ40 = kType == WeightType::kQ4_0;
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
   constexpr bool kQ8 = kType == WeightType::kQ8_0;
   constexpr bool kQ6K = kType == WeightType::kQ6_K;
@@ -364,6 +369,13 @@ __launch_bounds__(256) __global__
         __builtin_memcpy(&f_q6d[u], blk + kQ6KDOffset, 2);
         f_q6ns[u] = (seg >= 2) ? 4 : 0;
         f_q6bs[u] = 2 * seg;
+      } else if constexpr (kQ40) {
+        // Q4_0: the block's F16 scale then the same 16 nibble bytes Q5_1
+        // stores, without its separate high-bit word.
+        const std::uint8_t* blk =
+            f_ptr[u] + static_cast<std::size_t>(kb0 + f_c) * kQ4_0BlockBytes;
+        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+        __builtin_memcpy(&f_codes[u], blk + 2, 16);
       } else if constexpr (kBF16 || kF16) {
         // A BF16/F16 K block is 32 lanes = 64 bytes = four 16-byte chunks.
         const auto* u4 =
@@ -484,6 +496,13 @@ __launch_bounds__(256) __global__
           const float mn = f_live[u] ? __high2float(dm) : 0.0F;
           scale_bias =
               __builtin_bit_cast(std::uint32_t, __floats2half2_rn(d, mn));
+        } else if constexpr (kQ40) {
+          // Q4_0 dequantizes q - 8 scaled by d; the magic unpack carries the
+          // -8 into the product's sub, so the bias term is -8 * d.
+          const __half2 dm = __builtin_bit_cast(__half2, f_dm[u]);
+          const float d = f_live[u] ? __low2float(dm) : 0.0F;
+          scale_bias = __builtin_bit_cast(std::uint32_t,
+                                          __floats2half2_rn(d, -8.0F * d));
         } else {
           const int sb32 = f_sb32[u];
           std::uint32_t sc = 0;
@@ -626,6 +645,16 @@ __launch_bounds__(256) __global__
                        SpreadHighBits((high >> (4 * i)) & 0xFU);
               nib[4 + i] = ((words[i] >> 4U) & 0x0F0F0F0FU) |
                            SpreadHighBits((high >> (16 + 4 * i)) & 0xFU);
+            }
+          } else if constexpr (kQ40) {
+            // Q4_0: K block kb's 16 bytes are chunk kb; elements 0-15 take
+            // the low nibbles, 16-31 the high.
+            const uint4 r = raw[u][kb];
+            const std::uint32_t words[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              nib[i] = words[i] & 0x0F0F0F0FU;
+              nib[4 + i] = (words[i] >> 4U) & 0x0F0F0F0FU;
             }
           } else {
             // Q4_K / Q5_K: elements 0-15 of K block kb0 + kb are the low
@@ -914,6 +943,21 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
   }
 }
 
+__global__ void Concat2RowsHalfKernel(const float* x_a, const float* x_b,
+                                      __half* out, std::size_t rows,
+                                      std::uint32_t n) {
+  const std::size_t count = rows * n;
+  const std::size_t i =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (i < count) {
+    const std::size_t r = i / n;
+    const std::size_t c = i - r * n;
+    out[r * (2U * static_cast<std::size_t>(n)) + c] = __half(x_a[i]);
+    out[r * (2U * static_cast<std::size_t>(n)) + static_cast<std::size_t>(n) +
+        c] = __half(x_b[i]);
+  }
+}
+
 /// Identity row map for a dense token run treated as one virtual bucket:
 /// rows_out[i] = i for live tokens and -1 for 16-padding, pad_bounds =
 /// {0, padded}, and tiles[j] = j << 16 (read as BN-sized token buckets, so
@@ -983,6 +1027,13 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        dim3(kThreads), 0, stream, x, static_cast<__half*>(out),
                        count);
   }
+}
+
+void Concat2RowsHalf(const float* a, const float* b, __half* out,
+                     std::uint32_t rows, std::uint32_t n, hipStream_t stream) {
+  const std::size_t count = static_cast<std::size_t>(rows) * n;
+  hipLaunchKernelGGL(Concat2RowsHalfKernel, dim3(Blocks(count)), dim3(kThreads),
+                     0, stream, a, b, out, static_cast<std::size_t>(rows), n);
 }
 
 std::size_t RoutedCompactRows(std::size_t slots, std::size_t n_experts) {
@@ -1063,6 +1114,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
     case WeightType::kQ4_K:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, swiglu_limit, out, out_half, m, k, out_stride, nullptr);
+      return true;
+    case WeightType::kQ4_0:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ4_0, kBM, BN, kBK>), grid,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, swiglu_limit, out, out_half, m, k, out_stride, nullptr);
       return true;
@@ -1159,6 +1216,12 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
     case WeightType::kQ4_K:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ4_K, 128, BN, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, swiglu_limit, nullptr, out_half, m, k, 0, up);
+      return true;
+    case WeightType::kQ4_0:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ4_0, 128, BN, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
           rows_out, nullptr, swiglu_limit, nullptr, out_half, m, k, 0, up);
       return true;

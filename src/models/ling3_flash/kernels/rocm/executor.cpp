@@ -24,6 +24,9 @@ constexpr std::uint32_t kMlaTile = 256U;
 /// tier or the per-token path.
 bool WeightTypeOf(core::GgmlType t, WeightType* out) {
   switch (t) {
+    case core::GgmlType::kQ4_0:
+      *out = WeightType::kQ4_0;
+      return true;
     case core::GgmlType::kQ5_1:
       *out = WeightType::kQ5_1;
       return true;
@@ -88,6 +91,33 @@ bool DenseTierCovers(const Config& c, std::uint32_t il, const DeviceLayer& l) {
            t != core::GgmlType::kBF16)) {
         return false;
       }
+    }
+  }
+  return true;
+}
+
+/// True when the F16 WMMA tier can run the draft layer's projections. MTP
+/// checkpoints quantize their matrices as Q4_0, so the gate/up expert pair
+/// additionally accepts that format; a draft layer the tier cannot decode
+/// keeps MtpPrefill on the sequential per-token path.
+bool MtpDraftTierCovers(const DeviceLayer& l) {
+  WeightType w;
+  const core::GgmlType dense[] = {
+      l.attn_q.type,        l.attn_kv_a.type,     l.attn_gate.type,
+      l.attn_out.type,      l.attn_k_b.type,      l.attn_v_b.type,
+      l.nextn_eh_proj.type, l.ffn_down_exps.type, l.shexp_gate.type,
+      l.shexp_up.type,      l.shexp_down.type};
+  for (const core::GgmlType t : dense) {
+    if (!WeightTypeOf(t, &w)) {
+      return false;
+    }
+  }
+  const core::GgmlType gated[] = {l.ffn_gate_exps.type, l.ffn_up_exps.type};
+  for (const core::GgmlType t : gated) {
+    if (!WeightTypeOf(t, &w) ||
+        (t != core::GgmlType::kQ4_0 && t != core::GgmlType::kQ4_K &&
+         t != core::GgmlType::kQ8_0 && t != core::GgmlType::kBF16)) {
+      return false;
     }
   }
   return true;
@@ -443,6 +473,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     }
   }
   if (model.has_mtp()) {
+    e->mtp_draft_tier_ready_ =
+        e->prefill_ready_ && MtpDraftTierCovers(model.mtp());
     e->mtp_e_ = e->AllocFloats(hid, err);
     e->mtp_h_ = e->AllocFloats(hid, err);
     e->mtp_cat_ = e->AllocFloats(2 * hid, err);
@@ -456,12 +488,17 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->pf_moe_up_ = e->AllocFloats(k * used * ff, err);
     e->pf_moe_inter_ = e->AllocFloats(k * used * ff, err);
     e->pf_moe_down_ = e->AllocFloats(k * used * hid, err);
+    e->mtp_pf_e_ = e->AllocFloats(cap * hid, err);
+    e->mtp_pf_h_ = e->AllocFloats(cap * hid, err);
+    e->mtp_pf_x_ = e->AllocFloats(cap * hid, err);
     if (e->mtp_e_ == nullptr || e->mtp_h_ == nullptr ||
         e->mtp_cat_ == nullptr || e->mtp_x_ == nullptr ||
         e->mtp_chain_ == nullptr || e->pf_h_ == nullptr ||
         e->pf_logits_ == nullptr || e->pf_mla_abs_ == nullptr ||
         e->pf_moe_gate_ == nullptr || e->pf_moe_up_ == nullptr ||
-        e->pf_moe_inter_ == nullptr || e->pf_moe_down_ == nullptr) {
+        e->pf_moe_inter_ == nullptr || e->pf_moe_down_ == nullptr ||
+        e->mtp_pf_e_ == nullptr || e->mtp_pf_h_ == nullptr ||
+        e->mtp_pf_x_ == nullptr) {
       return nullptr;
     }
   }
@@ -1266,6 +1303,45 @@ void Executor::PrefillChunk(Session& session, std::uint32_t tokens,
   }
 }
 
+void Executor::PrefillMtpDraft(Session& session,
+                               const std::int32_t* next_tokens,
+                               std::uint32_t rows) {
+  const std::uint32_t hid = c_.hidden_size;
+  const DeviceLayer& l = model_.mtp();
+  GemvType type;
+  WeightType w;
+  DenseRowPrepare(pf_drows_, pf_dbounds_, pf_dtiles_, rows, nullptr);
+  (void)GemvTypeOf(model_.token_embd().type, &type);
+  for (std::uint32_t r = 0U; r < rows; ++r) {
+    EmbedRow(model_.token_embd().data, type,
+             static_cast<std::uint32_t>(next_tokens[r]),
+             static_cast<std::uint32_t>(hid),
+             mtp_pf_e_ + static_cast<std::size_t>(r) * hid, nullptr);
+  }
+  RmsNormRows(mtp_pf_e_, l.nextn_enorm.f32(), c_.rms_eps, mtp_pf_e_, rows, hid,
+              nullptr);
+  // The draft consumes the trunk hidden the per-token loop exposes as
+  // h_out_: output_norm first, then the draft's own hnorm.
+  RmsNormRows(pf_x_, model_.output_norm().f32(), c_.rms_eps, mtp_pf_h_, rows,
+              hid, nullptr);
+  RmsNormRows(mtp_pf_h_, l.nextn_hnorm.f32(), c_.rms_eps, mtp_pf_h_, rows, hid,
+              nullptr);
+  Concat2RowsHalf(mtp_pf_e_, mtp_pf_h_, pf_xh_, rows, hid, nullptr);
+  (void)WeightTypeOf(l.nextn_eh_proj.type, &w);
+  tier_failure_ |= !DenseF16Gemm(l.nextn_eh_proj.data, w, pf_xh_, pf_drows_,
+                                 pf_dbounds_, pf_dtiles_, rows, mtp_pf_x_,
+                                 nullptr, hid, 2U * hid, 0U, nullptr);
+  RmsNormRows(mtp_pf_x_, l.attn_norm.f32(), c_.rms_eps, pf_normed_, rows, hid,
+              nullptr);
+  PrefillMla(l, session.mtp_kv_, session.mtp_kpe_, session.mtp_position_, rows);
+  Add(mtp_pf_x_, pf_attn_, mtp_pf_x_, rows * hid, nullptr);
+  RmsNormRows(mtp_pf_x_, l.ffn_norm.f32(), c_.rms_eps, pf_normed_, rows, hid,
+              nullptr);
+  PrefillFfn(l, c_.num_layers, rows);
+  Add(mtp_pf_x_, pf_ffn_, mtp_pf_x_, rows * hid, nullptr);
+  session.mtp_position_ += rows;
+}
+
 bool Executor::Prefill(Session& session, const std::int32_t* tokens,
                        std::uint32_t count, std::string* error_msg) {
   for (std::uint32_t i = 0; i < count; ++i) {
@@ -1391,11 +1467,29 @@ bool Executor::MtpPrefill(Session& session, const std::int32_t* tokens,
     // Pair the draft block with every trunk position except the final
     // prompt token: row r of pf_x_ is the hidden of tokens[done + r],
     // which the per-token loop exposes as h_out_ to MtpStep(tokens[i + 1]).
-    for (std::uint32_t r = 0U; r < rows && done + r + 1U < count; ++r) {
-      RmsNorm(pf_x_ + static_cast<std::size_t>(r) * hid,
-              model_.output_norm().f32(), c_.rms_eps, h_out_, hid, nullptr);
-      if (!MtpAdvance(session, tokens[done + r + 1U], h_out_, error_msg)) {
-        return false;
+    // The batch tier runs the one draft layer over these rows with the
+    // same WMMA kernels the 46 trunk layers use, instead of one sequential
+    // GEMV graph per row.
+    const std::uint32_t draft_rows =
+        done + rows + 1U <= count
+            ? rows
+            : (done < count - 1U ? count - 1U - done : 0U);
+    if (draft_rows > 0U) {
+      if (mtp_draft_tier_ready_) {
+        PrefillMtpDraft(session, tokens + done + 1U, draft_rows);
+        if (tier_failure_) {
+          return fail("chunked prefill tier rejected a draft projection");
+        }
+      } else {
+        // A draft format the WMMA tier cannot decode: the per-token draft
+        // step is the reference-shaped path and always correct.
+        for (std::uint32_t r = 0U; r < draft_rows; ++r) {
+          RmsNorm(pf_x_ + static_cast<std::size_t>(r) * hid,
+                  model_.output_norm().f32(), c_.rms_eps, h_out_, hid, nullptr);
+          if (!MtpAdvance(session, tokens[done + r + 1U], h_out_, error_msg)) {
+            return false;
+          }
+        }
       }
     }
     done += rows;

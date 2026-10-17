@@ -565,3 +565,28 @@ remain bit-exact because greedy verification owns the final tokens.
 Plain cells unchanged; exclusive suite 11/12 with only the byte-identical
 parked `rocm_inference` fail; kernel-resources 0 worse. Accepted: a
 −2 % accept-rate slice buys 15–19× speculative prefill.
+
+Batched MTP draft-layer tier (STATUS.md lever 5.6c): even with the batched
+chunk prefill, each `MtpPrefill` chunk still walked its rows through one
+sequential GEMV draft graph per token (~0.9 ms/token), so spec pp2048
+capped at ~606 t/s against plain's 1329. Batching the draft layer hit a
+memory fault inside the first draft chunk, and instrumented stage prints
+pinned it to stale `WeightType` values: the MTP checkpoint (blk.42)
+quantizes every matrix as **Q4_0**, a format the WMMA tier never decoded,
+and the `(void)WeightTypeOf` tier call sites launched whatever register
+value survived. Q4_0 is structurally Q5_1 without the high-bit plane and
+with bias −8·d — nibble bytes identical — so the kernel gained a Q4_0
+arm (18-byte block fetch, `(d, −8·d)` scale pair with no `s_high` plane,
+nibble-only dequant, plain and gated-pair dispatch), `WeightTypeOf` now
+maps the type (a trunk layer holding Q4_0 tensors therefore runs the tier
+rather than disabling prefill entirely), and `MtpDraftTierCovers` gates
+the draft path on every MTP matrix being tier-decodable, keeping the
+per-token `MtpAdvance` loop as the fallback for a format the tier still
+cannot read. Gate `rocm_mtp_accept` green; exclusive suite 11/12 with
+only the byte-identical parked `rocm_inference` fail; kernel-resources
+0 worse, 6 one-side rows (the new Q4_0 instantiations). Exclusive BAAB
+×2 (`gufo_bench_baab56c`): spec pp2048 605.6–607.5 → 1270.9–1280.1 t/s
+(**2.1×**), pp4096 546.5 → 1140.5 (**2.1×**) — the spec-vs-plain prefill
+gap falls from 46 % to 4 %; spec tg1024 39.37 → 39.55 (+0.5 %, within
+noise) confirms the tier's Q4_0 dequant costs no accept rate against
+GEMV, and the plain pp2048 control is unchanged (1329.6/1329.3).

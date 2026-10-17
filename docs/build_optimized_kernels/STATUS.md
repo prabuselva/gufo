@@ -1496,6 +1496,30 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             the parked `rocm_inference` fail, byte-identical),
             kernel-resources 0 worse, resume (`common > 0`) tails still
             sequential.
+    - [x] 5.6c ACCEPTED — the draft layer itself batched. `MtpPrefill`
+            chunk tails still ran one sequential GEMV draft graph per row
+            (~0.9 ms/token), holding spec pp2048 at 606 t/s against
+            plain's 1329. The gate exposed why no tier covered the draft:
+            the MTP checkpoint stores every matrix as Q4_0, the WMMA tier
+            had no Q4_0 arm, and the `(void)WeightTypeOf` call sites
+            launched stale types into the kernels (memory fault at the
+            first draft chunk). Q4_0 is Q5_1 minus the high-bit plane
+            with bias -8·d, so the kernel gained an 18-byte block fetch,
+            a `(d, -8d)` scale pair with no `s_high` plane, a nibble-only
+            dequant branch and plain + gated-pair dispatch arms;
+            `MtpDraftTierCovers` gates the path
+            (`mtp_draft_tier_ready_`), with the 5.6b per-row
+            `RmsNorm`+`MtpAdvance` loop as the fallback for checkpoints
+            the tier still cannot decode. Matched BAAB ×2 exclusive
+            (`gufo_bench_baab56c`): spec pp2048 605.6–607.5 →
+            1270.9–1280.1 t/s (**2.1×**; spec-vs-plain gap 46 % → 4 %),
+            pp4096 546.5 → 1140.5 (**2.1×**); spec tg1024 39.37 → 39.55
+            (+0.5 %, no accept-rate cost — the tier's Q4_0 dequant
+            matches GEMV to F16 fma rounding), plain pp2048 control
+            1329.6/1329.3. Exclusive suite 11/12 (only the parked
+            `rocm_inference` fail), gate `rocm_mtp_accept` green,
+            kernel-resources 0 worse / 6 one-side (new Q4_0
+            instantiations).
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +

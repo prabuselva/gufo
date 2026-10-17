@@ -155,6 +155,17 @@ pair consistent; outputs stay bit-exact under greedy verification. Plain
 cells unchanged. The tg rows quoted above stand as the sequential-sync
 pipeline's history.
 
+5.6c (October 17) runs the draft layer itself as a batched WMMA tier in
+`MtpPrefill` and adds Q4_0 decoding to the F16 GEMM kernels: the MTP
+checkpoint stores every matrix as Q4_0, which the tier could not decode,
+so each chunk tail had kept a sequential per-token GEMV draft (~0.9 ms/token).
+Matched BAAB ×2, exclusive (`gufo_bench_baab56c`): spec pp2048
+605.6–607.5 → 1270.9–1280.1 t/s (**2.1×**), pp4096 546.5 → 1140.5
+(**2.1×**) — spec prefill is now within ~4 % of plain; spec tg1024 after
+pp2048 39.37 → 39.55 (+0.5 %, no accept-rate cost) and the plain pp2048
+control is unchanged (1329.6/1329.3). Outputs stay bit-exact under greedy
+verification.
+
 ## Measurement detail
 
 ```sh

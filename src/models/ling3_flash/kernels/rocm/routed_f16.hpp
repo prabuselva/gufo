@@ -20,6 +20,7 @@ namespace gufo::models::ling3_flash::rocm {
 enum class WeightType : std::uint32_t {
   kF32 = 0,
   kF16 = 1,
+  kQ4_0 = 2,
   kQ5_1 = 7,
   kQ8_0 = 8,
   kQ4_K = 12,
@@ -31,6 +32,13 @@ enum class WeightType : std::uint32_t {
 /// Narrows `count` F32 activations to F16 (or BF16 when `bf16`) in `out`.
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        hipStream_t stream);
+
+/// Row-batched [embedding; hidden] concat fused with the F16 narrowing the
+/// dense tier consumes: out[r * 2n + 0:n] = half(a[r * n + 0:n]) and
+/// out[r * 2n + n:2n] = half(b[r * n + 0:n]) for `rows` rows, matching the
+/// narrowing of a Concat2 row fed to DenseF16Gemm with k = 2n.
+void Concat2RowsHalf(const float* a, const float* b, __half* out,
+                     std::uint32_t rows, std::uint32_t n, hipStream_t stream);
 
 /// Rows a compacted bucket layout needs for `slots` routed assignments over
 /// `n_experts` experts with 16-row padded buckets.
