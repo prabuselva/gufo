@@ -721,3 +721,24 @@ tg1024 +0.5 %/+0.7 %, tg128-plain +0.2 %/−0.1 % — the dense matrices
 (leading dense FFN, shared expert) are every-token main-stream work, so
 the kernel gain lands directly. Gate `rocm_mtp_accept` green, suite
 11/11 selected, kernel-resources 0 worse / 2962 same.
+
+### 6.2 — Q6_K pairing and the exact-product fold (October 17, not adopted)
+
+`Q4ScaleMinFromWords` has no Q6 analogue — the sixteen int8 scales sit at
+offset 192 of a 210-byte block, so per-word loads would be misaligned —
+but the mantissa budget allows a different fold: `d` (≤11 bits) ×
+`scale` (≤127) × `quant` (≤32) is ≤23 significant bits, so
+`d*float(scale*quant)` is exact and bit-identical to the unpacked chain.
+Probe: the fold was bit-exact but +3.6…+4.0 % (the scale byte loads, not
+the conversions, are the cost — the constant-scale diagnostic hits
+−28.8 %), and the 210-byte stride leaves no bit-exact way to load them
+wider. A two-rows-per-wave variant instead doubled the independent FMA
+chains per lane: −9.1 %, bit-exact, 417 GB/s — pure ILP, since each row
+still loads its own `qh`/`ql`/scale bytes. End-to-end that ILP win did
+not survive the real schedule: BAAB ×2 plus a 9-pair tg tiebreaker
+against the 6.1 control averaged −0.25 % (5/9 ahead) — plain cells
++0.1…+0.4 % but speculative cells consistently negative (to −1.3 %).
+The lever was reverted from production; the `rocm_gemv` contract test
+earned its keep by catching a production-rewrite bug (the second
+accumulator re-initialized inside the block loop) during the first gate,
+before any E2E evidence was collected.

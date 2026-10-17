@@ -441,6 +441,111 @@ __global__ void DenseQ5KV(const Q5KBlock* __restrict__ w,
   }
 }
 
+template <bool kFold, bool kNoScale>
+__global__ void DenseQ6KV(const Q6KBlock* __restrict__ w,
+                          const float* __restrict__ x, float* __restrict__ out,
+                          std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t nblocks = cols / 256;
+  const Q6KBlock* __restrict__ row = w + static_cast<std::size_t>(r) * nblocks;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const Q6KBlock& blk = row[b];
+    const float d = __half2float(blk.d);
+    const float* xrow = x + b * 256 + lane;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const std::uint8_t qhb = blk.qh[half * 32 + lane];
+      const std::uint8_t q0 = blk.ql[half * 64 + lane];
+      const std::uint8_t q1 = blk.ql[half * 64 + 32 + lane];
+#pragma unroll
+      for (int seg = 0; seg < 4; ++seg) {
+        const std::uint8_t byte = (seg & 1) ? q1 : q0;
+        const int low = (seg < 2) ? (byte & 0xF) : (byte >> 4);
+        const int high = (qhb >> (2 * seg)) & 0x3;
+        const auto quant = static_cast<std::int8_t>((high << 4) | low) - 32;
+        const int scale = kNoScale ? 63
+                                   : blk.scales[half * 8 + (lane >> 4) +
+                                                seg * 2];
+        if (kFold) {
+          acc += (d * static_cast<float>(scale * static_cast<int>(quant))) *
+                 xrow[128 * half + 32 * seg];
+        } else {
+          acc += d * static_cast<float>(scale) * static_cast<float>(quant) *
+                 xrow[128 * half + 32 * seg];
+        }
+      }
+    }
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
+__global__ void DenseQ6KPair(const Q6KBlock* __restrict__ w,
+                             const float* __restrict__ x, float* __restrict__ out,
+                             std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t hr = rows / 2U;
+  const std::uint32_t r0 = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r0 >= hr) {
+    return;
+  }
+  const std::uint32_t r1 = r0 + hr;
+  const std::uint32_t nblocks = cols / 256;
+  const Q6KBlock* __restrict__ rowa = w + static_cast<std::size_t>(r0) * nblocks;
+  const Q6KBlock* __restrict__ rowb = w + static_cast<std::size_t>(r1) * nblocks;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const Q6KBlock& blk = rowa[b];
+    const Q6KBlock& blk2 = rowb[b];
+    const float d = __half2float(blk.d);
+    const float d2 = __half2float(blk2.d);
+    const float* xrow = x + b * 256 + lane;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const std::uint8_t qhb = blk.qh[half * 32 + lane];
+      const std::uint8_t q0 = blk.ql[half * 64 + lane];
+      const std::uint8_t q1 = blk.ql[half * 64 + 32 + lane];
+      const std::uint8_t qhb2 = blk2.qh[half * 32 + lane];
+      const std::uint8_t q02 = blk2.ql[half * 64 + lane];
+      const std::uint8_t q12 = blk2.ql[half * 64 + 32 + lane];
+      const int l16 = static_cast<int>(lane >> 4);
+#pragma unroll
+      for (int seg = 0; seg < 4; ++seg) {
+        const std::uint8_t byte = (seg & 1) ? q1 : q0;
+        const int low = (seg < 2) ? (byte & 0xF) : (byte >> 4);
+        const int high = (qhb >> (2 * seg)) & 0x3;
+        const auto quant = static_cast<std::int8_t>((high << 4) | low) - 32;
+        const int scale = blk.scales[half * 8 + l16 + seg * 2];
+        const std::uint8_t byte2 = (seg & 1) ? q12 : q02;
+        const int low2 = (seg < 2) ? (byte2 & 0xF) : (byte2 >> 4);
+        const int high2 = (qhb2 >> (2 * seg)) & 0x3;
+        const auto quant2 = static_cast<std::int8_t>((high2 << 4) | low2) - 32;
+        const int scale2 = blk2.scales[half * 8 + l16 + seg * 2];
+        const float fv = (d * static_cast<float>(scale)) *
+                         static_cast<float>(quant);
+        const float fv2 = (d2 * static_cast<float>(scale2)) *
+                          static_cast<float>(quant2);
+        acc0 += fv * xrow[128 * half + 32 * seg];
+        acc1 += fv2 * xrow[128 * half + 32 * seg];
+      }
+    }
+  }
+  acc0 = WarpReduceSum(acc0);
+  acc1 = WarpReduceSum(acc1);
+  if (lane == 0) {
+    out[r0] = acc0;
+    out[r1] = acc1;
+  }
+}
+
 int main() {
   CU(hipSetDevice(0));
   CU(hipMalloc(&mismatches, sizeof(std::uint32_t)));
@@ -689,6 +794,77 @@ int main() {
                   dname[which], best[0], "(base)", dname[which], best[1],
                   dmb[which] * 1e3 / best[1], 100.0 * (best[1] / best[0] - 1.0),
                   bad == 0U ? "BIT-EXACT" : "DIFFERS");
+    }
+  }
+
+  // ---- Q6_K dense-shape check (lever 6.2): production GemvQ6K vs the
+  // exact-product fold vs a no-scale-load diagnostic. ----
+  {
+    const std::uint32_t drows = 6144U;
+    const std::uint32_t dgrid = (drows + 3U) / 4U;
+    const Q6KBlock* w6 = reinterpret_cast<const Q6KBlock*>(w0);
+    float* oa[4] = {nullptr, nullptr, nullptr, nullptr};
+    for (float*& o : oa) {
+      CU(hipMalloc(&o, drows * sizeof(float)));
+    }
+    auto qlaunch = [&](int v, float* dst) {
+      switch (v) {
+        case 0:
+          GemvQ6K<<<dgrid, 128>>>(w6, x, dst, drows, kCols);
+          break;
+        case 1:
+          DenseQ6KV<true, false><<<dgrid, 128>>>(w6, x, dst, drows, kCols);
+          break;
+        case 2:
+          DenseQ6KV<false, true><<<dgrid, 128>>>(w6, x, dst, drows, kCols);
+          break;
+        default:
+          DenseQ6KPair<<<dgrid, 128>>>(w6, x, dst, drows, kCols);
+          break;
+      }
+    };
+    const double qmb = 61440.0 * 210.0 / 1e6;
+    std::printf("\nQ6K dense check (rows=6144, cols=%u)\n", kCols);
+    for (int v = 0; v < 4; ++v) {
+      qlaunch(v, oa[v]);
+    }
+    CU(hipDeviceSynchronize());
+    std::uint32_t bad = 0;
+    std::uint32_t bad2 = 0;
+    CU(hipMemset(mismatches, 0, sizeof(std::uint32_t)));
+    DiffKernel<<<(drows + 255U) / 256U, 256>>>(oa[0], oa[1], drows,
+                                               mismatches);
+    CU(hipDeviceSynchronize());
+    CU(hipMemcpy(&bad, mismatches, sizeof(bad), hipMemcpyDeviceToHost));
+    CU(hipMemset(mismatches, 0, sizeof(std::uint32_t)));
+    DiffKernel<<<(drows + 255U) / 256U, 256>>>(oa[0], oa[3], drows,
+                                               mismatches);
+    CU(hipDeviceSynchronize());
+    CU(hipMemcpy(&bad2, mismatches, sizeof(bad2), hipMemcpyDeviceToHost));
+    double best[4] = {1e30, 1e30, 1e30, 1e30};
+    for (int round = 0; round < 5; ++round) {
+      for (int v = 0; v < 4; ++v) {
+        CU(hipDeviceSynchronize());
+        CU(hipEventRecord(t0));
+        for (int it = 0; it < 10; ++it) {
+          qlaunch(v, oa[0]);
+        }
+        CU(hipEventRecord(t1));
+        CU(hipEventSynchronize(t1));
+        float ms = 0.0F;
+        CU(hipEventElapsedTime(&ms, t0, t1));
+        best[v] = std::min(best[v], ms * 1e2);
+      }
+    }
+    const char* qname[4] = {"base   ", "fold   ", "noscale", "pair   "};
+    for (int v = 0; v < 4; ++v) {
+      std::printf("Q6K dense %s: %8.3f us  %6.1f GB/s  (%+.1f%%)%s\n", qname[v],
+                  best[v], qmb * 1e3 / best[v],
+                  100.0 * (best[v] / best[0] - 1.0),
+                  v == 1 ? (bad == 0U ? "  BIT-EXACT" : "  DIFFERS")
+                         : (v == 3
+                                ? (bad2 == 0U ? "  BIT-EXACT" : "  DIFFERS")
+                                : ""));
     }
   }
   return 0;

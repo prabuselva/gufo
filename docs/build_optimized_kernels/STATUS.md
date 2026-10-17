@@ -1615,6 +1615,21 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         tg1024-spec +0.5 %/+0.7 %, tg128-plain +0.2 %/−0.1 %. Gate green,
         suite 11/11, kernel-resources 0 worse / 2962 same.
 
+- [x] 6.2 REJECTED — Q6_K row-pairing / exact-product fold.
+        Probe on dense shape: the exact-product fold (`d*float(scale*quant)`,
+        bit-safe at ≤23 significant bits) was bit-exact but +3.6/+4.0 %
+        slower; a two-row-per-wave pairing (two independent FMA chains per
+        lane — ILP, not load sharing: every row keeps its own qh/ql/scale
+        bytes) was −9.1 % bit-exact, 417 GB/s. The −28.8 % no-scale-load
+        diagnostic shows the eight sign-extended scale byte loads/warp/block
+        are the residual gap and are not removable bit-exactly. End-to-end
+        the ILP win does not survive real scheduling: BAAB ×2 + a 9-pair
+        tg tiebreaker (`gufo_bench_moeq6ab`, `gufo_bench_moeq6tb`) mean
+        −0.25 %, ahead 5/9 — plain cells +0.1…+0.4 %, speculative cells
+        consistently negative (to −1.3 %). Not adopted; rewrite-era
+        production partial-sum bug (per-block reinit of the second
+        accumulator) was caught by `rocm_gemv` before any E2E ran.
+
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
 cold/frontier tg grid; gates `ctest --preset gpu-full -R '^ling3_flash\.'`
