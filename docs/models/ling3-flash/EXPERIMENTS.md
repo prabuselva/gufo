@@ -674,3 +674,32 @@ new instantiation). What is left of KdaDelta (~1.3 ms of the ~27.5 ms
 decode token, still ~3× above roofline) needs coalesced tile staging through shared
 memory, since scalar-strided row access wastes L1/L2 bandwidth; that
 restructures the dot and invites reduction-order risk, so it waits.
+
+`prof58` priced `GemvGroupedQ4K` (routed gate/up GEMVs) at 24.8 % of decode
+kernel time — 100 launches/token (50 routed layers × 2), 77 µs under stream
+overlap, 52 µs alone, i.e. ~170 GB/s on the 8.85 MB per-launch footprint.
+A STREAM diagnostic inside the probe (`tools/bench/ling3_moeq4k_bench.hip`,
+production kernel source on a 64-expert contiguous ring) read the same
+bytes in a pure `uint4` sweep at 296 GB/s (lever 6.0), so the plateau lives
+in the kernel, not in DRAM pages. Every load-restructuring candidate came
+back bit-exact but *slower*: 4 rows/wave +4.2 %, coalesced `uint4` staging
+of `qs` through LDS +11.3 %, pipelined staging +1.9 %, full-144 B ping-pong
+staging +4.8 %. The decisive diagnostic was a no-unpack variant (branching
+`Q4ScaleMin` replaced by constants): −32.6 %, so the per-element sub-block
+(scale, min) unpack, not the byte loads, held the kernel 1.7× under the
+streaming rate. `Q4ScaleMinFromWords` ports that discovery bit-safely: the
+12-byte header is read as three 4-aligned 32-bit words (byte extracts are
+masked before shifting; a `FoldCheck` kernel diffed all 3.9 M (scale, min)
+pairs against the oracle), and the term per element folds to
+`d * float(sc*quant) - dmin*float(mn)` — valid because `half` × ≤6-bit
+scale and × ≤4-bit quant never round in fp32, so the single-product form
+is bitwise the double product. Probe 52.6 → 47.9 µs (−8.9 %, bit-exact;
+the fixture needed NaN-halves cleared — random-bit weights make any
+operation-shape change payload-differ for meaningless reasons). Matched
+BAAB ×2 exclusive (`gufo_bench_moeab`) vs a 5.9 HEAD control: candidate
+ahead in 7/8 sustained pairs — tg128-plain +0.2 %/+0.5 %, tg1024-plain
++0.2 %/+0.5 %, spec tg1024 +1.0 %/+1.2 %, spec tg128 +1.4 % and a −1.4 %
+noise outlier — the wall-clock gain lands well under the kernel-level
+−8.9 % because the grouped GEMVs run inside the overlapped stream window.
+Gate `rocm_mtp_accept` green, suite 11/11 selected, kernel-resources
+0 worse / 2962 same, launch geometry and `Q5K` paths untouched.

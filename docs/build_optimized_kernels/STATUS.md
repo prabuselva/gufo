@@ -1589,6 +1589,21 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         excluded), gate `rocm_mtp_accept` green, kernel-resources 0
         worse / 0 better / 2961 same / 1 one-side (the new kernel).
 
+- [x] 6.0 ACCEPTED — fold the Q4_K expert-GEMV sub-block unpack.
+        `GemvGroupedQ4K` (24.8 % of decode kernel time, 170 GB/s against
+        a 296 GB/s STREAM diagnostic on the same footprint): four
+        load-restructuring probe variants all bit-exact but 1.9-11.3 %
+        slower; the no-unpack diagnostic (constant scale/min) hit
+        −32.6 %, attributing the gap to the branching `Q4ScaleMin`
+        unpack. Shipped `Q4ScaleMinFromWords` (12-byte header as three
+        4-aligned words, masked extracts, `FoldCheck`-verified vs the
+        oracle) plus the bit-safe fold `d*float(sc*q) - dmin*float(mn)`
+        (half x <=6-bit x <=4-bit never rounds in fp32): probe −8.9 %
+        bit-exact (52.6 → 47.9 µs). BAAB ×2 (`gufo_bench_moeab`) ahead
+        7/8 pairs — tg-plain +0.2…+0.5 %, spec tg1024 +1.0/+1.2 %, one
+        −1.4 % spec outlier; gate green, suite 11/11, kernel-resources
+        0 worse / 2962 same.
+
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
 cold/frontier tg grid; gates `ctest --preset gpu-full -R '^ling3_flash\.'`

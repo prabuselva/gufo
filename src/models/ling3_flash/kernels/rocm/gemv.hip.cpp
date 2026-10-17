@@ -77,6 +77,27 @@ __device__ __forceinline__ void Q4ScaleMin(int index,
   }
 }
 
+// Branchless (scale, minimum) unpack for the Q4_K super-block given the
+// 12-byte header as three little-endian words. Bit-identical to Q4ScaleMin:
+// every byte extract is masked before shifting so no neighbouring byte leaks
+// into the >=4 groups.
+__device__ __forceinline__ void Q4ScaleMinFromWords(std::uint32_t lo,
+                                                    std::uint32_t mid,
+                                                    std::uint32_t hi, int index,
+                                                    int& scale, int& minimum) {
+  if (index < 4) {
+    scale = static_cast<int>((lo >> (8 * index)) & 0x3FU);
+    minimum = static_cast<int>((mid >> (8 * index)) & 0x3FU);
+  } else {
+    const std::uint32_t pj4 = (hi >> (8 * (index - 4))) & 0xFFU;
+    scale = static_cast<int>(pj4 & 0xFU) |
+            (static_cast<int>(((lo >> (8 * (index - 4))) & 0xFFU) >> 6) << 4);
+    minimum =
+        static_cast<int>(pj4 >> 4) |
+        (static_cast<int>(((mid >> (8 * (index - 4))) & 0xFFU) >> 6) << 4);
+  }
+}
+
 // One block of four waves handles four consecutive output rows: wave w owns
 // row blockIdx.x*4+w. Each wave walks its row with a four-block unrolled
 // stream so several weight loads stay in flight, then reduces within the
@@ -813,16 +834,30 @@ __global__ void GemvGroupedQ4K(const Q4KBlock* __restrict__ w,
       const Q4KBlock& blk = row[o * nblocks + b];
       const float d = __half2float(blk.d);
       const float dmin = __half2float(blk.dmin);
+      const std::uint32_t* sp =
+          reinterpret_cast<const std::uint32_t*>(blk.scales);
+      const std::uint32_t lo = sp[0];
+      const std::uint32_t mid = sp[1];
+      const std::uint32_t hi = sp[2];
+      int scv[8];
+      float dmn[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        int s0 = 0;
+        int m0 = 0;
+        Q4ScaleMinFromWords(lo, mid, hi, j, s0, m0);
+        scv[j] = s0;
+        dmn[j] = dmin * static_cast<float>(m0);
+      }
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
         const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
-        int sc = 0;
-        int mn = 0;
-        Q4ScaleMin(j, blk.scales, sc, mn);
-        acc[o] += (d * static_cast<float>(sc) * static_cast<float>(quant) -
-                   dmin * static_cast<float>(mn)) *
-                  xv[j];
+        // half * (<=6-bit scale) and * (<=4-bit quant) are exact in fp32,
+        // so the integer product scale*quant folds through one cvt with a
+        // single fp multiply, bit-identical to the two-step product.
+        const float t = static_cast<float>(scv[j] * quant);
+        acc[o] += ((d * t) - dmn[j]) * xv[j];
       }
     }
   }

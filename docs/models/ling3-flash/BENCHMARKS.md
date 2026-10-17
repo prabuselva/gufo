@@ -137,7 +137,12 @@ matched BAAB ×2 (`gufo_bench_kdaab`): tg1024 after pp2048 36.46/36.48 →
 36.97/37.03 (**+1.4 %/+1.5 %**), tg128 after pp256 37.58/37.67 →
 37.97/37.82 (+1.0 %/+0.4 %), speculative tg128 +2.5 %/+1.2 % and tg1024
 +1.4 %/+1.7 %; pp2048 tg1 controls within noise, cold grid not
-re-measured.
+re-measured. 6.0 (October 17) folds the
+Q4_K grouped expert-GEMV sub-block unpack into three word loads and exact
+integer products (`Q4ScaleMinFromWords`, bit-identical, kernel probe
+−8.9 %); matched BAAB ×2 (`gufo_bench_moeab`): tg1024 after pp2048
++0.2 %/+0.5 % plain, +1.0 %/+1.2 % speculative (7/8 pairs ahead, one
+−1.4 % spec outlier); cold grid not re-measured.
 
 ## MTP speculative decode
 
