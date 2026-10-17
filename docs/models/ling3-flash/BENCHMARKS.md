@@ -8,11 +8,10 @@ AMD Strix Halo `gfx1151`, 128 GB unified memory.
 `-ngl 999`, flash-attn auto), freshly built clean on this host for both
 backends: ROCm (`GGML_HIP=ON`, gfx1151 fatbin, HIP 7.15.26333, `GGML_NATIVE=OFF`)
 and Vulkan (`GGML_VULKAN=ON`, Release, RADV `STRIX_HALO`). Prefill and
-decode Gufo columns refreshed October 16, 2026 on HEAD `0554f35f` + the
-accepted `__expf` fused-softmax, `5.3a` binary16 router/WMMA, `5.3b`
-head-bucket MLA route and `5.3c` WMMA hi/lo MLA prefill attention (see
-`EXPERIMENTS.md`) as `build/release/gufo`,
-log `gufo_bench_53cgrid.log`. The model loads on
+decode Gufo columns refreshed October 17, 2026 on HEAD `2127c37d`
+(5.3c plus the accepted 5.4b→5.9 decode levers and the 6.0/6.1 Q4_K/Q5_K
+unpack folds; see `EXPERIMENTS.md`) as `build/release/gufo`,
+log `gufo_bench_p6grid.log`. The model loads on
 llama.cpp as arch `bailingmoe3 124B.A5.1B`. Positive gain favors Gufo; all
 cells are single same-session matched runs (Gufo `-r 2`/`-r 3`, llama-bench
 `-r 2`/`-r 3`), except the refreshed Gufo columns (noted below). [Quality evidence](QUALITY.md) ·
@@ -24,10 +23,15 @@ Same prompt length, fresh context, timed prefill phase only on both sides.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| pp2048 | 1334.23 | 659.34 | **+102.4%** | 618.64 | **+115.7%** |
-| pp4096 | 1191.96 | 633.69 | **+88.1%** | 590.35 | **+101.9%** |
-| pp8192 | 928.43 | 583.71 | **+59.1%** | 559.02 | **+66.1%** |
-| pp16384 | 670.12 | 507.39 | **+32.1%** | 504.40 | **+32.9%** |
+| pp2048 | 1323.69 | 659.34 | **+100.8%** | 618.64 | **+114.0%** |
+| pp4096 | 1167.65 | 633.69 | **+84.3%** | 590.35 | **+97.8%** |
+| pp8192 | 920.27 | 583.71 | **+57.7%** | 559.02 | **+64.6%** |
+| pp16384 | 663.98 | 507.39 | **+30.9%** | 504.40 | **+31.6%** |
+
+The October 17 refresh is 0.8–2.0 % below the October 16 values in all
+four prefill cells (pp4096 within its ±23.5 spread, the other three
+tight); no prefill path changed in 5.4b→6.1, so this is treated as
+session variance, not attributed to a lever.
 
 Gufo now wins at every measured depth, but still decays faster with
 depth than the references: 1334→670 (−50%) across the 8× range against
@@ -71,18 +75,18 @@ so pairs are kept as evidence notes rather than table cells.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128 | 35.88 | 33.78 | **+6.2%** | 41.42 | −13.4% |
-| tg1024 | 34.92 | 34.59 | **+1.0%** | 41.59 | −16.0% |
+| tg128 | 38.30 | 33.78 | **+13.4%** | 41.42 | −7.5% |
+| tg1024 | 36.94 | 34.59 | **+6.8%** | 41.59 | −11.2% |
 
-Gufo cold decode now leads the ROCm backend at tg128 and is at parity at
-tg1024, about 15% behind llama.cpp **Vulkan**, whose decode (41.4–41.6)
-is still the strongest decode path measured on this host for the model
-(the column cells are the October 16 `5.3b`-build grid refresh
-`gufo_bench_53bgrid.log`, `-r 3`, against the retained reference runs;
+Gufo cold decode now leads the ROCm backend at tg128 (+13.4 %) and
+tg1024 (+6.8 %), 7–11 % behind llama.cpp **Vulkan**, whose decode
+(41.4–41.6) is still the strongest decode path measured on this host for
+the model (the column cells are the October 17 refresh
+`gufo_bench_p6grid.log`, `-r 3`, against the retained reference runs;
 cumulative 5.2a→5.4b lever
 gains per depth are in the paragraph below). llama
 decode does not slow as it generates (its tg1024 ≥ tg128 on both backends);
-Gufo loses 2.4% from tg128→tg1024. Preparing a 2048-token frontier before
+Gufo loses 3.6% from tg128→tg1024. Preparing a 2048-token frontier before
 timed generation (`gufo bench --n-prompt 0 --n-gen 128,1024 -d 2048`) costs
 Gufo a further ~4–6% (31.40 / 31.35), and the retained `pp2048+tg` blends
 (Gufo `--n-prompt 2048` runs: 33.62 / 32.51 in-pipeline; llama ROCm 93.30,
@@ -208,7 +212,9 @@ llama-bench -m Ling-3.0-flash-Q4_K_M-00001-of-00002.gguf \
   -r 2 -ngl 999 -o jsonl
 ```
 
-Raw logs: `/tmp/opencode/gufo_bench_llgrid.log` (first full three-engine
+Raw logs: `/tmp/opencode/gufo_bench_p6grid.log` (October 17 close-out
+refresh of the Gufo prefill/cold-decode columns, HEAD `2127c37d`),
+`/tmp/opencode/gufo_bench_llgrid.log` (first full three-engine
 grid, markdown), `gufo_bench_llgrid2.log` (split-phase JSONL grids, source
 of the cells above), `gufo_bench_llcold.log` (cold tg128/tg1024),
 `gufo_bench_gucid.log` (Gufo cold + `-d 2048` decode),

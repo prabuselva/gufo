@@ -701,7 +701,8 @@ it only pays together with the fork's register-frugal 2.5 template
       see lever-5 re-budget), so no fork parity win exists here yet.
 - [ ] 3.6 MTP width-invariance via `wmma_gemv`; hash-equality gate vs AR.
 - [ ] 3.7 Calibrated draft policy (+`draft_policy_bench.py` pattern).
-- [ ] 3.8 Re-measure `BENCHMARKS.md`; QUALITY.md MTP framing fixed.
+- [~] 3.8 Re-measure `BENCHMARKS.md` — Gufo prefill/cold-decode columns
+      refreshed October 17, see 6.6; QUALITY.md MTP framing fixed.
 
 ## Phase 4 — qwen36_a3b fan-out (nodes 1,2,3,5,6,7,8; GDN: producers only)
 
@@ -1669,6 +1670,17 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         vectors are L2-resident; weights dominate). No further decode
         optimization levers retained: proceed to close-out. 2.2/3.6/3.3
         stay open as gemma4-numeric items outside this Ling3 line.
+
+- [x] 6.6 CLOSE-OUT LANDED — exclusive matrix on HEAD `2127c37d`
+        (`gufo_bench_p6grid.log`, -r 3): pp2048 **1323.69 ± 1.13**,
+        pp4096 **1167.65 ± 23.53**, pp8192 **920.27 ± 0.65**, pp16384
+        **663.98 ± 0.92**, cold tg128 **38.30 ± 0.12**, cold tg1024
+        **36.94 ± 0.29** (in-pipeline tg128 38.31 / tg1024 36.69).
+        Vs the October 16 refresh: cold decode +6.7 %/+5.8 %, prefill
+        −0.8…−2 % (variance note landed with the table). `BENCHMARKS.md`
+        header, both Gufo columns, gain recalculation, the decode-depth
+        prose (now −3.6 % tg128→tg1024, 7–11 % behind Vulkan) and the
+        retained-log list updated in the same commit.
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
