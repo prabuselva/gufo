@@ -124,7 +124,13 @@ gate → down chain, kernels and reduction orders unchanged; matched
 BAAB ×2 (`gufo_bench_baabov`) at short context: tg1024 after pp2048
 34.79/34.14 → 36.19/36.17 (**+5.0 %**), tg128 after pp256
 35.79/35.77 → 37.25/37.17 (**+4.0 %**); the cold grid above was not
-re-measured.
+re-measured. 5.8 (October 17) fans the six decode KDA projection GEMVs
+and the MLA `attn_kv_a`/`attn_gate` chains over the same two side
+streams, joins unchanged downstream, kernels and reduction orders
+untouched; matched BAAB ×2 (`gufo_bench_fanoutbaab`) at short context:
+tg1024 after pp2048 36.16/36.00 → 36.61/36.45 (**+1.2 %/+1.3 %**),
+tg128 after pp256 37.30/36.85 → 37.50/37.30 (+0.5 %/+1.2 %); spec and
+pp2048 controls neutral, cold grid not re-measured.
 
 ## MTP speculative decode
 

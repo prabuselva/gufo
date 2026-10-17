@@ -1540,7 +1540,31 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
        (verify rows bypass `Ffn`); pp2048 controls ±0.6 % (untouched
        paths). Exclusive suite 11/12 (only the parked `rocm_inference`
        fail), gate `rocm_mtp_accept` green (accept unchanged),
-       kernel-resources 0 worse / 0 better / 2961 same (no new kernels).
+        kernel-resources 0 worse / 0 better / 2961 same (no new kernels).
+- [x] 5.8 ACCEPTED — KDA/MLA decode projections on the side streams.
+        Clean decode attribution (`prof58`, plain tg pass) showed the GPU
+        was busy (idle ≈ 0, 2397 ms overlapped) with the six per-layer KDA
+        projection GEMVs still serial on the main stream at ≈29 % of the
+        decode wall. A standalone probe
+        (`tools/bench/ling3_proj_fanout_bench.hip`, real `Gemv` launcher,
+        production shapes/quant mix, 16-layer ring) measured fan-out over
+        1/2/3/4 lanes: 200.4 µs serial, 176.1 (−12.1 %), 169.7 (−15.3 %),
+        175.2 — three lanes won, so `KdaLayer` puts `ssm_q`/`ssm_f` on
+        main and round-robins `k`,`g` and `v`,`beta` onto the two (then
+        idle) MoE side streams. `MlaLayer` rides the same lanes:
+        `attn_kv_a` + its latent RmsNorm/Rope into the cache row hide
+        behind the wide `attn_q` GEMV (joined before `MlaDecodePartial`),
+        `attn_gate` + sigmoid on the other lane (joined before
+        `RowScale`). Forks snapshot the main stream so lane scratch is
+        only rewritten after earlier layers' consumers drained; same
+        kernels, same reduction orders, same bits. Batch/prefill paths
+        untouched. Matched BAAB ×2 exclusive (`gufo_bench_fanoutbaab`)
+        vs a 5.7 HEAD control: tg1024-plain 36.16 → 36.61 and 36.00 →
+        36.45 (**+1.2 %/+1.3 %**), tg128-plain 37.30 → 37.50 and 36.85 →
+        37.30 (+0.5 %/+1.2 %, A ahead in 4/4 pairs); spec and pp2048
+        controls neutral. Exclusive suite 11/12 (only the parked
+        `rocm_inference` fail), gate `rocm_mtp_accept` green,
+        kernel-resources 0 worse / 0 better / 2961 same (no new kernels).
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +

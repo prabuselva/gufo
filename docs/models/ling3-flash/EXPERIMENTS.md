@@ -617,3 +617,31 @@ suite 11/12 with only the byte-identical parked `rocm_inference` fail,
 gate `rocm_mtp_accept` green with acceptance unchanged, kernel-resources
 0 worse / 0 better / 2961 same — the lever adds no kernels, only
 streams and events.
+
+KDA/MLA projections fan out on the same lanes (STATUS.md lever 5.8):
+a clean plain-decode profile (`prof58`) after 5.7 showed the GPU
+already busy (idle ≈ 0, 2397 ms overlapped) yet the six per-layer KDA
+projection GEMVs still serialized on the main stream at ≈29 % of the
+decode wall. A standalone probe (`tools/bench/ling3_proj_fanout_bench.hip`,
+real `Gemv` launcher, production shapes and quant mix, 16-layer ring)
+swept the fan-out width: 200.4 µs serial, 176.1 on two lanes (−12.1 %),
+169.7 on three (−15.3 %), 175.2 on four — the second stream catches
+nearly all the slack, the fourth costs scheduling. `KdaLayer` keeps
+`ssm_q`/`ssm_f` on main and puts `k`,`g` plus `v`,`beta` on the two MoE
+side streams, which sit idle through attention; both join before the dt
+bias. `MlaLayer` fans the same way: the `attn_kv_a` chain (latent
+RmsNorm and rope write into the cache row) rides one lane behind the
+wide `attn_q` GEMV and joins before `MlaDecodePartial`, while
+`attn_gate` + sigmoid rides the other and joins before `RowScale`. A
+single main-stream fork event per layer orders every lane write behind
+all earlier consumers, so scratch reuse and the cache row stay exactly
+as the serial ordering guaranteed; bits are unchanged. Exclusive BAAB
+×2 (`gufo_bench_fanoutbaab`) vs a 5.7 HEAD control: tg1024-plain
+36.16/36.00 → 36.61/36.45 (**+1.2 %/+1.3 %**), tg128-plain 37.30/36.85
+→ 37.50/37.30 (+0.5 %/+1.2 %, candidate ahead in 4/4 plain pairs);
+speculative pairs and pp2048 controls sit within noise, as verify rows
+use the batched tier and prefill is untouched. The realized gain is
+well under the probe's −15.3 % on the isolated slice, so per-layer
+join latency and the unbalanced big-GEMV lane cap the win; suite 11/12
+(parked `rocm_inference` only), gate green, kernel-resources 0 worse /
+0 better / 2961 same.

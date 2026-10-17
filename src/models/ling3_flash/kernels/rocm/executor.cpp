@@ -254,7 +254,8 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
-  for (hipEvent_t e : {ev_up_fork_, ev_shared_fork_, ev_up_, ev_shared_}) {
+  for (hipEvent_t e : {ev_up_fork_, ev_shared_fork_, ev_up_, ev_shared_,
+                       ev_proj_fork_, ev_proj_up_, ev_proj_shared_}) {
     if (e != nullptr) {
       (void)hipEventDestroy(e);
     }
@@ -523,9 +524,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       hipEventCreateWithFlags(&e->ev_up_, hipEventDisableTiming) !=
           hipSuccess ||
       hipEventCreateWithFlags(&e->ev_shared_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_proj_fork_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_proj_up_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_proj_shared_, hipEventDisableTiming) !=
           hipSuccess) {
     if (error_msg != nullptr) {
-      *error_msg = "failed to create MoE FFN side streams/events";
+      *error_msg = "failed to create side streams/events";
     }
     return nullptr;
   }
@@ -631,24 +638,36 @@ void Executor::KdaLayer(Session& session, std::uint32_t il,
   const std::uint32_t d = c_.ssm_head_dim;
   const std::uint32_t kern = c_.ssm_conv_kernel;
   GemvType type;
+  // The six projections read only the shared normed x and write disjoint
+  // scratch, so they fan out over the two MoE side streams (idle during
+  // attention). Both lanes wait on a main snapshot taken here, which covers
+  // x and every consumer enqueued by earlier layers before their scratch is
+  // rewritten; main rejoins both lanes before the dt bias reads them.
+  (void)hipEventRecord(ev_proj_fork_, nullptr);
+  (void)hipStreamWaitEvent(moe_up_stream_, ev_proj_fork_, 0);
+  (void)hipStreamWaitEvent(moe_shared_stream_, ev_proj_fork_, 0);
   (void)GemvTypeOf(l.ssm_q.type, &type);
   Gemv(l.ssm_q.data, type, l.ssm_q.rows, l.ssm_q.cols, l.ssm_q.row_bytes, x,
        kda_q_, nullptr);
   (void)GemvTypeOf(l.ssm_k.type, &type);
   Gemv(l.ssm_k.data, type, l.ssm_k.rows, l.ssm_k.cols, l.ssm_k.row_bytes, x,
-       kda_k_, nullptr);
+       kda_k_, moe_up_stream_);
   (void)GemvTypeOf(l.ssm_v.type, &type);
   Gemv(l.ssm_v.data, type, l.ssm_v.rows, l.ssm_v.cols, l.ssm_v.row_bytes, x,
-       kda_v_, nullptr);
+       kda_v_, moe_shared_stream_);
   (void)GemvTypeOf(l.ssm_f.type, &type);
   Gemv(l.ssm_f.data, type, l.ssm_f.rows, l.ssm_f.cols, l.ssm_f.row_bytes, x,
        kda_f_, nullptr);
   (void)GemvTypeOf(l.ssm_g.type, &type);
   Gemv(l.ssm_g.data, type, l.ssm_g.rows, l.ssm_g.cols, l.ssm_g.row_bytes, x,
-       kda_g_, nullptr);
+       kda_g_, moe_up_stream_);
   (void)GemvTypeOf(l.ssm_beta.type, &type);
   Gemv(l.ssm_beta.data, type, l.ssm_beta.rows, l.ssm_beta.cols,
-       l.ssm_beta.row_bytes, x, kda_beta_, nullptr);
+       l.ssm_beta.row_bytes, x, kda_beta_, moe_shared_stream_);
+  (void)hipEventRecord(ev_proj_up_, moe_up_stream_);
+  (void)hipEventRecord(ev_proj_shared_, moe_shared_stream_);
+  (void)hipStreamWaitEvent(nullptr, ev_proj_up_, 0);
+  (void)hipStreamWaitEvent(nullptr, ev_proj_shared_, 0);
   // The decay input carries the per-channel dt bias before the gate.
   Add(kda_f_, l.ssm_dt.f32(), kda_f_, inner, nullptr);
 
@@ -682,20 +701,37 @@ void Executor::MlaLayer(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
   const float scale = 1.0F / std::sqrt(static_cast<float>(c_.mla_head_dim));
   GemvType type;
 
+  // attn_q, attn_kv_a and attn_gate all read only x, so the two small chains
+  // (latent projection to the cache row; gate projection with its sigmoid)
+  // ride the MoE side streams and hide behind the wide attn_q GEMV. The
+  // forks wait on a main snapshot covering x and all earlier enqueued work,
+  // main rejoins the latent lane before MlaDecodePartial reads the cache row
+  // and the gate lane before RowScale reads mla_gate_.
+  (void)hipEventRecord(ev_proj_fork_, nullptr);
+  (void)hipStreamWaitEvent(moe_up_stream_, ev_proj_fork_, 0);
+  (void)hipStreamWaitEvent(moe_shared_stream_, ev_proj_fork_, 0);
+
   (void)GemvTypeOf(l.attn_q.type, &type);
   Gemv(l.attn_q.data, type, l.attn_q.rows, l.attn_q.cols, l.attn_q.row_bytes, x,
        mla_q_, nullptr);
   (void)GemvTypeOf(l.attn_kv_a.type, &type);
   Gemv(l.attn_kv_a.data, type, l.attn_kv_a.rows, l.attn_kv_a.cols,
-       l.attn_kv_a.row_bytes, x, mla_kv_a_, nullptr);
+       l.attn_kv_a.row_bytes, x, mla_kv_a_, moe_up_stream_);
+  (void)GemvTypeOf(l.attn_gate.type, &type);
+  Gemv(l.attn_gate.data, type, l.attn_gate.rows, l.attn_gate.cols,
+       l.attn_gate.row_bytes, x, mla_gate_, moe_shared_stream_);
+  SigmoidInPlace(mla_gate_, heads, moe_shared_stream_);
+  (void)hipEventRecord(ev_proj_shared_, moe_shared_stream_);
 
   // The latent half is RMS-normalized straight into the cache row; the rope
   // half is rotated into the kpe row beside it. Each q rope tail is rotated
   // out of its 192-wide head row directly into the absorbed-query row.
   RmsNorm(mla_kv_a_, l.attn_kv_a_norm.f32(), c_.rms_eps,
-          kv_cache + static_cast<std::size_t>(pos) * kv_rank, kv_rank, nullptr);
+          kv_cache + static_cast<std::size_t>(pos) * kv_rank, kv_rank,
+          moe_up_stream_);
   RopeTo(mla_kv_a_ + kv_rank, kpe_cache + static_cast<std::size_t>(pos) * rot,
-         1U, rot, rot, rot, pos, c_.rope_theta, nullptr);
+         1U, rot, rot, rot, pos, c_.rope_theta, moe_up_stream_);
+  (void)hipEventRecord(ev_proj_up_, moe_up_stream_);
   RopeTo(mla_q_ + nope, mla_q_abs_ + kv_rank, heads, c_.mla_head_dim,
          kv_rank + rot, rot, pos, c_.rope_theta, nullptr);
 
@@ -710,6 +746,7 @@ void Executor::MlaLayer(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
 
   const std::uint32_t n_pos = pos + 1U;
   const std::uint32_t tiles = MlaDecodeTiles(n_pos, kMlaTile);
+  (void)hipStreamWaitEvent(nullptr, ev_proj_up_, 0);
   MlaDecodePartial(mla_q_abs_, kv_cache, kpe_cache, n_pos, kMlaTile, scale,
                    mla_ws_, heads, kv_rank, rot, nullptr);
   MlaDecodeCombine(mla_ws_, tiles, heads, kv_rank, mla_latent_, nullptr);
@@ -720,10 +757,7 @@ void Executor::MlaLayer(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
          mla_latent_ + static_cast<std::size_t>(h) * kv_rank,
          mla_head_out_ + static_cast<std::size_t>(h) * v_dim, nullptr);
   }
-  (void)GemvTypeOf(l.attn_gate.type, &type);
-  Gemv(l.attn_gate.data, type, l.attn_gate.rows, l.attn_gate.cols,
-       l.attn_gate.row_bytes, x, mla_gate_, nullptr);
-  SigmoidInPlace(mla_gate_, heads, nullptr);
+  (void)hipStreamWaitEvent(nullptr, ev_proj_shared_, 0);
   RowScale(mla_head_out_, mla_gate_, heads, v_dim, nullptr);
   (void)GemvTypeOf(l.attn_out.type, &type);
   Gemv(l.attn_out.data, type, l.attn_out.rows, l.attn_out.cols,

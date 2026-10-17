@@ -283,6 +283,12 @@ private:
   hipEvent_t ev_up_fork_{nullptr};      ///< Recorded on main after RouterTopK.
   hipEvent_t ev_up_{nullptr};           ///< Routed up done on the up stream.
   hipEvent_t ev_shared_{nullptr};       ///< Shared chain done on its stream.
+  hipEvent_t ev_proj_fork_{
+      nullptr};  ///< Recorded on main when the layer input x is ready.
+  hipEvent_t ev_proj_up_{
+      nullptr};  ///< KDA/MLA projection lane done on the up stream.
+  hipEvent_t ev_proj_shared_{
+      nullptr};  ///< KDA/MLA projection lane done on the shared stream.
 
   // MTP scratch.
   float* mtp_e_{nullptr};
