@@ -645,3 +645,32 @@ well under the probe's −15.3 % on the isolated slice, so per-layer
 join latency and the unbalanced big-GEMV lane cap the win; suite 11/12
 (parked `rocm_inference` only), gate green, kernel-resources 0 worse /
 0 better / 2961 same.
+
+The same attribution priced the decode-only `KdaDeltaKernel` at 4.8 % of
+kernel time — 35 launches/token averaging 43 µs (probe-grade 60 µs with
+L2-cold inputs) against a ~17 µs DRAM roofline for its ±2 MB of state
+read/write (lever 5.9). The kernel walks each thread's 128-float state
+row twice: decay-and-dot, then a dependent update-and-dot, storing and
+reloading the row through global memory between the two. A standalone
+probe (`tools/bench/ling3_kdadelta_bench.hip`, production kernel source,
+32 heads × 128² state on a 64-buffer ring bigger than L2, seeded fills
+and a word-exact diff harness) scored float4 load+store in both passes
+(bit-exact, 3.8 % *slower* — wide ops alone hurt), keeping the whole row
+in 32 `float4` registers across both passes with one load and one store
+(bit-exact, −15.3 %), and an f32-accumulator diagnostic (+0.2 %): the
+FP64 accumulate costs nothing here, the pointless global round-trip is
+the whole remaining gap. `KdaDeltaVec4Kernel` ships the register-resident
+form as a `d == 128` specialization dispatched in the launcher; per
+element the arithmetic stays in ascending index order, so state, output
+and snapshots are bit-identical to the generic kernel, and other head
+dimensions keep the generic path untouched. Matched BAAB ×2 exclusive
+(`gufo_bench_kdaab`) vs a 5.8 HEAD control: tg1024-plain 36.46/36.48 →
+36.97/37.03 (**+1.4 %/+1.5 %**), tg128-plain +1.0 %/+0.4 %, speculative
+tg128 +2.5 %/+1.2 % and tg1024 +1.4 %/+1.7 % — candidate ahead in all
+8/8 sustained pairs; pp2048 tg1 controls sit within noise. Suite 11/11
+selected (parked `rocm_inference` excluded), gate `rocm_mtp_accept`
+green, kernel-resources 0 worse / 0 better / 2961 same / 1 one-side (the
+new instantiation). What is left of KdaDelta (~1.3 ms of the ~27.5 ms
+decode token, still ~3× above roofline) needs coalesced tile staging through shared
+memory, since scalar-strided row access wastes L1/L2 bandwidth; that
+restructures the dot and invites reduction-order risk, so it waits.

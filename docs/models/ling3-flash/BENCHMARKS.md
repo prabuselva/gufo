@@ -130,7 +130,14 @@ streams, joins unchanged downstream, kernels and reduction orders
 untouched; matched BAAB ×2 (`gufo_bench_fanoutbaab`) at short context:
 tg1024 after pp2048 36.16/36.00 → 36.61/36.45 (**+1.2 %/+1.3 %**),
 tg128 after pp256 37.30/36.85 → 37.50/37.30 (+0.5 %/+1.2 %); spec and
-pp2048 controls neutral, cold grid not re-measured.
+pp2048 controls neutral, cold grid not re-measured. 5.9 (October 17)
+keeps each `KdaDelta` decode thread's state row in registers between
+the two dependent passes (`KdaDeltaVec4Kernel`, d = 128, bit-identical);
+matched BAAB ×2 (`gufo_bench_kdaab`): tg1024 after pp2048 36.46/36.48 →
+36.97/37.03 (**+1.4 %/+1.5 %**), tg128 after pp256 37.58/37.67 →
+37.97/37.82 (+1.0 %/+0.4 %), speculative tg128 +2.5 %/+1.2 % and tg1024
++1.4 %/+1.7 %; pp2048 tg1 controls within noise, cold grid not
+re-measured.
 
 ## MTP speculative decode
 

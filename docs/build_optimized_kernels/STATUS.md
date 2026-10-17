@@ -1565,6 +1565,29 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         controls neutral. Exclusive suite 11/12 (only the parked
         `rocm_inference` fail), gate `rocm_mtp_accept` green,
         kernel-resources 0 worse / 0 better / 2961 same (no new kernels).
+- [x] 5.9 ACCEPTED — KDA delta-rule state rows kept in registers.
+        Clean decode attribution (`prof58`) priced the decode-only
+        `KdaDeltaKernel` at 4.8 % of kernel time (35 launches/token, avg
+        43 µs against a ~17 µs DRAM roofline for its ±2 MB state r/w).
+        A standalone probe (`tools/bench/ling3_kdadelta_bench.hip`, real
+        kernel source, 32 heads × 128² state ring, seeded inputs with a
+        bitwise diff vs the production kernel) scored four variants:
+        float4 load+store in both passes 3.8 % slower (bit-exact),
+        register-resident row (load 32×float4 once, both passes in
+        registers, single store) −15.3 % bit-exact, and an f32-accumulator
+        diagnostic at +0.2 % — the FP64 accumulate is free, the global
+        round-trip between the two dependent passes is the cost. Shipped
+        as `KdaDeltaVec4Kernel`, a d == 128 specialization dispatched in
+        the `KdaDelta` launcher; ascending per-element order keeps it
+        bit-identical, other d keep the generic kernel. Batch/prefill
+        paths untouched. Matched BAAB ×2 exclusive (`gufo_bench_kdaab`)
+        vs a 5.8 HEAD control: tg1024-plain 36.46 → 36.97 and 36.48 →
+        37.03 (**+1.4 %/+1.5 %**), tg128-plain +1.0 %/+0.4 %, spec tg128
+        +2.5 %/+1.2 % and tg1024 +1.4 %/+1.7 % — ahead in 8/8 sustained
+        pairs; pp2048 tg1 controls within noise (−0.7 %/−0.4 %).
+        Exclusive suite 11/11 selected (parked `rocm_inference`
+        excluded), gate `rocm_mtp_accept` green, kernel-resources 0
+        worse / 0 better / 2961 same / 1 one-side (the new kernel).
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
