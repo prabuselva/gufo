@@ -1804,6 +1804,9 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::Object() {
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
     const json::Value& schema, bool strict, ToolFormat format) {
+  // Ling 3.0 Flash calls are recognized in the output, never constrained.
+  if (format == ToolFormat::kLing3)
+    Invalid("Ling 3.0 Flash tool calls have no native grammar");
   // Ordinary agent tools leave nested objects open. Preserve their declared
   // requirements/types and native framing without relaxing strict output
   // schemas or injecting a second protocol into the model's chat template.
@@ -1911,6 +1914,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
     ToolFormat format) {
+  if (format == ToolFormat::kLing3)
+    Invalid("Ling 3.0 Flash tool calls have no native grammar");
   if (format == ToolFormat::kJson)
     return Object();
   if (format == ToolFormat::kGemma4) {
@@ -2027,6 +2032,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     bool required, bool parallel, ToolFormat format) {
   if (tools.empty())
     return answer;
+  if (format == ToolFormat::kLing3)
+    Invalid("Ling 3.0 Flash tool calls have no native grammar");
   using Key = std::tuple<std::shared_ptr<const JsonConstraint>,
                          std::vector<Tool>, bool, bool, ToolFormat>;
   static std::mutex mutex;

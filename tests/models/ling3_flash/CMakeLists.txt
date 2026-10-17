@@ -8,6 +8,16 @@ add_test(NAME ling3_flash.config COMMAND ling3_flash_config_test)
 set_tests_properties(ling3_flash.config PROPERTIES LABELS "ling3_flash;cpu")
 add_dependencies(ling3_flash_tests ling3_flash_config_test)
 
+# Chat template parity: every rendering artifact (thinking directive, tools
+# header, native call frames, OBSERVATION turns) must match the pinned
+# Jinja template goldens byte for byte.
+add_executable(ling3_flash_chat_template_test chat_template_test.cpp)
+target_link_libraries(ling3_flash_chat_template_test PRIVATE gufo_ling3_flash)
+add_test(NAME ling3_flash.chat_template COMMAND ling3_flash_chat_template_test)
+set_tests_properties(ling3_flash.chat_template PROPERTIES
+  LABELS "ling3_flash;cpu")
+add_dependencies(ling3_flash_tests ling3_flash_chat_template_test)
+
 # Binds the real artifact (headers only) to prove every tensor name and shape
 # resolves. Skips (77) unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash
 # GGUF (the first shard of a split file).

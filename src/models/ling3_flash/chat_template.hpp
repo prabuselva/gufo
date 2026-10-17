@@ -36,11 +36,15 @@ struct ChatTemplateOptions {
 
 /// Renders one conversation in the pinned Bailing V3 format: role-framed
 /// turns closed by kTurnEnd with a `detailed thinking` directive in the
-/// system header. Returns nullopt for the template features this runtime
-/// does not serve (tool definitions, tool calls, tool results).
+/// system header. `tools` renders the native tools section into the system
+/// header, assistant `tool_calls` into their native frames and tool-result
+/// turns into the OBSERVATION response frame. Returns nullopt for the
+/// template features this runtime does not serve (images, tool calls on
+/// non-assistant turns).
 [[nodiscard]] std::optional<std::string> RenderChat(
     std::span<const tokenization::ChatMessage> messages,
-    const ChatTemplateOptions& options, bool add_generation_prompt = true);
+    const ChatTemplateOptions& options, bool add_generation_prompt = true,
+    std::span<const tokenization::ChatTool> tools = {});
 
 }  // namespace gufo::models::ling3_flash
 

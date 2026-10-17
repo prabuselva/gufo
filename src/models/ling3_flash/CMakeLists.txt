@@ -5,6 +5,7 @@
 add_library(gufo_ling3_flash STATIC
   chat_template.cpp
   config.cpp
+  tool_syntax.cpp
   weights.cpp)
 
 target_include_directories(gufo_ling3_flash PUBLIC ${PROJECT_SOURCE_DIR})

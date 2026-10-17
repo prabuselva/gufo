@@ -37,11 +37,7 @@ void SetError(std::string* error, std::string message) {
 }
 
 ChatTemplateOptions Ling3ChatOptions(const ChatRequest& request) {
-  auto options = ResolveLing3ChatOptions(request.reasoning);
-  if (!request.tools.empty()) {
-    throw std::invalid_argument("Ling 3.0 Flash does not support tool calling");
-  }
-  return options;
+  return ResolveLing3ChatOptions(request.reasoning);
 }
 
 std::vector<std::int32_t> EngineTokens(
@@ -175,13 +171,24 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    const auto rendered =
-        RenderChat(request.messages, Ling3ChatOptions(request));
+    // `tool_choice: "none"` hides the tools section, so the model is free to
+    // answer in prose and its calls would have no advertised frame.
+    const bool show_tools =
+        request.tool_choice != ChatRequest::ToolChoice::kNone;
+    const auto rendered = RenderChat(
+        request.messages, Ling3ChatOptions(request), true,
+        show_tools ? std::span<const tokenization::ChatTool>(request.tools)
+                   : std::span<const tokenization::ChatTool>{});
     if (!rendered.has_value()) {
       throw std::invalid_argument(
           "Ling 3.0 Flash does not support this conversation");
     }
     return Tokenize(*rendered);
+  }
+
+  [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
+      const override {
+    return sampling::JsonConstraint::ToolFormat::kLing3;
   }
 
   [[nodiscard]] server::TextGenerationBackend::InitialOutputState
@@ -296,6 +303,13 @@ public:
     std::string error;
     if (!ling3.session().DecodeStep(max_tokens, sampler, &decoded, &error)) {
       throw std::runtime_error("Ling 3.0 Flash MTP decode failed: " + error);
+    }
+    // The round commits the framing token that ends the turn; it is the
+    // stop signal, not content. Dropping it here mirrors the non-MTP
+    // SelectNext path so the stream ends without the raw control text.
+    if (decoded.stop && !decoded.tokens.empty() &&
+        model_->IsStopToken(decoded.tokens.back())) {
+      decoded.tokens.pop_back();
     }
     server::TextDecodeStep step;
     step.stop = decoded.stop;

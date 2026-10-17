@@ -35,12 +35,19 @@ std::optional<ChatRequest> ConstrainChatRequest(
   auto instruction = request.response_format ? request.response_format->prompt()
                                              : std::string();
   auto grammar = request.response_format;
+  auto format = runner.ToolFormat();
+  // Ling 3.0 Flash calls are recognized in its native frames by the HTTP
+  // layer; unlike the JSON fallback, no grammar rewrites the dialect, and
+  // the reference project constrains it with neither form. A response
+  // format still constrains the final answer.
+  const bool ling_native_tools =
+      format == sampling::JsonConstraint::ToolFormat::kLing3;
   if (!request.tools.empty() &&
-      request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      request.tool_choice != ChatRequest::ToolChoice::kNone &&
+      !ling_native_tools) {
     std::vector<sampling::JsonConstraint::Tool> tools;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
-    auto format = runner.ToolFormat();
     for (const auto& tool : request.tools) {
       const auto definition = tool.definition_json.empty()
                                   ? json::Value()
@@ -665,6 +672,11 @@ struct TextRunnerPool::Impl {
 std::shared_ptr<const sampling::TokenConstraint>
 TextModelRunner::BindConstraint(
     std::shared_ptr<const sampling::JsonConstraint> grammar) const {
+  if (!grammar) {
+    // Parse-only dialects (Ling 3.0 Flash tool calls) constrain nothing; a
+    // null grammar must not pull in a constraint vocabulary.
+    return nullptr;
+  }
   const std::lock_guard lock(constraint_mutex_);
   for (const auto& binding : constraints_)
     if (binding->grammar == grammar)

@@ -117,6 +117,12 @@ int GenerateTurn(const Model& model, Session& session,
     }
     drafted += decoded.drafted;
     accepted += decoded.accepted;
+    // The end-of-turn framing token is the stop signal, not content; drop
+    // it so the reply never carries the raw control text.
+    if (decoded.stop && !decoded.tokens.empty() &&
+        model.IsStopToken(decoded.tokens.back())) {
+      decoded.tokens.pop_back();
+    }
     for (const std::int32_t token : decoded.tokens) {
       const std::string piece = model.TokenText(token);
       std::cout << piece << std::flush;

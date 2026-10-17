@@ -22,7 +22,10 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
-  enum class ToolFormat { kJson, kQwen, kDeepSeek, kGemma4 };
+  // Ling 3.0 Flash writes its native `<arg_key>` calls without a grammar;
+  // the HTTP layer recognizes the frames in the output instead. The
+  // reference project constrains this dialect with neither form.
+  enum class ToolFormat { kJson, kQwen, kDeepSeek, kGemma4, kLing3 };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;

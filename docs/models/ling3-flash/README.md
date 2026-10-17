@@ -49,8 +49,13 @@ content), every turn closes with the eos token `kTurnEnd` (id 156895, with
 bos/pad siblings 156891/156892 in the vocabulary), and the system header
 carries the `detailed thinking on|off` directive. Reasoning output arrives
 between the `kThinkStart` and `kThinkEnd` markers; the interactive chat and
-the serve reasoning split both key on that boundary. Tool definitions, tool
-calls and tool results are rejected by the renderer (and by `gufo serve`).
+the serve reasoning split both key on that boundary. Tool calls run in the
+checkpoint's native dialect (`src/models/ling3_flash/tool_syntax.hpp`): the
+tools section renders into the system header, assistant turns open calls
+with `<tool_call>NAME`, one `<arg_key>`/`<arg_value>` frame per argument,
+and tool results ride in the OBSERVATION turn inside `<tool_response>`.
+`gufo serve` parses that dialect back into OpenAI `tool_calls` without a
+decoding grammar, matching the reference project.
 
 ## Usage
 
@@ -64,8 +69,8 @@ gufo serve  --model .../Ling-3.0-flash-Q4_K_M-00001-of-00002.gguf --port 8083
 - `gufo serve` supports `--sessions 1..16` with the `--ctx` window divided
   across sessions; sessions share the executor and own their KV/recurrent
   state.
-- Unsupported and rejected at load: image input, tool calling, speculative
-  decoding (`--speculative`), the continuation disk cache.
+- Unsupported and rejected at load: image input, speculative decoding
+  (`--speculative`), the continuation disk cache.
 
 ## Tests
 
