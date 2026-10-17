@@ -222,16 +222,23 @@ __global__ void GemvQ4K(const Q4KBlock* __restrict__ w,
     const float d = __half2float(blk.d);
     const float dmin = __half2float(blk.dmin);
     const float* xrow = x + b * 256 + lane;
+    const std::uint32_t* sp =
+        reinterpret_cast<const std::uint32_t*>(blk.scales);
+    int scv[8];
+    float dmn[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      int s0 = 0;
+      int m0 = 0;
+      Q4ScaleMinFromWords(sp[0], sp[1], sp[2], j, s0, m0);
+      scv[j] = s0;
+      dmn[j] = dmin * static_cast<float>(m0);
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
       const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
-      int sc = 0;
-      int mn = 0;
-      Q4ScaleMin(j, blk.scales, sc, mn);
-      acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
-              dmin * static_cast<float>(mn)) *
-             xrow[32 * j];
+      acc += ((d * static_cast<float>(scv[j] * quant)) - dmn[j]) * xrow[32 * j];
     }
   }
   acc = WarpReduceSum(acc);
@@ -260,17 +267,25 @@ __global__ void GemvQ5K(const Q5KBlock* __restrict__ w,
     const float dmin = __half2float(blk.dmin);
     const std::uint8_t qhb = blk.qh[lane];
     const float* xrow = x + b * 256 + lane;
+    const std::uint32_t* sp =
+        reinterpret_cast<const std::uint32_t*>(blk.scales);
+    int scv[8];
+    float dmn[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      int s0 = 0;
+      int m0 = 0;
+      Q4ScaleMinFromWords(sp[0], sp[1], sp[2], j, s0, m0);
+      scv[j] = s0;
+      dmn[j] = dmin * static_cast<float>(m0);
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const std::uint8_t qb = blk.qs[(j >> 1) * 32 + lane];
       const int quant4 = (j & 1) ? (qb >> 4) : (qb & 0xF);
       const int quant = quant4 + (((qhb >> j) & 1) ? 16 : 0);
-      int sc = 0;
-      int mn = 0;
-      Q4ScaleMin(j, blk.scales, sc, mn);
-      acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
-              dmin * static_cast<float>(mn)) *
-             xrow[32 * j];
+      // scale*quant (<=6 b, <=5 b) is exact in fp32 like Q4K's.
+      acc += ((d * static_cast<float>(scv[j] * quant)) - dmn[j]) * xrow[32 * j];
     }
   }
   acc = WarpReduceSum(acc);
@@ -526,15 +541,23 @@ __global__ void GemvRowsQ4K(const Q4KBlock* __restrict__ w,
     const Q4KBlock& blk = row[b];
     const float d = __half2float(blk.d);
     const float dmin = __half2float(blk.dmin);
+    const std::uint32_t* sp =
+        reinterpret_cast<const std::uint32_t*>(blk.scales);
+    int scv[8];
+    float dmn[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      int s0 = 0;
+      int m0 = 0;
+      Q4ScaleMinFromWords(sp[0], sp[1], sp[2], j, s0, m0);
+      scv[j] = s0;
+      dmn[j] = dmin * static_cast<float>(m0);
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
       const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
-      int sc = 0;
-      int mn = 0;
-      Q4ScaleMin(j, blk.scales, sc, mn);
-      const float wv = d * static_cast<float>(sc) * static_cast<float>(quant) -
-                       dmin * static_cast<float>(mn);
+      const float wv = d * static_cast<float>(scv[j] * quant) - dmn[j];
 #pragma unroll
       for (std::uint32_t o = 0; o < Rows; ++o) {
         acc[o] +=
@@ -573,16 +596,24 @@ __global__ void GemvRowsQ5K(const Q5KBlock* __restrict__ w,
     const float d = __half2float(blk.d);
     const float dmin = __half2float(blk.dmin);
     const std::uint8_t qhb = blk.qh[lane];
+    const std::uint32_t* sp =
+        reinterpret_cast<const std::uint32_t*>(blk.scales);
+    int scv[8];
+    float dmn[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      int s0 = 0;
+      int m0 = 0;
+      Q4ScaleMinFromWords(sp[0], sp[1], sp[2], j, s0, m0);
+      scv[j] = s0;
+      dmn[j] = dmin * static_cast<float>(m0);
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const std::uint8_t qb = blk.qs[(j >> 1) * 32 + lane];
       const int quant4 = (j & 1) ? (qb >> 4) : (qb & 0xF);
       const int quant = quant4 + (((qhb >> j) & 1) ? 16 : 0);
-      int sc = 0;
-      int mn = 0;
-      Q4ScaleMin(j, blk.scales, sc, mn);
-      const float wv = d * static_cast<float>(sc) * static_cast<float>(quant) -
-                       dmin * static_cast<float>(mn);
+      const float wv = d * static_cast<float>(scv[j] * quant) - dmn[j];
 #pragma unroll
       for (std::uint32_t o = 0; o < Rows; ++o) {
         acc[o] +=

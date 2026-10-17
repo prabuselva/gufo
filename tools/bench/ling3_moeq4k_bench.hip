@@ -323,6 +323,124 @@ __global__ void FillKernel(float* p, std::size_t n, unsigned seed) {
 
 }  // namespace
 
+
+// ---- dense-shape (lever 6.1) ----
+template <bool kFold>
+__global__ void DenseQ4KV(const Q4KBlock* __restrict__ w,
+                          const float* __restrict__ x, float* __restrict__ out,
+                          std::uint32_t rows, std::uint32_t cols) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t nblocks = cols / 256;
+  const Q4KBlock* __restrict__ row = w + static_cast<std::size_t>(r) * nblocks;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const Q4KBlock& blk = row[b];
+    const float d = __half2float(blk.d);
+    const float dmin = __half2float(blk.dmin);
+    const float* xrow = x + b * 256 + lane;
+    if constexpr (kFold) {
+      const std::uint32_t* sp =
+          reinterpret_cast<const std::uint32_t*>(blk.scales);
+      int scv[8];
+      float dmn[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        int s0 = 0;
+        int m0 = 0;
+        Q4ScaleMinFromWords(sp[0], sp[1], sp[2], j, s0, m0);
+        scv[j] = s0;
+        dmn[j] = dmin * static_cast<float>(m0);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
+        const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
+        acc += ((d * static_cast<float>(scv[j] * quant)) - dmn[j]) *
+               xrow[32 * j];
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t packed = blk.qs[(j >> 1) * 32 + lane];
+        const int quant = (j & 1) ? (packed >> 4) : (packed & 0xF);
+        int sc = 0;
+        int mn = 0;
+        Q4ScaleMin(j, blk.scales, sc, mn);
+        acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
+                dmin * static_cast<float>(mn)) *
+               xrow[32 * j];
+      }
+    }
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
+__global__ void DenseQ5KV(const Q5KBlock* __restrict__ w,
+                          const float* __restrict__ x, float* __restrict__ out,
+                          std::uint32_t rows, std::uint32_t cols, int fold) {
+  const std::uint32_t r = blockIdx.x * 4U + (threadIdx.x >> 5);
+  if (r >= rows) {
+    return;
+  }
+  const std::uint32_t nblocks = cols / 256;
+  const Q5KBlock* __restrict__ row = w + static_cast<std::size_t>(r) * nblocks;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float acc = 0.0f;
+  for (std::uint32_t b = 0; b < nblocks; ++b) {
+    const Q5KBlock& blk = row[b];
+    const float d = __half2float(blk.d);
+    const float dmin = __half2float(blk.dmin);
+    const std::uint8_t qhb = blk.qh[lane];
+    const float* xrow = x + b * 256 + lane;
+    if (fold == 0) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t qb = blk.qs[(j >> 1) * 32 + lane];
+        const int quant4 = (j & 1) ? (qb >> 4) : (qb & 0xF);
+        const int quant = quant4 + (((qhb >> j) & 1) ? 16 : 0);
+        int sc = 0;
+        int mn = 0;
+        Q4ScaleMin(j, blk.scales, sc, mn);
+        acc += (d * static_cast<float>(sc) * static_cast<float>(quant) -
+                dmin * static_cast<float>(mn)) *
+               xrow[32 * j];
+      }
+    } else {
+      const std::uint32_t* sp =
+          reinterpret_cast<const std::uint32_t*>(blk.scales);
+      int scv[8];
+      float dmn[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        int s0 = 0;
+        int m0 = 0;
+        Q4ScaleMinFromWords(sp[0], sp[1], sp[2], j, s0, m0);
+        scv[j] = s0;
+        dmn[j] = dmin * static_cast<float>(m0);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t qb = blk.qs[(j >> 1) * 32 + lane];
+        const int quant4 = (j & 1) ? (qb >> 4) : (qb & 0xF);
+        const int quant = quant4 + (((qhb >> j) & 1) ? 16 : 0);
+        acc += ((d * static_cast<float>(scv[j] * quant)) - dmn[j]) *
+               xrow[32 * j];
+      }
+    }
+  }
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[r] = acc;
+  }
+}
+
 int main() {
   CU(hipSetDevice(0));
   CU(hipMalloc(&mismatches, sizeof(std::uint32_t)));
@@ -511,5 +629,67 @@ int main() {
   }
   std::printf("STREAM same footprint   : %8.3f us  %6.1f GB/s\n", sbest,
               mb_per_launch * 1e3 / sbest);
+
+  // ---- dense-shape fold check (lever 6.1): production GemvQ4K / GemvQ5K
+  // on a dense-FFN-sized matrix vs the folded walk (same oracle chain). ----
+  {
+    const std::uint32_t drows = 6144U;
+    const std::uint32_t dgrid = (drows + 3U) / 4U;
+    float* da[2] = {nullptr, nullptr};
+    float* db[2] = {nullptr, nullptr};
+    for (int which = 0; which < 2; ++which) {
+      CU(hipMalloc(&da[which], drows * sizeof(float)));
+      CU(hipMalloc(&db[which], drows * sizeof(float)));
+    }
+    const Q5KBlock* w5 = reinterpret_cast<const Q5KBlock*>(w0);
+    auto dlaunch = [&](int which, int variant, float* dst) {
+      if (which == 0) {
+        if (variant == 0) {
+          GemvQ4K<<<dgrid, 128>>>(w0, x, dst, drows, kCols);
+        } else {
+          DenseQ4KV<true><<<dgrid, 128>>>(w0, x, dst, drows, kCols);
+        }
+      } else if (variant == 0) {
+        GemvQ5K<<<dgrid, 128>>>(w5, x, dst, drows, kCols);
+      } else {
+        DenseQ5KV<<<dgrid, 128>>>(w5, x, dst, drows, kCols, 1);
+      }
+    };
+    const double dmb[2] = {61440.0 * 144.0 / 1e6, 61440.0 * 176.0 / 1e6};
+    const char* dname[2] = {"Q4K dense", "Q5K dense"};
+    std::printf("\ndense-shape fold check (rows=6144, cols=%u)\n", kCols);
+    for (int which = 0; which < 2; ++which) {
+      for (int v = 0; v < 2; ++v) {
+        dlaunch(which, v, v == 0 ? da[which] : db[which]);
+      }
+      CU(hipDeviceSynchronize());
+      CU(hipMemset(mismatches, 0, sizeof(std::uint32_t)));
+      DiffKernel<<<(drows + 255U) / 256U, 256>>>(da[which], db[which], drows,
+                                                 mismatches);
+      CU(hipDeviceSynchronize());
+      std::uint32_t bad = 0;
+      CU(hipMemcpy(&bad, mismatches, sizeof(bad), hipMemcpyDeviceToHost));
+      double best[2] = {1e30, 1e30};
+      for (int round = 0; round < 5; ++round) {
+        for (int v = 0; v < 2; ++v) {
+          CU(hipDeviceSynchronize());
+          CU(hipEventRecord(t0));
+          for (int it = 0; it < 10; ++it) {
+            dlaunch(which, v, da[which]);
+          }
+          CU(hipEventRecord(t1));
+          CU(hipEventSynchronize(t1));
+          float ms = 0.0F;
+          CU(hipEventElapsedTime(&ms, t0, t1));
+          best[v] = std::min(best[v], ms * 1e2);
+        }
+      }
+      std::printf("%s : %8.3f us  %s\n%s         : %8.3f us  %6.1f GB/s  "
+                  "(%+.1f%%)  %s\n",
+                  dname[which], best[0], "(base)", dname[which], best[1],
+                  dmb[which] * 1e3 / best[1], 100.0 * (best[1] / best[0] - 1.0),
+                  bad == 0U ? "BIT-EXACT" : "DIFFERS");
+    }
+  }
   return 0;
 }

@@ -143,6 +143,10 @@ integer products (`Q4ScaleMinFromWords`, bit-identical, kernel probe
 −8.9 %); matched BAAB ×2 (`gufo_bench_moeab`): tg1024 after pp2048
 +0.2 %/+0.5 % plain, +1.0 %/+1.2 % speculative (7/8 pairs ahead, one
 −1.4 % spec outlier); cold grid not re-measured.
+6.1 (October 17) folds the same unpack into the dense and batched
+Q4_K/Q5_K GEMV kernels (probe −11.0 %/−4.7 % bit-identical); matched
+BAAB ×2 (`gufo_bench_moeab2`): tg1024-plain +0.6 %/+0.7 %, speculative
++0.5 %/+0.7 % at both tg128 and tg1024; cold grid not re-measured.
 
 ## MTP speculative decode
 

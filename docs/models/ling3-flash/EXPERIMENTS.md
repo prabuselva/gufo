@@ -703,3 +703,21 @@ noise outlier — the wall-clock gain lands well under the kernel-level
 −8.9 % because the grouped GEMVs run inside the overlapped stream window.
 Gate `rocm_mtp_accept` green, suite 11/11 selected, kernel-resources
 0 worse / 2962 same, launch geometry and `Q5K` paths untouched.
+
+### 6.1 — fold the unpack into every GEMV walk (October 17)
+
+The same branchy `Q4ScaleMin` unpack runs in the dense and batched GEMV
+kernels too, so the probe gained a dense section (rows=6144, cols=2560,
+production `GemvQ4K`/`GemvQ5K` as baseline vs the folded walk over the
+same oracle chain): Q4K 38.31 → 34.09 µs (−11.0 %, 259.5 GB/s — nearly
+the streaming ceiling), Q5K 44.21 → 42.13 µs (−4.7 %), both bit-exact.
+Folded all four production kernels (`GemvQ4K`, `GemvQ5K`, `GemvRowsQ4K`,
+`GemvRowsQ5K` — in the batched variants the folded term is computed once
+per element and reused across rows); `EmbedRowQ4K`/`EmbedRowQ5K` stay
+unpacked because they dequantize once at load time, not in the decode
+loop. Matched BAAB ×2 exclusive (`gufo_bench_moeab2`) vs the 6.0 HEAD
+control: tg1024-plain +0.6 %/+0.7 %, speculative tg128 +0.5 %/+0.7 % and
+tg1024 +0.5 %/+0.7 %, tg128-plain +0.2 %/−0.1 % — the dense matrices
+(leading dense FFN, shared expert) are every-token main-stream work, so
+the kernel gain lands directly. Gate `rocm_mtp_accept` green, suite
+11/11 selected, kernel-resources 0 worse / 2962 same.

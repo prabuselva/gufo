@@ -1604,6 +1604,17 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
         −1.4 % spec outlier; gate green, suite 11/11, kernel-resources
         0 worse / 2962 same.
 
+- [x] 6.1 ACCEPTED — fold the Q4_K/Q5_K unpack into every GEMV walk.
+        Extended `Q4ScaleMinFromWords` + the exact-product fold to the
+        dense `GemvQ4K`/`GemvQ5K` and batched `GemvRowsQ4K`/`GemvRowsQ5K`
+        kernels (`EmbedRow*` stays unpacked — load-time dequant, not
+        decode-hot). Probe at dense shape (rows=6144, cols=2560):
+        Q4K 38.31 → 34.09 µs (−11.0 %, 259.5 GB/s), Q5K 44.21 → 42.13 µs
+        (−4.7 %), both bit-exact. Matched BAAB ×2 (`gufo_bench_moeab2`)
+        vs 6.0 HEAD: tg1024-plain +0.6 %/+0.7 %, tg128-spec +0.5 %/+0.7 %,
+        tg1024-spec +0.5 %/+0.7 %, tg128-plain +0.2 %/−0.1 %. Gate green,
+        suite 11/11, kernel-resources 0 worse / 2962 same.
+
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
 cold/frontier tg grid; gates `ctest --preset gpu-full -R '^ling3_flash\.'`
