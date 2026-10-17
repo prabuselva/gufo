@@ -118,7 +118,13 @@ MTP-draft grouped Q4_0/Q8_0 tiers — bit-identical, +8.6 % on the
 cold-L2 down-shape microbench — but it covers only the single draft
 layer, so the matched `--speculative mtp` BAAB tg1024 pair is neutral
 (40.51/40.56 → 40.50/40.49, `gufo_bench_mo54tgm.log`) and no cell
-above moves.
+above moves. 5.7 (October 17) runs the decode shared-expert chain and
+routed `up` on non-blocking side streams, overlapped with the router →
+gate → down chain, kernels and reduction orders unchanged; matched
+BAAB ×2 (`gufo_bench_baabov`) at short context: tg1024 after pp2048
+34.79/34.14 → 36.19/36.17 (**+5.0 %**), tg128 after pp256
+35.79/35.77 → 37.25/37.17 (**+4.0 %**); the cold grid above was not
+re-measured.
 
 ## MTP speculative decode
 

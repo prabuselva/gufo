@@ -273,6 +273,17 @@ private:
   float* sh_inter_{nullptr};
   float* sh_down_{nullptr};
 
+  // Non-blocking side streams and ordering events for the decode MoE FFN:
+  // the shared-expert chain and routed `up` overlap the serial router ->
+  // routed gate/down chain. Non-blocking keeps them independent of the
+  // legacy default stream; ordering is exactly the events below.
+  hipStream_t moe_up_stream_{nullptr};
+  hipStream_t moe_shared_stream_{nullptr};
+  hipEvent_t ev_shared_fork_{nullptr};  ///< Recorded on main when x is ready.
+  hipEvent_t ev_up_fork_{nullptr};      ///< Recorded on main after RouterTopK.
+  hipEvent_t ev_up_{nullptr};           ///< Routed up done on the up stream.
+  hipEvent_t ev_shared_{nullptr};       ///< Shared chain done on its stream.
+
   // MTP scratch.
   float* mtp_e_{nullptr};
   float* mtp_h_{nullptr};

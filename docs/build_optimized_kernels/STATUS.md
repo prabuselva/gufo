@@ -1518,8 +1518,29 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             matches GEMV to F16 fma rounding), plain pp2048 control
             1329.6/1329.3. Exclusive suite 11/12 (only the parked
             `rocm_inference` fail), gate `rocm_mtp_accept` green,
-            kernel-resources 0 worse / 6 one-side (new Q4_0
-            instantiations).
+             kernel-resources 0 worse / 6 one-side (new Q4_0
+             instantiations).
+- [x] 5.7 ACCEPTED — MoE decode branches on non-blocking side streams.
+       Decode attribution (`prof57`, spec tg pass) put routed
+       `GemvGrouped` at 14.8 % (5.5 ms/token) plus the shared-expert
+       chain, while each small GEMV left bandwidth bubbles the legacy
+       single stream could not fill. A standalone probe
+       (`tools/bench/ling3_twostream_bench.hip`, real launchers and a
+       32-layer weight ring) measured the decode FFN per layer: serial
+       196.6 µs, shared expert on a side stream 186.4 (−5.2 %), plus
+       routed `up` on a second stream 178.1 (−9.4 %). Production
+       `Executor::Ffn` now forks the shared-expert chain at `x` and
+       routed `up` after `RouterTopK` onto `hipStreamNonBlocking`
+       streams, and the main stream joins `ev_up` before the routed
+       Swiglu and `ev_shared` before the final Add — same kernels, same
+       reduction orders, same bits. Dense and prefill tiers unchanged.
+       Matched BAAB ×2 exclusive (`gufo_bench_baabov`) vs a 5.6c HEAD
+       control: tg1024-plain 34.47 → 36.18 (**+5.0 %**), tg128-plain
+       35.78 → 37.21 (**+4.0 %**); spec tg128 +0.4 %, tg1024 +0.9 %
+       (verify rows bypass `Ffn`); pp2048 controls ±0.6 % (untouched
+       paths). Exclusive suite 11/12 (only the parked `rocm_inference`
+       fail), gate `rocm_mtp_accept` green (accept unchanged),
+       kernel-resources 0 worse / 0 better / 2961 same (no new kernels).
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +

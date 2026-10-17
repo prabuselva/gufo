@@ -254,6 +254,16 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  for (hipEvent_t e : {ev_up_fork_, ev_shared_fork_, ev_up_, ev_shared_}) {
+    if (e != nullptr) {
+      (void)hipEventDestroy(e);
+    }
+  }
+  for (hipStream_t s : {moe_up_stream_, moe_shared_stream_}) {
+    if (s != nullptr) {
+      (void)hipStreamDestroy(s);
+    }
+  }
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -502,6 +512,23 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
   }
+  if (hipStreamCreateWithFlags(&e->moe_up_stream_, hipStreamNonBlocking) !=
+          hipSuccess ||
+      hipStreamCreateWithFlags(&e->moe_shared_stream_, hipStreamNonBlocking) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_shared_fork_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_up_fork_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_up_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&e->ev_shared_, hipEventDisableTiming) !=
+          hipSuccess) {
+    if (error_msg != nullptr) {
+      *error_msg = "failed to create MoE FFN side streams/events";
+    }
+    return nullptr;
+  }
   return e;
 }
 
@@ -724,20 +751,46 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
   const std::uint32_t used = c_.num_experts_used;
   const std::uint32_t ff = c_.expert_ff;
   const std::uint32_t hid = c_.hidden_size;
+
+  // Overlap the MoE branches with the serial router -> gate -> down chain on
+  // non-blocking side streams. The always-on shared expert only reads x, so
+  // it starts immediately; routed `up` waits for the expert ids. Main joins
+  // ev_up before the routed Swiglu and ev_shared before the final Add, so
+  // the dependency graph - and the arithmetic - match the serial order.
+  (void)hipEventRecord(ev_shared_fork_, nullptr);
+  (void)hipStreamWaitEvent(moe_shared_stream_, ev_shared_fork_, 0);
+  (void)GemvTypeOf(l.shexp_gate.type, &type);
+  Gemv(l.shexp_gate.data, type, l.shexp_gate.rows, l.shexp_gate.cols,
+       l.shexp_gate.row_bytes, x, sh_gate_, moe_shared_stream_);
+  (void)GemvTypeOf(l.shexp_up.type, &type);
+  Gemv(l.shexp_up.data, type, l.shexp_up.rows, l.shexp_up.cols,
+       l.shexp_up.row_bytes, x, sh_up_, moe_shared_stream_);
+  SwigluClamped(sh_gate_, sh_up_, sh_inter_, c_.shared_expert_ff,
+                c_.swiglu_clamp_shexp[il], moe_shared_stream_);
+  (void)GemvTypeOf(l.shexp_down.type, &type);
+  Gemv(l.shexp_down.data, type, l.shexp_down.rows, l.shexp_down.cols,
+       l.shexp_down.row_bytes, sh_inter_, sh_down_, moe_shared_stream_);
+  (void)hipEventRecord(ev_shared_, moe_shared_stream_);
+
   (void)GemvTypeOf(l.router.type, &type);
   Gemv(l.router.data, type, l.router.rows, l.router.cols, l.router.row_bytes, x,
        moe_logits_, nullptr);
   RouterTopK(moe_logits_, l.exp_probs_b.f32(), c_.num_experts, c_.expert_groups,
              c_.expert_groups_used, used, c_.expert_weights_scale, moe_ids_,
              moe_weights_, nullptr);
+  (void)hipEventRecord(ev_up_fork_, nullptr);
+  (void)hipStreamWaitEvent(moe_up_stream_, ev_up_fork_, 0);
+  (void)GemvTypeOf(l.ffn_up_exps.type, &type);
+  GemvGrouped(l.ffn_up_exps.data, type,
+              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_, used,
+              used, ff, c_.hidden_size, x, 0U, moe_up_, moe_up_stream_);
+  (void)hipEventRecord(ev_up_, moe_up_stream_);
+
   (void)GemvTypeOf(l.ffn_gate_exps.type, &type);
   GemvGrouped(l.ffn_gate_exps.data, type,
               l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_, used,
               used, ff, c_.hidden_size, x, 0U, moe_gate_, nullptr);
-  (void)GemvTypeOf(l.ffn_up_exps.type, &type);
-  GemvGrouped(l.ffn_up_exps.data, type,
-              l.ffn_up_exps.row_bytes * l.ffn_up_exps.rows, moe_ids_, used,
-              used, ff, c_.hidden_size, x, 0U, moe_up_, nullptr);
+  (void)hipStreamWaitEvent(nullptr, ev_up_, 0);
   SwigluClamped(moe_gate_, moe_up_, moe_inter_, used * ff,
                 c_.swiglu_clamp_exp[il], nullptr);
   (void)GemvTypeOf(l.ffn_down_exps.type, &type);
@@ -745,19 +798,7 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
               l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, moe_ids_, used,
               1U, hid, ff, moe_inter_, ff, moe_down_, nullptr);
   RowWeightedSum(moe_down_, moe_weights_, out, used, hid, nullptr);
-
-  // Always-on shared expert.
-  (void)GemvTypeOf(l.shexp_gate.type, &type);
-  Gemv(l.shexp_gate.data, type, l.shexp_gate.rows, l.shexp_gate.cols,
-       l.shexp_gate.row_bytes, x, sh_gate_, nullptr);
-  (void)GemvTypeOf(l.shexp_up.type, &type);
-  Gemv(l.shexp_up.data, type, l.shexp_up.rows, l.shexp_up.cols,
-       l.shexp_up.row_bytes, x, sh_up_, nullptr);
-  SwigluClamped(sh_gate_, sh_up_, sh_inter_, c_.shared_expert_ff,
-                c_.swiglu_clamp_shexp[il], nullptr);
-  (void)GemvTypeOf(l.shexp_down.type, &type);
-  Gemv(l.shexp_down.data, type, l.shexp_down.rows, l.shexp_down.cols,
-       l.shexp_down.row_bytes, sh_inter_, sh_down_, nullptr);
+  (void)hipStreamWaitEvent(nullptr, ev_shared_, 0);
   Add(out, sh_down_, out, hid, nullptr);
 }
 

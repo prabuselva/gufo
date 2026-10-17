@@ -590,3 +590,30 @@ only the byte-identical parked `rocm_inference` fail; kernel-resources
 gap falls from 46 % to 4 %; spec tg1024 39.37 → 39.55 (+0.5 %, within
 noise) confirms the tier's Q4_0 dequant costs no accept rate against
 GEMV, and the plain pp2048 control is unchanged (1329.6/1329.3).
+
+MoE decode branches on side streams (STATUS.md lever 5.7): decode
+attribution (`prof57`, speculative tg pass) showed the routed
+`GemvGrouped` chains at 14.8 % (5.5 ms/token) with the shared-expert
+Q8_0 chain behind them, all launched serially on the legacy default
+stream — every small GEMV ends with a wave-drain bubble long before
+DRAM saturates. A standalone probe (`tools/bench/ling3_twostream_bench.hip`,
+which includes the production `gemv.hip.cpp` and launches the real
+kernels against a 32-layer weight ring at decode sizes) measured the
+MoE FFN per layer: serial 196.6 µs, shared expert moved to one
+`hipStreamNonBlocking` stream 186.4 (−5.2 %), and additionally routed
+`up` to a second stream 178.1 (−9.4 %). Blocking streams cannot be
+used here: they serialize implicitly against the legacy default stream
+everything else runs on, so ordering is exactly two forks
+(shared-expert chain at `x`, routed `up` after `RouterTopK`) and two
+joins (routed Swiglu waits `ev_up`, final Add waits `ev_shared`). The
+elementwise kernels stay on their original streams, so the dependency
+graph and every reduction order match the serial code bit for bit.
+Exclusive BAAB ×2 (`gufo_bench_baabov`) vs a 5.6c HEAD control:
+tg1024-plain 34.79/34.14 → 36.19/36.17 (**+5.0 %**), tg128-plain
+35.79/35.77 → 37.25/37.17 (**+4.0 %**); speculative tg128 +0.4 % and
+tg1024 +0.9 % (verify rows run the batched tier, not `Ffn`); pp2048
+plain/spec controls ±0.6 %, inside noise on untouched paths. Exclusive
+suite 11/12 with only the byte-identical parked `rocm_inference` fail,
+gate `rocm_mtp_accept` green with acceptance unchanged, kernel-resources
+0 worse / 0 better / 2961 same — the lever adds no kernels, only
+streams and events.
