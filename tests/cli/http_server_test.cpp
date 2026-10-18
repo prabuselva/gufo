@@ -1,6 +1,7 @@
 #include "src/cli/serve/http_server.hpp"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -101,13 +103,13 @@ public:
       const gufo::sampling::SamplingConfig& sampling,
       const CancellationCheck& cancellation, bool stream, bool ignore_eos,
       std::string_view client_id,
-      const std::vector<std::string>& stop_sequences,
-      bool return_progress) override {
+      const std::vector<std::string>& stop_sequences, bool return_progress,
+      bool cache_prompt) override {
     last_ignore_eos = ignore_eos;
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_complete(
             prompt, max_tokens, sampling, cancellation, stream, false,
-            client_id, stop_sequences, return_progress),
+            client_id, stop_sequences, return_progress, cache_prompt),
         progress, admit.load());
   }
   std::shared_ptr<GenerationRequest> start_chat(
@@ -141,13 +143,14 @@ public:
   std::optional<std::size_t> chat_token_count;
   mutable std::size_t counted_messages{0};
   mutable std::size_t counted_tools{0};
-  Result complete(
-      std::string_view prompt, std::size_t limit,
-      const gufo::sampling::SamplingConfig& sampling,
-      const CancellationCheck& cancel, const TokenCallback& token,
-      std::string_view client_id = "anonymous",
-      const std::vector<std::string>& stop_sequences = {}) override {
+  Result complete(std::string_view prompt, std::size_t limit,
+                  const gufo::sampling::SamplingConfig& sampling,
+                  const CancellationCheck& cancel, const TokenCallback& token,
+                  std::string_view client_id = "anonymous",
+                  const std::vector<std::string>& stop_sequences = {},
+                  bool cache_prompt = true) override {
     ++calls;
+    last_cache_prompt = cache_prompt;
     if (failure == 1)
       throw std::length_error("context exceeded");
     if (failure == 2)
@@ -230,6 +233,7 @@ public:
   }
   std::atomic<int> calls{0};
   std::atomic<bool> last_ignore_eos{false};
+  std::atomic<bool> last_cache_prompt{true};
   std::vector<PromptProgress> progress;
   // Report a scheduler admission before generation, as the HIP backend does.
   std::atomic<bool> admit{false};
@@ -253,10 +257,14 @@ private:
 class RunningServer {
 public:
   explicit RunningServer(gufo::server::HttpServerOptions options = {},
-                         bool handle_signals = false)
+                         bool handle_signals = false,
+                         std::string host = "127.0.0.1")
       : backend(std::make_shared<FakeBackend>()),
-        server("127.0.0.1", 0, backend, nullptr, nullptr, nullptr,
+        server(std::move(host), 0, backend, nullptr, nullptr, nullptr,
                std::move(options)) {
+    server.add("GET", "/peer", [](const auto& request, auto&) {
+      return gufo::server::HttpResponse{.body = request.client_id};
+    });
     server.add("POST", "/echo", [](const auto& request, auto&) {
       return gufo::server::HttpResponse{.body = request.body};
     });
@@ -317,22 +325,33 @@ public:
     worker.join();
   }
 
-  int Connect() {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  int Connect(const std::string& peer = "127.0.0.1") {
+    sockaddr_storage address{};
+    socklen_t length = 0;
+    auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+    auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+    if (::inet_pton(AF_INET, peer.c_str(), &ipv4->sin_addr) == 1) {
+      ipv4->sin_family = AF_INET;
+      ipv4->sin_port = htons(server.port());
+      length = sizeof(*ipv4);
+    } else {
+      assert(::inet_pton(AF_INET6, peer.c_str(), &ipv6->sin6_addr) == 1);
+      ipv6->sin6_family = AF_INET6;
+      ipv6->sin6_port = htons(server.port());
+      length = sizeof(*ipv6);
+    }
+    const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
     assert(fd >= 0);
     const timeval timeout{3, 0};
     assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                         sizeof(timeout)) == 0);
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(server.port());
-    assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
-    assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address),
-                     sizeof(address)) == 0);
+    assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) ==
+           0);
     return fd;
   }
-  std::string Send(std::string_view request, bool half_close = false) {
-    const int fd = Connect();
+  std::string Send(std::string_view request, bool half_close = false,
+                   const std::string& peer = "127.0.0.1") {
+    const int fd = Connect(peer);
     while (!request.empty()) {
       const auto count =
           ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
@@ -902,6 +921,11 @@ void TestLlamaSlotsAndMetrics() {
   assert(metrics.find("# TYPE gufo_device_lost_total counter\n") !=
          std::string::npos);
   assert(metrics.find("gufo_device_lost_total 0\n") != std::string::npos);
+  for (const std::string counter : {"gufo_spec_lookup_tokens_total",
+                                    "gufo_spec_lookup_accepted_tokens_total"}) {
+    assert(metrics.find("# TYPE " + counter + " counter\n") !=
+           std::string::npos);
+  }
   const std::string ratio_prefix = "llamacpp:kv_cache_usage_ratio ";
   const auto ratio_pos = metrics.find("\n" + ratio_prefix);
   assert(ratio_pos != std::string::npos);
@@ -2169,6 +2193,207 @@ void TestInvalidBindSettings() {
   assert(!error.empty());
 }
 
+// Some CI containers have no IPv6 loopback; listener checks skip there.
+bool HasIpv6Loopback() {
+  const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd < 0)
+    return false;
+  sockaddr_in6 address{};
+  address.sin6_family = AF_INET6;
+  address.sin6_addr = in6addr_loopback;
+  const bool bound = ::bind(fd, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address)) == 0;
+  ::close(fd);
+  return bound;
+}
+
+void TestListenAddresses() {
+  using gufo::server::IsListenAddress;
+  for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1", "fe80::1%lo"})
+    assert(IsListenAddress(host));
+  for (const char* host : {"", "localhost", "127.1", "[::1]", "bad.address"})
+    assert(!IsListenAddress(host));
+  if (!HasIpv6Loopback()) {
+    std::cout << "IPv6 loopback unavailable; skipping IPv6 listener checks.\n";
+    return;
+  }
+  const auto peer = [](RunningServer& server, const std::string& address) {
+    const auto response =
+        server.Send("GET /peer HTTP/1.1\r\n\r\n", false, address);
+    ExpectStatus(response, 200);
+    return response.substr(response.find("\r\n\r\n") + 4);
+  };
+  {
+    RunningServer loopback({}, false, "::1");
+    assert(peer(loopback, "::1") == "::1");
+  }
+  // `::` is dual-stack, and an IPv4 peer keeps its IPv4 client ID.
+  RunningServer dual({}, false, "::");
+  assert(peer(dual, "::1") == "::1");
+  assert(peer(dual, "127.0.0.1") == "127.0.0.1");
+}
+
+// Binds port 0 to find a free port, then releases it for the code under test.
+int FreePort(const std::string& host = "127.0.0.1") {
+  sockaddr_storage address{};
+  socklen_t length = 0;
+  auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+  auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+  if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET;
+    length = sizeof(*ipv4);
+  } else {
+    assert(::inet_pton(AF_INET6, host.c_str(), &ipv6->sin6_addr) == 1);
+    ipv6->sin6_family = AF_INET6;
+    length = sizeof(*ipv6);
+  }
+  const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+  assert(fd >= 0);
+  assert(::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0);
+  assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
+         0);
+  ::close(fd);
+  return ntohs(address.ss_family == AF_INET6 ? ipv6->sin6_port
+                                             : ipv4->sin_port);
+}
+
+int ConnectTo(const std::string& host, int port) {
+  sockaddr_storage address{};
+  socklen_t length = 0;
+  auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+  auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+  if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
+    ipv4->sin_family = AF_INET;
+    ipv4->sin_port = htons(static_cast<std::uint16_t>(port));
+    length = sizeof(*ipv4);
+  } else {
+    assert(::inet_pton(AF_INET6, host.c_str(), &ipv6->sin6_addr) == 1);
+    ipv6->sin6_family = AF_INET6;
+    ipv6->sin6_port = htons(static_cast<std::uint16_t>(port));
+    length = sizeof(*ipv6);
+  }
+  const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+  assert(fd >= 0);
+  const timeval timeout{3, 0};
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
+         0);
+  if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+// Sends each part separately, pausing between them, and reads to EOF.
+std::string SendParts(const std::string& host, int port,
+                      const std::vector<std::string>& parts) {
+  const int fd = ConnectTo(host, port);
+  assert(fd >= 0);
+  for (std::size_t index = 0; index < parts.size(); ++index) {
+    if (index > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(::send(fd, parts[index].data(), parts[index].size(), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(parts[index].size()));
+  }
+  std::string response;
+  char buffer[4096];
+  for (;;) {
+    const auto count = ::read(fd, buffer, sizeof(buffer));
+    assert(count >= 0);
+    if (count == 0)
+      break;
+    response.append(buffer, static_cast<std::size_t>(count));
+  }
+  ::close(fd);
+  return response;
+}
+
+void ExpectLoading(const std::string& response) {
+  ExpectStatus(response, 503);
+  assert(response.find("\r\nRetry-After: 1\r\n") != std::string::npos);
+  const auto body = response.substr(response.find("\r\n\r\n") + 4);
+  assert(body ==
+         R"({"error":{"message":"Loading model","type":"unavailable_error",)"
+         R"("code":"loading"}})");
+}
+
+void TestLoadingResponder() {
+  using gufo::server::LoadingResponder;
+  // Nothing to hold for an ephemeral port or an address HttpServer rejects.
+  assert(!LoadingResponder("127.0.0.1", 0).listening());
+  assert(!LoadingResponder("127.0.0.1", 65536).listening());
+  assert(!LoadingResponder("localhost", FreePort()).listening());
+
+  const int port = FreePort();
+  LoadingResponder loading("127.0.0.1", port);
+  assert(loading.listening());
+  // Health and readiness included: a 200 would read as ready to llama-swap
+  // and other pollers, then their requests would fail.
+  for (const std::string path : {"/health", "/v1/health", "/healthz", "/ready",
+                                 "/v1/ready", "/readyz", "/v1/models"}) {
+    ExpectLoading(
+        SendParts("127.0.0.1", port, {"GET " + path + " HTTP/1.1\r\n\r\n"}));
+  }
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"}));
+  // A request head split across segments is answered after it completes.
+  ExpectLoading(
+      SendParts("127.0.0.1", port, {"GET /hea", "lth HTTP/1.1\r\n", "\r\n"}));
+
+  // The port is held: the real server cannot bind it until stop().
+  {
+    HttpServer early("127.0.0.1", port, nullptr);
+    std::string error;
+    assert(!early.start(&error));
+  }
+
+  // A client that connects and sends nothing delays neither the next client
+  // nor stop() beyond the bounded request wait.
+  const int idle = ConnectTo("127.0.0.1", port);
+  assert(idle >= 0);
+  auto started = std::chrono::steady_clock::now();
+  ExpectLoading(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}));
+  assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+  const int idle_during_stop = ConnectTo("127.0.0.1", port);
+  assert(idle_during_stop >= 0);
+  started = std::chrono::steady_clock::now();
+  loading.stop();
+  assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+  assert(!loading.listening());
+  ::close(idle);
+  ::close(idle_during_stop);
+
+  // Handoff: the real server binds the same address and answers health.
+  HttpServer server("127.0.0.1", port, nullptr);
+  std::string error;
+  assert(server.start(&error));
+  std::jthread worker([&server] { server.run(); });
+  const auto health =
+      SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"});
+  ExpectStatus(health, 200);
+  assert(health.ends_with(R"({"status":"ok"})"));
+  server.stop();
+  worker.join();
+
+  // A port already in use leaves the responder idle and the owner unaffected.
+  {
+    RunningServer owner;
+    LoadingResponder blocked("127.0.0.1", owner.server.port());
+    assert(!blocked.listening());
+    ExpectStatus(owner.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
+  }
+
+  if (!HasIpv6Loopback()) {
+    std::cout << "IPv6 loopback unavailable; skipping IPv6 loading checks.\n";
+    return;
+  }
+  const int ipv6_port = FreePort("::1");
+  LoadingResponder ipv6("::1", ipv6_port);
+  assert(ipv6.listening());
+  ExpectLoading(SendParts("::1", ipv6_port, {"GET /health HTTP/1.1\r\n\r\n"}));
+}
+
 void TestCompatibilityUtf8() {
   RunningServer server;
   server.backend->SetOutput("é中😀\xE2\x94!\xF0\x9F");
@@ -2377,7 +2602,13 @@ void TestResponseSamplingDefaults() {
       assert(server.backend->LastCall().chat.cache_prompt == cache);
     }
   }
-  for (const char* invalid : {"null", "0", "\"false\""}) {
+  // As in llama-server, null keeps the default.
+  body["cache_prompt"] = false;
+  ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+  body["cache_prompt"] = gufo::json::Value();
+  ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+  assert(server.backend->LastCall().chat.cache_prompt);
+  for (const char* invalid : {"0", "\"false\""}) {
     body["cache_prompt"] = gufo::json::parse(invalid);
     const int calls = server.backend->calls;
     ExpectStatus(server.Post("/v1/responses", body.dump()), 400);
@@ -2590,6 +2821,38 @@ void TestSignalShutdown() {
 
 }  // namespace
 
+void TestRawCompletionCachePrompt() {
+  RunningServer server;
+  for (const auto* path : {"/v1/completions", "/completion"}) {
+    ExpectStatus(
+        server.Post(path, R"({"prompt":"hello","cache_prompt":false})"), 200);
+    assert(!server.backend->last_cache_prompt);
+    ExpectStatus(server.Post(path, R"({"prompt":"hello"})"), 200);
+    assert(server.backend->last_cache_prompt);
+    ExpectStatus(
+        server.Post(path, R"({"prompt":"hello","cache_prompt":false})"), 200);
+    ExpectStatus(server.Post(path, R"({"prompt":"hello","cache_prompt":true})"),
+                 200);
+    assert(server.backend->last_cache_prompt);
+    // As in llama-server, null keeps the default.
+    ExpectStatus(
+        server.Post(path, R"({"prompt":"hello","cache_prompt":false})"), 200);
+    ExpectStatus(server.Post(path, R"({"prompt":"hello","cache_prompt":null})"),
+                 200);
+    assert(server.backend->last_cache_prompt);
+    const auto before = server.backend->calls.load();
+    for (const auto* value : {"\"false\"", "0"}) {
+      const auto rejected = server.Post(
+          path,
+          std::string(R"({"prompt":"hello","cache_prompt":)") + value + "}");
+      ExpectStatus(rejected, 400);
+      assert(rejected.find("'cache_prompt' must be a boolean") !=
+             std::string::npos);
+    }
+    assert(server.backend->calls == before);
+  }
+}
+
 void TestRawCompletionPromptProgress() {
   RunningServer server;
   server.backend->progress = {
@@ -2633,6 +2896,8 @@ int main() {
   TestLogLevelFilter();
   TestLogLevelNames();
   TestInvalidBindSettings();
+  TestListenAddresses();
+  TestLoadingResponder();
   TestQueryParameters();
   TestAuthorization();
   TestFramingAndMetrics();
@@ -2647,6 +2912,7 @@ int main() {
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
   TestRawCompletionPromptProgress();
+  TestRawCompletionCachePrompt();
   TestCompatibilityStopSequences();
   TestCompatibilityThinkingDefaults();
   TestResponseSamplingDefaults();

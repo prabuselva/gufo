@@ -109,8 +109,9 @@ public:
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
   }
-  /// Drops every token; the next Forward starts at position 0.
-  void Reset();
+  /// Drops every token; the next Forward starts at position 0. Cache slot
+  /// reassignment may retain bounded MTP scratch and its recorded graphs.
+  void Reset(bool reuse_mtp = false);
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool CheckCancellation(std::string* error) const;
   [[nodiscard]] bool Cancelled() const noexcept { return cancelled_; }
@@ -169,6 +170,10 @@ private:
     float* target_hidden{nullptr};  ///< last max_speculative trunk rows
     std::uint32_t position{0};
     bool residual_valid{false};
+    /// The request's draft table (draft_vocab.hpp): kMtpDraftExtraRows
+    /// output() rows and their token IDs, -1 for an empty slot.
+    std::uint8_t* draft_rows{nullptr};
+    std::int32_t* draft_ids{nullptr};
   };
 
   mutable bool cancelled_{false};
@@ -312,6 +317,9 @@ public:
     /// Prefill needs only persistent KV. A subsequent full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
+    /// Draft through the small head (the output() prefix plus the
+    /// session's draft table) when the model has one.
+    bool draft_subset{false};
   };
   struct MtpHeadItem {
     Session* session;
@@ -322,6 +330,14 @@ public:
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
   };
+  /// Copies output() rows `ids` into the session's draft table from slot
+  /// `first` on. Enqueued on stream(); never during graph capture.
+  [[nodiscard]] bool AppendDraftRows(Session& session, std::uint32_t first,
+                                     std::span<const std::int32_t> ids,
+                                     std::string* error_msg) const;
+  /// Empties the session's draft table from slot `first` on.
+  [[nodiscard]] bool ClearDraftRows(Session& session, std::uint32_t first,
+                                    std::string* error_msg) const;
   /// Runs independent short predictor chains with shared projections and
   /// private attention caches, positions and carried hidden states.
   [[nodiscard]] bool MtpForwardBatch(std::span<const MtpBatchItem> items,
@@ -457,9 +473,11 @@ private:
                std::uint32_t n_tokens, std::string* error_msg) const;
   /// `normed` says the previous Combine already produced m's grouped norm
   /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
+  /// `half_only` leaves only the F16 copy of `mixed`; `no_f32` keeps its
+  /// F16 and tiled Q8 copies but skips the F32 rows nothing reads.
   bool HcMix(const DeviceMixer& m, const float* res, bool normed, float* mixed,
              float* inject, std::uint32_t n_tokens, std::string* error_msg,
-             bool half_only = false) const;
+             bool half_only = false, bool no_f32 = false) const;
   /// Share mixer projections across decode requests without selecting the
   /// prefill arithmetic. Injection rows are compact across the whole batch.
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -467,8 +485,11 @@ private:
                   std::string* error) const;
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
-  /// mixer (`gamma`); wide batches write it as F16 and tiled Q8.
-  void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
+  /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
+  /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
+  /// partials in s_.inject (inject_fused_).
+  void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
+               const float* inject_w = nullptr) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -503,24 +524,43 @@ private:
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
+  /// Whether MoeExperts takes the routed F16 WMMA route, whose epilogue the
+  /// following combine absorbs (see Moe).
+  bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
                   std::uint32_t n_tokens, std::string* error_msg) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
-  /// Selects the greedy token or compact candidates from full MTP logits.
+  /// Whether a draft of `session` requesting the small head gets it.
+  bool UseDraftSubset(const Session& session, bool requested) const noexcept {
+    return requested && !model_->draft_output().empty() &&
+           session.mtp_.draft_rows != nullptr;
+  }
+  /// The session's draft table as a weight of kMtpDraftExtraRows rows.
+  DeviceTensor DraftTable(const Session& session) const noexcept;
+  /// Small-head draft logits: prefix rows, then the table rows with empty
+  /// slots at -infinity.
+  bool DraftLogits(const Session& session, const float* x, float* logits,
+                   std::string* error_msg) const;
+  /// Selects the greedy token or compact candidates from MTP draft logits.
+  /// With `draft`, the logits come from that session's small head and the
+  /// returned IDs are remapped to token IDs.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool candidates, std::string* error_msg) const;
+               bool candidates, const Session* draft,
+               std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
                    std::uint32_t start_pos, std::uint32_t pool_grid,
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
-                   PrefillCheckpoint* checkpoint = nullptr) const;
+                   PrefillCheckpoint* checkpoint = nullptr,
+                   bool embeddings_ready = false) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
-               const float* hidden_source, MtpTrace* trace, bool kv_only) const;
+               const float* hidden_source, MtpTrace* trace, bool kv_only,
+               bool draft_subset) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -562,6 +602,7 @@ private:
     float* mixed;
     float* inject;
     float* block_out;
+    float* hc_defer_w;  ///< [t][4] stream weights of a deferred combine
     // linear attention
     float* qkv;
     float* z;
@@ -583,7 +624,9 @@ private:
     std::uint32_t* mask;
     float* scores;
     float* ctx;
-    float* attn_partials;  ///< split-key partials of a narrow batch
+    float* attn_partials;        ///< split-key partials of a narrow batch
+    std::uint32_t* attn_lists;   ///< [row][selection budget] compacted blocks
+    std::uint32_t* attn_counts;  ///< selected blocks per narrow-batch row
     // ple
     float* ple_emb;
     float* ple_key;
@@ -686,11 +729,10 @@ private:
   std::uint32_t* counts_host_{nullptr};
   std::int32_t* tiles_host_{nullptr};         ///< routed tile map staging
   mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
-  mutable std::uint32_t routed_n_tiles_{0};   ///< down projection tiles
-  mutable std::uint32_t routed_64_tiles_{0};  ///< appended 64-token tiles
+  mutable std::uint32_t routed_n_tiles_{0};   ///< routed_tile_rows_ tiles
+  mutable std::uint32_t routed_64_tiles_{0};  ///< wide batches' down tiles
   mutable std::uint32_t routed_pair_offset_{0};
   mutable std::uint32_t routed_pair_tiles_{0};
-  mutable std::uint32_t routed_pair_rows_{64};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
@@ -700,6 +742,11 @@ private:
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
+  /// Set before an attention-side combine whose FFN combine fuses the MoE
+  /// epilogue: that combine may then leave its residual update to the next
+  /// one (res_deferred_), which reads s_.block_out and s_.hc_defer_w.
+  mutable bool defer_residual_{false};
+  mutable bool res_deferred_{false};
   /// Set by GatedDense when s_.shexp_half holds the SwiGLU rows its F16
   /// down projection reads.
   mutable bool shexp_half_ready_{false};
@@ -717,6 +764,9 @@ private:
   mutable bool xn_half_{false};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
+  /// Inject weights whose partials the last combine already wrote to
+  /// s_.inject, so the following HcMix skips its inject pass.
+  mutable const float* inject_fused_{nullptr};
   mutable unsigned q8_slot_{0};
   /// Producer-written Q8_1 rows (see ReadyQ8): source, rows and width.
   struct ReadyRows {
