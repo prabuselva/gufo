@@ -198,7 +198,15 @@ void ReferenceModel::MlaAttention(const LayerWeights& l, MlaState& s,
 
   std::vector<float> q_all(c_.MlaQDim());
   std::vector<float> kv_all(kv_rank + rot);
-  MatVec(l.attn_q, 0, x, q_all);
+  if (c_.mla_q_split) {
+    std::vector<float> q_latent(c_.mla_q_lora);
+    MatVec(l.attn_q_a, 0, x, q_latent);
+    RmsNorm(q_latent, static_cast<const float*>(l.attn_q_a_norm.data),
+            c_.rms_eps);
+    MatVec(l.attn_q_b, 0, q_latent, q_all);
+  } else {
+    MatVec(l.attn_q, 0, x, q_all);
+  }
   MatVec(l.attn_kv_a, 0, x, kv_all);
 
   std::vector<float> q_pe(static_cast<std::size_t>(heads) * rot);
@@ -466,9 +474,9 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     h = ffn_inp;
     RmsNorm(h, static_cast<const float*>(l.ffn_norm.data), c_.rms_eps);
     if (c_.IsDenseFfnLayer(il)) {
-      DenseFfn(l, c_.swiglu_clamp_shexp[il], h, ffn);
+      DenseFfn(l, c_.ClampShexp(il), h, ffn);
     } else {
-      MoeFfn(l, c_.swiglu_clamp_exp[il], c_.swiglu_clamp_shexp[il], h, ffn);
+      MoeFfn(l, c_.ClampExp(il), c_.ClampShexp(il), h, ffn);
     }
     for (std::size_t i = 0; i < hid; ++i) {
       x[i] = ffn_inp[i] + ffn[i];
@@ -541,8 +549,7 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   RmsNorm(normed, static_cast<const float*>(l.ffn_norm.data), c_.rms_eps);
   // The draft block is the last artifact block: both clamp slots are 0.
   const std::uint32_t mtp_il = c_.num_layers;
-  MoeFfn(l, c_.swiglu_clamp_exp[mtp_il], c_.swiglu_clamp_shexp[mtp_il], normed,
-         ffn);
+  MoeFfn(l, c_.ClampExp(mtp_il), c_.ClampShexp(mtp_il), normed, ffn);
   for (std::size_t i = 0; i < hid; ++i) {
     x[i] = ffn_inp[i] + ffn[i];
   }

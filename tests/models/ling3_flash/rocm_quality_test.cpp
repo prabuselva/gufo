@@ -4,7 +4,7 @@
 // that the CPU oracle and GPU executor agree, so they cannot catch a shared
 // formula error (a corrupted conv history once decoded pure whitespace while
 // both paths matched). Skips (77) unless GUFO_LING3_FLASH_GGUF points at a
-// Ling 3.0 Flash GGUF.
+// Ling 3.0 GGUF (Flash or Tiny).
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -94,6 +94,6 @@ int main() {
     std::cerr << failures << " quality checks failed\n";
     return 1;
   }
-  std::cout << "Ling 3.0 Flash greedy generation is coherent.\n";
+  std::cout << "Ling 3.0 greedy generation is coherent.\n";
   return 0;
 }

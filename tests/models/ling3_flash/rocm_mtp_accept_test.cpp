@@ -4,7 +4,8 @@
 // freshly sampled token, the draft must predict the trunk's next greedy
 // token most of the time. A position, cache or gate misalignment leaves the
 // formulas intact and collapses agreement to near zero. Skips (77) unless
-// GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash GGUF.
+// GUFO_LING3_FLASH_GGUF points at a Ling 3.0 GGUF with an MTP block;
+// artifacts without MTP skip as well.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -85,6 +86,10 @@ int main() {
   if (!weights.has_value()) {
     std::cerr << "trunk bind failed: " << error << "\n";
     return 1;
+  }
+  if (weights->config.nextn_layers == 0) {
+    std::cout << "SKIP: artifact has no MTP block\n";
+    return 77;
   }
   const auto mtp = l3::MtpWeights::Bind(*reader, weights->config, &error);
   if (!mtp.has_value()) {

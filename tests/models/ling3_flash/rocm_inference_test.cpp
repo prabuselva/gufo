@@ -1,16 +1,17 @@
-// Greedy-decodes a short continuation twice over the real Ling 3.0 Flash
+// Greedy-decodes a short continuation twice over the real Ling 3.0
 // artifact: once through the scalar oracle and once through the ROCm
 // executor, feeding each argmax back as the next token. The token streams
 // must agree exactly at every step; a single divergence means the GPU path
 // is not yet quality-safe even when the forward test's logit tolerance
-// passes. Skips (77) unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash
-// GGUF.
+// passes. Skips (77) unless GUFO_LING3_FLASH_GGUF points at a supported
+// Ling 3.0 GGUF (Flash or Tiny).
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -77,13 +78,18 @@ int main() {
     std::cerr << "trunk bind failed: " << error << "\n";
     return 1;
   }
-  const auto mtp = l3::MtpWeights::Bind(*reader, weights->config, &error);
-  if (!mtp.has_value()) {
-    std::cerr << "MTP bind failed: " << error << "\n";
-    return 1;
+  const bool has_mtp = weights->config.nextn_layers > 0;
+  std::optional<l3::MtpWeights> mtp;
+  if (has_mtp) {
+    auto bound = l3::MtpWeights::Bind(*reader, weights->config, &error);
+    if (!bound.has_value()) {
+      std::cerr << "MTP bind failed: " << error << "\n";
+      return 1;
+    }
+    mtp = std::move(bound);
   }
-  const auto device =
-      rocm::DeviceModel::Upload(*weights, *reader, &*mtp, &error);
+  const auto device = rocm::DeviceModel::Upload(
+      *weights, *reader, has_mtp ? &*mtp : nullptr, &error);
   if (device == nullptr) {
     std::cerr << "device upload failed: " << error << "\n";
     return 1;

@@ -1,15 +1,18 @@
 // Runs the ROCm executor and the scalar oracle over the same tokens on the
-// real Ling 3.0 Flash artifact and requires them to agree: trunk logits, the
-// post-output_norm hidden stream, chunked Prefill at block boundaries, the
-// MTP draft logits and a replay after Reset. This is the end-to-end numerical
-// contract for the GPU path; the per-operator tests only pin the pieces.
-// Skips (77) unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash GGUF.
+// real Ling 3.0 artifact (Flash or Tiny) and requires them to agree: trunk
+// logits, the post-output_norm hidden stream, chunked Prefill at block
+// boundaries, the MTP draft logits when the artifact ships a draft, and a
+// replay after Reset. This is the end-to-end numerical contract for the GPU
+// path; the per-operator tests only pin the pieces.
+// Skips (77) unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 GGUF.
 #include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -100,14 +103,19 @@ int main() {
     std::cerr << "trunk bind failed: " << error << "\n";
     return 1;
   }
-  const auto mtp = l3::MtpWeights::Bind(*reader, weights->config, &error);
-  if (!mtp.has_value()) {
-    std::cerr << "MTP bind failed: " << error << "\n";
-    return 1;
+  const bool has_mtp = weights->config.nextn_layers > 0;
+  std::optional<l3::MtpWeights> mtp;
+  if (has_mtp) {
+    auto bound = l3::MtpWeights::Bind(*reader, weights->config, &error);
+    if (!bound.has_value()) {
+      std::cerr << "MTP bind failed: " << error << "\n";
+      return 1;
+    }
+    mtp = std::move(bound);
   }
 
-  const auto device =
-      rocm::DeviceModel::Upload(*weights, *reader, &*mtp, &error);
+  const auto device = rocm::DeviceModel::Upload(
+      *weights, *reader, has_mtp ? &*mtp : nullptr, &error);
   if (device == nullptr) {
     std::cerr << "device upload failed: " << error << "\n";
     return 1;
@@ -148,18 +156,20 @@ int main() {
   Expect(session->position() == static_cast<std::uint32_t>(prompt.size()),
          "session position advanced");
 
-  std::vector<float> cpu_mtp(c.vocab_size);
-  if (!oracle.MtpStep(*mtp, /*token=*/400, cpu_hidden, cpu_mtp, &error)) {
-    std::cerr << "oracle mtp failed: " << error << "\n";
-    return 1;
+  if (has_mtp) {
+    std::vector<float> cpu_mtp(c.vocab_size);
+    if (!oracle.MtpStep(*mtp, /*token=*/400, cpu_hidden, cpu_mtp, &error)) {
+      std::cerr << "oracle mtp failed: " << error << "\n";
+      return 1;
+    }
+    if (!executor->MtpStep(*session, /*token=*/400, &error)) {
+      std::cerr << "executor mtp failed: " << error << "\n";
+      return 1;
+    }
+    const auto gpu_mtp = DownloadRaw(executor->mtp_logits(), c.vocab_size);
+    Compare(cpu_mtp, gpu_mtp, "mtp logits");
+    Expect(ArgMax(cpu_mtp) == ArgMax(gpu_mtp), "mtp argmax matches");
   }
-  if (!executor->MtpStep(*session, /*token=*/400, &error)) {
-    std::cerr << "executor mtp failed: " << error << "\n";
-    return 1;
-  }
-  const auto gpu_mtp = DownloadRaw(executor->mtp_logits(), c.vocab_size);
-  Compare(cpu_mtp, gpu_mtp, "mtp logits");
-  Expect(ArgMax(cpu_mtp) == ArgMax(gpu_mtp), "mtp argmax matches");
 
   // After Reset both must replay the first token identically again.
   oracle.Reset();
@@ -183,6 +193,7 @@ int main() {
   for (std::uint32_t i = 0; i < 40; ++i) {
     long_prompt.push_back(static_cast<std::int32_t>(1 + (i * 37U) % 1000U));
   }
+
   const std::uint32_t blocks[] = {1, 16, 22, 1};
   std::size_t done = 0;
   for (const std::uint32_t block : blocks) {
@@ -211,6 +222,6 @@ int main() {
     std::cerr << failures << " forward parity checks failed\n";
     return 1;
   }
-  std::cout << "Ling 3.0 Flash GPU forward matches the oracle.\n";
+  std::cout << "Ling 3.0 GPU forward matches the oracle.\n";
   return 0;
 }

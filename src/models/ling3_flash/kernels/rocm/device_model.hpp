@@ -45,9 +45,10 @@ struct DeviceLayer {
   // Kimi Delta Attention (KDA layers).
   DeviceTensor ssm_q, ssm_k, ssm_v, ssm_conv_q, ssm_conv_k, ssm_conv_v, ssm_f,
       ssm_g, ssm_beta, ssm_a, ssm_dt, ssm_norm, ssm_out;
-  // Absorbed MLA (MLA layers).
-  DeviceTensor attn_q, attn_kv_a, attn_kv_a_norm, attn_k_b, attn_v_b, attn_gate,
-      attn_out;
+  // Absorbed MLA (MLA layers). Tiny exports q through attn_q_a, a RMSNorm
+  // and attn_q_b; Flash ships the fused attn_q.
+  DeviceTensor attn_q, attn_q_a, attn_q_a_norm, attn_q_b, attn_kv_a,
+      attn_kv_a_norm, attn_k_b, attn_v_b, attn_gate, attn_out;
   // Dense FFN (leading layers only).
   DeviceTensor ffn_gate, ffn_up, ffn_down;
   // Mixture of experts with one always-on shared expert.

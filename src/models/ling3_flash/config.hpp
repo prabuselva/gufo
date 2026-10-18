@@ -4,25 +4,28 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
 
 namespace gufo::models::ling3_flash {
 
-/// Architecture parameters of a Ling 3.0 Flash (`bailingmoe3`) GGUF artifact:
+/// Architecture parameters of a Ling 3.0 (`bailingmoe3`) GGUF artifact:
 /// a hybrid trunk of Kimi Delta Attention (KDA) linear layers and absorbed
 /// Multi-head Latent Attention (MLA) layers, a sigmoid-gated Mixture-of-Experts
-/// FFN with group-limited top-k routing and one always-on shared expert, and a
-/// self-speculative MTP block. Every value is read from the file; the
-/// validated-geometry check in `FromGguf` locks the shape this runtime was
-/// written and tested for.
+/// FFN with group-limited top-k routing and one always-on shared expert, and
+/// the optional self-speculative MTP block. Every value is read from the file;
+/// the geometry check in `FromGguf` accepts only the measured profiles (Ling
+/// 3.0 Flash and Tiny) and records the matched one in `profile_name`. The
+/// documented dimensions below are the Flash profile's values.
 struct Config {
-  std::uint32_t num_layers{0};      ///< Trunk layers (MTP block excluded).
-  std::uint32_t num_layers_all{0};  ///< block_count, includes the MTP block.
-  std::uint32_t hidden_size{0};     ///< n_embd, 2560.
-  std::uint32_t vocab_size{0};      ///< 157184.
-  std::uint32_t context_length{0};  ///< 262144.
+  std::string_view profile_name{""};  ///< Matched kernel geometry profile.
+  std::uint32_t num_layers{0};        ///< Trunk layers (MTP block excluded).
+  std::uint32_t num_layers_all{0};    ///< block_count, includes the MTP block.
+  std::uint32_t hidden_size{0};       ///< n_embd, 2560.
+  std::uint32_t vocab_size{0};        ///< 157184.
+  std::uint32_t context_length{0};    ///< 262144.
   float rms_eps{1e-6F};
 
   // Absorbed MLA on every layer with a non-zero head_count_kv entry. The Q
@@ -33,7 +36,9 @@ struct Config {
   std::uint32_t mla_value_dim{0};  ///< value_length_mla, 128
   std::uint32_t kv_lora_rank{0};   ///< 512
   std::uint32_t rotary_dim{0};     ///< 64
-  float rope_theta{0.0F};          ///< 6e6
+  std::uint32_t mla_q_lora{0};     ///< q_lora_rank metadata; 0 when fused q.
+  bool mla_q_split{false};  ///< True when q is attn_q_a, norm and attn_q_b.
+  float rope_theta{0.0F};   ///< 6e6
   std::vector<std::uint32_t> head_count_kv;  ///< [num_layers_all], 0 on KDA.
 
   // Kimi Delta Attention (linear layers). q/k/v are separate projections.
@@ -53,13 +58,15 @@ struct Config {
   bool expert_weights_norm{true};
   std::uint32_t expert_gating_func{2};  ///< 2 = sigmoid
 
-  // Dense FFN prefix and per-layer SwiGLU clamps (0 disables the clamp).
+  // Dense FFN prefix and per-layer SwiGLU clamps (0 disables the clamp; the
+  // arrays themselves are absent on artifacts that never clamp, like Tiny).
   std::uint32_t leading_dense_blocks{0};  ///< 2
   std::uint32_t dense_ff{0};              ///< 6144
-  std::vector<float> swiglu_clamp_exp;    ///< [num_layers_all]
-  std::vector<float> swiglu_clamp_shexp;  ///< [num_layers_all]
+  std::vector<float> swiglu_clamp_exp;    ///< [num_layers_all] or empty
+  std::vector<float> swiglu_clamp_shexp;  ///< [num_layers_all] or empty
 
-  // Speculative MTP block (`nextn`), the last block of the artifact.
+  // Speculative MTP blocks (`nextn`), the trailing blocks of the artifact;
+  // zero when the artifact ships without a draft (Tiny).
   std::uint32_t nextn_layers{0};
 
   [[nodiscard]] std::uint32_t SsmInnerSize() const noexcept {
@@ -85,6 +92,13 @@ struct Config {
   }
   [[nodiscard]] bool IsDenseFfnLayer(std::uint32_t layer) const noexcept {
     return layer < leading_dense_blocks;
+  }
+  /// SwiGLU clamp limits of a block; 0 when the artifact has no clamp arrays.
+  [[nodiscard]] float ClampExp(std::uint32_t layer) const noexcept {
+    return layer < swiglu_clamp_exp.size() ? swiglu_clamp_exp[layer] : 0.0F;
+  }
+  [[nodiscard]] float ClampShexp(std::uint32_t layer) const noexcept {
+    return layer < swiglu_clamp_shexp.size() ? swiglu_clamp_shexp[layer] : 0.0F;
   }
 
   /// The draft executes with trunk constants and shared vocabulary weights.

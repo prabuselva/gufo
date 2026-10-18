@@ -8,10 +8,9 @@ AMD Strix Halo `gfx1151`, 128 GB unified memory.
 `-ngl 999`, flash-attn auto), freshly built clean on this host for both
 backends: ROCm (`GGML_HIP=ON`, gfx1151 fatbin, HIP 7.15.26333, `GGML_NATIVE=OFF`)
 and Vulkan (`GGML_VULKAN=ON`, Release, RADV `STRIX_HALO`). Prefill and
-decode Gufo columns refreshed October 17, 2026 on HEAD `2127c37d`
-(5.3c plus the accepted 5.4b→5.9 decode levers and the 6.0/6.1 Q4_K/Q5_K
-unpack folds; see `EXPERIMENTS.md`) as `build/release/gufo`,
-log `gufo_bench_p6grid.log`. The model loads on
+decode Gufo columns refreshed October 18, 2026 on the Ling 3.0 Tiny
+enablement tree (no Flash kernel path changed; `2127c37d` levers intact)
+as `build/release/gufo`, log `gufo_bench_bgrid10.log`. The model loads on
 llama.cpp as arch `bailingmoe3 124B.A5.1B`. Positive gain favors Gufo; all
 cells are single same-session matched runs (Gufo `-r 2`/`-r 3`, llama-bench
 `-r 2`/`-r 3`), except the refreshed Gufo columns (noted below). [Quality evidence](QUALITY.md) ·
@@ -23,18 +22,18 @@ Same prompt length, fresh context, timed prefill phase only on both sides.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| pp2048 | 1323.69 | 659.34 | **+100.8%** | 618.64 | **+114.0%** |
-| pp4096 | 1167.65 | 633.69 | **+84.3%** | 590.35 | **+97.8%** |
-| pp8192 | 920.27 | 583.71 | **+57.7%** | 559.02 | **+64.6%** |
-| pp16384 | 663.98 | 507.39 | **+30.9%** | 504.40 | **+31.6%** |
+| pp2048 | 1354.75 | 659.34 | **+105.5%** | 618.64 | **+119.0%** |
+| pp4096 | 1222.36 | 633.69 | **+92.9%** | 590.35 | **+107.1%** |
+| pp8192 | 948.70 | 583.71 | **+62.5%** | 559.02 | **+69.7%** |
+| pp16384 | 679.84 | 507.39 | **+34.0%** | 504.40 | **+34.8%** |
 
-The October 17 refresh is 0.8–2.0 % below the October 16 values in all
-four prefill cells (pp4096 within its ±23.5 spread, the other three
-tight); no prefill path changed in 5.4b→6.1, so this is treated as
-session variance, not attributed to a lever.
+The October 18 refresh is 2.3–4.7 % **above** the October 17 values in all
+four prefill cells (spreads ≤ ±0.9); no Flash kernel path changed in the
+Tiny enablement tree, so this is session variance in Gufo's favour, not
+a lever.
 
 Gufo now wins at every measured depth, but still decays faster with
-depth than the references: 1334→670 (−50%) across the 8× range against
+depth than the references: 1355→680 (−50%) across the 8× range against
 659→507 (−23%) on both llama.cpp backends; after the `5.3c` WMMA hi/lo
 MLA prefill attention the 16K lead is **+32%**. After the October 15
 `__expf` online-softmax lever the column
@@ -75,18 +74,18 @@ so pairs are kept as evidence notes rather than table cells.
 
 | Cell | Gufo (tok/s) | llama.cpp ROCm b11557 | Gain | llama.cpp Vulkan b11557 | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| tg128 | 38.30 | 33.78 | **+13.4%** | 41.42 | −7.5% |
-| tg1024 | 36.94 | 34.59 | **+6.8%** | 41.59 | −11.2% |
+| tg128 | 38.32 | 33.78 | **+13.4%** | 41.42 | −7.5% |
+| tg1024 | 37.24 | 34.59 | **+7.7%** | 41.59 | −10.5% |
 
 Gufo cold decode now leads the ROCm backend at tg128 (+13.4 %) and
-tg1024 (+6.8 %), 7–11 % behind llama.cpp **Vulkan**, whose decode
+tg1024 (+7.7 %), 7–11 % behind llama.cpp **Vulkan**, whose decode
 (41.4–41.6) is still the strongest decode path measured on this host for
-the model (the column cells are the October 17 refresh
-`gufo_bench_p6grid.log`, `-r 3`, against the retained reference runs;
+the model (the column cells are the October 18 refresh
+`gufo_bench_bgrid10.log`, `-r 3`, against the retained reference runs;
 cumulative 5.2a→5.4b lever
 gains per depth are in the paragraph below). llama
 decode does not slow as it generates (its tg1024 ≥ tg128 on both backends);
-Gufo loses 3.6% from tg128→tg1024. Preparing a 2048-token frontier before
+Gufo loses 2.8% from tg128→tg1024. Preparing a 2048-token frontier before
 timed generation (`gufo bench --n-prompt 0 --n-gen 128,1024 -d 2048`) costs
 Gufo a further ~4–6% (31.40 / 31.35), and the retained `pp2048+tg` blends
 (Gufo `--n-prompt 2048` runs: 33.62 / 32.51 in-pipeline; llama ROCm 93.30,
@@ -212,7 +211,10 @@ llama-bench -m Ling-3.0-flash-Q4_K_M-00001-of-00002.gguf \
   -r 2 -ngl 999 -o jsonl
 ```
 
-Raw logs: `/tmp/opencode/gufo_bench_p6grid.log` (October 17 close-out
+Raw logs: `/tmp/opencode/gufo_bench_bgrid10.log` (October 18 Tiny-enablement
+regression grid — all prefill/decode cells at or above the `p6grid`
+retained values; also the source of the [Tiny benchmarks](../ling3-tiny/BENCHMARKS.md) tables),
+`/tmp/opencode/gufo_bench_p6grid.log` (October 17 close-out
 refresh of the Gufo prefill/cold-decode columns, HEAD `2127c37d`),
 `/tmp/opencode/gufo_bench_llgrid.log` (first full three-engine
 grid, markdown), `gufo_bench_llgrid2.log` (split-phase JSONL grids, source

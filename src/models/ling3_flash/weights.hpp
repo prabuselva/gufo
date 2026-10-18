@@ -57,14 +57,18 @@ struct LayerWeights {
   TensorRef ssm_conv_v;  ///< [conv_kernel, 1, inner] F32.
   TensorRef ssm_f;       ///< [hidden -> inner], the decay input f.
   TensorRef ssm_g;       ///< [hidden -> inner], the output gate g_proj.
-  TensorRef ssm_beta;    ///< [hidden -> heads], F32.
+  TensorRef ssm_beta;    ///< [hidden -> heads], quantized like other maps.
   TensorRef ssm_a;       ///< [1, heads] = exp(A_log), F32.
   TensorRef ssm_dt;      ///< [inner] dt bias, F32.
   TensorRef ssm_norm;    ///< [head_dim], F32, the per-head gated RMSNorm.
   TensorRef ssm_out;     ///< [inner -> hidden] (attn_output on KDA layers).
 
-  // Absorbed MLA (MLA layers).
-  TensorRef attn_q;          ///< [hidden -> heads * (nope + rope)].
+  // Absorbed MLA (MLA layers). Tiny exports q through a low-rank bottleneck
+  // (attn_q_a, RMSNorm, attn_q_b); Flash ships the fused attn_q.
+  TensorRef attn_q;    ///< [hidden -> heads * (nope + rope)], fused export.
+  TensorRef attn_q_a;  ///< [hidden -> q_lora_rank], split export.
+  TensorRef attn_q_a_norm;   ///< [q_lora_rank], F32, split export.
+  TensorRef attn_q_b;        ///< [q_lora_rank -> heads * (nope + rope)], split.
   TensorRef attn_kv_a;       ///< [hidden -> kv_lora_rank + rope].
   TensorRef attn_kv_a_norm;  ///< [kv_lora_rank], F32.
   TensorRef attn_k_b;        ///< [nope, kv_lora_rank] x heads (wk_b).

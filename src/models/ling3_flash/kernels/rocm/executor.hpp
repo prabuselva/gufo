@@ -252,8 +252,9 @@ private:
   float* kda_attn_{nullptr};
 
   // MLA scratch (reused across MLA layers).
-  float* mla_q_{nullptr};       ///< [heads * (nope + rope)] raw query.
-  float* mla_kv_a_{nullptr};    ///< [kv_rank + rope] latent + rope key row.
+  float* mla_q_{nullptr};         ///< [heads * (nope + rope)] raw query.
+  float* mla_q_latent_{nullptr};  ///< [q_lora] low-rank q bottleneck row.
+  float* mla_kv_a_{nullptr};      ///< [kv_rank + rope] latent + rope key row.
   float* mla_q_abs_{nullptr};   ///< [heads * (kv_rank + rope)] absorbed query.
   float* mla_latent_{nullptr};  ///< [heads * kv_rank] attention output latent.
   float* mla_head_out_{nullptr};  ///< [heads * value_dim] gated head outputs.
@@ -320,8 +321,9 @@ private:
   float* pf_kda_f_{nullptr};
   float* pf_kda_g_{nullptr};
   float* pf_kda_beta_{nullptr};
-  float* pf_mla_q_{nullptr};    ///< [rows][heads * mla_head_dim] raw queries.
-  float* pf_mla_a_{nullptr};    ///< [rows][MlaKeyDim] latent + rope rows.
+  float* pf_mla_q_{nullptr};      ///< [rows][heads * mla_head_dim] raw queries.
+  float* pf_mla_q_lat_{nullptr};  ///< [rows][q_lora] low-rank q bottleneck.
+  float* pf_mla_a_{nullptr};      ///< [rows][MlaKeyDim] latent + rope rows.
   float* pf_mla_abs_{nullptr};  ///< [rows][heads * MlaKeyDim] absorbed queries.
   float* pf_mla_head_{nullptr};  ///< [rows][heads * value_dim] gated heads.
   std::int32_t* pf_moe_ids_{nullptr};  ///< [rows][used] routed slot ids.

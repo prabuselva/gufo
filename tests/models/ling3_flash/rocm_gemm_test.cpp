@@ -760,6 +760,102 @@ bool DenseRejects() {
   return ok;
 }
 
+// Head-bucket absorbed projections (PrefillMla): every token visits every
+// head, so all buckets hold exactly `tokens` rows. Checks the HeadTiles map
+// with the uniform bucket distribution for the Tiny and Flash head counts.
+bool HeadBucket(std::uint32_t heads, std::uint32_t tokens, std::uint32_t m) {
+  const std::uint32_t tr = 64U;
+  const std::size_t slots = static_cast<std::size_t>(tokens) * heads;
+  const std::uint32_t rows = heads * m;
+  const std::uint32_t seed = 0x0B0B0B01U + heads * 251U + tokens * 31U + m;
+  const auto w = EncodeQ8(rows, seed);
+  t::HipBuffer<std::uint8_t> d_w(w.size());
+  t::CheckHip(hipMemcpy(d_w.get(), w.data(), w.size(), hipMemcpyHostToDevice),
+              "upload head-bucket weights");
+  std::vector<std::int32_t> ids(slots);
+  std::vector<std::uint32_t> counts(heads, tokens);
+  for (std::size_t i = 0; i < slots; ++i) {
+    ids[i] = static_cast<std::int32_t>(i % heads);
+  }
+  const std::size_t compact = q::RoutedCompactRows(slots, heads);
+  t::HipBuffer<std::int32_t> d_ids(ids.size()), d_bounds(heads + 1),
+      d_rows_token(compact), d_rows_slot(compact);
+  t::HipBuffer<std::uint32_t> d_counts(counts.size());
+  t::HipBuffer<std::int32_t> d_cursors(heads);
+  t::CheckHip(
+      hipMemcpy(d_ids.get(), ids.data(), d_ids.bytes(), hipMemcpyHostToDevice),
+      "upload head-bucket ids");
+  t::CheckHip(hipMemcpy(d_counts.get(), counts.data(), d_counts.bytes(),
+                        hipMemcpyHostToDevice),
+              "upload head-bucket counts");
+  auto x = t::MakeValues(slots * kK, seed ^ 0x1234U, 2.0F);
+  std::vector<__half> x_half(x.size());
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x_half[i] = __float2half(x[i]);
+    x[i] = __half2float(x_half[i]);
+  }
+  t::HipBuffer<__half> d_xh(x_half.size());
+  t::CheckHip(
+      hipMemcpy(d_xh.get(), x_half.data(), d_xh.bytes(), hipMemcpyHostToDevice),
+      "upload head-bucket activations");
+  q::RoutedCompact(d_ids.get(), d_counts.get(), d_bounds.get(), d_cursors.get(),
+                   d_rows_token.get(), d_rows_slot.get(), tokens, heads, heads,
+                   nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "head-bucket compact sync");
+  const std::uint32_t tiles_per_head = (tokens + tr - 1U) / tr;
+  std::vector<std::int32_t> tiles(static_cast<std::size_t>(heads) *
+                                  tiles_per_head);
+  for (std::size_t i = 0; i < tiles.size(); ++i) {
+    tiles[i] = static_cast<std::int32_t>((i % heads) | ((i / heads) << 16U));
+  }
+  DeviceTiles d_tiles(tiles);
+  t::HipBuffer<float> d_out(slots * m);
+  t::CheckHip(hipMemset(d_out.get(), 0x7F, d_out.bytes()),
+              "head-bucket sentinel out");
+  if (!q::RoutedF16Gemm(d_w.get(), q::WeightType::kQ8_0, d_xh.get(),
+                        d_tiles.buf.get(), d_tiles.count, tr, d_bounds.get(),
+                        d_rows_slot.get(), d_rows_slot.get(), nullptr, 0.0F,
+                        d_out.get(), nullptr, m, kK, 0U, nullptr)) {
+    throw std::runtime_error("head-bucket routed GEMM rejected the shape");
+  }
+  t::CheckHip(hipGetLastError(), "head-bucket routed GEMM launch");
+  t::CheckHip(hipDeviceSynchronize(), "head-bucket routed GEMM sync");
+  const auto out = t::Download(&d_out, slots * m);
+  std::vector<float> ref(slots * m);
+  std::vector<float> deq(kK);
+  std::size_t unwritten = 0;
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    if (!std::isfinite(out[i])) {
+      ++unwritten;
+    }
+  }
+  if (unwritten != 0) {
+    throw std::runtime_error("head-bucket: " + std::to_string(unwritten) + "/" +
+                             std::to_string(out.size()) +
+                             " outputs kept the no-write NaN sentinel");
+  }
+  for (std::size_t s = 0; s < slots; ++s) {
+    const std::uint32_t e = ids[s];
+    for (std::uint32_t row = 0; row < m; ++row) {
+      const void* row_bytes =
+          w.data() + (static_cast<std::size_t>(e) * m + row) * 34U * (kK / 32U);
+      DequantizeRow(q::WeightType::kQ8_0, row_bytes, deq.data());
+      for (std::uint32_t i = 0; i < kK; ++i) {
+        deq[i] = __half2float(__float2half(deq[i]));
+      }
+      double acc = 0.0;
+      const float* xr = x.data() + s * kK;
+      for (std::uint32_t i = 0; i < kK; ++i) {
+        acc += static_cast<double>(deq[i]) * xr[i];
+      }
+      ref[s * m + row] = static_cast<float>(acc);
+    }
+  }
+  const std::string name = "HeadBucket/h" + std::to_string(heads) + "/t" +
+                           std::to_string(tokens) + "/m" + std::to_string(m);
+  return Check(name.c_str(), WorstScaled(ref, out), 2e-3);
+}
+
 }  // namespace
 
 int main() {
@@ -782,6 +878,12 @@ int main() {
     ok &= DensePlain(20, q::WeightType::kQ5_K, 0xD0000007U);
     ok &= DensePlain(130, q::WeightType::kQ6_K, 0xD0000008U);
     ok &= DenseRejects();
+    ok &= HeadBucket(16, 2, 128);
+    ok &= HeadBucket(16, 2, 576);
+    ok &= HeadBucket(32, 2, 128);
+    ok &= HeadBucket(32, 2, 576);
+    ok &= HeadBucket(16, 17, 128);
+    ok &= HeadBucket(16, 17, 576);
   } catch (const std::exception& error) {
     std::cerr << "ling3_flash rocm_gemm: " << error.what() << '\n';
     return 1;

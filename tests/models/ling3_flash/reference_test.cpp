@@ -1,9 +1,10 @@
-// Runs the scalar oracle over the real Ling 3.0 Flash artifact. It is the
+// Runs the scalar oracle over the real Ling 3.0 artifact. It is the
 // numerical contract every ROCm kernel must reproduce, so the first gate is
 // that a short forward pass produces finite, non-degenerate and repeatable
-// logits and that the MTP draft does the same. Strict parity against llama.cpp
+// logits and that the MTP draft does the same. Artifacts without a draft
+// block (Tiny) skip only the MTP step. Strict parity against llama.cpp
 // logits is captured separately once a matched run is available. Skips (77)
-// unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash GGUF.
+// unless GUFO_LING3_FLASH_GGUF points at a supported Ling 3.0 GGUF.
 #include "src/models/ling3_flash/reference.hpp"
 
 #include <algorithm>
@@ -95,7 +96,7 @@ int main() {
     return 1;
   }
   const auto mtp = l3::MtpWeights::Bind(*reader, weights->config, &error);
-  if (!mtp.has_value()) {
+  if (weights->config.nextn_layers > 0 && !mtp.has_value()) {
     std::cerr << "MTP bind failed: " << error << "\n";
     return 1;
   }
@@ -125,12 +126,15 @@ int main() {
   Expect(model.Position() == static_cast<std::uint32_t>(prompt.size()),
          "position advanced");
 
-  // The MTP draft consumes the last trunk hidden and the next token.
-  if (!model.MtpStep(*mtp, /*token=*/400, last_hidden, logits, &error)) {
-    std::cerr << "mtp step failed: " << error << "\n";
-    return 1;
+  // The MTP draft consumes the last trunk hidden and the next token. Tiny
+  // ships no draft block, so only the declared-then-missing case is fatal.
+  if (mtp.has_value()) {
+    if (!model.MtpStep(*mtp, /*token=*/400, last_hidden, logits, &error)) {
+      std::cerr << "mtp step failed: " << error << "\n";
+      return 1;
+    }
+    CheckLogits(logits, c.vocab_size, "mtp draft");
   }
-  CheckLogits(logits, c.vocab_size, "mtp draft");
 
   // A fresh model replaying the same prompt must reproduce the trunk logits.
   l3::ReferenceModel replay(*weights, /*max_context=*/64);
@@ -147,6 +151,6 @@ int main() {
     std::cerr << failures << " reference-model checks failed\n";
     return 1;
   }
-  std::cout << "Ling 3.0 Flash scalar reference passed.\n";
+  std::cout << "Ling 3.0 scalar reference passed.\n";
   return 0;
 }

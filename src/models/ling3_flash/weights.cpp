@@ -134,7 +134,17 @@ struct Binder {
     l.ffn_norm = Get(p + "ffn_norm.weight", hidden, 1, 1, norm);
 
     if (mla) {
-      l.attn_q = Get(p + "attn_q.weight", hidden, c.MlaQDim(), 1, dense_types);
+      if (c.mla_q_split) {
+        l.attn_q_a =
+            Get(p + "attn_q_a.weight", hidden, c.mla_q_lora, 1, dense_types);
+        l.attn_q_a_norm =
+            Get(p + "attn_q_a_norm.weight", c.mla_q_lora, 1, 1, norm);
+        l.attn_q_b = Get(p + "attn_q_b.weight", c.mla_q_lora, c.MlaQDim(), 1,
+                         dense_types);
+      } else {
+        l.attn_q =
+            Get(p + "attn_q.weight", hidden, c.MlaQDim(), 1, dense_types);
+      }
       l.attn_kv_a = Get(p + "attn_kv_a_mqa.weight", hidden, c.MlaKeyDim(), 1,
                         dense_types);
       l.attn_kv_a_norm =
@@ -162,7 +172,7 @@ struct Binder {
       l.ssm_f = Get(p + "ssm_f_a.weight", hidden, inner, 1, dense_types);
       l.ssm_g = Get(p + "ssm_g_a.weight", hidden, inner, 1, dense_types);
       l.ssm_beta =
-          Get(p + "ssm_beta.weight", hidden, c.num_heads, 1, {GgmlType::kF32});
+          Get(p + "ssm_beta.weight", hidden, c.num_heads, 1, dense_types);
       l.ssm_a = Get(p + "ssm_a", 1, c.num_heads, 1, {GgmlType::kF32});
       l.ssm_dt = Get(p + "ssm_dt.bias", inner, 1, 1, {GgmlType::kF32});
       l.ssm_norm =

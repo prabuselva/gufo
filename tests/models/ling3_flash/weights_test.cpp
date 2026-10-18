@@ -1,8 +1,9 @@
-// Binds the real Ling 3.0 Flash artifact and checks that every tensor the
-// runtime reads resolves with the expected shape and a decodable format. Only
-// GGUF headers are touched (the payload stays mapped), so this is CPU-only and
-// cheap even for a 40 GB split file. It skips when the artifact is not
-// provided.
+// Binds the real Ling 3.0 artifact (Flash or Tiny) and checks that every
+// tensor the runtime reads resolves with the expected shape and a decodable
+// format, following the matched geometry profile (fused vs low-rank query,
+// MTP block only when the artifact has one). Only GGUF headers are touched
+// (the payload stays mapped), so this is CPU-only and cheap even for a 40 GB
+// split file. It skips when the artifact is not provided.
 #include "src/models/ling3_flash/weights.hpp"
 
 #include <cstdint>
@@ -54,7 +55,14 @@ void CheckLayer(const l3::LayerWeights& l, const l3::Config& c,
   const std::uint64_t hidden = c.hidden_size;
   if (l.mla) {
     Expect(c.IsMlaLayer(il), tag + " MLA classification");
-    ExpectShape(l.attn_q, hidden, c.MlaQDim(), 1, tag + " attn_q");
+    if (c.mla_q_split) {
+      ExpectShape(l.attn_q_a, hidden, c.mla_q_lora, 1, tag + " attn_q_a");
+      ExpectShape(l.attn_q_a_norm, c.mla_q_lora, 1, 1, tag + " attn_q_a_norm");
+      ExpectShape(l.attn_q_b, c.mla_q_lora, c.MlaQDim(), 1, tag + " attn_q_b");
+      Expect(l.attn_q.empty(), tag + " has no fused q");
+    } else {
+      ExpectShape(l.attn_q, hidden, c.MlaQDim(), 1, tag + " attn_q");
+    }
     ExpectShape(l.attn_kv_a, hidden, c.MlaKeyDim(), 1, tag + " attn_kv_a");
     ExpectShape(l.attn_kv_a_norm, c.kv_lora_rank, 1, 1,
                 tag + " attn_kv_a_norm");
@@ -83,6 +91,8 @@ void CheckLayer(const l3::LayerWeights& l, const l3::Config& c,
     ExpectShape(l.ssm_norm, c.ssm_head_dim, 1, 1, tag + " ssm_norm");
     ExpectShape(l.ssm_out, inner, hidden, 1, tag + " ssm_out");
     Expect(l.attn_q.empty(), tag + " has no MLA q");
+    Expect(l.attn_q_a.empty() && l.attn_q_b.empty(),
+           tag + " has no low-rank q");
   }
   if (c.IsDenseFfnLayer(il)) {
     ExpectShape(l.ffn_gate, hidden, c.dense_ff, 1, tag + " ffn_gate");
@@ -127,7 +137,8 @@ int main() {
     return 1;
   }
   const auto& c = weights->config;
-  Expect(c.num_layers == 42, "trunk layer count");
+  const bool tiny = c.profile_name == "Ling 3.0 Tiny";
+  Expect(c.num_layers == (tiny ? 24U : 42U), "trunk layer count");
   Expect(c.num_layers_all == c.num_layers + c.nextn_layers, "layer split");
   Expect(weights->layers.size() == c.num_layers, "layer vector size");
   ExpectBound(weights->token_embd, "token_embd");
@@ -140,7 +151,9 @@ int main() {
   }
 
   const auto mtp = l3::MtpWeights::Bind(*reader, c, &error);
-  if (mtp.has_value()) {
+  if (c.nextn_layers == 0) {
+    Expect(!mtp.has_value(), "artifact without nextn layers has no MTP");
+  } else if (mtp.has_value()) {
     Expect(mtp->block.mla, "MTP block is MLA");
     CheckSharedExpert(mtp->block, "mtp");
     ExpectBound(mtp->block.nextn_enorm, "nextn_enorm");
@@ -157,6 +170,6 @@ int main() {
     std::cerr << failures << " weight-binding checks failed\n";
     return 1;
   }
-  std::cout << "Ling 3.0 Flash weight binding passed.\n";
+  std::cout << "Ling 3.0 weight binding passed.\n";
   return 0;
 }

@@ -23,12 +23,13 @@ void Require(bool condition, const char* message) {
     throw std::runtime_error(message);
 }
 
-// MLA blocks sit at (il + 1) % 6 == 0 plus the trailing MTP block.
+// MLA blocks sit at (il + 1) % stride == 0 plus the trailing MTP block.
 std::vector<std::uint64_t> HeadCountKv(std::uint32_t num_layers_all,
-                                       std::uint32_t num_layers) {
+                                       std::uint32_t num_layers,
+                                       std::uint32_t stride = 6) {
   std::vector<std::uint64_t> kv(num_layers_all, 0);
   for (std::uint32_t il = 0; il < num_layers_all; ++il) {
-    if ((il + 1) % 6 == 0 || il >= num_layers)
+    if ((il + 1) % stride == 0 || il >= num_layers)
       kv[il] = 1;
   }
   return kv;
@@ -210,9 +211,53 @@ Metadata ValidMetadata() {
   return fields;
 }
 
+// Tiny artifact metadata: 24 blocks, no MTP key, MLA every fourth block, one
+// leading dense FFN block and no SwiGLU clamp arrays.
+Metadata TinyMetadata() {
+  Metadata fields{
+      {"general.architecture", std::string{"bailingmoe3"}},
+      {"tokenizer.ggml.tokens", std::vector<std::string>{"a", "b", "c"}}};
+  for (const auto& [key, value] :
+       std::initializer_list<std::pair<const char*, std::uint32_t>>{
+           {"block_count", 24},
+           {"embedding_length", 1536},
+           {"vocab_size", 157184},
+           {"context_length", 131072},
+           {"attention.head_count", 16},
+           {"attention.key_length_mla", 192},
+           {"attention.value_length_mla", 128},
+           {"attention.kv_lora_rank", 512},
+           {"attention.q_lora_rank", 256},
+           {"rope.dimension_count", 64},
+           {"ssm.conv_kernel", 4},
+           {"kda.head_dim", 128},
+           {"expert_count", 128},
+           {"expert_used_count", 8},
+           {"expert_group_count", 8},
+           {"expert_group_used_count", 4},
+           {"expert_feed_forward_length", 512},
+           {"expert_shared_feed_forward_length", 512},
+           {"expert_gating_func", 2},
+           {"leading_dense_block_count", 1},
+           {"feed_forward_length", 4608}}) {
+    fields[std::string{"bailingmoe3."} + key] = value;
+  }
+  fields["bailingmoe3.attention.layer_norm_rms_epsilon"] = 1e-6F;
+  fields["bailingmoe3.rope.freq_base"] = 6e6F;
+  fields["bailingmoe3.attention.head_count_kv"] = HeadCountKv(24, 24, 4);
+  fields["bailingmoe3.kda.safe_gate"] = true;
+  fields["bailingmoe3.kda.gate_lower_bound"] = -5.0F;
+  fields["bailingmoe3.expert_weights_scale"] = 2.5F;
+  fields["bailingmoe3.expert_weights_norm"] = true;
+  return fields;
+}
+
 void CheckValidMetadata() {
   const auto config = Parse(ValidMetadata());
   Require(config.has_value(), "valid metadata rejected");
+  Require(config->profile_name == "Ling 3.0 Flash", "wrong geometry profile");
+  Require(config->mla_q_lora == 0 && !config->mla_q_split,
+          "Flash must use the fused query projection");
   Require(config->num_layers == 42 && config->num_layers_all == 43 &&
               config->nextn_layers == 1,
           "trunk/MTP layer split incorrect");
@@ -249,6 +294,56 @@ void CheckValidMetadata() {
           "shared-expert clamps incorrect");
 }
 
+void CheckTinyMetadata() {
+  const auto config = Parse(TinyMetadata());
+  Require(config.has_value(), "valid Tiny metadata rejected");
+  Require(config->profile_name == "Ling 3.0 Tiny", "wrong geometry profile");
+  Require(config->mla_q_lora == 256 && config->mla_q_split,
+          "Tiny must use the low-rank query chain");
+  Require(config->num_layers == 24 && config->num_layers_all == 24 &&
+              config->nextn_layers == 0,
+          "Tiny has no MTP block");
+  Require(config->hidden_size == 1536 && config->vocab_size == 157184 &&
+              config->context_length == 131072,
+          "Tiny core dimensions incorrect");
+  Require(config->SsmInnerSize() == 2048, "Tiny KDA channel count wrong");
+  Require(config->MlaQDim() == 3072 && config->MlaNopeDim() == 128 &&
+              config->MlaKeyDim() == 576 && config->MlaVDim() == 2048,
+          "Tiny absorbed-MLA dimensions wrong");
+  // MLA sits every fourth block (indices 3, 7, ..., 23); the rest are KDA.
+  Require(
+      config->IsMlaLayer(3) && config->IsMlaLayer(11) && config->IsMlaLayer(23),
+      "Tiny MLA layer misclassified");
+  Require(!config->IsMlaLayer(0) && !config->IsMlaLayer(2) &&
+              !config->IsMlaLayer(22),
+          "Tiny KDA layer misclassified");
+  Require(config->IsDenseFfnLayer(0) && !config->IsDenseFfnLayer(1),
+          "Tiny dense FFN prefix misclassified");
+  Require(
+      config->swiglu_clamp_exp.empty() && config->swiglu_clamp_shexp.empty(),
+      "Tiny must not carry clamp arrays");
+
+  // Mixing one Flash dimension into Tiny (or vice versa) is rejected.
+  for (const auto& [key, value] :
+       {std::pair{"expert_count", 512U}, std::pair{"embedding_length", 2560U},
+        std::pair{"leading_dense_block_count", 2U},
+        std::pair{"feed_forward_length", 6144U}}) {
+    auto wrong = TinyMetadata();
+    wrong[std::string{"bailingmoe3."} + key] = value;
+    Require(!Parse(wrong), "Flash/Tiny geometry mix accepted");
+  }
+  auto with_mtp = TinyMetadata();
+  with_mtp["bailingmoe3.nextn_predict_layers"] = std::uint32_t{1};
+  Require(!Parse(with_mtp), "Tiny + MTP is not a measured profile");
+
+  // Tiny MLA placement is part of its pattern.
+  auto misplaced = HeadCountKv(24, 24, 4);
+  misplaced[4] = 1;
+  auto wrong_placement = TinyMetadata();
+  wrong_placement["bailingmoe3.attention.head_count_kv"] = misplaced;
+  Require(!Parse(wrong_placement), "Tiny MLA misplacement accepted");
+}
+
 void CheckMalformedMetadata() {
   const auto valid = ValidMetadata();
   assert(Parse(valid));
@@ -265,14 +360,19 @@ void CheckMalformedMetadata() {
 
   // Any deviation from the validated kernel geometry is rejected.
   for (const auto& [key, value] :
-       {std::pair{"block_count", 42U}, std::pair{"embedding_length", 2048U},
+       {std::pair{"block_count", 42U},
+        std::pair{"embedding_length", 2048U},
         std::pair{"vocab_size", 151936U},
         std::pair{"attention.head_count", 16U},
         std::pair{"attention.key_length_mla", 128U},
         std::pair{"attention.value_length_mla", 64U},
         std::pair{"attention.kv_lora_rank", 256U},
-        std::pair{"rope.dimension_count", 128U}, std::pair{"kda.head_dim", 64U},
-        std::pair{"ssm.conv_kernel", 3U}, std::pair{"expert_count", 256U},
+        std::pair{"attention.q_lora_rank", 128U},
+        std::pair{"attention.q_lora_rank", 256U},
+        std::pair{"rope.dimension_count", 128U},
+        std::pair{"kda.head_dim", 64U},
+        std::pair{"ssm.conv_kernel", 3U},
+        std::pair{"expert_count", 256U},
         std::pair{"expert_used_count", 10U},
         std::pair{"expert_group_count", 4U},
         std::pair{"expert_group_used_count", 2U},
@@ -284,6 +384,12 @@ void CheckMalformedMetadata() {
     wrong[std::string{"bailingmoe3."} + key] = value;
     assert(!Parse(wrong));
   }
+  // The low-rank query rank is metadata only for the split (Tiny) profile;
+  // the fused Flash artifact above must parse without it, and Tiny must not
+  // parse when it goes missing.
+  auto tiny_no_rank = TinyMetadata();
+  tiny_no_rank.erase("bailingmoe3.attention.q_lora_rank");
+  assert(!Parse(tiny_no_rank));
 
   // Gate constants must keep the decay bounded away from zero.
   for (const float limit : {0.0F, 1.0F}) {
@@ -326,6 +432,7 @@ void CheckMalformedMetadata() {
 int main() {
   CheckSidecarCompatibility();
   CheckValidMetadata();
+  CheckTinyMetadata();
   CheckMalformedMetadata();
-  std::cout << "Ling 3.0 Flash metadata checks passed.\n";
+  std::cout << "Ling 3.0 metadata checks passed.\n";
 }

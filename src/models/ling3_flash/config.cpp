@@ -11,6 +11,93 @@ namespace {
 
 constexpr std::string_view kArchitecture = "bailingmoe3";
 
+// One artifact size whose specialized KDA, absorbed-MLA and grouped-expert
+// kernels were built and measured end to end. Membership means the kernel
+// tiles, cache strides and expert buckets fit the shape, so meeting the
+// structural limits above is not enough to run.
+struct GeometryProfile {
+  std::string_view name;
+  std::uint32_t num_layers;    // trunk layers, MTP block excluded
+  std::uint32_t nextn_layers;  // self-speculative MTP blocks
+  std::uint32_t hidden_size;
+  std::uint32_t vocab_size;
+  std::uint32_t num_heads;
+  std::uint32_t mla_head_dim;
+  std::uint32_t mla_value_dim;
+  std::uint32_t kv_lora_rank;
+  std::uint32_t rotary_dim;
+  // q_lora_rank metadata value: absent (0) with the fused q export, 256 with
+  // the split a/norm/b export.
+  std::uint32_t mla_q_lora;
+  bool mla_q_split;  // q exported as attn_q_a, attn_q_a_norm and attn_q_b
+  std::uint32_t ssm_conv_kernel;
+  std::uint32_t ssm_head_dim;
+  std::uint32_t num_experts;
+  std::uint32_t num_experts_used;
+  std::uint32_t expert_groups;
+  std::uint32_t expert_groups_used;
+  std::uint32_t expert_ff;
+  std::uint32_t shared_expert_ff;
+  std::uint32_t leading_dense_blocks;
+  std::uint32_t dense_ff;
+  // MLA blocks sit at (layer + 1) % mla_stride == 0 in the trunk and on the
+  // MTP block; every other block is KDA.
+  std::uint32_t mla_stride;
+};
+
+constexpr GeometryProfile kProfiles[] = {
+    {
+        .name = "Ling 3.0 Flash",
+        .num_layers = 42,
+        .nextn_layers = 1,
+        .hidden_size = 2560,
+        .vocab_size = 157184,
+        .num_heads = 32,
+        .mla_head_dim = 192,
+        .mla_value_dim = 128,
+        .kv_lora_rank = 512,
+        .rotary_dim = 64,
+        .mla_q_lora = 0,
+        .mla_q_split = false,
+        .ssm_conv_kernel = 4,
+        .ssm_head_dim = 128,
+        .num_experts = 512,
+        .num_experts_used = 8,
+        .expert_groups = 8,
+        .expert_groups_used = 4,
+        .expert_ff = 768,
+        .shared_expert_ff = 768,
+        .leading_dense_blocks = 2,
+        .dense_ff = 6144,
+        .mla_stride = 6,
+    },
+    {
+        .name = "Ling 3.0 Tiny",
+        .num_layers = 24,
+        .nextn_layers = 0,
+        .hidden_size = 1536,
+        .vocab_size = 157184,
+        .num_heads = 16,
+        .mla_head_dim = 192,
+        .mla_value_dim = 128,
+        .kv_lora_rank = 512,
+        .rotary_dim = 64,
+        .mla_q_lora = 256,
+        .mla_q_split = true,
+        .ssm_conv_kernel = 4,
+        .ssm_head_dim = 128,
+        .num_experts = 128,
+        .num_experts_used = 8,
+        .expert_groups = 8,
+        .expert_groups_used = 4,
+        .expert_ff = 512,
+        .shared_expert_ff = 512,
+        .leading_dense_blocks = 1,
+        .dense_ff = 4608,
+        .mla_stride = 4,
+    },
+};
+
 struct Reader {
   const core::GgufReader& gguf;
   std::string* error;
@@ -143,6 +230,7 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
   c.mla_value_dim = r.U32(key("attention.value_length_mla"));
   c.kv_lora_rank = r.U32(key("attention.kv_lora_rank"));
   c.rotary_dim = r.U32(key("rope.dimension_count"));
+  c.mla_q_lora = r.U32(key("attention.q_lora_rank"), false, 0);
   c.rope_theta = r.F32(key("rope.freq_base"), 6000000.0F);
   {
     const auto kv = r.U64Array(key("attention.head_count_kv"));
@@ -212,25 +300,43 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
     return std::nullopt;
   }
   // These dimensions select the specialized KDA, absorbed-MLA and grouped
-  // expert kernels. Reject other profiles before allocating or launching;
-  // satisfying divisibility alone does not make a shape executable.
-  if (c.num_layers != 42 || c.num_layers_all != 43 || c.nextn_layers != 1 ||
-      c.hidden_size != 2560 || c.vocab_size != 157184 || c.num_heads != 32 ||
-      c.mla_head_dim != 192 || c.mla_value_dim != 128 ||
-      c.kv_lora_rank != 512 || c.rotary_dim != 64 || c.ssm_conv_kernel != 4 ||
-      c.ssm_head_dim != 128 || c.num_experts != 512 ||
-      c.num_experts_used != 8 || c.expert_groups != 8 ||
-      c.expert_groups_used != 4 || c.expert_ff != 768 ||
-      c.shared_expert_ff != 768 || c.leading_dense_blocks != 2 ||
-      c.dense_ff != 6144) {
-    r.Fail("unsupported Ling 3.0 Flash kernel geometry");
+  // expert kernels. Reject artifacts outside the measured profiles before
+  // allocating or launching; satisfying divisibility alone does not make a
+  // shape executable.
+  const GeometryProfile* profile = nullptr;
+  for (const GeometryProfile& p : kProfiles) {
+    if (c.num_layers == p.num_layers && c.nextn_layers == p.nextn_layers &&
+        c.num_layers_all == p.num_layers + p.nextn_layers &&
+        c.hidden_size == p.hidden_size && c.vocab_size == p.vocab_size &&
+        c.num_heads == p.num_heads && c.mla_head_dim == p.mla_head_dim &&
+        c.mla_value_dim == p.mla_value_dim &&
+        c.kv_lora_rank == p.kv_lora_rank && c.rotary_dim == p.rotary_dim &&
+        c.mla_q_lora == p.mla_q_lora &&
+        c.ssm_conv_kernel == p.ssm_conv_kernel &&
+        c.ssm_head_dim == p.ssm_head_dim && c.num_experts == p.num_experts &&
+        c.num_experts_used == p.num_experts_used &&
+        c.expert_groups == p.expert_groups &&
+        c.expert_groups_used == p.expert_groups_used &&
+        c.expert_ff == p.expert_ff &&
+        c.shared_expert_ff == p.shared_expert_ff &&
+        c.leading_dense_blocks == p.leading_dense_blocks &&
+        c.dense_ff == p.dense_ff) {
+      profile = &p;
+      break;
+    }
+  }
+  if (profile == nullptr) {
+    r.Fail("unsupported Ling 3.0 kernel geometry");
     return std::nullopt;
   }
+  c.profile_name = profile->name;
+  c.mla_q_split = profile->mla_q_split;
   if (require_trunk) {
-    // MLA layers sit at (layer + 1) % 6 == 0 in the trunk and on the MTP
-    // block; every other block is KDA.
+    // MLA layers sit at (layer + 1) % mla_stride == 0 in the trunk and on
+    // the MTP block; every other block is KDA.
     for (std::uint32_t il = 0; il < c.num_layers_all; ++il) {
-      const bool expected = ((il + 1) % 6 == 0) || il >= c.num_layers;
+      const bool expected =
+          ((il + 1) % profile->mla_stride == 0) || il >= c.num_layers;
       if (c.IsMlaLayer(il) != expected) {
         r.Fail(
             "bailingmoe3 MLA layer placement differs from the supported "

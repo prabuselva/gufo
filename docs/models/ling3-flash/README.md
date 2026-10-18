@@ -9,7 +9,7 @@ module is isolated in `src/models/ling3_flash`; it shares no code with the
 Qwen engines beyond the generic `gufo_core` GGUF reader, sampler, and the
 HF-BPE tokenizer loader.
 
-[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md)
+[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [Tiny enablement](../ling3-tiny/README.md)
 
 ## Artifacts
 

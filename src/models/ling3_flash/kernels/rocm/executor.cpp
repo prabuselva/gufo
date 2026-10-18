@@ -57,7 +57,7 @@ bool WeightTypeOf(core::GgmlType t, WeightType* out) {
 /// can be decoded by the F16 WMMA tier; a trunk format it cannot decode
 /// falls back to the per-token path in Prefill instead of failing Create.
 /// Only the projections this layer kind actually uses are checked: KDA
-/// layers hold no MLA tensors and vice versa, and ssm_beta (F32) runs on
+/// layers hold no MLA tensors and vice versa, and ssm_beta runs on
 /// the GEMV tier while the router (converted to binary16 at upload) projects
 /// through the WMMA tier. The swiglu gate variant only instantiates three
 /// decoders.
@@ -65,8 +65,14 @@ bool DenseTierCovers(const Config& c, std::uint32_t il, const DeviceLayer& l) {
   WeightType w;
   std::vector<core::GgmlType> types;
   if (c.IsMlaLayer(il)) {
-    types = {l.attn_q.type,   l.attn_kv_a.type, l.attn_gate.type,
-             l.attn_out.type, l.attn_k_b.type,  l.attn_v_b.type};
+    if (c.mla_q_split) {
+      types = {l.attn_q_a.type,  l.attn_q_b.type, l.attn_kv_a.type,
+               l.attn_gate.type, l.attn_out.type, l.attn_k_b.type,
+               l.attn_v_b.type};
+    } else {
+      types = {l.attn_q.type,   l.attn_kv_a.type, l.attn_gate.type,
+               l.attn_out.type, l.attn_k_b.type,  l.attn_v_b.type};
+    }
   } else {
     types = {l.ssm_q.type, l.ssm_k.type, l.ssm_v.type,
              l.ssm_f.type, l.ssm_g.type, l.ssm_out.type};
@@ -169,43 +175,27 @@ bool CheckTensor(const DeviceTensor& t, const char* what,
 bool CheckLayer(const DeviceLayer& l, std::uint32_t il,
                 std::string* error_msg) {
   const std::string tag = "layer " + std::to_string(il);
-  const DeviceTensor* tensors[] = {&l.attn_norm,
-                                   &l.ffn_norm,
-                                   &l.ssm_q,
-                                   &l.ssm_k,
-                                   &l.ssm_v,
-                                   &l.ssm_conv_q,
-                                   &l.ssm_conv_k,
-                                   &l.ssm_conv_v,
-                                   &l.ssm_f,
-                                   &l.ssm_g,
-                                   &l.ssm_beta,
-                                   &l.ssm_a,
-                                   &l.ssm_dt,
-                                   &l.ssm_norm,
-                                   &l.ssm_out,
-                                   &l.attn_q,
-                                   &l.attn_kv_a,
-                                   &l.attn_kv_a_norm,
-                                   &l.attn_k_b,
-                                   &l.attn_v_b,
-                                   &l.attn_gate,
-                                   &l.attn_out,
-                                   &l.ffn_gate,
-                                   &l.ffn_up,
-                                   &l.ffn_down,
-                                   &l.router,
-                                   &l.exp_probs_b,
-                                   &l.ffn_gate_exps,
-                                   &l.ffn_up_exps,
-                                   &l.ffn_down_exps,
-                                   &l.shexp_gate,
-                                   &l.shexp_up,
-                                   &l.shexp_down,
-                                   &l.nextn_enorm,
-                                   &l.nextn_hnorm,
-                                   &l.nextn_eh_proj,
-                                   &l.nextn_shared_head_norm};
+  const DeviceTensor* tensors[] = {
+      &l.attn_norm,      &l.ffn_norm,
+      &l.ssm_q,          &l.ssm_k,
+      &l.ssm_v,          &l.ssm_conv_q,
+      &l.ssm_conv_k,     &l.ssm_conv_v,
+      &l.ssm_f,          &l.ssm_g,
+      &l.ssm_beta,       &l.ssm_a,
+      &l.ssm_dt,         &l.ssm_norm,
+      &l.ssm_out,        &l.attn_q,
+      &l.attn_q_a,       &l.attn_q_a_norm,
+      &l.attn_q_b,       &l.attn_kv_a,
+      &l.attn_kv_a_norm, &l.attn_k_b,
+      &l.attn_v_b,       &l.attn_gate,
+      &l.attn_out,       &l.ffn_gate,
+      &l.ffn_up,         &l.ffn_down,
+      &l.router,         &l.exp_probs_b,
+      &l.ffn_gate_exps,  &l.ffn_up_exps,
+      &l.ffn_down_exps,  &l.shexp_gate,
+      &l.shexp_up,       &l.shexp_down,
+      &l.nextn_enorm,    &l.nextn_hnorm,
+      &l.nextn_eh_proj,  &l.nextn_shared_head_norm};
   for (const DeviceTensor* t : tensors) {
     if (!CheckTensor(*t, tag.c_str(), error_msg)) {
       return false;
@@ -312,7 +302,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   const std::size_t heads = c.num_heads;
   const std::size_t used = c.num_experts_used;
   const std::size_t ff = c.expert_ff;
-  const std::size_t wide_ff = used * ff > c.dense_ff ? used * ff : c.dense_ff;
+  std::size_t wide_ff = used * ff > c.dense_ff ? used * ff : c.dense_ff;
+  // The MLA v projection contracts per-head latent rows, so its gathered
+  // input plane is [token * head][kv_rank]: reserve the wider of the two.
+  if (const std::size_t mla_xh = heads * c.kv_lora_rank; mla_xh > wide_ff) {
+    wide_ff = mla_xh;
+  }
   const std::size_t tiles = MlaDecodeTiles(max_context, kMlaTile);
   float** f[] = {&e->x_,       &e->normed_, &e->attn_,   &e->ffn_,
                  &e->ffn_inp_, &e->h_out_,  &e->sh_down_};
@@ -343,6 +338,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   }
   e->mla_q_ = e->AllocFloats(heads * c.mla_head_dim, err);
+  if (c.mla_q_split) {
+    e->mla_q_latent_ = e->AllocFloats(c.mla_q_lora, err);
+    if (e->mla_q_latent_ == nullptr) {
+      return nullptr;
+    }
+  }
   e->mla_kv_a_ = e->AllocFloats(c.MlaKeyDim(), err);
   e->mla_q_abs_ = e->AllocFloats(heads * c.MlaKeyDim(), err);
   e->mla_latent_ = e->AllocFloats(heads * c.kv_lora_rank, err);
@@ -433,6 +434,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->pf_kq_ = e->AllocFloats(cap * heads, err);
   e->pf_mla_pgate_ = e->AllocFloats(cap * heads, err);
   e->pf_mla_q_ = e->AllocFloats(cap * heads * c.mla_head_dim, err);
+  if (c.mla_q_split) {
+    e->pf_mla_q_lat_ = e->AllocFloats(cap * c.mla_q_lora, err);
+  }
   e->pf_mla_a_ = e->AllocFloats(cap * c.MlaKeyDim(), err);
   e->pf_mla_head_ = e->AllocFloats(cap * heads * c.mla_value_dim, err);
   e->pf_moe_weights_ = e->AllocFloats(cap * used, err);
@@ -459,6 +463,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->pf_kda_beta_ == nullptr || e->pf_bpre_ == nullptr ||
       e->pf_kq_ == nullptr || e->pf_mla_pgate_ == nullptr ||
       e->pf_mla_q_ == nullptr || e->pf_mla_a_ == nullptr ||
+      (c.mla_q_split && e->pf_mla_q_lat_ == nullptr) ||
       e->pf_mla_head_ == nullptr || e->pf_moe_weights_ == nullptr ||
       e->pf_moe_log_ == nullptr || e->pf_moe_ids_ == nullptr ||
       e->pf_counts_ == nullptr || e->pf_bounds_ == nullptr ||
@@ -485,7 +490,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   if (model.has_mtp()) {
     e->mtp_draft_tier_ready_ =
-        e->prefill_ready_ && MtpDraftTierCovers(model.mtp());
+        model.has_mtp() && e->prefill_ready_ && MtpDraftTierCovers(model.mtp());
     e->mtp_e_ = e->AllocFloats(hid, err);
     e->mtp_h_ = e->AllocFloats(hid, err);
     e->mtp_cat_ = e->AllocFloats(2 * hid, err);
@@ -711,9 +716,22 @@ void Executor::MlaLayer(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
   (void)hipStreamWaitEvent(moe_up_stream_, ev_proj_fork_, 0);
   (void)hipStreamWaitEvent(moe_shared_stream_, ev_proj_fork_, 0);
 
-  (void)GemvTypeOf(l.attn_q.type, &type);
-  Gemv(l.attn_q.data, type, l.attn_q.rows, l.attn_q.cols, l.attn_q.row_bytes, x,
-       mla_q_, nullptr);
+  if (c_.mla_q_split) {
+    // The low-rank q chain is narrow (hidden -> 256 -> heads * head_dim), so
+    // the three operators stay on main ahead of the rest of the forks.
+    (void)GemvTypeOf(l.attn_q_a.type, &type);
+    Gemv(l.attn_q_a.data, type, l.attn_q_a.rows, l.attn_q_a.cols,
+         l.attn_q_a.row_bytes, x, mla_q_latent_, nullptr);
+    RmsNorm(mla_q_latent_, l.attn_q_a_norm.f32(), c_.rms_eps, mla_q_latent_,
+            c_.mla_q_lora, nullptr);
+    (void)GemvTypeOf(l.attn_q_b.type, &type);
+    Gemv(l.attn_q_b.data, type, l.attn_q_b.rows, l.attn_q_b.cols,
+         l.attn_q_b.row_bytes, mla_q_latent_, mla_q_, nullptr);
+  } else {
+    (void)GemvTypeOf(l.attn_q.type, &type);
+    Gemv(l.attn_q.data, type, l.attn_q.rows, l.attn_q.cols, l.attn_q.row_bytes,
+         x, mla_q_, nullptr);
+  }
   (void)GemvTypeOf(l.attn_kv_a.type, &type);
   Gemv(l.attn_kv_a.data, type, l.attn_kv_a.rows, l.attn_kv_a.cols,
        l.attn_kv_a.row_bytes, x, mla_kv_a_, moe_up_stream_);
@@ -768,7 +786,7 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
                    float* out) {
   GemvType type;
   if (c_.IsDenseFfnLayer(il)) {
-    const float limit = c_.swiglu_clamp_shexp[il];
+    const float limit = c_.ClampShexp(il);
     (void)GemvTypeOf(l.ffn_gate.type, &type);
     Gemv(l.ffn_gate.data, type, l.ffn_gate.rows, l.ffn_gate.cols,
          l.ffn_gate.row_bytes, x, sh_gate_, nullptr);
@@ -800,7 +818,7 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
   Gemv(l.shexp_up.data, type, l.shexp_up.rows, l.shexp_up.cols,
        l.shexp_up.row_bytes, x, sh_up_, moe_shared_stream_);
   SwigluClamped(sh_gate_, sh_up_, sh_inter_, c_.shared_expert_ff,
-                c_.swiglu_clamp_shexp[il], moe_shared_stream_);
+                c_.ClampShexp(il), moe_shared_stream_);
   (void)GemvTypeOf(l.shexp_down.type, &type);
   Gemv(l.shexp_down.data, type, l.shexp_down.rows, l.shexp_down.cols,
        l.shexp_down.row_bytes, sh_inter_, sh_down_, moe_shared_stream_);
@@ -825,8 +843,8 @@ void Executor::Ffn(const DeviceLayer& l, std::uint32_t il, const float* x,
               l.ffn_gate_exps.row_bytes * l.ffn_gate_exps.rows, moe_ids_, used,
               used, ff, c_.hidden_size, x, 0U, moe_gate_, nullptr);
   (void)hipStreamWaitEvent(nullptr, ev_up_, 0);
-  SwigluClamped(moe_gate_, moe_up_, moe_inter_, used * ff,
-                c_.swiglu_clamp_exp[il], nullptr);
+  SwigluClamped(moe_gate_, moe_up_, moe_inter_, used * ff, c_.ClampExp(il),
+                nullptr);
   (void)GemvTypeOf(l.ffn_down_exps.type, &type);
   GemvGrouped(l.ffn_down_exps.data, type,
               l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, moe_ids_, used,
@@ -926,10 +944,24 @@ void Executor::MlaBatch(const DeviceLayer& l, float* kv_cache, float* kpe_cache,
   const std::size_t hrow = static_cast<std::size_t>(heads) * v_dim;
   const float scale = 1.0F / std::sqrt(static_cast<float>(c_.mla_head_dim));
   GemvType type;
-  GemvTypeOf(l.attn_q.type, &type);
-  GemvRows(l.attn_q.data, type, rows, l.attn_q.rows, l.attn_q.cols,
-           l.attn_q.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
-           pf_mla_q_, static_cast<std::uint32_t>(qrow), nullptr);
+  if (c_.mla_q_split) {
+    const std::uint32_t q_lora = c_.mla_q_lora;
+    GemvTypeOf(l.attn_q_a.type, &type);
+    GemvRows(l.attn_q_a.data, type, rows, l.attn_q_a.rows, l.attn_q_a.cols,
+             l.attn_q_a.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+             pf_mla_q_lat_, q_lora, nullptr);
+    RmsNormRows(pf_mla_q_lat_, l.attn_q_a_norm.f32(), c_.rms_eps, pf_mla_q_lat_,
+                rows, q_lora, nullptr);
+    GemvTypeOf(l.attn_q_b.type, &type);
+    GemvRows(l.attn_q_b.data, type, rows, l.attn_q_b.rows, l.attn_q_b.cols,
+             l.attn_q_b.row_bytes, pf_mla_q_lat_, q_lora, pf_mla_q_,
+             static_cast<std::uint32_t>(qrow), nullptr);
+  } else {
+    GemvTypeOf(l.attn_q.type, &type);
+    GemvRows(l.attn_q.data, type, rows, l.attn_q.rows, l.attn_q.cols,
+             l.attn_q.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
+             pf_mla_q_, static_cast<std::uint32_t>(qrow), nullptr);
+  }
   GemvTypeOf(l.attn_kv_a.type, &type);
   GemvRows(l.attn_kv_a.data, type, rows, l.attn_kv_a.rows, l.attn_kv_a.cols,
            l.attn_kv_a.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
@@ -1018,7 +1050,7 @@ void Executor::FfnBatch(const DeviceLayer& l, std::uint32_t il,
               used, ff, c_.hidden_size, pf_normed_,
               static_cast<std::uint32_t>(hid), pf_moe_up_, nullptr);
   SwigluClamped(pf_moe_gate_, pf_moe_up_, pf_moe_inter_, slots * ff,
-                c_.swiglu_clamp_exp[il], nullptr);
+                c_.ClampExp(il), nullptr);
   GemvTypeOf(l.ffn_down_exps.type, &type);
   GemvGrouped(l.ffn_down_exps.data, type,
               l.ffn_down_exps.row_bytes * l.ffn_down_exps.rows, pf_moe_ids_,
@@ -1041,7 +1073,7 @@ void Executor::FfnBatch(const DeviceLayer& l, std::uint32_t il,
            l.shexp_up.row_bytes, pf_normed_, static_cast<std::uint32_t>(hid),
            pf_sh_up_, static_cast<std::uint32_t>(shared), nullptr);
   SwigluClamped(pf_sh_gate_, pf_sh_up_, pf_sh_inter_, rows * shared,
-                c_.swiglu_clamp_shexp[il], nullptr);
+                c_.ClampShexp(il), nullptr);
   GemvTypeOf(l.shexp_down.type, &type);
   GemvRows(l.shexp_down.data, type, rows, l.shexp_down.rows, l.shexp_down.cols,
            l.shexp_down.row_bytes, pf_sh_inter_,
@@ -1187,13 +1219,21 @@ void Executor::PrefillMla(const DeviceLayer& l, float* kv_cache,
   const std::size_t hid = c_.hidden_size;
   const float scale = 1.0F / std::sqrt(static_cast<float>(c_.mla_head_dim));
   WeightType w;
-
   NarrowActivations(pf_normed_, pf_xh_, false, tokens * hid, nullptr);
-  (void)WeightTypeOf(l.attn_q.type, &w);
-  tier_failure_ |= !DenseF16Gemm(
-      l.attn_q.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_, tokens,
-      pf_mla_q_, nullptr, static_cast<std::size_t>(heads) * c_.mla_head_dim,
-      hid, 0U, nullptr);
+  if (c_.mla_q_split) {
+    (void)WeightTypeOf(l.attn_q_a.type, &w);
+    tier_failure_ |= !DenseF16Gemm(
+        l.attn_q_a.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_, tokens,
+        pf_mla_q_lat_, nullptr, c_.mla_q_lora, hid, 0U, nullptr);
+    RmsNormRows(pf_mla_q_lat_, l.attn_q_a_norm.f32(), c_.rms_eps, pf_mla_q_lat_,
+                tokens, c_.mla_q_lora, nullptr);
+  } else {
+    (void)WeightTypeOf(l.attn_q.type, &w);
+    tier_failure_ |= !DenseF16Gemm(
+        l.attn_q.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_, tokens,
+        pf_mla_q_, nullptr, static_cast<std::size_t>(heads) * c_.mla_head_dim,
+        hid, 0U, nullptr);
+  }
   (void)WeightTypeOf(l.attn_kv_a.type, &w);
   tier_failure_ |= !DenseF16Gemm(l.attn_kv_a.data, w, pf_xh_, pf_drows_,
                                  pf_dbounds_, pf_dtiles_, tokens, pf_mla_a_,
@@ -1202,6 +1242,18 @@ void Executor::PrefillMla(const DeviceLayer& l, float* kv_cache,
   tier_failure_ |= !DenseF16Gemm(l.attn_gate.data, w, pf_xh_, pf_drows_,
                                  pf_dbounds_, pf_dtiles_, tokens, pf_mla_pgate_,
                                  nullptr, heads, hid, 0U, nullptr);
+  if (c_.mla_q_split) {
+    // The second half of the low-rank q chain narrows its own activations
+    // into the staging plane once kv_a and gate are done reading x.
+    NarrowActivations(pf_mla_q_lat_, pf_xh_, false,
+                      tokens * static_cast<std::size_t>(c_.mla_q_lora),
+                      nullptr);
+    (void)WeightTypeOf(l.attn_q_b.type, &w);
+    tier_failure_ |= !DenseF16Gemm(
+        l.attn_q_b.data, w, pf_xh_, pf_drows_, pf_dbounds_, pf_dtiles_, tokens,
+        pf_mla_q_, nullptr, static_cast<std::size_t>(heads) * c_.mla_head_dim,
+        c_.mla_q_lora, 0U, nullptr);
+  }
 
   // RoPE, the latent cache write and the absorbed query over the whole chunk.
   MlaQRopeRows(pf_mla_q_, pf_mla_qrp_, base_pos, tokens, heads, c_.mla_head_dim,
@@ -1234,13 +1286,15 @@ void Executor::PrefillMla(const DeviceLayer& l, float* kv_cache,
       nullptr, kv_rank, nope, 0U, nullptr);
   MlaPrefill(pf_mla_pabs_, pf_mla_qrp_, kv_cache, kpe_cache, pf_mla_qlatent_,
              base_pos, tokens, heads, kv_rank, rot, scale, nullptr);
-  // v_b contracts over the [token][kv_rank] attention latent through the
-  // token gather rows of the same head-bucket map.
-  NarrowActivations(pf_mla_qlatent_, pf_xh_, false, tokens * kv_rank, nullptr);
+  // v_b contracts over the [slot][kv_rank] attention latent: each head
+  // bucket reads the latent row of its own (token, head) slot.
+  NarrowActivations(pf_mla_qlatent_, pf_xh_, false,
+                    static_cast<std::size_t>(tokens) * heads * kv_rank,
+                    nullptr);
   (void)WeightTypeOf(l.attn_v_b.type, &w);
   tier_failure_ |= !RoutedF16Gemm(
       l.attn_v_b.data, w, pf_xh_, pf_htiles_, n_head_tiles, head_tile_rows,
-      pf_hbounds_, pf_rows_tok_, pf_rows_slot_, nullptr, 0.0F, pf_mla_head_,
+      pf_hbounds_, pf_rows_slot_, pf_rows_slot_, nullptr, 0.0F, pf_mla_head_,
       nullptr, v_dim, kv_rank, 0U, nullptr);
   SigmoidInPlace(pf_mla_pgate_, tokens * heads, nullptr);
   RowScale(pf_mla_head_, pf_mla_pgate_, tokens * heads, v_dim, nullptr);
@@ -1273,7 +1327,7 @@ void Executor::PrefillFfn(const DeviceLayer& l, std::uint32_t il,
                                    nullptr, c_.dense_ff, hid, 0U, nullptr);
     SwigluClamped(pf_dn_gate_, pf_dn_up_, pf_dn_inter_,
                   tokens * static_cast<std::uint32_t>(c_.dense_ff),
-                  c_.swiglu_clamp_shexp[il], nullptr);
+                  c_.ClampShexp(il), nullptr);
     NarrowActivations(pf_dn_inter_, pf_xh_, false,
                       tokens * static_cast<std::uint32_t>(c_.dense_ff),
                       nullptr);
@@ -1324,8 +1378,8 @@ void Executor::PrefillFfn(const DeviceLayer& l, std::uint32_t il,
   (void)WeightTypeOf(l.ffn_gate_exps.type, &w);
   tier_failure_ |= !RoutedGatedF16Gemm(
       l.ffn_gate_exps.data, l.ffn_up_exps.data, w, pf_xh_, pf_tiles_, n_tiles,
-      tile_rows, pf_bounds_, pf_rows_tok_, pf_rows_slot_,
-      c_.swiglu_clamp_exp[il], pf_interh_, ff, hid, nullptr);
+      tile_rows, pf_bounds_, pf_rows_tok_, pf_rows_slot_, c_.ClampExp(il),
+      pf_interh_, ff, hid, nullptr);
   (void)WeightTypeOf(l.ffn_down_exps.type, &w);
   tier_failure_ |=
       !RoutedF16Gemm(l.ffn_down_exps.data, w, pf_interh_, pf_tiles_, n_tiles,
@@ -1345,8 +1399,8 @@ void Executor::PrefillFfn(const DeviceLayer& l, std::uint32_t il,
                                  pf_dbounds_, pf_dtiles_, tokens, pf_sh_up_,
                                  nullptr, shared, hid, 0U, nullptr);
   SwigluClamped(pf_sh_gate_, pf_sh_up_, pf_sh_inter_,
-                tokens * static_cast<std::uint32_t>(shared),
-                c_.swiglu_clamp_shexp[il], nullptr);
+                tokens * static_cast<std::uint32_t>(shared), c_.ClampShexp(il),
+                nullptr);
   NarrowActivations(pf_sh_inter_, pf_xh_, false, tokens * shared, nullptr);
   (void)WeightTypeOf(l.shexp_down.type, &w);
   tier_failure_ |= !DenseF16Gemm(l.shexp_down.data, w, pf_xh_, pf_drows_,

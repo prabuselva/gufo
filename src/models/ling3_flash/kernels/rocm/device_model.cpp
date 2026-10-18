@@ -67,6 +67,9 @@ struct Uploader {
     d.ffn_norm = Copy(l.ffn_norm);
     if (l.mla) {
       d.attn_q = Copy(l.attn_q);
+      d.attn_q_a = Copy(l.attn_q_a);
+      d.attn_q_a_norm = Copy(l.attn_q_a_norm);
+      d.attn_q_b = Copy(l.attn_q_b);
       d.attn_kv_a = Copy(l.attn_kv_a);
       d.attn_kv_a_norm = Copy(l.attn_kv_a_norm);
       d.attn_k_b = Copy(l.attn_k_b);
