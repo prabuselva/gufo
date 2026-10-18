@@ -7,7 +7,7 @@
 // the six projections spread over 1..4 lanes (main + non-blocking side
 // streams, joined after the last projection where production ConvSilu reads
 // them). Same bytes are never replayed through L2 across ring passes.
-#include "src/models/ling3_flash/kernels/rocm/gemv.hip.cpp"
+#include "src/models/ling3_0/kernels/rocm/gemv.hip.cpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -25,7 +25,7 @@
 
 namespace {
 
-using namespace gufo::models::ling3_flash::rocm;
+using namespace gufo::models::ling3_0::rocm;
 
 constexpr std::uint32_t kHidden = 2560;
 constexpr std::uint32_t kInner = 4096;   // ssm_head_dim * num_heads

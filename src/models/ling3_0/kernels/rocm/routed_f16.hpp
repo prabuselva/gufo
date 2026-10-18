@@ -1,0 +1,141 @@
+#ifndef GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_ROUTED_F16_HPP_
+#define GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_ROUTED_F16_HPP_
+
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+/// Routed F16 WMMA expert GEMM for the Ling 3.0 Flash MoE prefill, ported
+/// from the Qwen3.6-35B-A3B route (src/models/qwen36_a3b/kernels/rocm/
+/// routed_f16.hip.cpp), which itself ports the Qwen3.8-Flash-Next kernel. The
+/// routed assignments are compacted by expert into 16-row padded buckets;
+/// activations are narrowed to F16; one WMMA GEMM per (expert, row tile) runs
+/// on the matrix cores with the weights dequantized to F16 after the LDS
+/// read. Nothing here is shared with another model.
+namespace gufo::models::ling3_0::rocm {
+
+/// GGUF type ids the routed F16 GEMM accepts for the expert weights.
+enum class WeightType : std::uint32_t {
+  kF32 = 0,
+  kF16 = 1,
+  kQ4_0 = 2,
+  kQ5_1 = 7,
+  kQ8_0 = 8,
+  kQ4_K = 12,
+  kQ5_K = 13,
+  kQ6_K = 14,
+  kBF16 = 30,
+};
+
+/// Narrows `count` F32 activations to F16 (or BF16 when `bf16`) in `out`.
+void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
+                       hipStream_t stream);
+
+/// Row-batched [embedding; hidden] concat fused with the F16 narrowing the
+/// dense tier consumes: out[r * 2n + 0:n] = half(a[r * n + 0:n]) and
+/// out[r * 2n + n:2n] = half(b[r * n + 0:n]) for `rows` rows, matching the
+/// narrowing of a Concat2 row fed to DenseF16Gemm with k = 2n.
+void Concat2RowsHalf(const float* a, const float* b, __half* out,
+                     std::uint32_t rows, std::uint32_t n, hipStream_t stream);
+
+/// Rows a compacted bucket layout needs for `slots` routed assignments over
+/// `n_experts` experts with 16-row padded buckets.
+std::size_t RoutedCompactRows(std::size_t slots, std::size_t n_experts);
+
+/// Compacts the routed assignments by expert into 16-row padded buckets.
+/// `ids` [n_tokens * k] holds the chosen expert per (token, slot) or -1;
+/// `counts` [n_experts] is the per-expert histogram. `pad_bounds`
+/// [n_experts + 1] receives the exclusive scan of the padded bucket starts,
+/// `cursors` [n_experts] is scratch, and `rows_token` / `rows_slot`
+/// (RoutedCompactRows long) map each compacted row back to its token and slot.
+void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
+                   std::int32_t* pad_bounds, std::int32_t* cursors,
+                   std::int32_t* rows_token, std::int32_t* rows_slot,
+                   std::uint32_t n_tokens, std::uint32_t k,
+                   std::uint32_t n_experts, hipStream_t stream);
+
+/// Tile list for head-grouped buckets (the absorbed MLA per-head projections,
+/// where every token visits every head). The histograms are uniform, so the
+/// list `[e | (j << 16)]` for e < heads and j < ceil(tokens / tile_rows)
+/// builds on the device with no host fetch; `tiles` needs that many entries.
+void HeadTiles(std::int32_t* tiles, std::uint32_t heads, std::uint32_t tokens,
+               std::uint32_t tile_rows, hipStream_t stream);
+
+/// Narrows the first `cols` halves of each of `rows` strided F32 rows to F16
+/// packed rows: out[r * cols + c] = half(x[r * x_stride + c]). The k_b query
+/// projection contracts over the nope part of the raw query row only.
+void NarrowRowsStripped(const float* x, __half* out, std::size_t rows,
+                        std::uint32_t x_stride, std::uint32_t cols,
+                        hipStream_t stream);
+
+/// Routed F16 WMMA expert GEMM. `w` is the [n_experts][m][k] weight tensor in
+/// `type`; `x` is the F16 activation rows indexed by `rows_in`; `tiles`
+/// [n_tiles] packs the expert in the low 16 bits and the token macro-tile
+/// index in the high 16. `pad_bounds` [n_experts + 1] gives the bucket starts.
+/// Each compacted output row `rows_out[c]` receives the result as F32 `out`
+/// (m-wide) or, when `out_half` is given, as F16 with the SwiGLU gate applied
+/// from `swiglu_gate`. Exactly one of `out` / `out_half` is non-null.
+/// `swiglu_limit > 0` reproduces the reference clamp: the up value is clamped
+/// to [-limit, limit] and the gate's SiLU to (-inf, limit] before the product.
+/// `tile_rows` is 16, 48 or 64. `out_stride` is the row stride of `out` /
+/// `out_half` (0 selects m); rows are still indexed through `rows_out`, so a
+/// padded or wider plane needs no identity indirection. Returns false for an
+/// unsupported shape.
+bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
+                   const std::int32_t* tiles, std::uint32_t n_tiles,
+                   std::uint32_t tile_rows, const std::int32_t* pad_bounds,
+                   const std::int32_t* rows_in, const std::int32_t* rows_out,
+                   const float* swiglu_gate, float swiglu_limit, float* out,
+                   __half* out_half, std::size_t m, std::size_t k,
+                   std::size_t out_stride, hipStream_t stream);
+
+/// --- Dense token tier -------------------------------------------------------
+/// Runs of consecutive tokens projected by one matrix (the attention and
+/// dense-FFN projections of a prefill chunk) reuse the routed kernel with an
+/// identity bucket: prepare the map once per chunk with DenseRowPrepare and
+/// launch each projection with DenseF16Gemm. The F32 accumulation order is
+/// the routed kernel's; the epilogue writes plain rows (no SwiGLU), matching
+/// the Gemv/GemvRows results within the F16 narrowing of `x`.
+
+/// Writes the identity row map for tokens 0..tokens-1 into padded
+/// (16-rounded) rows `[tokens, padded)` marked -1, `pad_bounds = {0, padded}`
+/// and the bucket index vector `tiles[j] = j << 16` (j < padded / 16, valid
+/// for any tile_rows). `rows_out` and `tiles` need padded (and padded / 16)
+/// entries; capacity is sized once per chunk cap.
+void DenseRowPrepare(std::int32_t* rows_out, std::int32_t* pad_bounds,
+                     std::int32_t* tiles, std::uint32_t tokens,
+                     hipStream_t stream);
+
+/// Dense projection over token-major F16 rows `x` [tokens][k]: out[token]
+/// (m-wide, F32 `out` or F16 `out_half`, row stride `out_stride` or m) =
+/// W x[token] for the matrix `w` [m][k] in `type`. Selects the token macro
+/// tile size and reads the map DenseRowPrepare wrote for this chunk. Returns
+/// false for an unsupported shape (tokens == 0 or a k not divisible by the
+/// type's quant block).
+bool DenseF16Gemm(const void* w, WeightType type, const __half* x,
+                  const std::int32_t* rows_out, const std::int32_t* pad_bounds,
+                  const std::int32_t* tiles, std::uint32_t tokens, float* out,
+                  __half* out_half, std::size_t m, std::size_t k,
+                  std::size_t out_stride, hipStream_t stream);
+
+/// Fused gate+up routed GEMM. `gate` and `up` are the [n_experts][m][k] weight
+/// tensors in the same `type`; the kernel reads the F16 activation rows once
+/// and writes the SwiGLU product `up * SiluF(gate)` as F16 to `out_half`
+/// (indexed by `rows_out`). `swiglu_limit > 0` applies the reference clamp to
+/// both factors before the product. `tile_rows` is 64 or 128. Bit-identical to
+/// a gate GEMM into F32 followed by an up GEMM with the same arguments, but
+/// one launch and no gate round trip. Returns false for an unsupported shape.
+bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
+                        const __half* x, const std::int32_t* tiles,
+                        std::uint32_t n_tiles, std::uint32_t tile_rows,
+                        const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, float swiglu_limit,
+                        __half* out_half, std::size_t m, std::size_t k,
+                        hipStream_t stream);
+
+}  // namespace gufo::models::ling3_0::rocm
+
+#endif  // GUFO_MODELS_LING3_FLASH_KERNELS_ROCM_ROUTED_F16_HPP_

@@ -1,4 +1,4 @@
-# Port plan: fork gemma4 kernel optimizations → shared ROCm core → gemma4 / qwen36_a3b / ling3_flash
+# Port plan: fork gemma4 kernel optimizations → shared ROCm core → gemma4 / qwen36_a3b / ling3_0
 
 Source analysis: [docs/models/gemma4/OPTIMIZATION_DIFF_REPORT_v2.md](../models/gemma4/OPTIMIZATION_DIFF_REPORT_v2.md).
 Donor: `fm/feat/gemma` (`gufo_franzmoca` @ `22341ae7`). Our Gemma 4 and the fork's
@@ -14,7 +14,7 @@ consumed by every MoE model.
    `gufo::core::hip`. Model dirs keep dispatch, shapes, plans, oracle and
    tests. This carves a deliberate exception to "model-private kernels"
    (`dense_f16_gemm` is already duplicated four times: qwen38_flash_next,
-   gemma4, qwen36_a3b, ling3_flash); the fork set the same precedent by
+   gemma4, qwen36_a3b, ling3_0); the fork set the same precedent by
    consuming `qwen38_flash_next::rocm::DenseF16Gemm` from its gemma4 executor
    (`executor.cpp:427-437,485-490`).
 3. Scope: all kernel levers + MTP width-invariance correctness + calibrated
@@ -23,7 +23,7 @@ consumed by every MoE model.
 
 ## Node-compatibility map (report §8 levers × our models)
 
-| Lever | gemma4 site | qwen36_a3b site | ling3_flash site |
+| Lever | gemma4 site | qwen36_a3b site | ling3_0 site |
 |---|---|---|---|
 | 1 Shape-tuned dense F16 plan | `kernels/rocm/dense_f16_gemm.hpp:25` (no plan) | `dense_f16_gemm.*` + `gemm.hip.cpp:137` | `kernels.hip.cpp DenseF16Gemm` w/ device tile maps (`executor.cpp:985-997`) |
 | 2 Kill F32/BF16 SGEMM route | `gemm.hip.cpp:145-176`, `weights.cpp:126-234` allow `kF32` | `gemm.hip.cpp` (sgemm), `executor.cpp:27,36,41` | no sgemm; `executor.cpp:110` maps `kF32`; weights allowlist |
@@ -112,7 +112,7 @@ router + elementwise fusion, MTP width-invariance via `wmma_gemv`, draft
 policy. GDN layers take producer/traffic changes only. Gates: own oracle KL,
 existing rocm tests, MTP hash-invariance, matched pp/tg A/B.
 
-## Phase 5 — ling3_flash fan-out
+## Phase 5 — ling3_0 fan-out
 
 Plan-aware dense tile-GEMM (`executor.cpp:985-997`), half producers
 (`executor.cpp:982`), router/elementwise fusion (`routed_f16`), MTP

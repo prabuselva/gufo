@@ -7,7 +7,7 @@ absorbed MLA layers, sigmoid-gated group-limited MoE with one shared
 expert). Tiny carries **no self-speculative MTP block**. Support is tracked
 in the model-private [PLAN.md](PLAN.md) · [STATUS.md](STATUS.md) ·
 [BENCHMARKS.md](BENCHMARKS.md) · [EXPERIMENTS.md](EXPERIMENTS.md); the
-runtime code lives in `src/models/ling3_flash` under an explicit geometry
+runtime code lives in `src/models/ling3_0` under an explicit geometry
 profile.
 
 ## Artifact
@@ -52,7 +52,7 @@ same 192/128/512/64 absorbed shapes as Flash, 16 heads. There are no
 
 Supported end to end: `gufo prompt`, `gufo chat` and `gufo serve` (native
 Ling 3.0 tool dialect, shared with Flash) run Tiny through the same
-`src/models/ling3_flash` engine via an explicit geometry profile selected
+`src/models/ling3_0` engine via an explicit geometry profile selected
 from artifact metadata — stride-4 MLA placement, stride-2 leading dense
 blocks, low-rank split query projection with its own norm, no MTP path and
 no SwiGLU clamp arrays. Gate evidence (greedy forward/hidden parity vs

@@ -1,4 +1,4 @@
-// Standalone A/B: ling3_flash RmsNorm decode shapes, bit-exact variants.
+// Standalone A/B: ling3_0 RmsNorm decode shapes, bit-exact variants.
 // Baseline = production RmsNormKernel verbatim. Cached = stage x in LDS in
 // pass 1 and reread from LDS in pass 2 (identical values, identical double
 // accumulation order). CachedW = Cached plus w prefetched into registers

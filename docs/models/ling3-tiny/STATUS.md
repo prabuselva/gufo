@@ -22,7 +22,7 @@ memory. Strategy and acceptance criteria: [PLAN.md](PLAN.md). Shape facts:
       KDA on the other 18; MoE on 1..23. Invalidated the earlier
       planning-time assumption of `(il+1)%6==0`.
 - [x] 0.3 Kernel-constant grep audit: no Flash geometry literals in
-      `src/models/ling3_flash/kernels/`; executor sizes buffers from config
+      `src/models/ling3_0/kernels/`; executor sizes buffers from config
       (`executor.cpp:312, 341-417`); model/weights layers are
       config-driven (`weights.cpp:198` nextn load is conditional).
 - [x] 0.4 Identified the four blockers: config pin `config.cpp:217-228`,
@@ -50,13 +50,13 @@ memory. Strategy and acceptance criteria: [PLAN.md](PLAN.md). Shape facts:
 - [x] 1.4 Config unit test: Tiny fixture (measured table) parses to profile
       Tiny with split-q asserts; Flash fixture asserts fused (rank key
       absent, 256/128 deviations + Tiny-without-rank rejected); mixed
-      geometries rejected. `ling3_flash.config` Passed.
+      geometries rejected. `ling3_0.config` Passed.
 - [x] 1.5 Weights allowlist: split `attn_q_a`/`attn_q_a_norm`/`attn_q_b`
       bound for Tiny profile (fused path kept for Flash), `ssm_beta` pin
       relaxed to the dense type set (Tiny ships Q8_0). Real-file binding:
-      `GUFO_LING3_FLASH_GGUF=…ling3_flash_weights_test` passes for BOTH
+      `GUFO_LING3_FLASH_GGUF=…ling3_0_weights_test` passes for BOTH
       artifacts (`Ling 3.0 weight binding passed.`).
-- [x] 1.6 Gate: `ctest --test-dir build/cpu-test -R '^ling3_flash'` →
+- [x] 1.6 Gate: `ctest --test-dir build/cpu-test -R '^ling3_0'` →
       config + chat_template Passed, weights/reference Skipped (no env);
       both artifact gates executed manually incl. the oracle
       (`Ling 3.0 scalar reference passed.`); `check-format.py` PASS.
@@ -138,7 +138,7 @@ memory. Strategy and acceptance criteria: [PLAN.md](PLAN.md). Shape facts:
       `replay_server_{TINY,FLASH}.log`, `gufo_bench_replay8.log`.
 - [x] 4.5 Docs/labels: model README support text (Known gaps struck),
       [ling3-flash README](../ling3-flash/README.md) links Tiny; GPU/unit
-      tests inherit the registered `ling3_flash` labels (no TESTING.md
+      tests inherit the registered `ling3_0` labels (no TESTING.md
       per-model registry; Flash launch precedent).
 - [x] 4.6 Final (2026-10-18): `ctest build/cpu-test` **131/131 PASS**
       (external-model tests skip without fixtures);

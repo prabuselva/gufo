@@ -11,7 +11,7 @@
 // accumulator attribution run: NOT bit-safe, reported only to price the
 // double accumulate. Every variant is bitwise-compared against V0's
 // state and out on identical inputs.
-#include "src/models/ling3_flash/kernels/rocm/kernels.hip.cpp"
+#include "src/models/ling3_0/kernels/rocm/kernels.hip.cpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -27,7 +27,7 @@
     }                                                                \
   } while (0)
 
-namespace gufo::models::ling3_flash::rocm {
+namespace gufo::models::ling3_0::rocm {
 namespace {
 
 constexpr std::uint32_t kHeads = 32;
@@ -262,9 +262,9 @@ void Launch(int variant, const float* q, const float* k, const float* v,
 }
 
 }  // namespace
-}  // namespace gufo::models::ling3_flash::rocm
+}  // namespace gufo::models::ling3_0::rocm
 
-using namespace gufo::models::ling3_flash::rocm;
+using namespace gufo::models::ling3_0::rocm;
 
 int main() {
   const float* q = Alloc(1, kInner, 11);

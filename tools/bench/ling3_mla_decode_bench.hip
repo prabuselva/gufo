@@ -7,9 +7,9 @@
 #include <random>
 #include <vector>
 
-#include "src/models/ling3_flash/kernels/rocm/attention.hip.cpp"
+#include "src/models/ling3_0/kernels/rocm/attention.hip.cpp"
 
-namespace q = gufo::models::ling3_flash::rocm;
+namespace q = gufo::models::ling3_0::rocm;
 
 namespace {
 

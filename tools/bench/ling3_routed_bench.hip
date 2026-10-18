@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
-#include "src/models/ling3_flash/kernels/rocm/routed_f16.hip.cpp"
+#include "src/models/ling3_0/kernels/rocm/routed_f16.hip.cpp"
 
-namespace q = gufo::models::ling3_flash::rocm;
+namespace q = gufo::models::ling3_0::rocm;
 
 namespace {
 

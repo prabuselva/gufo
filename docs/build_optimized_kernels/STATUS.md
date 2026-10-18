@@ -942,7 +942,7 @@ it only pays together with the fork's register-frugal 2.5 template
        staged/rgroups8 on spill-free `false` templates (priv 0) and stays
        as measured. Re-open only if a BF16-dense gemma4 checkpoint lands.
 
-## Phase 5 — ling3_flash fan-out (long-context recovery first; nodes 1,3,5,6,7,8)
+## Phase 5 — ling3_0 fan-out (long-context recovery first; nodes 1,3,5,6,7,8)
 
 Anchors (`docs/models/ling3-flash/BENCHMARKS.md`, three-engine grid): prefill
 840→402 t/s from 2K→16K (−52 %; llama ROCm 659→507, Vulkan 619→504 — Gufo
@@ -986,7 +986,7 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
           (+5.0 %), pp8192 578.61/580.84 → 628.44/628.28 (+8.4 %),
           pp16384 403.65/401.13 → 446.41/446.25 (+10.9 %); same-window
           control drift ≤0.7 %. Gates (exclusive window):
-          `ling3_flash.rocm_attention`/`rocm_forward`/`rocm_inference`/
+          `ling3_0.rocm_attention`/`rocm_forward`/`rocm_inference`/
           `rocm_quality` pass (the attention test enforces the 5e-4
           contract). pp16384 gap to llama ROCm narrows −20.7 % →
           −12.0 %; BENCHMARKS prefill grid refreshed (Oct 15).
@@ -1058,7 +1058,7 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
       - Production integration + paired A/B (candidate = this route:
         hi/lo slab pack on the KV append path, `MlaPrefillWmmaKernel`
         for causal chunks, routed from `MlaPrefill`). Quality gates
-        passed (`ling3_flash.rocm_attention` on the full Q4_K_M
+        passed (`ling3_0.rocm_attention` on the full Q4_K_M
         artifact, 5e-4 contract), but every paired depth regressed
         (`gufo_bench_ta51.log`, tokens/s candidate vs the 5.1a control):
         pp2048 541.6 vs 831.7, pp4096 329.7 vs 739.4, pp8192 188.3 vs
@@ -1209,7 +1209,7 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             branch as a word `bit_cast` of the kBF16 fetch path
             (`RowBytes`/`kChunks`/launch case). New WMMA
             instantiations 95–103 VGPR, 0 spill; `--compare` 5.4b:
-            0 kernels worse. Full `ling3_flash` suite exclusive: only
+            0 kernels worse. Full `ling3_0` suite exclusive: only
             the two known parked fails (`gufo_bench_qual53a.log`);
             `rocm_forward`/`rocm_inference`/`rocm_quality` pass, so no
             expert-selection flips. Matched BAAB ×2 (control = 5.4b
@@ -1314,7 +1314,7 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             (`__shfl_down` tree is wave-scoped) → bit-identical.
             `rocm_gemv` unchanged-failing baseline (only the parked
             `GemvRowsQ8` case) with `GemvRowsF32 bit-exact yes`, full
-            `ling3_flash` suite shows only the two known parked fails
+            `ling3_0` suite shows only the two known parked fails
             (`gufo_bench_gemv54`, `gufo_bench_suite54`). Matched BAAB
             pair, twice (control = 5.2a build,
             `gufo_bench_ba54.log`), tg128: d0 33.71/33.83 → 33.80/34.10
@@ -1374,7 +1374,7 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
             (`tools/bench/ling3_router_fused_bench.hip`, retained with
             the rejection), and the retained bench's paired-launch wall
             was −0.15…−0.66 µs (~2 %) per router pair. Gate parity:
-            the full `ling3_flash` suite fails exactly THREE
+            the full `ling3_0` suite fails exactly THREE
             pre-existing parked tests — `rocm_gemv`, `rocm_inference`
             (step-1 greedy parity, `cpu 220 gpu 2538`, top-2 gap
             0.0990877; reproduced 6/6 on a HEAD-`6af0f594` control
@@ -1444,13 +1444,13 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
       draft-token sweeps were flat (36.46–36.72) and the MLA copy removal
       already cleared +2.5 %; keep the width-invariance gate and re-check
       after 5.2/5.4 move the decode operating point. Known-failing
-      baseline: `ling3_flash.rocm_mtp_accept` fails at HEAD `0554f35f`
+      baseline: `ling3_0.rocm_mtp_accept` fails at HEAD `0554f35f`
       (25/32 greedy draft agreement = 78.125 %, bit-parity row deltas
       ≈7e-6 max); reproduced identically on a control binary built
       without the 5.1a change, so it is pre-existing, not lever-caused —
       first action under 5.6 is repairing this gate, and until then do
       not blame it on new levers (verify against a control binary).
-    - [x] 5.6a ACCEPTED — gate repair landed; `ling3_flash.rocm_mtp_accept`
+    - [x] 5.6a ACCEPTED — gate repair landed; `ling3_0.rocm_mtp_accept`
             is green (29.10 s standalone; exclusive suite 11/12, only the
             parked `rocm_inference` step-1 divergence fails). Two real
             causes, one kernel: `GemvRows` Q8_0 Vec4 accumulated the
@@ -1684,7 +1684,7 @@ t/s, 16K gap −12.0 %; the anchor figures above are the phase-entry state.)
 
 Protocol per lever (golden rule): standalone microbench first; paired
 ABBA/BAAB exclusive windows across {pp2048, pp8192, pp16384} +
-cold/frontier tg grid; gates `ctest --preset gpu-full -R '^ling3_flash\.'`
+cold/frontier tg grid; gates `ctest --preset gpu-full -R '^ling3_0\.'`
 with `GUFO_LING3_FLASH_GGUF=/home/praburaja/projects/llm/models/gguf/`
 `Ling3.0-Flash/Ling-3.0-flash-Q4_K_M-00001-of-00002.gguf`; regenerate
 `tools/ci/kernel-resources.json` budgets; `check-format`; BENCHMARKS/

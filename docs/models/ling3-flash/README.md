@@ -5,7 +5,7 @@ Strix Halo `gfx1151`: a 42-layer trunk of Kimi Delta Attention (KDA) linear
 recurrent layers interleaved with absorbed Multi-head Latent Attention (MLA)
 layers, a sigmoid-gated MoE FFN with group-limited top-k routing plus one
 always-on shared expert, and a trailing self-speculative MTP block. The
-module is isolated in `src/models/ling3_flash`; it shares no code with the
+module is isolated in `src/models/ling3_0`; it shares no code with the
 Qwen engines beyond the generic `gufo_core` GGUF reader, sampler, and the
 HF-BPE tokenizer loader.
 
@@ -43,14 +43,14 @@ sequence. The GPU tests locate the file through `GUFO_LING3_FLASH_GGUF`.
 
 ## Chat framing (Bailing V3)
 
-`src/models/ling3_flash/chat_template.hpp` owns the framing: role turns open
+`src/models/ling3_0/chat_template.hpp` owns the framing: role turns open
 with `<role>HUMAN</role>`/`<role>ASSISTANT</role>` (and `<role>SYSTEM</role>`
 content), every turn closes with the eos token `kTurnEnd` (id 156895, with
 bos/pad siblings 156891/156892 in the vocabulary), and the system header
 carries the `detailed thinking on|off` directive. Reasoning output arrives
 between the `kThinkStart` and `kThinkEnd` markers; the interactive chat and
 the serve reasoning split both key on that boundary. Tool calls run in the
-checkpoint's native dialect (`src/models/ling3_flash/tool_syntax.hpp`): the
+checkpoint's native dialect (`src/models/ling3_0/tool_syntax.hpp`): the
 tools section renders into the system header, assistant turns open calls
 with `<tool_call>NAME`, one `<arg_key>`/`<arg_value>` frame per argument,
 and tool results ride in the OBSERVATION turn inside `<tool_response>`.
@@ -82,6 +82,6 @@ ctest --preset gpu-full -R ling3 --output-on-failure   # ROCm + model tests
 ctest --preset cpu -R ling3 --output-on-failure        # config/weights
 ```
 
-`tests/models/ling3_flash/` keeps the scalar oracle (`reference_test`), the
+`tests/models/ling3_0/` keeps the scalar oracle (`reference_test`), the
 kernel/forward comparisons, and the model-gated inference test driven by
 `GUFO_LING3_FLASH_GGUF`. A missing-model skip is not a quality pass.

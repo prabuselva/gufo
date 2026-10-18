@@ -40,8 +40,8 @@
 #include "src/models/gemma4/engine.hpp"
 #include "src/models/gemma4/serve_runner.hpp"
 #include "src/models/gemma4/vision/prompt.hpp"
-#include "src/models/ling3_flash/engine.hpp"
-#include "src/models/ling3_flash/serve_runner.hpp"
+#include "src/models/ling3_0/engine.hpp"
+#include "src/models/ling3_0/serve_runner.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -3291,7 +3291,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config));
   }
   if (reader->GetMetadataString("general.architecture") == "bailingmoe3") {
-    auto model = models::ling3_flash::LoadServeModel(
+    auto model = models::ling3_0::LoadServeModel(
         model_path, *reader, max_context, speculative_config, &load_error);
     if (model == nullptr) {
       SetError(error, load_error);
@@ -3734,7 +3734,7 @@ bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
   }
 }
 
-bool InferenceBackend::load(std::shared_ptr<models::ling3_flash::Model> model,
+bool InferenceBackend::load(std::shared_ptr<models::ling3_0::Model> model,
                             std::string* error, std::uint32_t max_context,
                             std::size_t session_count,
                             TextPrefillPolicy prefill_policy,
@@ -3746,7 +3746,7 @@ bool InferenceBackend::load(std::shared_ptr<models::ling3_flash::Model> model,
     return false;
   }
   try {
-    auto runner = models::ling3_flash::CreateTextRunner(
+    auto runner = models::ling3_0::CreateTextRunner(
         std::move(model), max_context, session_count, speculative_config,
         disk_cache_config, error);
     if (runner == nullptr) {

@@ -1,6 +1,6 @@
 // A/B: Add+RmsNorm pair vs fused AddRmsNorm (ling3 lever 5.5-B1).
 // Kernels copied verbatim from
-// src/models/ling3_flash/kernels/rocm/kernels.hip.cpp at this revision.
+// src/models/ling3_0/kernels/rocm/kernels.hip.cpp at this revision.
 #include <hip/hip_runtime.h>
 
 #include <cstdint>

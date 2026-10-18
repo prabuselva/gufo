@@ -1,0 +1,148 @@
+# Metadata checks are CPU-only and run in the routine suite. Operator and
+# model checks are added as their kernels land.
+add_custom_target(ling3_0_tests)
+
+add_executable(ling3_0_config_test config_test.cpp)
+target_link_libraries(ling3_0_config_test PRIVATE gufo_ling3_0)
+add_test(NAME ling3_0.config COMMAND ling3_0_config_test)
+set_tests_properties(ling3_0.config PROPERTIES LABELS "ling3_0;cpu")
+add_dependencies(ling3_0_tests ling3_0_config_test)
+
+# Chat template parity: every rendering artifact (thinking directive, tools
+# header, native call frames, OBSERVATION turns) must match the pinned
+# Jinja template goldens byte for byte.
+add_executable(ling3_0_chat_template_test chat_template_test.cpp)
+target_link_libraries(ling3_0_chat_template_test PRIVATE gufo_ling3_0)
+add_test(NAME ling3_0.chat_template COMMAND ling3_0_chat_template_test)
+set_tests_properties(ling3_0.chat_template PROPERTIES
+  LABELS "ling3_0;cpu")
+add_dependencies(ling3_0_tests ling3_0_chat_template_test)
+
+# Binds the real artifact (headers only) to prove every tensor name and shape
+# resolves. Skips (77) unless GUFO_LING3_FLASH_GGUF points at a Ling 3.0 Flash
+# GGUF (the first shard of a split file).
+add_executable(ling3_0_weights_test weights_test.cpp)
+target_link_libraries(ling3_0_weights_test PRIVATE gufo_ling3_0)
+add_test(NAME ling3_0.weights COMMAND ling3_0_weights_test)
+set_tests_properties(ling3_0.weights PROPERTIES
+  LABELS "ling3_0;cpu;external-model" SKIP_RETURN_CODE 77)
+add_dependencies(ling3_0_tests ling3_0_weights_test)
+
+# Runs the scalar oracle over the real artifact (a few tokens). Built only when
+# the reference library is requested, and skips (77) without the GGUF.
+add_executable(ling3_0_reference_test EXCLUDE_FROM_ALL reference_test.cpp)
+target_link_libraries(ling3_0_reference_test PRIVATE
+  gufo_ling3_0_reference)
+set_source_files_properties(reference_test.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+add_test(NAME ling3_0.reference COMMAND ling3_0_reference_test)
+set_tests_properties(ling3_0.reference PROPERTIES
+  LABELS "ling3_0;cpu;external-model;slow" SKIP_RETURN_CODE 77)
+
+if (ENGINE_ENABLE_HIP)
+  # GEMV checks: synthetic quantized matrices through the GEMV tier against a
+  # CPU reference that dequantizes with the canonical ggml dequantizers
+  # (gufo_core) and dots in double. No model artifact required.
+  add_executable(ling3_0_rocm_gemv_test rocm_gemv_test.cpp)
+  target_link_libraries(ling3_0_rocm_gemv_test PRIVATE
+    gufo_ling3_0_kernels gufo_core)
+  add_test(NAME ling3_0.rocm_gemv COMMAND ling3_0_rocm_gemv_test)
+  set_tests_properties(ling3_0.rocm_gemv PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151")
+  add_dependencies(ling3_0_tests ling3_0_rocm_gemv_test)
+
+  # Fused-operator checks: synthetic tensors through every fused kernel
+  # against a host reference mirroring the scalar oracle formulas.
+  add_executable(ling3_0_rocm_ops_test rocm_ops_test.cpp)
+  target_link_libraries(ling3_0_rocm_ops_test PRIVATE
+    gufo_ling3_0_kernels)
+  add_test(NAME ling3_0.rocm_ops COMMAND ling3_0_rocm_ops_test)
+  set_tests_properties(ling3_0.rocm_ops PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151")
+  add_dependencies(ling3_0_tests ling3_0_rocm_ops_test)
+
+  # Batched routed projection checks: synthetic Q4_K/Q5_K/Q6_K/Q8_0 expert
+  # matrices through the F16 WMMA tier against a canonical double reference,
+  # plus the SwiGLU epilogue widths/clamps and the fused gate+up launch.
+  add_executable(ling3_0_rocm_gemm_test rocm_gemm_test.cpp)
+  target_link_libraries(ling3_0_rocm_gemm_test PRIVATE
+    gufo_ling3_0_kernels gufo_core)
+  add_test(NAME ling3_0.rocm_gemm COMMAND ling3_0_rocm_gemm_test)
+  set_tests_properties(ling3_0.rocm_gemm PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151")
+  add_dependencies(ling3_0_tests ling3_0_rocm_gemm_test)
+
+  # Chunked-prefill checks: the batched KDA tier (conv, history advance, head
+  # norms, prep, both delta loops, output norm) against the decode chain run
+  # token by token over the same chunk. No model artifact required.
+  add_executable(ling3_0_rocm_kda_prefill_test rocm_kda_prefill_test.cpp)
+  target_link_libraries(ling3_0_rocm_kda_prefill_test PRIVATE
+    gufo_ling3_0_kernels)
+  add_test(NAME ling3_0.rocm_kda_prefill COMMAND
+    ling3_0_rocm_kda_prefill_test)
+  set_tests_properties(ling3_0.rocm_kda_prefill PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151")
+  add_dependencies(ling3_0_tests ling3_0_rocm_kda_prefill_test)
+
+  # Absorbed-MLA decode checks: synthetic latent caches through the split-KV
+  # partial+combine kernels against a host double reference.
+  add_executable(ling3_0_rocm_attention_test rocm_attention_test.cpp)
+  target_link_libraries(ling3_0_rocm_attention_test PRIVATE
+    gufo_ling3_0_kernels)
+  add_test(NAME ling3_0.rocm_attention COMMAND
+    ling3_0_rocm_attention_test)
+  set_tests_properties(ling3_0.rocm_attention PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151")
+  add_dependencies(ling3_0_tests ling3_0_rocm_attention_test)
+
+  # End-to-end forward pass: the GPU executor's trunk, hidden stream and MTP
+  # logits must agree with the scalar oracle over the real artifact. Skips (77)
+  # without the GGUF.
+  add_executable(ling3_0_rocm_forward_test EXCLUDE_FROM_ALL
+    rocm_forward_test.cpp)
+  target_link_libraries(ling3_0_rocm_forward_test PRIVATE
+    gufo_ling3_0_executor gufo_ling3_0_reference)
+  add_test(NAME ling3_0.rocm_forward COMMAND ling3_0_rocm_forward_test)
+  set_tests_properties(ling3_0.rocm_forward PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
+
+  # CPU-vs-GPU greedy decode: the token streams must agree exactly, which is
+  # the quality gate the forward test cannot provide. Skips (77) without the
+  # GGUF.
+  add_executable(ling3_0_rocm_inference_test EXCLUDE_FROM_ALL
+    rocm_inference_test.cpp)
+  target_link_libraries(ling3_0_rocm_inference_test PRIVATE
+    gufo_ling3_0_executor gufo_ling3_0_reference)
+  add_test(NAME ling3_0.rocm_inference COMMAND
+    ling3_0_rocm_inference_test)
+  set_tests_properties(ling3_0.rocm_inference PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
+
+  # Greedy quality gate over real text: parity cannot catch a shared formula
+  # error, so the artifact itself must produce a coherent continuation against
+  # the reference server's ground truth. Skips (77) without the GGUF.
+  add_executable(ling3_0_rocm_quality_test EXCLUDE_FROM_ALL
+    rocm_quality_test.cpp)
+  target_link_libraries(ling3_0_rocm_quality_test PRIVATE
+    gufo_ling3_0_engine)
+  add_test(NAME ling3_0.rocm_quality COMMAND
+    ling3_0_rocm_quality_test)
+  set_tests_properties(ling3_0.rocm_quality PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
+
+  # MTP draft semantics over real text: the draft block must predict the
+  # trunk's next greedy token at a healthy rate, which only alignment of the
+  # draft cache, positions and hidden chain with the trunk achieves. Skips
+  # (77) without the GGUF.
+  add_executable(ling3_0_rocm_mtp_accept_test EXCLUDE_FROM_ALL
+    rocm_mtp_accept_test.cpp)
+  target_link_libraries(ling3_0_rocm_mtp_accept_test PRIVATE
+    gufo_ling3_0_engine)
+  add_test(NAME ling3_0.rocm_mtp_accept COMMAND
+    ling3_0_rocm_mtp_accept_test)
+  set_tests_properties(ling3_0.rocm_mtp_accept PROPERTIES
+    LABELS "ling3_0;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
+endif()

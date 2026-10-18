@@ -2,7 +2,7 @@
 
 Model facts (measured): [README.md](README.md). Experiment log:
 [EXPERIMENTS.md](EXPERIMENTS.md). Tracker: [STATUS.md](STATUS.md).
-Runtime code stays in `src/models/ling3_flash`. GPU rules:
+Runtime code stays in `src/models/ling3_0`. GPU rules:
 [.agents/skills/optimize-kernel/SKILL.md](../../../.agents/skills/optimize-kernel/SKILL.md)
 and AGENTS.md (exclusive runs, `bench_bg.sh` + `bench_wait.sh` in one tool
 call). Do not invoke `nix`.

@@ -11,9 +11,9 @@
 
 #include <hip/hip_fp16.h>
 
-#include "src/models/ling3_flash/kernels/rocm/attention.hip.cpp"
+#include "src/models/ling3_0/kernels/rocm/attention.hip.cpp"
 
-namespace q = gufo::models::ling3_flash::rocm;
+namespace q = gufo::models::ling3_0::rocm;
 
 namespace {
 
@@ -158,8 +158,8 @@ __global__ void FusedKVReuse(
     float* __restrict__ latent, std::uint32_t start_pos, std::uint32_t tokens,
     std::uint32_t heads, std::uint32_t kv_rank, std::uint32_t rotary,
     float scale) {
-  using namespace gufo::models::ling3_flash::rocm;
-  namespace qn = gufo::models::ling3_flash::rocm;
+  using namespace gufo::models::ling3_0::rocm;
+  namespace qn = gufo::models::ling3_0::rocm;
   constexpr std::uint32_t kStride = qn::kPrefillMaxKv + qn::kPrefillMaxRot;
   constexpr std::uint32_t kKT = qn::kPrefillFusedKT;
   __shared__ float s_kv[kKT][kStride];

@@ -3,7 +3,7 @@
 | Experiment | Decision / evidence |
 | --- | --- |
 | Fused MLA prefill kernel (Q-tile + online softmax + PV in one pass, 32×256 exec tile) | Retained (`473c946b`); up to 2.3× prefill vs staged path, suite worst prefill error 9.7e-5 (contract 5e-4). |
-| `-UNDEBUG` on `gufo_ling3_flash_kernels` | Retained (`473c946b`): `MlaPrefillFusedKernel` spilled 143 VGPR / 316 B per lane (DRAM scratch) under `-DNDEBUG` only; allocator artifact, asserts absent from the kernel. A/B with `-Rpass-analysis=kernel-resource-usage`; release fatbin now 191 VGPR / 0 spill. |
+| `-UNDEBUG` on `gufo_ling3_0_kernels` | Retained (`473c946b`): `MlaPrefillFusedKernel` spilled 143 VGPR / 316 B per lane (DRAM scratch) under `-DNDEBUG` only; allocator artifact, asserts absent from the kernel. A/B with `-Rpass-analysis=kernel-resource-usage`; release fatbin now 191 VGPR / 0 spill. |
 | KV row staged into registers (`v[KvSlice]`) shared by QK dot and PV update | Retained (`9b1434ca`): harness gain 1.02–1.05× alone; halves shared-memory traffic per (query, key) pair. Not bit-identical to the previous form (compiler contraction moves results ≤ ~4 ulp, maxabs 4e-9 in harness); suite passes. |
 | Fused kernel widened to 16 warps, `WarpQ` 4→2, Q-tile held at 32 | Retained (`9b1434ca`): harness gains 1.25–1.43× (best at depth), e2e pp +4.2/+8.4/+13.0/+22.4% at pp2048/4096/8192/16384; release build 118 VGPR, 0 spill, occupancy 12 waves/SIMD. Root lever: 36 KB LDS made 8 warps the resident maximum; the kernel is latency-bound (~2.2 TF/s fp32), not LDS-bound. |
 | 16 warps with Q-tile 64 (`WarpQ` 4) | Rejected: 1.27–1.36× — worse than tile-32 at 16K depth (805→846 µs) with equal short-context gains. |
@@ -17,8 +17,8 @@
 | Loop-body ISA decomposition of the KB steady loop (back-edge span analysis of the same listings) | Measurement only. The KB loop itself (down 336 instr: 16 WMMA, 96 packed decode, ~34 LDS loads, 4 global loads; gate 374 with the same shape) contains no 64-bit pointer math and no f32 scale products — the kernel-level address/f32 counts live entirely in the once-per-block prologue and peeled epilogue chains (~900-2900 instructions vs 40-80 × 350 of loop work). A buffer-load/addressing rework therefore has near-zero expected steady-state gain and was dropped before implementation. Remaining in-loop headroom: decode chain (ablation ≤7%) and WMMA staging only. |
 | `#pragma unroll 2` on the KB loop | Rejected: bit-identical (same Fnv sums), resources unchanged (114/108 VGPR, occupancy 12, no spill), but exclusive ABBA gate 3362→3404 µs (+1.2%), down 1956→1979 µs (+1.1%). Schedule slack is already covered by occupancy. |
 | Decode pass profile attribution (`tools/prof/prof.py run --stages ling3`, pp2048/tg64, exclusive; pass-204 kernel table via `prof_results.db`) | Measurement only. Decode is GEMV-tier + fixed-overhead: per token GemvGroupedQ4K 5.8 ms, GemvQ8_0 5.5, GemvQ6K 3.7, GemvQ4K 3.7, **RouterTopKKernel 2.7 ms (~9%, 40× 67.8 µs)**, GemvF32 1.7, KdaDelta 1.6; ~1911 dispatches/token, 31.2 ms kernel time vs ~13 ms DRAM roofline. |
-| Parallel `RouterTopKKernel` top-k (block-wide `BlockArgMax` (max value, lowest-index) rounds replacing the thread-0 serial group-select and expert argmax-removal scans; winner thread writes the `-inf` removal, thread-0 keeps the single-precision order-sensitive weight writes and double renorm sum) | Retained (`967de4ba`): bit-identical to the serial kernel in 112/112 randomized A/B cases (old/new extracted from git, `n_exp` 64–512, `groups` 1–64, random + adversarial-tie logits, 1 and 3 token rows; harness `/tmp/opencode/router_ab.hip`) and `ling3_flash.rocm_ops` contract pass (`RouterTopKRows` reports bit-identical, weights worst error 9.8e-8). Kernel micro (exclusive): 64.0→16.6 µs/call (−74%). The old cost was thread-0-only: `used×n_exp` + `groups_used×groups` dependent LDS scans ≈5100 ops ≈50 µs of single-thread latency chain. e2e exclusive ABBA (full recipe, `/tmp/opencode/gufo_bench_rrfull.log`): tg128 +8.2%, tg1024 +7.6% (29.24→31.47), pp +2.0…+3.4% (`RouterTopKRows` shares the kernel). |
-| vec4 Q8_0 dense GEMV ported from gemma4 (`GemvQ8_0Vec4`, gated `cols % 128 == 0` in `Gemv()`) | Retained (working tree): quality-contract not bit-identity; `ling3_flash_rocm_gemv_test` GemvQ8_0 worst error 2.3e-5 (tol 2e-3, `kCols=2560` exercises the vec4 path). Kernel micro (exclusive, 5000-launch, `/tmp/opencode/gufo_bench_v4micro.log`): −30% on all five dense shapes (2560×2560 15.76→10.98 µs, 6144×2560 34.06→21.72). e2e exclusive: short tg256 ABBA inconclusive (+0.6%, overlapping); dedicated tg1024 BAAB ×3 (+1.0%, separated, `gufo_bench_v4tg1k`); matched full-recipe BAAB (`gufo_bench_v4full`) tg128 +2.9%, tg1024 +3.2%, both fully separated, pp cells within noise (pp16384 noisy). Realized gain ≪ the 5.5 ms/token Q8_0 share × 30%, so decode wall time now sits in the MoE/other-quant tiers and launch gaps, not Q8_0 bytes. |
+| Parallel `RouterTopKKernel` top-k (block-wide `BlockArgMax` (max value, lowest-index) rounds replacing the thread-0 serial group-select and expert argmax-removal scans; winner thread writes the `-inf` removal, thread-0 keeps the single-precision order-sensitive weight writes and double renorm sum) | Retained (`967de4ba`): bit-identical to the serial kernel in 112/112 randomized A/B cases (old/new extracted from git, `n_exp` 64–512, `groups` 1–64, random + adversarial-tie logits, 1 and 3 token rows; harness `/tmp/opencode/router_ab.hip`) and `ling3_0.rocm_ops` contract pass (`RouterTopKRows` reports bit-identical, weights worst error 9.8e-8). Kernel micro (exclusive): 64.0→16.6 µs/call (−74%). The old cost was thread-0-only: `used×n_exp` + `groups_used×groups` dependent LDS scans ≈5100 ops ≈50 µs of single-thread latency chain. e2e exclusive ABBA (full recipe, `/tmp/opencode/gufo_bench_rrfull.log`): tg128 +8.2%, tg1024 +7.6% (29.24→31.47), pp +2.0…+3.4% (`RouterTopKRows` shares the kernel). |
+| vec4 Q8_0 dense GEMV ported from gemma4 (`GemvQ8_0Vec4`, gated `cols % 128 == 0` in `Gemv()`) | Retained (working tree): quality-contract not bit-identity; `ling3_0_rocm_gemv_test` GemvQ8_0 worst error 2.3e-5 (tol 2e-3, `kCols=2560` exercises the vec4 path). Kernel micro (exclusive, 5000-launch, `/tmp/opencode/gufo_bench_v4micro.log`): −30% on all five dense shapes (2560×2560 15.76→10.98 µs, 6144×2560 34.06→21.72). e2e exclusive: short tg256 ABBA inconclusive (+0.6%, overlapping); dedicated tg1024 BAAB ×3 (+1.0%, separated, `gufo_bench_v4tg1k`); matched full-recipe BAAB (`gufo_bench_v4full`) tg128 +2.9%, tg1024 +3.2%, both fully separated, pp cells within noise (pp16384 noisy). Realized gain ≪ the 5.5 ms/token Q8_0 share × 30%, so decode wall time now sits in the MoE/other-quant tiers and launch gaps, not Q8_0 bytes. |
 | Wide Q4_K grouped walk: one `uint32` weight load per lane per super-block (128 B/warp/instr, scale pair unpacked once, `Q4ScaleMin` ×2 instead of ×8 per lane) | Rejected after the `packed >> (4*i)` → `>> (8*i)` nibble bug was fixed (one-hot element-map probe `/tmp/opencode/gq4map`: all 256 elements map to the scalar-rule byte/nibble; wide-vs-scalar maxdiff 1.2–2.4e-4 in `/tmp/opencode/gq4w`): exclusive micro is *slower* — 768×2560 47.3→49.8 µs/call (+5.3%), 2560×768 53.9→55.2 (+2.5%). The scalar `qs[lane]` walk is already a fully-coalesced 32 B/warp/instr stream at ~70–78% of the 240.7 GB/s read peak and the wide x-loads (two 32-element windows per lane, 8×4 B instead of 2×16 B vector gathers) forfeit more than the weight-load count saves; kernel reverted to the shipped walk. |
 
 | Decode-only profile (`tools/prof/prof.py run --stages=`, pp8/tg256 `--speculative mtp`, exclusive) | Measurement only. Decode is ≥94% GPU-busy; top kernels GemvGroupedQ4K 24.0%, GemvQ6K 8.2%, KdaDeltaKernel 6.3%, MlaDecodePartialGroup 4.1% (119 µs/call). **`__amd_rocclr_copyBuffer` 2.3% at 94582 calls × 1.63 µs ≈ 92 D2D copies per decode forward** — the MLA append cluster (per MLA site: 2 cache-row copies + 32 per-head 256 B q-tail copies). |
@@ -75,7 +75,7 @@ depth (`tools/bench/ling3_mla_prefill_bench.hip`, tok=2048 start=14336):
 windows (control = HEAD `0554f35f` without the change, alternating reps):
 pp2048 +3.0%, pp4096 +5.0%, pp8192 +8.4%, pp16384 +10.9% (grid refreshed
 in `BENCHMARKS.md`; 16K gap to llama ROCm −20.7% → −12.0%); gates
-`ling3_flash.rocm_attention/forward/inference/quality` pass (the
+`ling3_0.rocm_attention/forward/inference/quality` pass (the
 `rocm_mtp_accept` failure reproduces identically on the control binary —
 pre-existing at HEAD, tracked under STATUS 5.6). The same probe pins QK
 dots + softmax at ≈61% of kernel time (PV-only bound 2.57×) and a
@@ -92,7 +92,7 @@ WMMA hi/lo MLA score kernel — REJECTED (October 15,
 built end-to-end (hi/lo fp16 slab pack on the append path,
 `MlaPrefillWmmaKernel` — 8-wave blocks, 32 queries × 512 dims,
 16-key tiles, online softmax, `p == 0` PV skip) and passed the
-numerics gates (`ling3_flash.rocm_attention` 5e-4 contract on the
+numerics gates (`ling3_0.rocm_attention` 5e-4 contract on the
 full Q4_K_M artifact). The standalone `wmma2` bench win
 (1.66×/1.77× vs shipped fused) was a synthetic-data artifact: at
 ×24-scaled random activations the online softmax flushes almost every
@@ -200,7 +200,7 @@ quantized launches — `<<<(rows+3)/4, 128>>>` with row `blockIdx.x*4 +
 warp` and a wave-local lane — so each row's strided dot and `__shfl_down`
 reduction chain run unchanged and results are bit-identical (the
 `rocm_gemv` failure set is exactly the parked `GemvRowsQ8` baseline with
-`GemvRowsF32 bit-exact yes`; the full `ling3_flash` suite shows only the
+`GemvRowsF32 bit-exact yes`; the full `ling3_0` suite shows only the
 two known parked fails, `gufo_bench_gemv54`/`gufo_bench_suite54`). The
 matched BAAB pair, twice, exclusive (control = the 5.2a build,
 `gufo_bench_ba54.log`): tg128 d0 33.71/33.83 → 33.80/34.10 (+0.5 %),
@@ -224,7 +224,7 @@ the old `<1>` walk). Each row keeps the exact super-block/j accumulation
 chain — the x values are loaded once and shared, the two rows only
 interleave their independent weight-stream decodes — so every output is
 bit-identical to the single-pair launch: the gemv test's grouped worst
-errors match the previous run byte-for-byte and the full `ling3_flash`
+errors match the previous run byte-for-byte and the full `ling3_0`
 suite fails only the two known parked tests
 (`gufo_bench_suite54b`). Matched BAAB pair, twice, exclusive (control =
 the 5.2a build, cumulative with 5.4a, `gufo_bench_ba54b.log`): tg128 d0
@@ -289,7 +289,7 @@ tier (the kF16 dequant is a word `bit_cast` of the kBF16 fetch path), and
 decode keeps its scalar chain via new `GemvF16`/`EmbedRowF16` kernels on
 half rows, halving the per-token router footprints too. The new WMMA
 instantiations land at 95–103 VGPR with 0 spill (`--compare` vs the 5.4b
-control: no kernel worse); the exclusive `ling3_flash` suite shows only
+control: no kernel worse); the exclusive `ling3_0` suite shows only
 the two known parked fails and `rocm_forward`/`rocm_inference`/
 `rocm_quality` pass — no expert-selection flips. Matched BAAB pair,
 twice, exclusive (control = the 5.4b build, `gufo_bench_ba53a.log`):

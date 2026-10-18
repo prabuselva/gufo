@@ -15,7 +15,7 @@
 //                 layer where Add consumes it.
 //   C gu+shared : additionally split routed gate || up, main joins per layer
 //                 where down consumes both.
-#include "src/models/ling3_flash/kernels/rocm/gemv.hip.cpp"
+#include "src/models/ling3_0/kernels/rocm/gemv.hip.cpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -33,7 +33,7 @@
 
 namespace {
 
-using namespace gufo::models::ling3_flash::rocm;
+using namespace gufo::models::ling3_0::rocm;
 
 constexpr std::uint32_t kHidden = 2560;
 constexpr std::uint32_t kFf = 768;      // expert_ff and shared_expert_ff
