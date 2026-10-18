@@ -1739,6 +1739,15 @@ bool ValidToolName(std::string_view name) {
   });
 }
 
+// Hold a possible closing delimiter until its next byte disambiguates it.
+std::string_view BeforePartialDelimiter(std::string_view value,
+                                        std::string_view delimiter) {
+  for (auto size = std::min(value.size(), delimiter.size()); size > 0; --size)
+    if (delimiter.starts_with(value.substr(value.size() - size)))
+      return value.substr(0, value.size() - size);
+  return value;
+}
+
 // Ling 3.0 Flash names its call directly after the opener and frames each
 // argument as `<arg_key>key</arg_key><arg_value>value</arg_value>`, closed
 // by `</tool_call>`. The structure mirrors ParseQwenCalls: declared names,
