@@ -135,6 +135,13 @@ struct ScheduledRequest {
   std::size_t prefix_position{0};
   bool prefix_considered{false};
   std::optional<TextGenerationScheduler::Clock::time_point> prefix_wait_start;
+  // Admission also waits, once and bounded, for a disk job writing a much
+  // deeper prefix of the prompt (a conversation larger than the RAM budget).
+  std::optional<TextGenerationScheduler::Clock::time_point>
+      publication_wait_start;
+  bool publication_waiting{false};
+  TextPendingPublication publication;
+  detail::PublicationWaitEstimate::Milliseconds publication_wait_limit{};
   // The held `/slots` session while counted_processing is set. Only the
   // scheduler worker changes it.
   std::size_t session{kNoSession};
@@ -158,6 +165,38 @@ struct PendingClient {
   std::string client_id;
   std::deque<std::shared_ptr<ScheduledRequest>> requests;
 };
+
+void LogPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
+                        std::string_view stage, std::string_view release = {}) {
+  if (!Logger::Enabled(LogLevel::kInfo))
+    return;
+  std::ostringstream line;
+  line << "event=publication_wait request=" << request->id << " stage=" << stage
+       << " checkpoint_id=" << request->publication.checkpoint_id
+       << " pending_tokens=" << request->publication.pending_tokens
+       << " available_tokens=" << request->publication.available_tokens
+       << " limit_ms=" << request->publication_wait_limit.count();
+  if (request->publication_wait_start)
+    line << " wait_ms="
+         << std::chrono::duration<double, std::milli>(
+                TextGenerationScheduler::Clock::now() -
+                *request->publication_wait_start)
+                .count();
+  if (!release.empty())
+    line << " release=" << release;
+  Logger::Info("cache", line.str());
+}
+
+void EndPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
+                        std::string_view reason) noexcept {
+  if (!std::exchange(request->publication_waiting, false))
+    return;
+  try {
+    LogPublicationWait(request, "release", reason);
+  } catch (...) {
+    // Observability cannot prevent cancellation or failure completion.
+  }
+}
 
 bool IsTerminal(const std::shared_ptr<ScheduledRequest>& request) noexcept {
   return request->phase.load(std::memory_order_acquire) ==
@@ -389,6 +428,8 @@ void WriteGenerationTrace(GenerationTrace trace,
                           const TextGenerationScheduler::Result& result,
                           const std::exception_ptr& failure) {
   auto& record = trace.record;
+  if (result.component_cache)
+    record["component_cache"] = ComponentCacheJson(*result.component_cache);
   record["prompt_tokens"] = result.prompt_tokens;
   record["cache"] = result.cache_disk_hit ? "disk"
                     : result.cache_hit    ? "memory"
@@ -702,6 +743,7 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteCancelled(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    EndPublicationWait(request, "cancelled");
     if (device_lost.load(std::memory_order_acquire)) {
       CompleteFailure(request, device_lost_failure);
       return;
@@ -709,6 +751,7 @@ struct TextGenerationScheduler::Impl {
     try {
       if (request->runner_request) {
         const auto retained = request->runner_request.Cancel();
+        request->result.component_cache = retained.component_cache;
         request->result.cache_snapshot_bytes = retained.snapshot_bytes;
         request->result.cache_snapshot_ms = retained.snapshot_ms;
         request->result.cache_disk_queued_bytes = retained.disk_queued_bytes;
@@ -727,6 +770,7 @@ struct TextGenerationScheduler::Impl {
   void CompleteFailure(const std::shared_ptr<ScheduledRequest>& request,
                        std::exception_ptr failure,
                        bool classified = false) noexcept {
+    EndPublicationWait(request, "failed");
     if (IsTerminal(request))
       return;
     if (!classified)
@@ -831,6 +875,7 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteDeadline(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    EndPublicationWait(request, "deadline");
     CompleteFailure(request, std::make_exception_ptr(TextGenerationError(
                                  TextGenerationErrorCode::kDeadlineExceeded,
                                  "text generation request deadline exceeded")));
@@ -877,6 +922,7 @@ struct TextGenerationScheduler::Impl {
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
             : request->runner_request.Commit();
+    request->result.component_cache = cache_commit.component_cache;
     request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
     request->result.cache_disk_queued_bytes = cache_commit.disk_queued_bytes;
@@ -1021,15 +1067,48 @@ struct TextGenerationScheduler::Impl {
         }
         request->prefix_leader.reset();
       }
+      if (request->publication_waiting) {
+        const auto pending = runner_pool->PendingPublication(
+            request->prompt, request->prompt_context.get(),
+            request->publication.checkpoint_id);
+        if (!pending) {
+          // Published, failed or superseded: the matching job is no longer
+          // pending. Its completion log carries this same checkpoint ID.
+          EndPublicationWait(request, "not_pending");
+        } else {
+          request->publication = *pending;
+          if (pending->Gain() <= TextPendingPublication::kMinimumGainTokens) {
+            EndPublicationWait(request, "available");
+          } else if (const auto limit =
+                         publication_prefill.Limit(pending->Gain())) {
+            // Better usable cache or faster recent prefill may shorten the
+            // original deadline. Neither slower samples nor a new disk job
+            // may extend it or restart this request's one publication wait.
+            request->publication_wait_limit =
+                std::min(request->publication_wait_limit, *limit);
+            if (Clock::now() - *request->publication_wait_start >=
+                request->publication_wait_limit)
+              EndPublicationWait(
+                  request, request->publication_wait_limit ==
+                                   detail::PublicationWaitEstimate::kMaximumWait
+                               ? "cap"
+                               : "cost_bound");
+          } else {
+            EndPublicationWait(request, "no_estimate");
+          }
+        }
+      }
       ++it;
     }
   }
 
   [[nodiscard]] static std::shared_ptr<ScheduledRequest> PopReleased(
       std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
-    const auto released = std::ranges::find_if(
-        waiting,
-        [](const auto& request) { return request->prefix_leader == nullptr; });
+    const auto released =
+        std::ranges::find_if(waiting, [](const auto& request) {
+          return request->prefix_leader == nullptr &&
+                 !request->publication_waiting;
+        });
     if (released == waiting.end())
       return {};
     auto request = std::move(*released);
@@ -1071,6 +1150,21 @@ struct TextGenerationScheduler::Impl {
           waiting.push_back(std::move(request));
           continue;
         }
+        if (request->cache_prompt && !request->publication_wait_start) {
+          if (const auto pending = runner_pool->PendingPublication(
+                  request->prompt, request->prompt_context.get())) {
+            request->publication = *pending;
+            if (const auto limit = publication_prefill.Limit(pending->Gain())) {
+              request->publication_wait_limit = *limit;
+              request->publication_wait_start = Clock::now();
+              request->publication_waiting = true;
+              LogPublicationWait(request, "start");
+              waiting.push_back(std::move(request));
+              continue;
+            }
+            LogPublicationWait(request, "skip", "no_estimate");
+          }
+        }
 
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
@@ -1090,6 +1184,8 @@ struct TextGenerationScheduler::Impl {
           continue;
         }
 
+        request->result.component_cache =
+            request->runner_request.component_cache_metrics();
         request->result.cache_hit = request->runner_request.cache_hit();
         const auto lookup = request->runner_request.cache_lookup();
         request->result.cache_miss_reason = lookup.miss_reason;
@@ -1170,6 +1266,8 @@ struct TextGenerationScheduler::Impl {
               .count();
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
+      if (!decoder_runnable && !peer_waiting)
+        publication_prefill.Observe(step.consumed_tokens, step_ms);
       request->live_prefill_tokens.store(request->result.prefill_tokens,
                                          std::memory_order_relaxed);
       detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
@@ -1356,6 +1454,8 @@ struct TextGenerationScheduler::Impl {
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      request->result.lookup_tokens += step.lookup_tokens;
+      request->result.lookup_accepted_tokens += step.lookup_accepted_tokens;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1660,6 +1760,9 @@ struct TextGenerationScheduler::Impl {
       item.request->result.draft_rounds += step.draft_rounds;
       item.request->result.draft_tokens += step.draft_tokens;
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      item.request->result.lookup_tokens += step.lookup_tokens;
+      item.request->result.lookup_accepted_tokens +=
+          step.lookup_accepted_tokens;
 
       bool published = true;
       try {
@@ -1938,6 +2041,7 @@ struct TextGenerationScheduler::Impl {
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
+  detail::PublicationWaitEstimate publication_prefill;
   std::shared_ptr<OutputBudget> output_budget;
   std::shared_ptr<SessionTable> sessions;
   bool incremental_prefill_supported{false};

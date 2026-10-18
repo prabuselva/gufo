@@ -183,17 +183,29 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-Disk staging and temporary disk-save buffers are separate from this RAM budget.
+On Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
+`max_bytes` excludes it. Other models' disk staging and temporary disk-save
+buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
-Payloads are allocated only when captured. Under pressure, optional copies
-give way before another conversation's last useful checkpoint.
+Qwen3.8-Flash-Next pins pages for up to about 89% of its budget as captures
+need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
+it grows. The first step runs at startup and later ones on a background thread
+ahead of need. Each takes about 200 ms while the host has free pages and longer
+when the kernel must reclaim page cache. Segments use ordinary pages that are
+registered with HIP: `hipHostMalloc` asks for high-order pages, and compacting
+host memory for them stalled decode for seconds when most RAM belonged to the GPU.
+Growth stops early while the host would keep less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
+tails and idle-session spill; there is no separate spill option.
+Other models allocate payloads only when captured. Under pressure, optional
+copies give way before another conversation's last useful checkpoint.
 
 Prompt reuse is enabled by default; how the cache finds, retains and
 evicts that state is described in [the KV cache](KV-CACHE.md).
 `cache_prompt: false` on
-`/v1/chat/completions` or `/v1/responses` bypasses memory and disk lookup for
-that request; the result can still populate the cache. DeepSeek and Qwen tool
+`/v1/chat/completions`, `/v1/responses`, `/v1/completions` or `/completion`
+bypasses memory and disk lookup for that request; the result can still
+populate the cache. `null` keeps the default, `true`. DeepSeek and Qwen tool
 requests retain a checkpoint before the assistant-generation suffix, including
 when a client drops the interrupted assistant and appends `"."` after a tool result. DeepSeek
 also accounts for tokenization changes where adjacent user/tool turns join.
@@ -215,20 +227,47 @@ With `preserve_thinking=false`, a new user turn removes reasoning from the
 preceding tool cycle. Gufo retains the state before that cycle and processes
 its changed suffix again.
 
+A loaded Qwen vision sidecar is prepared while the model loads, before the RAM
+cache is sized and before readiness: Gufo hashes the complete sidecar for image
+cache identities and uploads the encoder weights, so neither happens in the
+first image request and admission's free device memory already excludes them.
+The weights stay resident even if no image arrives, including a sidecar
+auto-discovered as `mmproj-BF16.gguf` in the model's directory or its parent.
+The startup line `event=vision_prepared` reports `resident_bytes`,
+`identity_ms` and `upload_ms`. Startup fails if the upload does not fit. Image
+encoding scratch is still allocated per image.
+
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
-`--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
-of available host RAM after model/session loading (including cgroup limits) and
-the disk budget. This bounds queued captures/writes and each disk read
-separately; it allocates nothing upfront. Live model state and retained RAM
-snapshots have separate budgets.
 
+On Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
+including temporary files of unfinished writes and files a crash left
+unreferenced. Restarting with a lower budget removes those first, then the
+oldest checkpoints by creation order, until the directory fits; use history does not
+survive a restart. One Flash-Next server owns the directory: a second one fails
+at startup, after loading its model but before committing its RAM budget, with
+an ownership error naming the directory. The lock does not wait: a restarted
+server fails if its predecessor is still draining disk writes when the new one
+finishes loading its model. Other models do not take this lock.
+The first start on a directory written by an earlier release removes its old
+checkpoint files (`*.kvc`), and the cache refills as conversations run. Do not
+share a directory between Flash-Next and other models; Flash-Next removes
+their checkpoint and temporary files too, including writes in progress.
+Flash-Next ignores `--cache-disk-staging-bytes` and logs
+`event=option_ignored`. Writes and restores stream each checkpoint through an
+internal 1 MiB pinned buffer, piece by piece; a larger buffer did not change
+restore or write speed and took pinned RAM and device heap from the cache and
+the sessions. Remove the option from Flash-Next command lines.
+
+For the other models, `--cache-disk-staging-bytes 0` (the default) selects the
+smaller of one eighth of available host RAM after model/session loading
+(including cgroup limits) and the disk budget. This bounds queued
+captures/writes and each disk read separately; it allocates nothing upfront.
+Live model state and retained RAM snapshots have separate budgets.
 Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
 files that exceed the current staging limit are preserved subject to disk LRU
 eviction and can be reused after restarting with sufficient staging.
-For Flash-Next/MTP at full 262K context, explicitly set
-`--cache-disk-staging-bytes 8589934592` (8 GiB) if RAM permits.
 Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
 use the required size reported in the skip log.
 
@@ -772,7 +811,8 @@ keys last. Impossible strict schemas are rejected before generation.
 call, with the same argument syntax as `auto`. Where
 the backend cannot constrain sampling, an unmet `required` choice still returns
 `tool_choice_unsatisfied` (HTTP 502, or an SSE error after streaming starts).
-Stops and token limits terminate normally without emitting incomplete calls.
+Stops and token limits terminate normally. Responses streams may retain a partial
+call with `status: "incomplete"`; clients must execute only completed calls.
 With no tools or `tool_choice:"none"`, tool markers are ordinary text and do
 not interrupt reasoning or delay streaming.
 
@@ -822,8 +862,12 @@ Supported: objects, arrays, nullable types, `enum`/`const`, `anyOf`, recursive l
 array length bounds. Formats include date/time, duration, email, hostname,
 IP addresses and UUID.
 
-The root must resolve to an object. Objects require `additionalProperties:false`;
-strict schemas require every property (use null for optional values).
+The root must resolve to an object. As in llama.cpp, an object that declares
+`properties` admits no other keys unless `additionalProperties` is `true` or a
+schema for their values; extra keys then follow the declared properties. An
+object without `properties` admits any keys unless `additionalProperties` is
+`false`. Strict schemas require every property (use null for optional values).
+Tool parameter schemas keep their separate rules below.
 Unsupported keywords, external references and unusable cycles are rejected.
 Schemas are limited to 2 MiB, 5,000 properties, 1,000 enum values and 120,000
 characters in names and enum/const strings. Patterns use ECMA-262 Unicode
@@ -901,8 +945,10 @@ Authorization: Bearer <local-token>
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
-address with `--host`; it must be an IPv4 address. TLS termination belongs in
-a reverse proxy.
+address with `--host`; it must be a numeric IPv4 or IPv6 address, not a host
+name. `--host ::` is dual-stack: it accepts IPv6 clients and IPv4 clients, and
+an IPv4 client keeps its IPv4 address as its client ID. `--host ::1` accepts
+only IPv6 loopback clients. TLS termination belongs in a reverse proxy.
 
 Request bodies, prompts, generated text and credentials are not logged.
 
@@ -940,6 +986,14 @@ positions and speculative state participate in restoration and cache isolation.
 service is ready, then reports `status` and the active model. Both read the
 recorded device state without performing GPU work on each poll. HTTP model replacement and persistent Responses
 conversations are not implemented.
+
+While `gufo serve llm` loads its model and walks the disk cache tier, the port
+already answers every request, `/health` included, with 503
+`{"error":{"message":"Loading model","type":"unavailable_error","code":"loading"}}`
+and `Retry-After: 1`, as llama-server does. A refused connection therefore
+means the process is not running; supervisors such as llama-swap, which treat
+only a 200 health check as ready, keep waiting until the model is loaded. If
+the address cannot be bound early, the port stays closed until the load ends.
 
 A GPU reset (for example `amdgpu` recovering from a MES hang) permanently
 invalidates the process's HIP context. The text scheduler checks it after five
@@ -1038,7 +1092,9 @@ reads the result, it adds the request's cached prompt tokens
 speculative verification rounds (`llamacpp:spec_decode_num_drafts_total`),
 proposed and accepted draft tokens
 (`llamacpp:spec_decode_num_draft_tokens_total`,
-`llamacpp:spec_decode_num_accepted_tokens_total`), and raises
+`llamacpp:spec_decode_num_accepted_tokens_total`), proposed and accepted
+prompt-lookup copies (`gufo_spec_lookup_tokens_total`,
+`gufo_spec_lookup_accepted_tokens_total`), and raises
 `llamacpp:n_tokens_max` to its prompt plus generated tokens. A request counts
 even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
