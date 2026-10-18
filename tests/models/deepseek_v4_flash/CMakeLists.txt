@@ -51,6 +51,7 @@ if(ENGINE_ENABLE_HIP)
     serving_test.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp
@@ -60,7 +61,7 @@ if(ENGINE_ENABLE_HIP)
   target_link_libraries(ds4_serving_test PRIVATE gufo_logging
     gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next
     gufo_gemma4_engine gufo_ling3_0_engine gufo_qwen36_a3b_engine
-    hip::host)
+    gufo_cache_hip hip::host)
   add_test(NAME ds4.serving COMMAND ds4_serving_test)
   set_tests_properties(ds4.serving PROPERTIES
     LABELS "gpu;hip;ds4;server;external-model;slow"

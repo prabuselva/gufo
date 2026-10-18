@@ -5,11 +5,15 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "src/cache/slot.hpp"
+#include "src/models/qwen/chat_template.hpp"
+#include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace cache = gufo::cache;
@@ -50,7 +54,7 @@ void Wait(cache::Completion done) {
   Require(done.Wait() == cache::TransferResult::kSucceeded, "transfer failed");
 }
 Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
-                   gufo::hip::TransferPool& streams) {
+                   gufo::hip::TransferPool& streams, bool registered = false) {
   Checkpoint result{adapter.Positions(slot), {}};
   constexpr std::size_t piece = (1 << 20) + 13;
   for (const auto& component : adapter.Components()) {
@@ -58,6 +62,16 @@ Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
     auto& bytes = result.bytes.emplace_back(component.row_bytes
                                                 ? rows * component.row_bytes
                                                 : component.state_bytes);
+    void* mapped{};
+    if (registered && !bytes.empty())
+      Require(hipHostMalloc(&mapped, bytes.size(), hipHostMallocDefault) ==
+                  hipSuccess,
+              "registered capture allocation failed");
+    const std::unique_ptr<void, decltype(&hipHostFree)> mapping(mapped,
+                                                                hipHostFree);
+    const auto buffer =
+        mapped ? std::span(static_cast<std::byte*>(mapped), bytes.size())
+               : std::span(bytes);
     if (component.row_bytes) {
       for (cache::Rows first = 0; first < rows;) {
         const auto end = std::min(rows, first + 97);
@@ -65,8 +79,8 @@ Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
         Require(bool(stream), "stream exhausted");
         Wait(adapter.CopyRowsOut(
             slot, component.id, first, end,
-            std::span(bytes).subspan(first * component.row_bytes,
-                                     (end - first) * component.row_bytes),
+            buffer.subspan(first * component.row_bytes,
+                           (end - first) * component.row_bytes),
             *stream));
         first = end;
       }
@@ -75,18 +89,21 @@ Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
         const auto count = std::min(piece, bytes.size() - offset);
         auto stream = streams.TryAcquire();
         Require(bool(stream), "stream exhausted");
-        Wait(adapter.CapturePrivatePiece(
-            slot, component.id, offset, std::span(bytes).subspan(offset, count),
-            *stream));
+        Wait(adapter.CapturePrivatePiece(slot, component.id, offset,
+                                         buffer.subspan(offset, count),
+                                         *stream));
         offset += count;
       }
     }
+    if (mapped)
+      std::memcpy(bytes.data(), mapped, bytes.size());
   }
   return result;
 }
 void Load(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
           const Checkpoint& checkpoint, gufo::hip::TransferPool& streams,
-          bool omit_last = false) {
+          bool omit_last = false,
+          const std::vector<cache::RowPin>* native_rows = nullptr) {
   adapter.BeginRestore(slot, checkpoint.positions);
   Require(!slot.IsValid(), "BeginRestore exposed executable state");
   Reject([&] { (void)adapter.GetSession(slot); });
@@ -110,7 +127,9 @@ void Load(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
   };
   for (std::size_t i = adapter.Components().size(); i-- > 0;) {
     const auto& component = adapter.Components()[i];
-    const auto& bytes = checkpoint.bytes[i];
+    const auto bytes = native_rows && !(*native_rows)[i].Bytes().empty()
+                           ? (*native_rows)[i].Bytes()
+                           : std::span<const std::byte>(checkpoint.bytes[i]);
     if (component.row_bytes) {
       const auto rows = checkpoint.positions[i].valid_rows;
       for (cache::Rows end = rows; end;) {
@@ -209,6 +228,144 @@ void SameLogits(const qfn::Session& a, const qfn::Session& b) {
                           a.Logits().size_bytes()) == 0,
           "restored next-step logits differ");
 }
+void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
+  const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive;
+  qfn::ContinuationAdapter adapter(model, mode, 4096,
+                                   {'r', 'e', 'u', 's', 'e'});
+  Guard guard;
+  auto slot = adapter.CreateSlot(guard);
+  auto& reused = adapter.GetSession(*slot);
+  std::string error;
+  auto fresh = model->CreateSession(mode, 4096, &error);
+  Require(bool(fresh), error);
+  const auto empty_bytes = reused.AllocatedBytes();
+  const auto first = model->Tokenize("Continue: red, blue, red, blue,");
+  const auto next = model->Tokenize(
+      "Write a Python function that retries a failed request three times.");
+  Require(reused.Sync(first, &error), error);
+  (void)Decode(reused, 48);
+  for (const bool sampled : {false, true}) {
+    const auto warm_bytes = reused.AllocatedBytes();
+    Require(warm_bytes <= model->SessionBytes(mode, 4096),
+            "slot scratch exceeded its admission bound");
+    if (mtp)
+      Require(warm_bytes > empty_bytes && reused.Statistics().drafted > 0,
+              "slot reuse did not exercise MTP rollback");
+    Require(adapter.Invalidate(*slot), "slot reassignment failed");
+    Require(reused.Position() == 0 && reused.Tokens().empty(),
+            "slot reassignment retained logical state");
+    Require(reused.AllocatedBytes() == warm_bytes,
+            "slot reassignment discarded reusable rollback");
+    fresh->Reset();
+    Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
+    SameLogits(reused, *fresh);
+    const auto reused_before = reused.Statistics();
+    const auto fresh_before = fresh->Statistics();
+    Require(Decode(reused, 48, sampled) == Decode(*fresh, 48, sampled),
+            "retained slot scratch changed continuation tokens");
+    SameLogits(reused, *fresh);
+    Require(reused.Statistics().drafted - reused_before.drafted ==
+                    fresh->Statistics().drafted - fresh_before.drafted &&
+                reused.Statistics().accepted - reused_before.accepted ==
+                    fresh->Statistics().accepted - fresh_before.accepted,
+            "retained slot scratch changed draft acceptance");
+  }
+  reused.SetCancellationCheck([] { return true; });
+  Require(!reused.Evaluate(first.front(), &error) && !reused.IsValid(),
+          "cancelled slot remained valid");
+  reused.SetCancellationCheck({});
+  Require(adapter.Invalidate(*slot) && reused.AllocatedBytes() == empty_bytes,
+          "failed slot retained rollback scratch");
+  Require(reused.Sync(next, &error), error);
+  (void)Decode(reused, 16);
+  reused.Reset();
+  Require(reused.AllocatedBytes() == empty_bytes,
+          "explicit reset retained rollback scratch");
+  std::cout << (mtp ? "MTP" : "AR")
+            << ",slot_reuse,sampled/greedy/cancellation/reset,PASS\n";
+}
+void CheckInPass(const std::shared_ptr<qfn::Model>& model, bool mtp,
+                 std::span<const std::int32_t> prompt) {
+  gufo::hip::TransferPool streams(2);
+  qfn::ContinuationAdapter adapter(
+      model,
+      mtp ? gufo::core::SessionMode::kSpeculative
+          : gufo::core::SessionMode::kAutoregressive,
+      16384, {'i', 'n', 'p', 'a', 's', 's'});
+  Guard source_guard, reference_guard;
+  auto source = adapter.CreateSlot(source_guard);
+  auto reference = adapter.CreateSlot(reference_guard);
+  auto& a = adapter.GetSession(*source);
+  auto& b = adapter.GetSession(*reference);
+  std::string error;
+  for (const auto boundary : {2047U, 8192U, 8203U}) {
+    const auto predicted =
+        adapter.PrefillCheckpointPositions(*source, boundary);
+    Checkpoint frozen;
+    bool called = false;
+    adapter.PrefillThrough(*source, prompt.first(boundary + 5), boundary, [&] {
+      called = true;
+      Require(adapter.Positions(*source) == predicted,
+              "in-pass positions differ from admission prediction");
+      Reject([&] { (void)adapter.GetSession(*source); });
+      Reject([&] { (void)a.Sync(prompt.first(boundary + 5), &error); });
+      Reject([&] { a.Reset(); });
+      Require(!adapter.Invalidate(*source),
+              "in-pass consumer invalidated its capture frontier");
+      frozen = Capture(adapter, *source, streams);
+    });
+    Require(called && a.Position() == boundary + 5,
+            "in-pass capture changed the completed live frontier");
+    std::unique_ptr<qfn::SessionSnapshot> native;
+    Require(
+        b.SyncThrough(prompt.first(boundary + 5), boundary, &native, &error),
+        error);
+    SameLogits(a, b);
+    Require(b.RestoreSnapshot(*native, &error), error);
+    const auto independent = Capture(adapter, *reference, streams);
+    Require(frozen.positions == independent.positions &&
+                frozen.bytes == independent.bytes,
+            "component in-pass bytes differ from native boundary restore");
+    Load(adapter, *source, frozen, streams);
+    Require(adapter.Validate(*source, frozen.positions),
+            "component in-pass restore rejected");
+    SameLogits(a, b);
+    Require(Decode(a, 24, mtp) == Decode(b, 24, mtp),
+            "in-pass sampled continuation differs");
+    SameLogits(a, b);
+    if (mtp)
+      Require(a.Statistics().drafted > 0, "in-pass MTP ran no drafts");
+    Require(adapter.Invalidate(*source) && adapter.Invalidate(*reference),
+            "in-pass reset failed");
+  }
+  const auto component =
+      std::ranges::find_if(adapter.Components(), [](const auto& c) {
+        return c.kind == cache::ComponentKind::kPrivateState;
+      });
+  Require(component != adapter.Components().end(), "missing private component");
+  for (const bool throw_consumer : {false, true}) {
+    auto stream = streams.TryAcquire();
+    Require(bool(stream), "in-pass failure stream exhausted");
+    std::vector<std::byte> bytes(
+        std::min<std::size_t>(64, component->state_bytes));
+    std::optional<cache::Completion> pending;
+    Reject([&] {
+      adapter.PrefillThrough(*source, prompt.first(2052), 2047, [&] {
+        pending.emplace(adapter.CapturePrivatePiece(*source, component->id, 0,
+                                                    bytes, *stream));
+        if (throw_consumer)
+          throw std::runtime_error("rejected in-pass consumer");
+      });
+    });
+    Require(pending && pending->Ready() &&
+                pending->Wait() == cache::TransferResult::kSucceeded,
+            "failed in-pass consumer left a transfer reading retired scratch");
+    Require(adapter.Invalidate(*source),
+            "failed in-pass transfer did not drain");
+  }
+  std::cout << (mtp ? "MTP" : "AR") << ",in_pass,PASS\n";
+}
 void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
                                    bool mtp,
                                    std::span<const std::int32_t> prompt) {
@@ -218,7 +375,7 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
       model,
       mtp ? gufo::core::SessionMode::kSpeculative
           : gufo::core::SessionMode::kAutoregressive,
-      64, {'l', 'i', 'f', 'e'});
+      16384, {'l', 'i', 'f', 'e'});
   gufo::hip::TransferPool streams(2);
   Guard source_guard, destination_guard;
   auto source = adapter.CreateSlot(source_guard);
@@ -253,7 +410,7 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
   // The real slot guard leases a new independent transfer for every piece.
   // The idle worker is kept dormant so each foreground mutation is the oracle.
   for (const int path : {0, 1, 2, 3, 4}) {
-    cache::ResourceLedger ledger({8 << 20, 8 << 20, 8 << 20, 8 << 20});
+    cache::ResourceLedger ledger({1 << 30, 1 << 30, 1 << 30, 1 << 30});
     IncompatibleStream unused;
     cache::LeasedSlot leased(
         ledger, adapter, unused, {1},
@@ -266,7 +423,8 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
     auto lease = leased.Acquire();
     auto& session = adapter.GetSession(lease.Execution());
     std::string error;
-    Require(session.Sync(prompt.first(17), &error), error);
+    const auto depth = path == 0 ? 2047u : path == 1 ? 8203u : 17u;
+    Require(session.Sync(prompt.first(depth), &error), error);
     const auto positions = adapter.Positions(lease.Execution());
     auto legacy = session.SaveSnapshot(&error);
     Require(bool(legacy), error);
@@ -289,8 +447,32 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
       auto assigned =
           charge.ReserveBacking(cache::ResourceCategory::kBackingAssigned);
       charges.push_back(charge);
-      borrowed.push_back(lease.Borrow(component.id, 0, rows,
-                                      std::move(assigned), backing, *backing));
+      borrowed.push_back(lease.Borrow(
+          component.id, 0, rows, std::move(assigned), backing, *backing,
+          adapter.BorrowRowsView(lease.Execution(), component.id, 0, rows)));
+    }
+    {
+      const auto saved = Capture(adapter, lease.Execution(), streams);
+      std::vector<cache::RowPin> pins(adapter.Components().size());
+      std::size_t next = 0;
+      for (const auto& component : adapter.Components()) {
+        const auto rows = positions[component.id.value - 1].valid_rows;
+        if (component.row_bytes && rows)
+          pins[component.id.value - 1] = borrowed[next++]->Pin();
+      }
+      Guard destination_guard;
+      auto destination = adapter.CreateSlot(destination_guard);
+      Load(adapter, *destination, saved, streams, false, &pins);
+      Require(adapter.Validate(*destination, saved.positions),
+              "pinned native rows did not validate");
+      Require(Capture(adapter, *destination, streams).bytes == saved.bytes,
+              "pinned native rows changed the restored checkpoint");
+      Require(std::ranges::any_of(pins,
+                                  [](const auto& pin) {
+                                    return pin.Location() &&
+                                           !pin.Bytes().empty();
+                                  }),
+              "native borrowed restore did not read a live device range");
     }
     if (path == 0)
       session.Reset();
@@ -411,8 +593,11 @@ void Check(const std::shared_ptr<qfn::Model>& model, bool mtp,
     std::cout << (mtp ? "MTP" : "AR") << ",boundary," << boundary << std::endl;
     Require(a.Sync(prompt.first(boundary), &error), error);
     const auto checkpoint = Capture(adapter, *source, streams);
+    const auto registered = Capture(adapter, *source, streams, true);
+    Require(registered.bytes == checkpoint.bytes,
+            "registered capture differs from pageable HIP capture");
     source_guard.Borrow(checkpoint);
-    Load(adapter, *destination, checkpoint, streams);
+    Load(adapter, *destination, registered, streams);
     Require(adapter.Validate(*destination, checkpoint.positions),
             "complete restore rejected");
     Require(Capture(adapter, *destination, streams).bytes == checkpoint.bytes,
@@ -677,17 +862,64 @@ void CheckImages(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   }
   std::cout << (mtp ? "MTP" : "AR") << ",image_restore,PASS\n";
 }
+void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
+  namespace qt = gufo::tokenization;
+  gufo::hip::TransferPool streams(2);
+  qfn::ContinuationAdapter adapter(model, gufo::core::SessionMode::kSpeculative,
+                                   4096, {'p', 'o', 'l', 'i', 'c', 'y'});
+  Guard source_guard, destination_guard;
+  auto source = adapter.CreateSlot(source_guard);
+  auto destination = adapter.CreateSlot(destination_guard);
+  auto& live = adapter.GetSession(*source);
+  auto& restored = adapter.GetSession(*destination);
+  const std::array messages{
+      qt::ChatMessage{qt::ChatRole::kUser,
+                      "Write a Python LRU cache implementation with get, "
+                      "put, eviction and tests. Explain the edge cases."}};
+  std::string error;
+  const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+      model->tokenizer(), messages, {.enable_thinking = false}, &error);
+  Require(encoded.has_value(), error);
+  const std::vector<std::int32_t> prompt(encoded->begin(), encoded->end());
+  Require(live.Sync(prompt, &error) && restored.Sync(prompt, &error), error);
+  sampling::SamplerState sampler(
+      {.temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = 73},
+      std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+  auto stale_sampler = sampler;
+  (void)gufo::test::DecodeMtpReplay(restored, stale_sampler, 32);
+  (void)gufo::test::DecodeMtpReplay(live, sampler, 128);
+  const auto checkpoint = Capture(adapter, *source, streams);
+  Load(adapter, *destination, checkpoint, streams);
+  Require(adapter.Validate(*destination, checkpoint.positions),
+          "learned MTP policy checkpoint rejected");
+  SameLogits(live, restored);
+  auto replay_sampler = sampler;
+  Require(gufo::test::DecodeMtpReplay(live, sampler, 64) ==
+              gufo::test::DecodeMtpReplay(restored, replay_sampler, 64),
+          "component restore lost learned MTP acceptance history");
+  SameLogits(live, restored);
+  std::cout << "MTP,learned_draft_policy,PASS\n";
+}
 }  // namespace
 int main(int argc, char** argv) {
   const bool guard_only =
       argc == 6 && std::string_view(argv[5]) == "--guard-only";
   const bool image_only =
       argc == 6 && std::string_view(argv[5]) == "--image-only";
-  if ((argc != 5 && !guard_only && !image_only) ||
+  const bool in_pass_only =
+      argc == 6 && std::string_view(argv[5]) == "--in-pass-only";
+  const bool policy_only =
+      argc == 6 && std::string_view(argv[5]) == "--policy-only";
+  const bool reuse_only =
+      argc == 6 && std::string_view(argv[5]) == "--reuse-only";
+  if ((argc != 5 && !guard_only && !image_only && !in_pass_only &&
+       !policy_only && !reuse_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: continuation_adapter_test --model FIRST.gguf "
-                 "--mtp-model MTP.gguf [--guard-only|--image-only]\n";
+                 "--mtp-model MTP.gguf "
+                 "[--guard-only|--image-only|--in-pass-only|--policy-only|"
+                 "--reuse-only]\n";
     return 77;
   }
   try {
@@ -695,6 +927,15 @@ int main(int argc, char** argv) {
     auto model = qfn::Model::Load(
         argv[2], {.max_context = 16384, .mtp_model_path = argv[4]}, &error);
     Require(bool(model), error);
+    if (policy_only) {
+      CheckLearnedDraftPolicy(model);
+      return 0;
+    }
+    if (reuse_only) {
+      CheckSlotReuse(model, false);
+      CheckSlotReuse(model, true);
+      return 0;
+    }
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. Strix Halo executes this "
         "deterministic benchmark sequence. ");
@@ -702,15 +943,37 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> prompt(10000);
     for (std::size_t i = 0; i < prompt.size(); ++i)
       prompt[i] = pattern[i % pattern.size()];
-    if (!image_only) {
+    // The repeated prefix can accept every draft. End the
+    // sampled boundary with real code generation to exercise rejection and
+    // residual replay as well as the long recurrent/KV state.
+    namespace qt = gufo::tokenization;
+    const std::array messages{
+        qt::ChatMessage{qt::ChatRole::kUser,
+                        "Write a Python LRU cache implementation with get, "
+                        "put, eviction and tests. Explain the edge cases."}};
+    const auto sampled_tail = qt::QwenChatTemplate::RenderAndTokenize(
+        model->tokenizer(), messages, {.enable_thinking = false}, &error);
+    Require(sampled_tail && sampled_tail->size() < 8203, error);
+    std::copy(sampled_tail->begin(), sampled_tail->end(),
+              prompt.begin() + 8203 - sampled_tail->size());
+    if (!image_only && !in_pass_only) {
       CheckTransferAndGuardLifetime(model, false, prompt);
       CheckTransferAndGuardLifetime(model, true, prompt);
     }
     if (guard_only)
       return 0;
     if (!image_only) {
+      CheckInPass(model, false, prompt);
+      CheckInPass(model, true, prompt);
+    }
+    if (in_pass_only)
+      return 0;
+    if (!image_only) {
       Check(model, false, prompt);
       Check(model, true, prompt);
+      CheckLearnedDraftPolicy(model);
+      CheckSlotReuse(model, false);
+      CheckSlotReuse(model, true);
     }
     CheckImages(model, false);
     CheckImages(model, true);

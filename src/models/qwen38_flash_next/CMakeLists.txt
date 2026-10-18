@@ -42,7 +42,7 @@ if (ENGINE_ENABLE_HIP)
     HIP_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON)
   target_compile_definitions(gufo_qwen38_flash_next_mmq PRIVATE
-    GGML_HIP_NO_VMM)
+    GGML_HIP_NO_VMM ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_qwen38_flash_next_mmq PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
@@ -51,6 +51,7 @@ if (ENGINE_ENABLE_HIP)
   set(QFN_HIP_SOURCES
     continuation_adapter.cpp
     ${QFN_ROCM_DIR}/kernels.hip.cpp
+    ${QFN_ROCM_DIR}/snapshot_copy.hip
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
