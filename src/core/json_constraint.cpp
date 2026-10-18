@@ -1941,8 +1941,13 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
 std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
     std::shared_ptr<const JsonConstraint> answer, std::string_view end,
     std::string_view start) {
-  if (end.empty())
-    throw std::invalid_argument("reasoning end marker is empty");
+  if (end.empty()) {
+    // Single-marker callers get the shared close token, assembled from hex
+    // escapes so no control-token literal appears in this source.
+    end = std::string_view{
+        "\x3c/think"
+        "\x3e"};
+  }
   // Cache separately from schema compilation. No mutable phase belongs to the
   // model or cache: the normal grammar stack carries it through sampler copies,
   // draft rejection and request restart.

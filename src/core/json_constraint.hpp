@@ -52,8 +52,9 @@ public:
   static std::shared_ptr<const JsonConstraint> OpenToolParameters(
       ToolFormat format);
   /// Any text up to and including `end` (the model's reasoning close), then
-  /// `answer`. A nonempty `start` makes the reasoning optional: `answer`
-  /// directly, or `start` followed by the reasoning above.
+  /// `answer`. An empty `end` selects the shared close token. A nonempty
+  /// `start` makes the reasoning optional: `answer` directly, or `start`
+  /// followed by the reasoning above.
   static std::shared_ptr<const JsonConstraint> WithReasoning(
       std::shared_ptr<const JsonConstraint> answer, std::string_view end = "",
       std::string_view start = {});

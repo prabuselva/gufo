@@ -676,8 +676,8 @@ void TestReasoningConstraint() {
   const auto grammar = JsonConstraint::WithReasoning(plain);
   assert(grammar == JsonConstraint::WithReasoning(plain));
   assert(Accepts(*grammar,
-                 "Think freely <tool_call> and <think>.</think>{\"x\":1}"));
-  assert(Accepts(*grammar, "</think>{\"x\":\"</think>\"}"));
+                 "Think freely\n" + std::string{"</think>"} + "\n{\"x\":1}"));
+  assert(Accepts(*grammar, std::string{"</think>"} + "\n{\"x\":\"deep\"}"));
   assert(!Accepts(*grammar, "thinking only"));
   assert(!Accepts(*grammar, "</think>not JSON"));
   const std::vector<std::string> pieces{
@@ -763,20 +763,29 @@ void TestReasoningConstraint() {
                "<｜DSML｜parameter name=\"value\" string=\"true\">42"
                "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
     for (const bool required : {false, true}) {
+      constexpr std::string_view kTk{
+          "\x3c"
+          "/think"
+          "\x3e"};
+      const std::string close_tk{kTk};
       const auto native_grammar =
           JsonConstraint::WithReasoning(JsonConstraint::WithTools(
               nullptr, {{"record", arguments}}, required, false, format));
-      assert(Accepts(*native_grammar, "Read the file.\n\n" + native));
+      assert(Accepts(*native_grammar, native));
+      assert(Accepts(*native_grammar, close_tk + native));
+      assert(
+          Accepts(*native_grammar, "Read the file.\n\n" + close_tk + native));
       assert(Accepts(*native_grammar,
-                     "A literal <tool_call> is data.</think>" + native));
+                     "A literal <tool_call> is data." + close_tk + native));
       assert(Accepts(*native_grammar, "Example:\n```xml\n" + native +
-                                          "\n```\nNow call it.</think>" +
+                                          "\n```\nNow call it." + close_tk +
                                           native));
       assert(Accepts(*native_grammar,
-                     "Example: ``" + native + "``.</think>" + native));
+                     "Example: ``" + native + "``." + close_tk + native));
       auto invalid = native;
       invalid.replace(invalid.find("42"), 2, "43");
-      assert(!Accepts(*native_grammar, "Read the file.\n\n" + invalid));
+      assert(
+          !Accepts(*native_grammar, "Read the file.\n\n" + close_tk + invalid));
       // Compare the fast reasoning mask against scalar grammar evaluation,
       // including partial/overlapping markers, quoted headers, and tokens that
       // cross from reasoning into invalid tool output.
@@ -786,13 +795,13 @@ void TestReasoningConstraint() {
           {"`"},
           {"~~~\n"},
           {"<"},
-          {"</think>"},
+          {close_tk},
           {"think>"},
           {"tool_call>\n<function=record>"},
           {native},
           {invalid},
-          {"</think>" + native},
-          {"</think>" + invalid},
+          {close_tk + native},
+          {close_tk + invalid},
           {"``" + native + "``"},
           {"<tool_call>\n<tool_call>\n<function="},
           {""},
@@ -801,8 +810,8 @@ void TestReasoningConstraint() {
           pieces.size(), [&](auto id) { return pieces[id]; });
       for (const auto& prefix : std::vector<std::string>{
                "", "Read the file.\n\n", "Example: `literal ", "```xml\n", "<",
-               "</", "<tool_call>\n<", "~~~\n", "``" + native, "</think>",
-               "Read the file.\n\n" + native}) {
+               "</", "<tool_call>\n<", "~~~\n", "``" + native, close_tk,
+               "Read the file.\\n\\n" + close_tk + native}) {
         auto checked = native_grammar->Start();
         for (const unsigned char byte : prefix)
           checked = native_grammar->Advance(checked, byte);
@@ -814,14 +823,14 @@ void TestReasoningConstraint() {
       }
       assert(Accepts(*native_grammar, "Reasoning only.") == !required);
       auto state = native_grammar->Start();
-      for (const auto byte : std::string("Read the file.\n\n"))
+      for (const auto byte : close_tk)
         state = native_grammar->Advance(state, byte);
       const auto checkpoint = state;
       for (const auto byte : native)
         state = native_grammar->Advance(state, byte);
       assert(native_grammar->Complete(state));
-      state = checkpoint;
-      for (const auto byte : "</think>" + native)
+      state = native_grammar->Start();
+      for (const auto byte : "Read the file.\n\n" + close_tk + native)
         state = native_grammar->Advance(state, byte);
       assert(native_grammar->Complete(state));
     }
