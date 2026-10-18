@@ -93,6 +93,9 @@ add_subdirectory(src/models/qwen3_tts)
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
 add_subdirectory(src/models/qwen3_asr)
 
+# Ling 3.0 Flash (bailingmoe3) — hybrid KDA + absorbed-MLA + MoE engine.
+add_subdirectory(src/models/ling3_0)
+
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -226,15 +229,35 @@ if (ENGINE_ENABLE_HIP)
     roc::hipblaslt roc::rocblas)
 endif()
 
+if (ENGINE_ENABLE_HIP)
+  # Shared dense binary16 prefill GEMM: Q8_0 weights dequantized to F16 in
+  # LDS over F16 activations, with a tile-plan hook the models select per
+  # projection (src/core/hip/gemm/dense_f16_gemm.hpp).
+  add_library(gufo_core_hip_gemm STATIC EXCLUDE_FROM_ALL
+    src/core/hip/gemm/dense_f16_gemm.hip.cpp)
+  set_source_files_properties(src/core/hip/gemm/dense_f16_gemm.hip.cpp
+    PROPERTIES LANGUAGE HIP)
+  set_target_properties(gufo_core_hip_gemm PROPERTIES
+    HIP_STANDARD 17
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_core_hip_gemm PUBLIC ${PROJECT_SOURCE_DIR})
+  target_compile_options(gufo_core_hip_gemm PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+  target_link_libraries(gufo_core_hip_gemm PUBLIC hip::host)
+endif()
+
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp
   src/models/gemma4/cli_runner.cpp
+  src/models/ling3_0/cli_runner.cpp
   src/models/qwen36_a3b/cli_runner.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next gufo_qwen36_a3b_engine gufo_gemma4_engine)
+    gufo_qwen38_flash_next gufo_qwen36_a3b_engine gufo_gemma4_engine
+    gufo_ling3_0_engine)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -265,7 +288,8 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_gemma4 gufo_qwen3_tts
+  gufo_qwen3_asr gufo_qwen_image_21)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -282,6 +306,7 @@ add_executable(gufo
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
   src/models/gemma4/serve_runner.cpp
+  src/models/ling3_0/serve_runner.cpp
   src/models/qwen36_a3b/serve_runner.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
@@ -444,7 +469,8 @@ if (BUILD_TESTING)
     src/models/deepseek_v4_flash/chat_template.cpp
     src/models/deepseek_v4_flash/tool_calls.cpp
   )
-  target_link_libraries(openai_chat_test PRIVATE gufo_core)
+  # Gemma 4 native tool-call parsing lives in the model package.
+  target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_gemma4)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
@@ -509,6 +535,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/qwen38_flash_next)
   add_subdirectory(tests/models/qwen36_a3b)
   add_subdirectory(tests/models/gemma4)
+  add_subdirectory(tests/models/ling3_0)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test

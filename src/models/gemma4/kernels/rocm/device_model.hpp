@@ -38,11 +38,17 @@ struct DeviceTensor {
 
 /// The device-side mirror of one trunk layer. SWA layers carry `attn_v`;
 /// full-attention layers derive V from `attn_k` and leave it empty.
+/// When fusable (`attn_qkv` / `ffn_gate_up` non-empty) the per-tensor views
+/// point into the fused row-major buffer (q, k, v / gate, up column order)
+/// and only describe their own column slice; consumers take the fused row
+/// pitch from the fused tensor.
 struct DeviceLayer {
   bool swa{true};
   DeviceTensor attn_norm, attn_q, attn_k, attn_v, attn_q_norm, attn_k_norm,
       attn_output, post_attention_norm;
+  DeviceTensor attn_qkv;
   DeviceTensor ffn_norm, ffn_gate, ffn_up, ffn_down, post_ffw_norm;
+  DeviceTensor ffn_gate_up;
   DeviceTensor router, router_scale, pre_ffw_norm_2, post_ffw_norm_1,
       post_ffw_norm_2;
   DeviceTensor ffn_gate_up_exps, ffn_down_exps, ffn_down_exps_scale;

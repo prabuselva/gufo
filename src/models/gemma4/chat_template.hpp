@@ -45,6 +45,12 @@ struct ChatTool {
   std::string definition_json;
 };
 
+/// Thought channel framing emitted by the chat template: the thinking
+/// generation prompt leaves the turn open before `kThoughtStart`, and a
+/// tool-response prompt opens the channel directly after `model\n`.
+inline constexpr std::string_view kThoughtStart = "<|channel>thought\n";
+inline constexpr std::string_view kThoughtEnd = "<channel|>";
+
 struct ChatTemplateOptions {
   bool add_generation_prompt{true};
   bool enable_thinking{false};

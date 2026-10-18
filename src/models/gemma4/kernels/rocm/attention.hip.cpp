@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 
+#include "src/models/gemma4/kernels/rocm/attention_wmma.hpp"
+#include "src/models/gemma4/kernels/rocm/half_store.hpp"
+
 namespace gufo::models::gemma4::rocm {
 namespace {
 
@@ -16,6 +19,15 @@ __device__ __forceinline__ float WarpReduceSumF(float v) {
 __device__ __forceinline__ double WarpReduceSumD(double v) {
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     v += __shfl_down(v, offset);
+  }
+  return v;
+}
+
+// Butterfly tree: every lane ends with the full sum, so callers can use the
+// result directly instead of broadcasting lane 0 afterwards.
+__device__ __forceinline__ double WarpAllReduceSumD(double v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v += __shfl_xor(v, offset);
   }
   return v;
 }
@@ -78,16 +90,282 @@ __device__ __forceinline__ void RopeHead(float* buf, std::uint32_t head_dim,
 
 constexpr float kRmsEps = 1.0e-6F;
 
+// Warp-wide variants: one warp owns one token and loops its heads, so each
+// lane computes its (head_dim/64) rope angles ONCE for the token — every head
+// shares inv_freq — and reuses them in registers. Per head the NEOX pairs
+// `(i, half+i)` and the double RMS sum stay in registers and the reduction is
+// a bare butterfly shuffle. head_dim must be a multiple of 64; the block
+// kernels below are the fallback for exotic widths. Per-element arithmetic is
+// the same (norm scale in float over a double sum, then rope); only the sum's
+// association order moves, and it stays in double.
+// `pitch` is the float stride of one input token row: equal to
+// heads * head_dim for a standalone q projection, or to the fused qkv row
+// width when q is a column slice of a wider fused GEMM output. The output
+// stays packed (heads * head_dim) because attention reads only q.
+__global__ void QknormRopeWarpKernel(const float* q, const float* gamma,
+                                     float* out, std::uint32_t tokens,
+                                     std::uint32_t heads,
+                                     std::uint32_t head_dim,
+                                     const float* inv_freq, std::uint32_t start,
+                                     std::uint32_t pitch) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t token =
+      blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (token >= tokens) {
+    return;
+  }
+  const std::uint32_t half = head_dim / 2U;
+  const std::uint32_t pairs = half / warpSize;
+  float cs[16];
+  float sn[16];
+  const float pos = static_cast<float>(start + token);
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = lane + warpSize * m;
+    sincosf(pos * inv_freq[i], &sn[m], &cs[m]);
+  }
+  float a[16];
+  float b[16];
+  const float* row = q + static_cast<std::size_t>(token) * pitch;
+  float* orow = out + static_cast<std::size_t>(token) * heads * head_dim;
+  for (std::uint32_t head = 0; head < heads; ++head) {
+    double ss = 0.0;
+    for (std::uint32_t m = 0; m < pairs; ++m) {
+      const std::uint32_t i = lane + warpSize * m;
+      a[m] = row[i];
+      b[m] = row[half + i];
+      ss += static_cast<double>(a[m]) * a[m] + static_cast<double>(b[m]) * b[m];
+    }
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(ss) /
+                                        static_cast<double>(head_dim)) +
+                     kRmsEps);
+    for (std::uint32_t m = 0; m < pairs; ++m) {
+      const std::uint32_t i = lane + warpSize * m;
+      const float ya = a[m] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+      const float yb =
+          b[m] * scale * (gamma != nullptr ? gamma[half + i] : 1.0F);
+      orow[i] = ya * cs[m] - yb * sn[m];
+      orow[half + i] = ya * sn[m] + yb * cs[m];
+    }
+    row += head_dim;
+    orow += head_dim;
+  }
+}
+
+__global__ void KvNormRopeWriteWarpKernel(
+    const float* k, const float* v, const float* k_gamma, __half* k_cache,
+    __half* v_cache, std::uint32_t tokens, std::uint32_t kv_heads,
+    std::uint32_t head_dim, const float* inv_freq, std::uint32_t start,
+    std::uint32_t pitch) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t token =
+      blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (token >= tokens) {
+    return;
+  }
+  const std::uint32_t half = head_dim / 2U;
+  const std::uint32_t pairs = half / warpSize;
+  float cs[16];
+  float sn[16];
+  const float pos = static_cast<float>(start + token);
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = lane + warpSize * m;
+    sincosf(pos * inv_freq[i], &sn[m], &cs[m]);
+  }
+  float ka[16];
+  float kb[16];
+  float va[16];
+  float vb[16];
+  const float* krow = k + static_cast<std::size_t>(token) * pitch;
+  const float* vrow = v + static_cast<std::size_t>(token) * pitch;
+  __half* kc =
+      k_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
+  __half* vc =
+      v_cache + (static_cast<std::size_t>(start) + token) * kv_heads * head_dim;
+  for (std::uint32_t head = 0; head < kv_heads; ++head) {
+    double kss = 0.0;
+    double vss = 0.0;
+    for (std::uint32_t m = 0; m < pairs; ++m) {
+      const std::uint32_t i = lane + warpSize * m;
+      ka[m] = krow[i];
+      kb[m] = krow[half + i];
+      va[m] = vrow[i];
+      vb[m] = vrow[half + i];
+      kss += static_cast<double>(ka[m]) * ka[m] +
+             static_cast<double>(kb[m]) * kb[m];
+      vss += static_cast<double>(va[m]) * va[m] +
+             static_cast<double>(vb[m]) * vb[m];
+    }
+    const float kscale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(kss) /
+                                        static_cast<double>(head_dim)) +
+                     kRmsEps);
+    const float vscale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(vss) /
+                                        static_cast<double>(head_dim)) +
+                     kRmsEps);
+    for (std::uint32_t m = 0; m < pairs; ++m) {
+      const std::uint32_t i = lane + warpSize * m;
+      const float ya =
+          ka[m] * kscale * (k_gamma != nullptr ? k_gamma[i] : 1.0F);
+      const float yb =
+          kb[m] * kscale * (k_gamma != nullptr ? k_gamma[half + i] : 1.0F);
+      kc[i] = __float2half(ya * cs[m] - yb * sn[m]);
+      kc[half + i] = __float2half(ya * sn[m] + yb * cs[m]);
+      vc[i] = __float2half(va[m] * vscale);
+      vc[half + i] = __float2half(vb[m] * vscale);
+    }
+    krow += head_dim;
+    vrow += head_dim;
+    kc += head_dim;
+    vc += head_dim;
+  }
+}
+
+// QKV post-processing in one launch: the q-head norm+RoPE jobs and the
+// kv-head norm+RoPE/cache-write jobs of the two warp kernels above, dispatched
+// round-robin over the block's warps (one block per token, one warp per head).
+// every head passes through the verbatim load/reduce/store loops of
+// QknormRopeWarpKernel and KvNormRopeWriteWarpKernel, so q and v are
+// bit-identical to running the two kernels back to back and K differs only on
+// rope rounding ties (see the store-loop note below). The RoPE sincos are
+// computed once per warp and shared by all of its heads. HD selects a
+// compile-time head_dim so the per-head loops and register arrays specialize
+// and fully unroll; HD == 0 keeps the runtime head_dim for exotic shapes.
+// Unrolling preserves the element and accumulation order, so every instance
+// is bit-identical to the runtime one.
+template<std::uint32_t HD>
+__global__ void QkvPostWarpKernel(const float* q, const float* q_gamma,
+                                  float* q_out, const float* k, const float* v,
+                                  const float* k_gamma, __half* k_cache,
+                                  __half* v_cache, std::uint32_t heads,
+                                  std::uint32_t kv_heads,
+                                  std::uint32_t head_dim, const float* inv_freq,
+                                  std::uint32_t start, std::uint32_t q_pitch,
+                                  std::uint32_t kv_pitch) {
+  const std::uint32_t hdim = HD != 0U ? HD : head_dim;
+  constexpr std::uint32_t kPairs = HD != 0U ? HD / 64U : 16U;
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t warp = threadIdx.x / warpSize;
+  const std::uint32_t warps = blockDim.x / warpSize;
+  const std::uint32_t token = blockIdx.x;
+  const std::uint32_t total = heads + kv_heads;
+  if (warp >= total) {
+    return;
+  }
+  const std::uint32_t half = hdim / 2U;
+  const std::uint32_t pairs = half / warpSize;
+  float cs[kPairs];
+  float sn[kPairs];
+  const float pos = static_cast<float>(start + token);
+  for (std::uint32_t m = 0; m < pairs; ++m) {
+    const std::uint32_t i = lane + warpSize * m;
+    sincosf(pos * inv_freq[i], &sn[m], &cs[m]);
+  }
+  const float* qrow = q + static_cast<std::size_t>(token) * q_pitch;
+  const float* krow = k + static_cast<std::size_t>(token) * kv_pitch;
+  const float* vrow = v + static_cast<std::size_t>(token) * kv_pitch;
+  float* orow0 = q_out + static_cast<std::size_t>(token) * heads * hdim;
+  __half* kc0 =
+      k_cache + (static_cast<std::size_t>(start) + token) * kv_heads * hdim;
+  __half* vc0 =
+      v_cache + (static_cast<std::size_t>(start) + token) * kv_heads * hdim;
+  for (std::uint32_t h = warp; h < total; h += warps) {
+    if (h < heads) {
+      float a[kPairs];
+      float b[kPairs];
+      const float* row = qrow + h * hdim;
+      float* orow = orow0 + h * hdim;
+      double ss = 0.0;
+      for (std::uint32_t m = 0; m < pairs; ++m) {
+        const std::uint32_t i = lane + warpSize * m;
+        a[m] = row[i];
+        b[m] = row[half + i];
+        ss +=
+            static_cast<double>(a[m]) * a[m] + static_cast<double>(b[m]) * b[m];
+      }
+      const float scale =
+          1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(ss) /
+                                          static_cast<double>(hdim)) +
+                       kRmsEps);
+      // Q rope stores: bit-identical to the standalone kernel's contraction
+      // choice at the pinned toolchain, pinned by the QkvPost unit test.
+      for (std::uint32_t m = 0; m < pairs; ++m) {
+        const std::uint32_t i = lane + warpSize * m;
+        const float ya =
+            a[m] * scale * (q_gamma != nullptr ? q_gamma[i] : 1.0F);
+        const float yb =
+            b[m] * scale * (q_gamma != nullptr ? q_gamma[half + i] : 1.0F);
+        orow[i] = ya * cs[m] - yb * sn[m];
+        orow[half + i] = ya * sn[m] + yb * cs[m];
+      }
+      continue;
+    }
+    const std::uint32_t hq = h - heads;
+    float ka[kPairs];
+    float kb[kPairs];
+    float va[kPairs];
+    float vb[kPairs];
+    const float* kr = krow + hq * hdim;
+    const float* vr = vrow + hq * hdim;
+    __half* kc = kc0 + hq * hdim;
+    __half* vc = vc0 + hq * hdim;
+    double kss = 0.0;
+    double vss = 0.0;
+    for (std::uint32_t m = 0; m < pairs; ++m) {
+      const std::uint32_t i = lane + warpSize * m;
+      ka[m] = kr[i];
+      kb[m] = kr[half + i];
+      va[m] = vr[i];
+      vb[m] = vr[half + i];
+      kss += static_cast<double>(ka[m]) * ka[m] +
+             static_cast<double>(kb[m]) * kb[m];
+      vss += static_cast<double>(va[m]) * va[m] +
+             static_cast<double>(vb[m]) * vb[m];
+    }
+    const float kscale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(kss) /
+                                        static_cast<double>(hdim)) +
+                     kRmsEps);
+    const float vscale =
+        1.0F / sqrtf(static_cast<float>(WarpAllReduceSumD(vss) /
+                                        static_cast<double>(hdim)) +
+                     kRmsEps);
+    // contract(off): the RoPE store must not contract into an FMA so this
+    // kernel's arithmetic stays revision-stable. The standalone kernel's
+    // contraction here is compiler-chosen, so K can differ from it by one
+    // half ulp on rounding ties (measured 2/81920 and 1/40960 elements);
+    // the prefill validator confirms the level is numerically inconsequential.
+    {
+#pragma clang fp contract(off)
+      for (std::uint32_t m = 0; m < pairs; ++m) {
+        const std::uint32_t i = lane + warpSize * m;
+        const float ya =
+            ka[m] * kscale * (k_gamma != nullptr ? k_gamma[i] : 1.0F);
+        const float yb =
+            kb[m] * kscale * (k_gamma != nullptr ? k_gamma[half + i] : 1.0F);
+        kc[i] = __float2half(ya * cs[m] - yb * sn[m]);
+        kc[half + i] = __float2half(ya * sn[m] + yb * cs[m]);
+        vc[i] = __float2half(va[m] * vscale);
+        vc[half + i] = __float2half(vb[m] * vscale);
+      }
+    }
+  }
+}
+
 __global__ void QknormRopeKernel(const float* q, const float* gamma, float* out,
                                  std::uint32_t heads, std::uint32_t head_dim,
-                                 const float* inv_freq, std::uint32_t start) {
+                                 const float* inv_freq, std::uint32_t start,
+                                 std::uint32_t pitch) {
   __shared__ float buf[512];
   __shared__ double reduce[32];
   const std::uint32_t token = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
+  const std::size_t o_in = static_cast<std::size_t>(token) * pitch +
+                           static_cast<std::size_t>(head) * head_dim;
   const std::size_t o =
       (static_cast<std::size_t>(token) * heads + head) * head_dim;
-  NormHead(q + o, gamma, buf, head_dim, kRmsEps, reduce);
+  NormHead(q + o_in, gamma, buf, head_dim, kRmsEps, reduce);
   __syncthreads();
   RopeHead(buf, head_dim, inv_freq, start + token);
   __syncthreads();
@@ -96,19 +374,17 @@ __global__ void QknormRopeKernel(const float* q, const float* gamma, float* out,
   }
 }
 
-__global__ void KvNormRopeWriteKernel(const float* k, const float* v,
-                                      const float* k_gamma, __half* k_cache,
-                                      __half* v_cache, std::uint32_t kv_heads,
-                                      std::uint32_t head_dim,
-                                      const float* inv_freq,
-                                      std::uint32_t start) {
+__global__ void KvNormRopeWriteKernel(
+    const float* k, const float* v, const float* k_gamma, __half* k_cache,
+    __half* v_cache, std::uint32_t kv_heads, std::uint32_t head_dim,
+    const float* inv_freq, std::uint32_t start, std::uint32_t pitch) {
   __shared__ float kb[512];
   __shared__ float vb[512];
   __shared__ double reduce[32];
   const std::uint32_t token = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
-  const std::size_t o =
-      (static_cast<std::size_t>(token) * kv_heads + head) * head_dim;
+  const std::size_t o = static_cast<std::size_t>(token) * pitch +
+                        static_cast<std::size_t>(head) * head_dim;
   NormHead(k + o, k_gamma, kb, head_dim, kRmsEps, reduce);
   __syncthreads();
   NormHead(v + o, nullptr, vb, head_dim, kRmsEps, reduce);
@@ -258,8 +534,9 @@ __global__ void AttentionDecodeCombineKernel(const float* part, float* out,
 // first tile with a valid key rescales it away exactly.
 __global__ void AttentionPrefillTiledKernel(
     const float* q, const __half* k_cache, const __half* v_cache, float* out,
-    std::uint32_t start, std::uint32_t tokens, std::uint32_t heads,
-    std::uint32_t kv_heads, std::uint32_t head_dim, std::uint32_t window) {
+    __half* out_half, std::uint32_t start, std::uint32_t tokens,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t window) {
   constexpr std::uint32_t kQT = 32;
   constexpr std::uint32_t kKT = 8;
   constexpr std::uint32_t kMaxHD = 512;
@@ -367,349 +644,10 @@ __global__ void AttentionPrefillTiledKernel(
       }
       const std::size_t o =
           (static_cast<std::size_t>(token) * heads + h) * head_dim + d;
-      out[o] = acc[qi] / rsum[qi];
-    }
-  }
-}
-
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// WMMA flash-attention prefill (matrix-core path for both layer classes).
-//
-// The scalar AttentionPrefillTiledKernel above stays the numerical oracle; this
-// kernel replaces it on the production path. Every QK^T and PV product becomes
-// a wave32 `wmma_f32_16x16x16_f16`. Fragment layout (verified against the CPU
-// reference): A holds row L%16 and 16 contiguous k, B holds column L%16 and 16
-// contiguous k (fed a transposed tile), C element i is row 2i + L/16, column
-// L%16. Q never reaches LDS -- each wave keeps its A fragments in registers for
-// the whole key loop. K and the transposed V share one staging buffer.
-//
-// The head dimension is a template parameter so the same tiling covers the full
-// layers (512) and the SWA layers (256); the waves split the head dimension
-// into `kWaves / kSTiles` partials summed through LDS, and each wave owns
-// `kDimTilesPerWave = (kHeadDim/16)/kWaves` output dim tiles. The attention
-// scale is 1.0 (pinned by the oracle), so Q is converted to F16 unscaled.
-// ---------------------------------------------------------------------------
-
-using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
-using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
-
-__device__ __forceinline__ v8f WmmaF16(v16h a, v16h b, v8f c) {
-  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
-}
-
-__device__ __forceinline__ v16h LoadFrag(const __half* p) {
-  union {
-    v16h f;
-    uint4 u[2];
-  } cvt;
-  cvt.u[0] = *reinterpret_cast<const uint4*>(p);
-  cvt.u[1] = *reinterpret_cast<const uint4*>(p + 8);
-  return cvt.f;
-}
-
-namespace {
-
-constexpr std::uint32_t kWmmaHeads = 2;  // query heads per block, divides GQA
-
-template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
-         std::uint32_t kHeadDim>
-__launch_bounds__(kWaves * 32, 1) __global__
-    void AttentionPrefillWmmaKernel(const float* __restrict__ q,
-                                    const __half* __restrict__ k_cache,
-                                    const __half* __restrict__ v_cache,
-                                    float* __restrict__ out,
-                                    std::uint32_t start, std::uint32_t tokens,
-                                    std::uint32_t heads, std::uint32_t kv_heads,
-                                    std::uint32_t window) {
-  constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
-  constexpr std::uint32_t kKeyBlocks = kKeys / 16;
-  constexpr std::uint32_t kThreads = kWaves * 32;
-  constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
-  constexpr std::uint32_t kWmmaKSteps = kHeadDim / 16;
-  constexpr std::uint32_t kKSplit = kWaves / kSTiles;
-  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / kKSplit;
-  constexpr std::uint32_t kRows = kRowBlocks * 16;
-  constexpr std::uint32_t kDimTilesPerWave = kWmmaKSteps / kWaves;
-  constexpr std::uint32_t kSoftmaxLanes = kThreads / kRows;
-  constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
-  constexpr std::uint32_t kVtStride = kKeys + 8;
-  static_assert(kSTiles * kKSplit == kWaves,
-                "the waves cover the S tiles in kKSplit head-dimension "
-                "partials");
-  static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
-  static_assert(kKStepsPerWave * (kWaves / kSTiles) == kWmmaKSteps, "k split");
-  static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
-                "fragment rows must start on a 16-byte boundary");
-  static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
-
-  const std::uint32_t tid = threadIdx.x;
-  const std::uint32_t lane = tid & 31u;
-  const std::uint32_t wave = tid >> 5u;
-  const std::uint32_t sub = lane & 15u;
-  const std::uint32_t half_id = lane >> 4u;
-
-  const std::uint32_t gqa = heads / kv_heads;
-  const std::size_t attn_width = static_cast<std::size_t>(heads) * kHeadDim;
-  const std::size_t kv_width = static_cast<std::size_t>(kv_heads) * kHeadDim;
-
-  const std::uint32_t query_start = blockIdx.x * kQueryRows;
-  const std::uint32_t head_pair = blockIdx.y;
-  const std::uint32_t kv_head = head_pair / (gqa / kWmmaHeads);
-  const std::uint32_t pair_in_group = head_pair % (gqa / kWmmaHeads);
-  const std::uint32_t first_query_head =
-      (kv_head * gqa) + (pair_in_group * kWmmaHeads);
-
-  const auto row_block_head = [&](std::uint32_t rb) {
-    return first_query_head + (rb % kWmmaHeads);
-  };
-  const auto row_block_offset = [&](std::uint32_t rb) {
-    return (rb / kWmmaHeads) * 16;
-  };
-
-  constexpr std::uint32_t kKvLdsHalves =
-      (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? (kKeys * kWmmaKStride)
-                                                    : (kHeadDim * kVtStride);
-  __shared__ __half kv_lds[kKvLdsHalves];
-  __shared__ float s_lds[kKSplit][kSTiles][16][16];
-  __shared__ __half p_lds[kRows][kKeys];
-  __shared__ float row_max[kRows];
-  __shared__ float row_sum[kRows];
-  __shared__ float row_scale[kRows];
-
-  const std::uint32_t s_tile = wave % kSTiles;
-  const std::uint32_t s_kh = wave / kSTiles;
-  const std::uint32_t s_rb = s_tile % kRowBlocks;
-  const std::uint32_t s_kb = s_tile / kRowBlocks;
-
-  v16h q_frag[kKStepsPerWave];
-  {
-    const std::uint32_t local_query =
-        query_start + row_block_offset(s_rb) + sub;
-    const bool live = local_query < tokens;
-    const float* q_row =
-        q + (static_cast<std::size_t>(local_query) * attn_width) +
-        (static_cast<std::size_t>(row_block_head(s_rb)) * kHeadDim);
-#pragma unroll
-    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
-      const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
-      const auto* qp = reinterpret_cast<const float4*>(q_row + d0);
-#pragma unroll
-      for (std::uint32_t v = 0; v < 4; ++v) {
-        const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-        q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x);
-        q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y);
-        q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z);
-        q_frag[ks][(v * 4) + 3] = static_cast<_Float16>(f.w);
-      }
-    }
-  }
-
-  v8f o_acc[kRowBlocks][kDimTilesPerWave] = {};
-  for (std::uint32_t r = tid; r < kRows; r += kThreads) {
-    row_max[r] = -INFINITY;
-    row_sum[r] = 0.0F;
-  }
-
-  const std::uint32_t context_end = start + tokens;
-  const std::uint32_t max_visible =
-      min(context_end, start + query_start + kQueryRows);
-  // The block's first query has the smallest window lower bound; keys below it
-  // are invisible to every query in the block, so the key loop starts there.
-  const std::uint32_t block_causal = start + query_start + 1u;
-  const std::uint32_t key_begin =
-      (window > 0 && block_causal > window)
-          ? ((block_causal - window) / kKeys) * kKeys
-          : 0u;
-
-  for (std::uint32_t key_start = key_begin; key_start < max_visible;
-       key_start += kKeys) {
-    constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (kThreads * 8);
-    uint4 v_raw[kVRegs];
-    {
-      const std::uint32_t v_key = lane % kKeys;
-      const std::uint32_t v_slice = ((tid / kKeys) * (kVRegs * 8));
-      const std::uint32_t key_position = key_start + v_key;
-      const auto* src =
-          v_cache + (static_cast<std::size_t>(key_position) * kv_width) +
-          (static_cast<std::size_t>(kv_head) * kHeadDim) + v_slice;
-      const bool live = key_position < context_end;
-#pragma unroll
-      for (std::uint32_t j = 0; j < kVRegs; ++j) {
-        v_raw[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
-                        : make_uint4(0u, 0u, 0u, 0u);
-      }
-    }
-
-    __syncthreads();
-    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8);
-         idx += kThreads) {
-      const std::uint32_t key_row = idx / (kHeadDim / 8);
-      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      const std::uint32_t key_position = key_start + key_row;
-      __half packed[8] = {};
-      if (key_position < context_end) {
-        const auto* src = k_cache +
-                          (static_cast<std::size_t>(key_position) * kv_width) +
-                          (static_cast<std::size_t>(kv_head) * kHeadDim) + d8;
-        *reinterpret_cast<uint4*>(packed) =
-            *reinterpret_cast<const uint4*>(src);
-      }
-      *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
-          *reinterpret_cast<const uint4*>(packed);
-    }
-    __syncthreads();
-
-    // --- S = Q K^T ---
-    {
-      v8f s_acc = {};
-#pragma unroll
-      for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
-        const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
-        const v16h k_frag =
-            LoadFrag(&kv_lds[(((s_kb * 16) + sub) * kWmmaKStride) + d0]);
-        s_acc = WmmaF16(q_frag[ks], k_frag, s_acc);
-      }
-#pragma unroll
-      for (std::uint32_t i = 0; i < 8; ++i) {
-        s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
-      }
-    }
-    __syncthreads();
-
-    // --- online softmax: kSoftmaxLanes threads per query row ---
-    {
-      const std::uint32_t rg = tid / kSoftmaxLanes;
-      const std::uint32_t seg = tid % kSoftmaxLanes;
-      constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
-      const std::uint32_t rb = rg / 16;
-      const std::uint32_t row = rg % 16;
-      const std::uint32_t local_query =
-          query_start + row_block_offset(rb) + row;
-      const std::uint32_t absolute_query = start + local_query;
-      float part_max = -INFINITY;
-      float vals[kPerLane];
-#pragma unroll
-      for (std::uint32_t m = 0; m < kPerLane; ++m) {
-        const std::uint32_t col = (seg * kPerLane) + m;
-        const std::uint32_t key_position = key_start + col;
-        bool valid = local_query < tokens && key_position <= absolute_query &&
-                     key_position < context_end;
-        if (window > 0) {
-          valid = valid && (absolute_query - key_position < window);
-        }
-        const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
-        float s = 0.0F;
-#pragma unroll
-        for (std::uint32_t kh = 0; kh < kKSplit; ++kh) {
-          s += s_lds[kh][tile][row][col % 16];
-        }
-        vals[m] = valid ? s : -INFINITY;
-        part_max = fmaxf(part_max, vals[m]);
-      }
-#pragma unroll
-      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
-        part_max = fmaxf(part_max, __shfl_xor(part_max, off));
-      }
-      const float prev_max = row_max[rg];
-      const float next_max = fmaxf(prev_max, part_max);
-      const float prior_scale =
-          isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
-      float part_sum = 0.0F;
-#pragma unroll
-      for (std::uint32_t m = 0; m < kPerLane; ++m) {
-        const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
-        part_sum += w;
-        p_lds[rg][(seg * kPerLane) + m] = static_cast<__half>(w);
-      }
-#pragma unroll
-      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
-        part_sum += __shfl_xor(part_sum, off);
-      }
-      if (seg == 0) {
-        row_max[rg] = next_max;
-        row_sum[rg] = (row_sum[rg] * prior_scale) + part_sum;
-        row_scale[rg] = prior_scale;
-      }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
-      float scale[8];
-#pragma unroll
-      for (std::uint32_t i = 0; i < 8; ++i) {
-        scale[i] = row_scale[(rb * 16) + (2 * i) + half_id];
-      }
-#pragma unroll
-      for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
-#pragma unroll
-        for (std::uint32_t i = 0; i < 8; ++i) {
-          o_acc[rb][t][i] *= scale[i];
-        }
-      }
-    }
-
-    // --- stage V transposed ---
-    {
-      const std::uint32_t v_key = lane % kKeys;
-      const std::uint32_t v_slice = ((tid / kKeys) * (kVRegs * 8));
-#pragma unroll
-      for (std::uint32_t j = 0; j < kVRegs; ++j) {
-        const auto* packed = reinterpret_cast<const __half*>(&v_raw[j]);
-#pragma unroll
-        for (std::uint32_t i = 0; i < 8; ++i) {
-          kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
-        }
-      }
-    }
-    __syncthreads();
-
-    // --- O += P V ---
-#pragma unroll
-    for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
-      const std::uint32_t dim_tile = wave + (t * kWaves);
-      v16h v_frag[kKeyBlocks];
-#pragma unroll
-      for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
-        v_frag[kb] = LoadFrag(
-            &kv_lds[(((dim_tile * 16) + sub) * kVtStride) + (kb * 16)]);
-      }
-#pragma unroll
-      for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
-#pragma unroll
-        for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
-          const v16h p_frag = LoadFrag(&p_lds[(rb * 16) + sub][kb * 16]);
-          o_acc[rb][t] = WmmaF16(p_frag, v_frag[kb], o_acc[rb][t]);
-        }
-      }
-    }
-  }
-  __syncthreads();
-
-  // --- epilogue ---
-#pragma unroll
-  for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
-    const std::uint32_t query_head = row_block_head(rb);
-    const std::uint32_t row_offset = row_block_offset(rb);
-#pragma unroll
-    for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
-      const std::uint32_t dim_tile = wave + (t * kWaves);
-#pragma unroll
-      for (std::uint32_t i = 0; i < 8; ++i) {
-        const std::uint32_t row = (2 * i) + half_id;
-        const std::uint32_t local_query = query_start + row_offset + row;
-        if (local_query >= tokens) {
-          continue;
-        }
-        const float denominator = row_sum[(rb * 16) + row];
-        const std::size_t offset =
-            (static_cast<std::size_t>(local_query) * attn_width) +
-            (static_cast<std::size_t>(query_head) * kHeadDim) +
-            (dim_tile * 16) + sub;
-        out[offset] =
-            (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
+      const float v = acc[qi] / rsum[qi];
+      out[o] = v;
+      if (out_half != nullptr) {
+        out_half[o] = HalfOf(v);
       }
     }
   }
@@ -720,18 +658,61 @@ __launch_bounds__(kWaves * 32, 1) __global__
 void QknormRope(const float* q, const float* gamma, float* out,
                 std::uint32_t tokens, std::uint32_t heads,
                 std::uint32_t head_dim, const float* inv_freq,
-                std::uint32_t start, hipStream_t stream) {
-  QknormRopeKernel<<<dim3(tokens, heads), 256, 0, stream>>>(
-      q, gamma, out, heads, head_dim, inv_freq, start);
+                std::uint32_t start, std::uint32_t pitch, hipStream_t stream) {
+  // One warp per token only pays off once tokens provide their own
+  // parallelism; at decode widths the block kernel's per-(token, head)
+  // blocks finish sooner than a single warp looping every head.
+  if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
+    QknormRopeWarpKernel<<<(tokens + 3U) / 4U, 128, 0, stream>>>(
+        q, gamma, out, tokens, heads, head_dim, inv_freq, start, pitch);
+  } else {
+    QknormRopeKernel<<<dim3(tokens, heads), 256, 0, stream>>>(
+        q, gamma, out, heads, head_dim, inv_freq, start, pitch);
+  }
 }
 
 void KvNormRopeWrite(const float* k, const float* v, const float* k_gamma,
                      __half* k_cache, __half* v_cache, std::uint32_t start,
                      std::uint32_t tokens, std::uint32_t kv_heads,
                      std::uint32_t head_dim, const float* inv_freq,
-                     hipStream_t stream) {
-  KvNormRopeWriteKernel<<<dim3(tokens, kv_heads), 256, 0, stream>>>(
-      k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start);
+                     std::uint32_t pitch, hipStream_t stream) {
+  if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
+    KvNormRopeWriteWarpKernel<<<(tokens + 3U) / 4U, 128, 0, stream>>>(
+        k, v, k_gamma, k_cache, v_cache, tokens, kv_heads, head_dim, inv_freq,
+        start, pitch);
+  } else {
+    KvNormRopeWriteKernel<<<dim3(tokens, kv_heads), 256, 0, stream>>>(
+        k, v, k_gamma, k_cache, v_cache, kv_heads, head_dim, inv_freq, start,
+        pitch);
+  }
+}
+
+void QkvPost(const float* q, const float* q_gamma, float* q_out, const float* k,
+             const float* v, const float* k_gamma, __half* k_cache,
+             __half* v_cache, std::uint32_t tokens, std::uint32_t heads,
+             std::uint32_t kv_heads, std::uint32_t head_dim,
+             const float* inv_freq, std::uint32_t start, std::uint32_t q_pitch,
+             std::uint32_t kv_pitch, hipStream_t stream) {
+  if (tokens >= 32U && head_dim % 64U == 0U && head_dim <= 1024U) {
+    if (head_dim == 256U) {
+      QkvPostWarpKernel<256U><<<tokens, 512, 0, stream>>>(
+          q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+          head_dim, inv_freq, start, q_pitch, kv_pitch);
+    } else if (head_dim == 512U) {
+      QkvPostWarpKernel<512U><<<tokens, 512, 0, stream>>>(
+          q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+          head_dim, inv_freq, start, q_pitch, kv_pitch);
+    } else {
+      QkvPostWarpKernel<0U><<<tokens, 512, 0, stream>>>(
+          q, q_gamma, q_out, k, v, k_gamma, k_cache, v_cache, heads, kv_heads,
+          head_dim, inv_freq, start, q_pitch, kv_pitch);
+    }
+  } else {
+    QknormRope(q, q_gamma, q_out, tokens, heads, head_dim, inv_freq, start,
+               q_pitch, stream);
+    KvNormRopeWrite(k, v, k_gamma, k_cache, v_cache, start, tokens, kv_heads,
+                    head_dim, inv_freq, kv_pitch, stream);
+  }
 }
 
 void AttentionDecode(const float* q, const __half* k_cache,
@@ -769,7 +750,7 @@ void AttentionPrefillScalar(const float* q, const __half* k_cache,
                             std::uint32_t start, std::uint32_t tokens,
                             std::uint32_t heads, std::uint32_t kv_heads,
                             std::uint32_t head_dim, std::uint32_t window,
-                            hipStream_t stream) {
+                            __half* out_half, hipStream_t stream) {
   if (tokens == 0 || head_dim > 512U) {
     return;
   }
@@ -777,45 +758,46 @@ void AttentionPrefillScalar(const float* q, const __half* k_cache,
   // One workgroup thread per head dimension: the online accumulator is a
   // per-thread register, so blockDim.x must cover the whole head.
   AttentionPrefillTiledKernel<<<grid, head_dim, 0, stream>>>(
-      q, k_cache, v_cache, out, start, tokens, heads, kv_heads, head_dim,
-      window);
+      q, k_cache, v_cache, out, out_half, start, tokens, heads, kv_heads,
+      head_dim, window);
 }
 
 void AttentionPrefill(const float* q, const __half* k_cache,
                       const __half* v_cache, float* out, std::uint32_t start,
                       std::uint32_t tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t head_dim,
-                      std::uint32_t window, hipStream_t stream) {
+                      std::uint32_t window, __half* out_half,
+                      hipStream_t stream) {
   if (tokens == 0 || head_dim > 512U) {
     return;
   }
   // The WMMA path covers the two Gemma-4 head dimensions; anything else keeps
-  // the scalar oracle.
-  if (head_dim != 256U && head_dim != 512U) {
-    AttentionPrefillScalar(q, k_cache, v_cache, out, start, tokens, heads,
-                           kv_heads, head_dim, window, stream);
+  // the scalar oracle. Absolute causal positions over the full F16 cache:
+  // the query row at index r sits at position start + r and every cache
+  // position below start + tokens is resident (ring 0, no per-row key ends,
+  // the whole head dimension is cached so no RoPE derivation applies).
+  AttentionArgs args{};
+  args.q = q;
+  args.k_cache = reinterpret_cast<const std::uint16_t*>(k_cache);
+  args.v_cache = reinterpret_cast<const std::uint16_t*>(v_cache);
+  args.out = out;
+  args.rows = tokens;
+  args.heads = heads;
+  args.kv_heads = kv_heads;
+  args.head_dim = head_dim;
+  args.first_position = start;
+  args.shared_position = false;
+  args.key_limit = start + tokens;
+  args.window = window;
+  args.ring = 0;
+  args.rope_pairs = 0;
+  args.key_ends = nullptr;
+  args.out_half = out_half;
+  if (LaunchWmmaPrefillAttention(args, stream)) {
     return;
   }
-  constexpr std::uint32_t kKeys = 16;
-  constexpr std::uint32_t kWaves = 8;
-  if (head_dim == 512U) {
-    // 512-wide heads split S over four head-dimension partials per tile:
-    // 32 query rows would need 128 VGPRs of Q fragments plus 128 of O
-    // accumulators and spills to scratch, so the block covers 16 rows.
-    constexpr std::uint32_t kQueryRows = 16;
-    const dim3 grid((tokens + kQueryRows - 1U) / kQueryRows,
-                    heads / kWmmaHeads);
-    AttentionPrefillWmmaKernel<kQueryRows, kKeys, kWaves, 512>
-        <<<grid, kWaves * 32, 0, stream>>>(q, k_cache, v_cache, out, start,
-                                           tokens, heads, kv_heads, window);
-  } else {
-    constexpr std::uint32_t kQueryRows = 32;
-    const dim3 grid((tokens + kQueryRows - 1U) / kQueryRows,
-                    heads / kWmmaHeads);
-    AttentionPrefillWmmaKernel<kQueryRows, kKeys, kWaves, 256>
-        <<<grid, kWaves * 32, 0, stream>>>(q, k_cache, v_cache, out, start,
-                                           tokens, heads, kv_heads, window);
-  }
+  AttentionPrefillScalar(q, k_cache, v_cache, out, start, tokens, heads,
+                         kv_heads, head_dim, window, out_half, stream);
 }
 
 }  // namespace gufo::models::gemma4::rocm

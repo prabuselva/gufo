@@ -22,6 +22,7 @@
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/gemma4/cli_runner.hpp"
 #include "src/models/gemma4/engine.hpp"
+#include "src/models/ling3_0/cli_runner.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -1046,6 +1047,23 @@ int RunPrompt(std::span<const char* const> args) {
   }
 #endif
 
+#if defined(ENGINE_ENABLE_HIP)
+  if (models::ling3_0::IsLing3Model(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Ling 3.0 Flash does not support image input\n";
+      return 2;
+    }
+    return models::ling3_0::RunLing3Prompt(opt, *reader, model_load_start,
+                                           PromptReasoningOptions(opt));
+  }
+#else
+  if (models::ling3_0::IsLing3Model(*reader)) {
+    std::cerr << "Ling 3.0 Flash requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+#endif
+
   std::string rendered_prompt = opt.prompt_text;
   std::vector<tokenization::ContentSpan> content_spans;
   std::vector<tokenization::ChatMessage> messages;
@@ -1284,6 +1302,22 @@ int RunChat(std::span<const char* const> args) {
 #else
   if (models::gemma4::IsGemma4(*reader)) {
     std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
+    return 1;
+  }
+#endif
+
+#if defined(ENGINE_ENABLE_HIP)
+  if (models::ling3_0::IsLing3Model(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Ling 3.0 Flash does not support image input\n";
+      return 2;
+    }
+    return models::ling3_0::RunLing3Chat(opt, *reader, model_load_start,
+                                         PromptReasoningOptions(opt));
+  }
+#else
+  if (models::ling3_0::IsLing3Model(*reader)) {
+    std::cerr << "Ling 3.0 Flash requires ENGINE_ENABLE_HIP=ON\n";
     return 1;
   }
 #endif

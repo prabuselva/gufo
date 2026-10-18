@@ -9,6 +9,7 @@
 #include "src/models/gemma4/kernels/rocm/fused.hpp"
 #include "src/models/gemma4/kernels/rocm/gemm.hpp"
 #include "src/models/gemma4/kernels/rocm/gemv.hpp"
+#include "src/models/gemma4/kernels/rocm/moe_prefill.hpp"
 #include "src/models/gemma4/kernels/rocm/routed_f16.hpp"
 
 namespace gufo::models::gemma4::rocm {
@@ -25,6 +26,9 @@ bool GemvTypeOf(core::GgmlType t, GemvType* out) {
     case core::GgmlType::kBF16:
       *out = GemvType::kBF16;
       return true;
+    case core::GgmlType::kF16:
+      *out = GemvType::kF16;
+      return true;
     case core::GgmlType::kQ4_K:
       *out = GemvType::kQ4_K;
       return true;
@@ -38,6 +42,53 @@ bool GemvTypeOf(core::GgmlType t, GemvType* out) {
 
 WeightType RoutedTypeOf(core::GgmlType t) {
   return static_cast<WeightType>(static_cast<std::uint32_t>(t));
+}
+
+// Expert encodings the 96-row prefill kernels (moe_prefill.hip.cpp) decode
+// natively; false falls through to the shared RoutedF16Gemm route.
+bool PrefillFormatOf(core::GgmlType t, ExpertFormat* out) {
+  switch (t) {
+    case core::GgmlType::kQ4_K:
+      *out = ExpertFormat::kQ4_K;
+      return true;
+    case core::GgmlType::kQ5_K:
+      *out = ExpertFormat::kQ5_K;
+      return true;
+    case core::GgmlType::kQ6_K:
+      *out = ExpertFormat::kQ6_K;
+      return true;
+    case core::GgmlType::kQ8_0:
+      *out = ExpertFormat::kQ8_0;
+      return true;
+    case core::GgmlType::kQ5_1:
+      *out = ExpertFormat::kQ5_1;
+      return true;
+    case core::GgmlType::kF16:
+      *out = ExpertFormat::kF16;
+      return true;
+    case core::GgmlType::kQ4_0:
+      *out = ExpertFormat::kQ4_0;
+      return true;
+    case core::GgmlType::kQ5_0:
+      *out = ExpertFormat::kQ5_0;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The fused [gate | up] stack shapes the prefill kernels run at 96-row tiles;
+// the down stack likewise (the Q6_K high-nibble path only exists for gate).
+bool OwnGateUpFormat(ExpertFormat f) {
+  return f == ExpertFormat::kQ4_K || f == ExpertFormat::kQ5_K ||
+         f == ExpertFormat::kQ6_K || f == ExpertFormat::kQ8_0 ||
+         f == ExpertFormat::kF16 || f == ExpertFormat::kQ4_0;
+}
+
+bool OwnDownFormat(ExpertFormat f) {
+  return f == ExpertFormat::kQ5_1 || f == ExpertFormat::kQ8_0 ||
+         f == ExpertFormat::kF16 || f == ExpertFormat::kQ4_0 ||
+         f == ExpertFormat::kQ5_0;
 }
 
 bool Fail(std::string* error_msg, const std::string& message) {
@@ -87,7 +138,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   std::unique_ptr<Executor> e(new Executor(model.config(), model));
   const Config& c = e->c_;
   if (prefill_chunk == 0) {
-    prefill_chunk = 512;
+    prefill_chunk = 2048;
   }
   if (model.token_embd().empty() || model.output().empty()) {
     Fail(error_msg, "model has no token embedding");
@@ -153,19 +204,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   GUFO_ALLOC(pf_cur_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_next_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_normed_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_q_, static_cast<std::size_t>(C) * q_dim);
+  e->pf_tok_ = reinterpret_cast<std::int32_t*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * sizeof(std::int32_t), error_msg));
+  if (e->pf_tok_ == nullptr)
+    return nullptr;
+  // One region holds both projection layouts: the fused GEMM box
+  // [tokens][qkv_rows] starts at the base with the fused row pitch, while
+  // the unfused fallback packs a natural [tokens][rows] box per tensor at
+  // fixed offsets. Both fit in the same bytes the three boxes needed.
+  GUFO_ALLOC(pf_qkv_, static_cast<std::size_t>(C) * (q_dim + 2U * kv_dim));
   GUFO_ALLOC(pf_qn_, static_cast<std::size_t>(C) * q_dim);
-  GUFO_ALLOC(pf_k_, static_cast<std::size_t>(C) * kv_dim);
-  GUFO_ALLOC(pf_v_, static_cast<std::size_t>(C) * kv_dim);
   GUFO_ALLOC(pf_attn_, static_cast<std::size_t>(C) * q_dim);
   GUFO_ALLOC(pf_proj_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_attn_out_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_mlp_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_mlp1_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_moe_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_moe2_, static_cast<std::size_t>(C) * hidden);
-  GUFO_ALLOC(pf_gate_, static_cast<std::size_t>(C) * ffn);
-  GUFO_ALLOC(pf_up_, static_cast<std::size_t>(C) * ffn);
+  GUFO_ALLOC(pf_gu_, static_cast<std::size_t>(C) * 2U * ffn);
   GUFO_ALLOC(pf_act_, static_cast<std::size_t>(C) * ffn);
   GUFO_ALLOC(pf_router_in_, static_cast<std::size_t>(C) * hidden);
   GUFO_ALLOC(pf_router_logits_, static_cast<std::size_t>(C) * c.num_experts);
@@ -196,10 +249,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       e->AllocBytes(compact_rows * sizeof(std::int32_t), error_msg));
   if (e->pf_rows_slot_ == nullptr)
     return nullptr;
-  const std::size_t max_tiles =
-      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 64);
+  // Two tile maps (gate/up and down) live in one buffer. Capacity shrinks with
+  // tile height, so a cap(48) span per map covers every 96/64 combination the
+  // dispatch may choose; the down map starts at the second span.
+  const std::size_t tile_span =
+      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 48);
   e->pf_tiles_dev_ = reinterpret_cast<std::int32_t*>(
-      e->AllocBytes(max_tiles * sizeof(std::int32_t), error_msg));
+      e->AllocBytes(2 * tile_span * sizeof(std::int32_t), error_msg));
   if (e->pf_tiles_dev_ == nullptr)
     return nullptr;
   e->pf_x_half_ = reinterpret_cast<__half*>(e->AllocBytes(
@@ -213,6 +269,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->pf_normed_half_ = reinterpret_cast<__half*>(e->AllocBytes(
       static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
   if (e->pf_normed_half_ == nullptr)
+    return nullptr;
+  e->pf_qkv_half_ = reinterpret_cast<__half*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * hidden * sizeof(__half), error_msg));
+  if (e->pf_qkv_half_ == nullptr)
+    return nullptr;
+  e->pf_attn_half_ = reinterpret_cast<__half*>(e->AllocBytes(
+      static_cast<std::size_t>(C) * q_dim * sizeof(__half), error_msg));
+  if (e->pf_attn_half_ == nullptr)
     return nullptr;
   e->pf_act_ffn_half_ = reinterpret_cast<__half*>(e->AllocBytes(
       static_cast<std::size_t>(C) * ffn * sizeof(__half), error_msg));
@@ -346,11 +410,11 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
   }
 
   QknormRope(q_, l.attn_q_norm.f32(), qn_, 1, heads, head_dim, inv_freq, pos,
-             nullptr);
+             heads * head_dim, nullptr);
   KvNormRopeWrite(k_raw_, l.attn_v.empty() ? k_raw_ : v_raw_,
                   l.attn_k_norm.f32(), session.k_cache_[il],
                   session.v_cache_[il], pos, 1, kvh, head_dim, inv_freq,
-                  nullptr);
+                  kvh * head_dim, nullptr);
 
   const std::uint32_t window = l.swa ? c.sliding_window : 0;
   const std::uint32_t n_keys = pos + 1;
@@ -365,9 +429,8 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
   }
   Gemv(l.attn_output.data, ot, hidden, heads * head_dim,
        l.attn_output.row_bytes, attn_, proj_, nullptr);
-  RmsNormRows(proj_, l.post_attention_norm.f32(), attn_out_, 1, hidden,
-              c.rms_eps, nullptr);
-  Add(attn_out_, cur_, hidden, nullptr);
+  RmsNormAddRows(proj_, l.post_attention_norm.f32(), cur_, attn_out_, 1, hidden,
+                 c.rms_eps, nullptr);
 
   // Shared dense FFN: down( gelu(gate(x)) * up(x) ), then its post-norm.
   RmsNormRows(attn_out_, l.ffn_norm.f32(), normed_, 1, hidden, c.rms_eps,
@@ -377,11 +440,17 @@ bool Executor::StepLayer(Session& session, std::uint32_t il,
       !GemvTypeOf(l.ffn_down.type, &ft)) {
     return Fail(error_msg, "unsupported shared FFN type");
   }
-  Gemv(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes, normed_,
-       up_, nullptr);
-  Gemv(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes, normed_,
-       gate_, nullptr);
-  GegluF32Separate(gate_, up_, act_, c.ffn_length, nullptr);
+  GemvMultiProj ffn_projs[2] = {
+      {l.ffn_up.data, ft, c.ffn_length, hidden, up_},
+      {l.ffn_gate.data, ft, c.ffn_length, hidden, gate_}};
+  if (!GemvMulti(ffn_projs, 2, normed_, nullptr)) {
+    Gemv(ffn_projs[0].base, ft, c.ffn_length, hidden, l.ffn_up.row_bytes,
+         normed_, up_, nullptr);
+    Gemv(ffn_projs[1].base, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
+         normed_, gate_, nullptr);
+  }
+  GegluF32Separate(gate_, up_, act_, c.ffn_length, c.ffn_length, c.ffn_length,
+                   nullptr);
   Gemv(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes, act_,
        mlp_, nullptr);
   RmsNormRows(mlp_, l.post_ffw_norm_1.f32(), mlp1_, 1, hidden, c.rms_eps,
@@ -459,20 +528,21 @@ bool Executor::Prefill(Session& session, const std::int32_t* tokens,
   }
   const std::uint32_t hidden = c.hidden_size;
   std::vector<std::int32_t> host_tokens(tokens, tokens + count);
+  for (const std::int32_t tok : host_tokens) {
+    if (tok < 0 || static_cast<std::uint32_t>(tok) >= c.vocab_size) {
+      return Fail(error_msg, "token id out of range");
+    }
+  }
 
+  const float emb_scale = std::sqrt(static_cast<float>(hidden));
   for (std::uint32_t start = 0; start < count; start += prefill_chunk_) {
     const std::uint32_t T = std::min(prefill_chunk_, count - start);
-    for (std::uint32_t t = 0; t < T; ++t) {
-      const std::int32_t tok = host_tokens[start + t];
-      if (tok < 0 || static_cast<std::uint32_t>(tok) >= c.vocab_size) {
-        return Fail(error_msg, "token id out of range");
-      }
-      EmbedRow(model_.token_embd().data, emb_type,
-               static_cast<std::uint32_t>(tok), hidden,
-               pf_cur_ + static_cast<std::size_t>(t) * hidden, nullptr);
+    if (hipMemcpy(pf_tok_, host_tokens.data() + start, T * sizeof(std::int32_t),
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      return Fail(error_msg, "embedding token upload failed");
     }
-    ScaleInPlace(pf_cur_, std::sqrt(static_cast<float>(hidden)),
-                 static_cast<std::size_t>(T) * hidden, nullptr);
+    EmbedRows(model_.token_embd().data, emb_type, pf_tok_, T, hidden, emb_scale,
+              pf_cur_, nullptr);
     // Splice the image embeddings over the scaled token rows they replace.
     // Both regions are contiguous [rows][hidden], so each overlap is one D2D
     // copy. Gemma does not scale the image rows, so this runs after the
@@ -537,9 +607,34 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   const std::uint32_t kvh = c.NumKvHeads(il);
   const float* inv_freq = model_.inv_freq(il);
   const std::size_t rows = tokens;
-
-  RmsNormRows(pf_cur_, l.attn_norm.f32(), pf_normed_, tokens, hidden, c.rms_eps,
-              nullptr);
+  const std::size_t chunk = static_cast<std::size_t>(prefill_chunk_);
+  const std::uint32_t q_dim = heads * head_dim;
+  const std::uint32_t kv_dim = kvh * head_dim;
+  // A fused upload stores q (and k, v) as one matrix whose rows concatenate
+  // the parts' rows, so ONE GEMM emits the whole [tokens][qkv_rows] box and
+  // the rope/norm consumers read the column slices with the fused row pitch.
+  // The fused box only takes the half-in route, so execution fuses exactly
+  // when that window is active; any other batch or shape runs the per-tensor
+  // GEMMs into natural-size boxes at fixed offsets of the same scratch region
+  // (the fused tensor views are natural-layout slices either way).
+  GemvType qkvt{};
+  if (!l.attn_qkv.empty() && !GemvTypeOf(l.attn_qkv.type, &qkvt)) {
+    return Fail(error_msg,
+                "unsupported attn_qkv type at layer " + std::to_string(il));
+  }
+  const bool fused_qkv = !l.attn_qkv.empty() && (hidden % 32U == 0U) &&
+                         HalfInWindow(qkvt, tokens, l.attn_qkv.rows, hidden);
+  const std::uint32_t qkv_rows = fused_qkv ? l.attn_qkv.rows : 0;
+  float* q_dst = pf_qkv_;
+  // Fused: k/v are column slices, so their pointers step by the fused row's
+  // column prefix. Unfused: each part owns a natural box at a fixed offset.
+  float* k_dst = fused_qkv ? pf_qkv_ + q_dim
+                           : pf_qkv_ + chunk * static_cast<std::size_t>(q_dim);
+  float* v_dst =
+      fused_qkv ? pf_qkv_ + q_dim + kv_dim
+                : pf_qkv_ + chunk * static_cast<std::size_t>(q_dim + kv_dim);
+  const std::uint32_t q_pitch = fused_qkv ? qkv_rows : q_dim;
+  const std::uint32_t kv_pitch = fused_qkv ? qkv_rows : kv_dim;
 
   GemvType qt{};
   GemvType kt{};
@@ -548,41 +643,84 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
     return Fail(error_msg,
                 "unsupported attention type at layer " + std::to_string(il));
   }
-  Gemm(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
-       pf_normed_, pf_q_, tokens, nullptr);
-  Gemm(l.attn_k.data, kt, kvh * head_dim, hidden, l.attn_k.row_bytes,
-       pf_normed_, pf_k_, tokens, nullptr);
-  if (!l.attn_v.empty()) {
-    if (!GemvTypeOf(l.attn_v.type, &vt)) {
-      return Fail(error_msg,
-                  "unsupported attn_v type at layer " + std::to_string(il));
+  if (!l.attn_v.empty() && !GemvTypeOf(l.attn_v.type, &vt)) {
+    return Fail(error_msg,
+                "unsupported attn_v type at layer " + std::to_string(il));
+  }
+  // Wide-batch binary16 attention input: one F16 row produced by the norm is
+  // shared by all projections, replacing the FP32->F16 narrowing pass
+  // each `Gemm` would insert into its own scratch (and the FP32 row write)
+  // while the values stay bit-identical to norm-then-narrow. Gated on all
+  // shapes taking the half-in route together; anything else keeps the
+  // FP32 path bit-for-bit.
+  const bool qkv_half =
+      fused_qkv ||
+      (hidden % 32U == 0U && HalfInWindow(qt, tokens, q_dim, hidden) &&
+       HalfInWindow(kt, tokens, kv_dim, hidden) &&
+       (l.attn_v.empty() || HalfInWindow(vt, tokens, kv_dim, hidden)));
+  if (qkv_half) {
+    RmsNormRowsHalf(pf_cur_, l.attn_norm.f32(), pf_qkv_half_, tokens, hidden,
+                    c.rms_eps, nullptr);
+    const bool ok =
+        fused_qkv ? GemmHalfIn(l.attn_qkv.data, qkvt, qkv_rows, hidden,
+                               pf_qkv_half_, pf_qkv_, tokens, nullptr)
+                  : GemmHalfIn(l.attn_q.data, qt, q_dim, hidden, pf_qkv_half_,
+                               q_dst, tokens, nullptr) &&
+                        GemmHalfIn(l.attn_k.data, kt, kv_dim, hidden,
+                                   pf_qkv_half_, k_dst, tokens, nullptr) &&
+                        (l.attn_v.empty() ||
+                         GemmHalfIn(l.attn_v.data, vt, kv_dim, hidden,
+                                    pf_qkv_half_, v_dst, tokens, nullptr));
+    if (!ok) {
+      return Fail(error_msg, "attention projection GEMM failed at layer " +
+                                 std::to_string(il));
     }
-    Gemm(l.attn_v.data, vt, kvh * head_dim, hidden, l.attn_v.row_bytes,
-         pf_normed_, pf_v_, tokens, nullptr);
+  } else {
+    RmsNormRows(pf_cur_, l.attn_norm.f32(), pf_normed_, tokens, hidden,
+                c.rms_eps, nullptr);
+    Gemm(l.attn_q.data, qt, q_dim, hidden, l.attn_q.row_bytes, pf_normed_,
+         q_dst, tokens, nullptr);
+    Gemm(l.attn_k.data, kt, kv_dim, hidden, l.attn_k.row_bytes, pf_normed_,
+         k_dst, tokens, nullptr);
+    if (!l.attn_v.empty()) {
+      Gemm(l.attn_v.data, vt, kv_dim, hidden, l.attn_v.row_bytes, pf_normed_,
+           v_dst, tokens, nullptr);
+    }
   }
 
-  QknormRope(pf_q_, l.attn_q_norm.f32(), pf_qn_, tokens, heads, head_dim,
-             inv_freq, start, nullptr);
-  KvNormRopeWrite(pf_k_, l.attn_v.empty() ? pf_k_ : pf_v_, l.attn_k_norm.f32(),
-                  session.k_cache_[il], session.v_cache_[il], start, tokens,
-                  kvh, head_dim, inv_freq, nullptr);
-
-  const std::uint32_t window = l.swa ? c.sliding_window : 0;
-  AttentionPrefill(pf_qn_, session.k_cache_[il], session.v_cache_[il], pf_attn_,
-                   start, tokens, heads, kvh, head_dim, window, nullptr);
+  QkvPost(pf_qkv_, l.attn_q_norm.f32(), pf_qn_, k_dst,
+          l.attn_v.empty() ? k_dst : v_dst, l.attn_k_norm.f32(),
+          session.k_cache_[il], session.v_cache_[il], tokens, heads, kvh,
+          head_dim, inv_freq, start, q_pitch, kv_pitch, nullptr);
 
   GemvType ot{};
   if (!GemvTypeOf(l.attn_output.type, &ot)) {
     return Fail(error_msg, "unsupported attn_output type");
   }
-  Gemm(l.attn_output.data, ot, hidden, heads * head_dim,
-       l.attn_output.row_bytes, pf_attn_, pf_proj_, tokens, nullptr);
-  RmsNormRows(pf_proj_, l.post_attention_norm.f32(), pf_attn_out_, tokens,
-              hidden, c.rms_eps, nullptr);
-  Add(pf_attn_out_, pf_cur_, rows * hidden, nullptr);
+  // Wide-batch binary16 attention output projection: when the projection is
+  // inside the F16 dense window, the attention epilogue writes the F16 twin
+  // of the output rows directly, which is bit-identical to the FP32->F16
+  // narrowing pass `Gemm` would insert for exactly this window, and
+  // `GemmHalfIn` runs the identical dense GEMM on it. Outside the window
+  // (or on a rejected plan) the FP32 rows and `Gemm` run as before; both
+  // attention paths always produce the FP32 output, so the fallback is
+  // bit-for-bit the old path.
+  const std::uint32_t attn_out_cols = heads * head_dim;
+  const bool oproj_half =
+      ot == GemvType::kQ8_0 && HalfInWindow(ot, tokens, hidden, attn_out_cols);
+  const std::uint32_t window = l.swa ? c.sliding_window : 0;
+  AttentionPrefill(pf_qn_, session.k_cache_[il], session.v_cache_[il], pf_attn_,
+                   start, tokens, heads, kvh, head_dim, window,
+                   oproj_half ? pf_attn_half_ : nullptr, nullptr);
 
-  RmsNormRows(pf_attn_out_, l.ffn_norm.f32(), pf_normed_, tokens, hidden,
-              c.rms_eps, nullptr);
+  if (!oproj_half || !GemmHalfIn(l.attn_output.data, ot, hidden, attn_out_cols,
+                                 pf_attn_half_, pf_proj_, tokens, nullptr)) {
+    Gemm(l.attn_output.data, ot, hidden, attn_out_cols, l.attn_output.row_bytes,
+         pf_attn_, pf_proj_, tokens, nullptr);
+  }
+  RmsNormAddRows(pf_proj_, l.post_attention_norm.f32(), pf_cur_, pf_attn_out_,
+                 tokens, hidden, c.rms_eps, nullptr);
+
   GemvType ft{};
   if (!GemvTypeOf(l.ffn_gate.type, &ft) || !GemvTypeOf(l.ffn_up.type, &ft) ||
       !GemvTypeOf(l.ffn_down.type, &ft)) {
@@ -594,45 +732,67 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   // row traffic. Gated so all three projections take the F16 route together
   // (up/gate shape [ffn x hidden], down shape [hidden x ffn]) and their K is a
   // multiple of 32, which is exactly when GemmHalfIn cannot fall back; any
-  // other shape or batch keeps the bit-identical FP32 path.
+  // other shape or batch keeps the bit-identical FP32 path. The fused box
+  // rides this route or not at all: outside the window the parts run their
+  // own GEMMs into natural-size boxes (the fused views are slices either way).
   const bool ffn_half = ft == GemvType::kQ8_0 && (hidden % 32U == 0U) &&
                         (c.ffn_length % 32U == 0U) &&
                         DenseF16Window(tokens, c.ffn_length, hidden) &&
                         DenseF16Window(tokens, hidden, c.ffn_length);
+  const bool fused_gu = !l.ffn_gate_up.empty() && ffn_half &&
+                        DenseF16Window(tokens, l.ffn_gate_up.rows, hidden);
+  // Same fused/unfused split as the attention projections: one wide GEMM
+  // emits [tokens][2 * ffn] (gate columns first) or the parts write their
+  // own natural boxes at fixed offsets of pf_gu_.
+  const float* gu_gate = pf_gu_;
+  const float* gu_up =
+      fused_gu ? pf_gu_ + c.ffn_length
+               : pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length);
+  const std::uint32_t gu_pitch = fused_gu ? l.ffn_gate_up.rows : c.ffn_length;
+  // One launch for the three norms taken off the post-attention row: the
+  // binary16 FFN input (inside the F16 window only; the FP32 branch keeps
+  // its own `RmsNormRows`), the router input with the router's
+  // per-dimension scale and the RMS 1/sqrt(hidden) constant folded into the
+  // store, and the binary16 routed-expert input (identical rounding to the
+  // old RmsNormRows + NarrowActivations pair). Every store pass runs the
+  // standalone kernel's loop, so all three outputs stay bit-identical.
+  RmsNormRowsTriple(pf_attn_out_, tokens, hidden, c.rms_eps,
+                    ffn_half ? l.ffn_norm.f32() : nullptr,
+                    ffn_half ? pf_normed_half_ : nullptr, l.router_scale.f32(),
+                    1.0F / std::sqrt(static_cast<float>(hidden)), pf_router_in_,
+                    l.pre_ffw_norm_2.f32(), pf_x_half_, nullptr);
   if (ffn_half) {
-    RmsNormRowsHalf(pf_attn_out_, l.ffn_norm.f32(), pf_normed_half_, tokens,
-                    hidden, c.rms_eps, nullptr);
-    const bool ok = GemmHalfIn(l.ffn_up.data, ft, c.ffn_length, hidden,
-                               pf_normed_half_, pf_up_, tokens, nullptr) &&
-                    GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden,
-                               pf_normed_half_, pf_gate_, tokens, nullptr);
+    const bool ok =
+        fused_gu ? GemmHalfIn(l.ffn_gate_up.data, ft, l.ffn_gate_up.rows,
+                              hidden, pf_normed_half_, pf_gu_, tokens, nullptr)
+                 : GemmHalfIn(
+                       l.ffn_up.data, ft, c.ffn_length, hidden, pf_normed_half_,
+                       pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length),
+                       tokens, nullptr) &&
+                       GemmHalfIn(l.ffn_gate.data, ft, c.ffn_length, hidden,
+                                  pf_normed_half_, pf_gu_, tokens, nullptr);
     if (!ok) {
       return Fail(error_msg, "shared FFN up/gate GEMM failed");
     }
-    GegluF16Separate(pf_gate_, pf_up_, pf_act_ffn_half_, rows * c.ffn_length,
-                     nullptr);
+    GegluF16Separate(gu_gate, gu_up, pf_act_ffn_half_, rows * c.ffn_length,
+                     c.ffn_length, gu_pitch, nullptr);
     if (!GemmHalfIn(l.ffn_down.data, ft, hidden, c.ffn_length, pf_act_ffn_half_,
                     pf_mlp_, tokens, nullptr)) {
       return Fail(error_msg, "shared FFN down GEMM failed");
     }
   } else {
+    RmsNormRows(pf_attn_out_, l.ffn_norm.f32(), pf_normed_, tokens, hidden,
+                c.rms_eps, nullptr);
     Gemm(l.ffn_up.data, ft, c.ffn_length, hidden, l.ffn_up.row_bytes,
-         pf_normed_, pf_up_, tokens, nullptr);
+         pf_normed_, pf_gu_ + chunk * static_cast<std::size_t>(c.ffn_length),
+         tokens, nullptr);
     Gemm(l.ffn_gate.data, ft, c.ffn_length, hidden, l.ffn_gate.row_bytes,
-         pf_normed_, pf_gate_, tokens, nullptr);
-    GegluF32Separate(pf_gate_, pf_up_, pf_act_, rows * c.ffn_length, nullptr);
+         pf_normed_, pf_gu_, tokens, nullptr);
+    GegluF32Separate(gu_gate, gu_up, pf_act_, rows * c.ffn_length, c.ffn_length,
+                     gu_pitch, nullptr);
     Gemm(l.ffn_down.data, ft, hidden, c.ffn_length, l.ffn_down.row_bytes,
          pf_act_, pf_mlp_, tokens, nullptr);
   }
-  RmsNormRows(pf_mlp_, l.post_ffw_norm_1.f32(), pf_mlp1_, tokens, hidden,
-              c.rms_eps, nullptr);
-
-  RmsNormRows(pf_attn_out_, nullptr, pf_router_in_, tokens, hidden, c.rms_eps,
-              nullptr);
-  MulInPlace(pf_router_in_, l.router_scale.f32(), rows * hidden, hidden,
-             nullptr);
-  ScaleInPlace(pf_router_in_, 1.0F / std::sqrt(static_cast<float>(hidden)),
-               rows * hidden, nullptr);
   GemvType rt{};
   if (!GemvTypeOf(l.router.type, &rt)) {
     return Fail(error_msg, "unsupported router type");
@@ -642,77 +802,104 @@ bool Executor::PrefillLayer(Session& session, std::uint32_t il,
   RouterTopK(pf_router_logits_, c.num_experts, pf_ids_, pf_weights_, tokens,
              c.num_experts, c.num_experts_used, nullptr);
 
-  RmsNormRows(pf_attn_out_, l.pre_ffw_norm_2.f32(), pf_normed_, tokens, hidden,
-              c.rms_eps, nullptr);
-  if (!MoeBatch(l, pf_normed_, pf_ids_, pf_weights_, pf_moe_, tokens,
-                error_msg)) {
+  if (!MoeBatch(l, pf_ids_, tokens, error_msg)) {
     return false;
   }
-  RmsNormRows(pf_moe_, l.post_ffw_norm_2.f32(), pf_moe2_, tokens, hidden,
-              c.rms_eps, nullptr);
-
-  if (hipMemcpyAsync(pf_next_, pf_mlp1_, rows * hidden * sizeof(float),
-                     hipMemcpyDeviceToDevice) != hipSuccess) {
-    return Fail(error_msg, "mlp copy failed");
-  }
-  Add(pf_next_, pf_moe2_, rows * hidden, nullptr);
-  RmsNormRows(pf_next_, l.post_ffw_norm.f32(), pf_normed_, tokens, hidden,
-              c.rms_eps, nullptr);
-  if (hipMemcpyAsync(pf_next_, pf_normed_, rows * hidden * sizeof(float),
-                     hipMemcpyDeviceToDevice) != hipSuccess) {
-    return Fail(error_msg, "residual copy failed");
-  }
-  Add(pf_next_, pf_attn_out_, rows * hidden, nullptr);
-  ScaleInPlace(pf_next_, l.layer_output_scale, rows * hidden, nullptr);
+  // The combine, the two expert/dense norms, their add, the post-FFN norm,
+  // the residual add and the layer-output scale in one launch.
+  MoeFinish(pf_mlp_, pf_expert_out_, pf_weights_, pf_ids_,
+            l.ffn_down_exps_scale.f32(), l.post_ffw_norm_1.f32(),
+            l.post_ffw_norm_2.f32(), l.post_ffw_norm.f32(),
+            l.layer_output_scale, pf_attn_out_, pf_next_, tokens,
+            c.num_experts_used, hidden, c.rms_eps, nullptr);
   std::swap(pf_cur_, pf_next_);
   return true;
 }
 
-bool Executor::MoeBatch(const DeviceLayer& l, const float* x,
-                        const std::int32_t* ids, const float* weights,
-                        float* out, std::uint32_t tokens,
-                        std::string* error_msg) {
+bool Executor::MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
+                        std::uint32_t tokens, std::string* error_msg) {
   const Config& c = c_;
   const std::uint32_t used = c.num_experts_used;
   const std::size_t slots = static_cast<std::size_t>(tokens) * used;
 
-  NarrowActivations(x, pf_x_half_, false,
-                    static_cast<std::size_t>(tokens) * c.hidden_size, nullptr);
   ExpertCounts(ids, pf_counts_, tokens, c.num_experts, used, nullptr);
-  // The routed tile map is built on the device from the per-expert counts, so
-  // the host never downloads the histogram or uploads a tile map: the GEMM
-  // launches the map's capacity and skips the dead entries. This removes a
-  // synchronous device-to-host round-trip from every MoE layer.
-  const std::uint32_t n_tiles =
-      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 64);
-  BuildRoutedTiles(pf_counts_, c.num_experts, 64, n_tiles, pf_tiles_dev_,
-                   nullptr);
+  // Each stack runs either the 96-row prefill kernel (its format decodes
+  // natively) or the 64-row fused WMMA kernel. Both tile maps are built on the
+  // device from the per-expert counts in one pass, so the host never downloads
+  // the histogram or uploads a tile map: the GEMMs launch their map's capacity
+  // and skip the dead entries.
+  ExpertFormat fmt_gu{};
+  ExpertFormat fmt_down{};
+  const bool half_shape = c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+  const bool own_gu = half_shape &&
+                      PrefillFormatOf(l.ffn_gate_up_exps.type, &fmt_gu) &&
+                      OwnGateUpFormat(fmt_gu);
+  const bool own_down = half_shape &&
+                        PrefillFormatOf(l.ffn_down_exps.type, &fmt_down) &&
+                        OwnDownFormat(fmt_down);
+  // Q8_0 buckets at Gemma scale (top-8 of 2048 tokens over 128 experts ~=
+  // 128 rows) fit one 128-row tile, halving per-expert weight re-streaming
+  // vs 96; other owned formats stay at 96.
+  const auto gu_tile = [](ExpertFormat f) {
+    return f == ExpertFormat::kQ8_0 ? 128U : 96U;
+  };
+  const std::uint32_t rows_gu = own_gu ? gu_tile(fmt_gu) : 64U;
+  const std::uint32_t rows_down = own_down ? gu_tile(fmt_down) : 64U;
+  const std::size_t tile_span =
+      RoutedTileCapacity(static_cast<std::uint32_t>(slots), c.num_experts, 48);
+  std::int32_t* tiles_gu = pf_tiles_dev_;
+  std::int32_t* tiles_down = pf_tiles_dev_ + tile_span;
+  const std::uint32_t n_tiles_gu =
+      static_cast<std::uint32_t>(RoutedTileCapacity(
+          static_cast<std::uint32_t>(slots), c.num_experts, rows_gu));
+  const std::uint32_t n_tiles_down =
+      static_cast<std::uint32_t>(RoutedTileCapacity(
+          static_cast<std::uint32_t>(slots), c.num_experts, rows_down));
+  BuildRoutedTiles(pf_counts_, c.num_experts, rows_gu, n_tiles_gu, tiles_gu,
+                   rows_down, n_tiles_down, tiles_down, nullptr);
   RoutedCompact(ids, pf_counts_, pf_pad_bounds_, pf_cursors_, pf_rows_token_,
                 pf_rows_slot_, tokens, used, c.num_experts, nullptr);
 
-  // gate/up and down are independent WMMA calls; a *_K_M artifact stores the
-  // gate/up stack as Q4_K and the down stack as Q8_0, so each GEMM dispatches
-  // on its own weight type (RoutedF16Gemm rejects an unsupported one below).
-  // The gate/up GEMM fuses Gemma-4's gelu-tanh activation into its epilogue and
-  // writes the expert_ff-wide act directly, so no wide gu buffer or separate
-  // GegluF16 pass is needed. Gemma-4's gate_up is always a 64-row tile over an
-  // even 2*expert_ff stack, which the fused epilogue always accepts.
-  const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
-  const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
-  if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, pf_tiles_dev_,
-                     n_tiles, 64, pf_pad_bounds_, pf_rows_token_, pf_rows_slot_,
-                     nullptr, pf_act_half_, 2 * c.expert_ff, c.hidden_size,
-                     nullptr, /*geglu=*/true)) {
-    return Fail(error_msg, "RoutedF16Gemm gate_up unsupported");
+  // gate/up and down are independent GEMMs; a *_K_M artifact stores the
+  // gate/up stack as Q4_K and the down stack as Q8_0, so each dispatches on
+  // its own weight type. Both fused paths write the expert_ff-wide act
+  // directly (gelu-tanh in the epilogue), so no wide gu buffer or separate
+  // GegluF16 pass is needed.
+  if (own_gu) {
+    if (!LaunchRoutedHalfGemm(fmt_gu, l.ffn_gate_up_exps.data, pf_x_half_,
+                              tiles_gu, n_tiles_gu, rows_gu, pf_pad_bounds_,
+                              pf_rows_token_, pf_rows_slot_, nullptr,
+                              pf_act_half_, 2 * c.expert_ff, c.hidden_size,
+                              nullptr, /*geglu=*/true)) {
+      return Fail(error_msg, "LaunchRoutedHalfGemm gate_up unsupported");
+    }
+  } else {
+    const WeightType wt_gu = RoutedTypeOf(l.ffn_gate_up_exps.type);
+    if (!RoutedF16Gemm(l.ffn_gate_up_exps.data, wt_gu, pf_x_half_, tiles_gu,
+                       n_tiles_gu, rows_gu, pf_pad_bounds_, pf_rows_token_,
+                       pf_rows_slot_, nullptr, pf_act_half_, 2 * c.expert_ff,
+                       c.hidden_size, nullptr, /*geglu=*/true)) {
+      return Fail(error_msg, "RoutedF16Gemm gate_up unsupported");
+    }
   }
-  if (!RoutedF16Gemm(l.ffn_down_exps.data, wt_down, pf_act_half_, pf_tiles_dev_,
-                     n_tiles, 64, pf_pad_bounds_, pf_rows_slot_, pf_rows_slot_,
-                     pf_expert_out_, nullptr, c.hidden_size, c.expert_ff,
-                     nullptr)) {
-    return Fail(error_msg, "RoutedF16Gemm down unsupported");
+  if (own_down) {
+    if (!LaunchRoutedHalfGemm(fmt_down, l.ffn_down_exps.data, pf_act_half_,
+                              tiles_down, n_tiles_down, rows_down,
+                              pf_pad_bounds_, pf_rows_slot_, pf_rows_slot_,
+                              pf_expert_out_, nullptr, c.hidden_size,
+                              c.expert_ff, nullptr,
+                              /*geglu=*/false)) {
+      return Fail(error_msg, "LaunchRoutedHalfGemm down unsupported");
+    }
+  } else {
+    const WeightType wt_down = RoutedTypeOf(l.ffn_down_exps.type);
+    if (!RoutedF16Gemm(l.ffn_down_exps.data, wt_down, pf_act_half_, tiles_down,
+                       n_tiles_down, rows_down, pf_pad_bounds_, pf_rows_slot_,
+                       pf_rows_slot_, pf_expert_out_, nullptr, c.hidden_size,
+                       c.expert_ff, nullptr)) {
+      return Fail(error_msg, "RoutedF16Gemm down unsupported");
+    }
   }
-  MoeEpilogue(pf_expert_out_, weights, ids, l.ffn_down_exps_scale.f32(), out,
-              tokens, used, c.hidden_size, nullptr);
   return true;
 }
 
@@ -830,7 +1017,7 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
     Gemv(l.attn_q.data, qt, heads * head_dim, hidden, l.attn_q.row_bytes,
          d_normed_, d_q_, nullptr);
     QknormRope(d_q_, l.attn_q_norm.f32(), d_qn_, 1, heads, head_dim, inv_freq,
-               pos, nullptr);
+               pos, heads * head_dim, nullptr);
 
     // Read the trunk KV cache read-only over the rows the trunk has written.
     const std::uint32_t window = swa ? dc.sliding_window : 0;
@@ -847,9 +1034,8 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
     }
     Gemv(l.attn_output.data, ot, hidden, heads * head_dim,
          l.attn_output.row_bytes, d_attn_, d_proj_, nullptr);
-    RmsNormRows(d_proj_, l.post_attention_norm.f32(), d_attn_out_, 1, hidden,
-                dc.rms_eps, nullptr);
-    Add(d_attn_out_, d_cur_, hidden, nullptr);
+    RmsNormAddRows(d_proj_, l.post_attention_norm.f32(), d_cur_, d_attn_out_, 1,
+                   hidden, dc.rms_eps, nullptr);
 
     RmsNormRows(d_attn_out_, l.ffn_norm.f32(), d_normed_, 1, hidden, dc.rms_eps,
                 nullptr);
@@ -858,11 +1044,16 @@ bool Executor::DraftStep(Session& session, std::int32_t token, const float* h,
         !GemvTypeOf(l.ffn_down.type, &ft)) {
       return Fail(error_msg, "unsupported draft FFN type");
     }
-    Gemv(l.ffn_up.data, ft, dffn, hidden, l.ffn_up.row_bytes, d_normed_, d_up_,
-         nullptr);
-    Gemv(l.ffn_gate.data, ft, dffn, hidden, l.ffn_gate.row_bytes, d_normed_,
-         d_gate_, nullptr);
-    GegluF32Separate(d_gate_, d_up_, d_act_, dffn, nullptr);
+    GemvMultiProj dffn_projs[2] = {
+        {l.ffn_up.data, ft, dffn, hidden, d_up_},
+        {l.ffn_gate.data, ft, dffn, hidden, d_gate_}};
+    if (!GemvMulti(dffn_projs, 2, d_normed_, nullptr)) {
+      Gemv(dffn_projs[0].base, ft, dffn, hidden, l.ffn_up.row_bytes, d_normed_,
+           d_up_, nullptr);
+      Gemv(dffn_projs[1].base, ft, dffn, hidden, l.ffn_gate.row_bytes,
+           d_normed_, d_gate_, nullptr);
+    }
+    GegluF32Separate(d_gate_, d_up_, d_act_, dffn, dffn, dffn, nullptr);
     Gemv(l.ffn_down.data, ft, hidden, dffn, l.ffn_down.row_bytes, d_act_,
          d_proj_, nullptr);
     RmsNormRows(d_proj_, l.post_ffw_norm.f32(), d_mlp1_, 1, hidden, dc.rms_eps,

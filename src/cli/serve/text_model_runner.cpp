@@ -16,6 +16,7 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
+#include "src/models/gemma4/chat_template.hpp"
 
 namespace gufo::server {
 
@@ -35,12 +36,19 @@ std::optional<ChatRequest> ConstrainChatRequest(
   auto instruction = request.response_format ? request.response_format->prompt()
                                              : std::string();
   auto grammar = request.response_format;
+  auto format = runner.ToolFormat();
+  // Ling 3.0 Flash calls are recognized in its native frames by the HTTP
+  // layer; unlike the JSON fallback, no grammar rewrites the dialect, and
+  // the reference project constrains it with neither form. A response
+  // format still constrains the final answer.
+  const bool ling_native_tools =
+      format == sampling::JsonConstraint::ToolFormat::kLing3;
   if (!request.tools.empty() &&
-      request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      request.tool_choice != ChatRequest::ToolChoice::kNone &&
+      !ling_native_tools) {
     std::vector<sampling::JsonConstraint::Tool> tools;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
-    auto format = runner.ToolFormat();
     for (const auto& tool : request.tools) {
       const auto definition = tool.definition_json.empty()
                                   ? json::Value()
@@ -82,9 +90,24 @@ std::optional<ChatRequest> ConstrainChatRequest(
     constrained.messages.insert(constrained.messages.begin(),
                                 std::move(message));
   }
-  if (runner.InitialOutputState(request) ==
-      TextGenerationBackend::InitialOutputState::kReasoning)
-    grammar = sampling::JsonConstraint::WithReasoning(grammar);
+  const auto initial_state = runner.InitialOutputState(request);
+  const bool gemma4 =
+      runner.ToolFormat() == sampling::JsonConstraint::ToolFormat::kGemma4;
+  if (grammar &&
+      initial_state == TextGenerationBackend::InitialOutputState::kReasoning) {
+    // The model template has opened the thought channel: the model must
+    // close it before the constrained answer. Without a model-specific
+    // marker the grammar takes the shared reasoning close token.
+    grammar = gemma4 ? sampling::JsonConstraint::WithReasoning(
+                           grammar, models::gemma4::kThoughtEnd)
+                     : sampling::JsonConstraint::WithReasoning(grammar);
+  } else if (gemma4 && grammar &&
+             initial_state ==
+                 TextGenerationBackend::InitialOutputState::kAuto) {
+    // The model may open and close the thought channel inside its turn.
+    grammar = sampling::JsonConstraint::WithReasoning(
+        grammar, models::gemma4::kThoughtEnd, models::gemma4::kThoughtStart);
+  }
   sampling->constraint = runner.BindConstraint(grammar);
   return constrained;
 }
@@ -690,6 +713,11 @@ struct TextRunnerPool::Impl {
 std::shared_ptr<const sampling::TokenConstraint>
 TextModelRunner::BindConstraint(
     std::shared_ptr<const sampling::JsonConstraint> grammar) const {
+  if (!grammar) {
+    // Parse-only dialects (Ling 3.0 Flash tool calls) constrain nothing; a
+    // null grammar must not pull in a constraint vocabulary.
+    return nullptr;
+  }
   const std::lock_guard lock(constraint_mutex_);
   for (const auto& binding : constraints_)
     if (binding->grammar == grammar)

@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_GEMV_HPP_
 #define GUFO_MODELS_QWEN36_A3B_KERNELS_ROCM_GEMV_HPP_
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -14,10 +15,27 @@ namespace gufo::models::qwen36_a3b::rocm {
 
 /// The quantized row formats the GEMV tier decodes. The executor maps the
 /// artifact's GGUF type onto this. Q8_0/F32/BF16 back the dense projections;
+/// kF16 is the binary16 retype of the uploaded BF16 dense projections (see
+/// ConvertBf16ToHalf), which gives the dense tier a native tensor-core route;
 /// Q4_K/Q5_K back the routed expert stacks of a Q4_K_XL artifact, which the
 /// grouped decode GEMV decodes on the fly (the fused pair/SwiGLU kernels are
 /// Q8_0-only, so those experts fall back to the plain grouped GEMV).
-enum class GemvType { kQ8_0, kF32, kBF16, kQ4_K, kQ5_K };
+enum class GemvType { kQ8_0, kF32, kBF16, kF16, kQ4_K, kQ5_K };
+
+/// Converts the resident `count` binary16 values in place from BF16 to
+/// round-to-nearest-even binary16, counting values outside the binary16 range
+/// into `overflow` (device uint32, caller-read). The dense tier rejects a
+/// tensor with a non-zero count at load rather than saturating silently.
+void ConvertBf16ToHalf(void* data, std::size_t count, std::uint32_t* overflow,
+                       hipStream_t stream);
+
+/// Converts the resident `count` single-precision values into a freshly
+/// allocated binary16 buffer (out-of-place: the source stays intact for the
+/// caller to free after the conversion syncs), counting values outside the
+/// binary16 range into `overflow` (device uint32, caller-read). `dst` must
+/// hold count * 2 bytes. Same overflow contract as ConvertBf16ToHalf.
+void ConvertF32ToHalf(const float* src, __half* dst, std::size_t count,
+                      std::uint32_t* overflow, hipStream_t stream);
 
 /// out[r] = sum_k W[r][k] * x[k] for r in [0, rows). `base` points at the first
 /// row of a row-major [rows x cols] matrix stored in `type`; `row_bytes` is the

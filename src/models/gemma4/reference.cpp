@@ -27,14 +27,45 @@ void RoundF16(std::span<float> x) {
   }
 }
 
+// Q8_1 round trip: per 32 values d = amax / 127 (stored as binary16) and
+// q = round(x / d), as the integer GEMM fallbacks decode their activation
+// rows. In place: each value is read and written once per block.
+void RoundQ8(std::span<float> x) {
+  for (std::size_t b = 0; b < x.size(); b += 32) {
+    const std::size_t n = std::min<std::size_t>(32, x.size() - b);
+    float amax = 0.0F;
+    for (std::size_t i = b; i < b + n; ++i) {
+      amax = std::max(amax, std::fabs(x[i]));
+    }
+    const float d = amax / 127.0F;
+    const float id = d != 0.0F ? 1.0F / d : 0.0F;
+    const float d_half = static_cast<float>(static_cast<_Float16>(d));
+    for (std::size_t i = b; i < b + n; ++i) {
+      x[i] = std::round(x[i] * id) * d_half;
+    }
+  }
+}
+
 }  // namespace
 
 ReferenceModel::ReferenceModel(const ModelWeights& weights,
-                               std::uint32_t max_context)
+                               std::uint32_t max_context, Storage storage)
     : w_(weights),
       c_(weights.config),
+      storage_(storage),
       max_context_(max_context),
       attention_(weights.config.num_layers) {}
+
+void ReferenceModel::Proj(const TensorRef& t, std::uint64_t e,
+                          std::span<const float> x, std::span<float> y) {
+  if (storage_ == Storage::kQ8Activations && t.type != core::GgmlType::kF32) {
+    rounded_.assign(x.begin(), x.end());
+    RoundQ8(rounded_);
+    cpu::MatVec(t, e, rounded_, y);
+    return;
+  }
+  cpu::MatVec(t, e, x, y);
+}
 
 void ReferenceModel::Reset() {
   position_ = 0;
@@ -136,7 +167,7 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     // Q: project, per-head RMSNorm, NEOX rope (proportional factors on full
     // layers only).
     q_proj.assign(static_cast<std::size_t>(num_heads) * head_dim, 0.0F);
-    cpu::MatVec(l.attn_q, 0, normed, q_proj);
+    Proj(l.attn_q, 0, normed, q_proj);
     for (std::uint32_t h = 0; h < num_heads; ++h) {
       cpu::RmsNorm(Head(q_proj, h, head_dim),
                    static_cast<const float*>(l.attn_q_norm.data), c_.rms_eps);
@@ -149,12 +180,12 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     // K: project, per-head RMSNorm, rope. V: weightless RMSNorm of the V (or
     // K on full layers) projection, never rotated.
     kv_proj.assign(static_cast<std::size_t>(num_kv_heads) * head_dim, 0.0F);
-    cpu::MatVec(l.attn_k, 0, normed, kv_proj);
+    Proj(l.attn_k, 0, normed, kv_proj);
     if (l.attn_v.empty()) {
       v_proj = kv_proj;
     } else {
       v_proj.assign(static_cast<std::size_t>(num_kv_heads) * head_dim, 0.0F);
-      cpu::MatVec(l.attn_v, 0, normed, v_proj);
+      Proj(l.attn_v, 0, normed, v_proj);
     }
     for (std::uint32_t h = 0; h < num_kv_heads; ++h) {
       cpu::RmsNorm(Head(kv_proj, h, head_dim),
@@ -167,8 +198,10 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
         swa ? nullptr : static_cast<const float*>(w_.rope_freqs.data));
 
     auto& state = attention_[il];
-    RoundF16(kv_proj);
-    RoundF16(v_proj);
+    if (storage_ != Storage::kFloat32) {
+      RoundF16(kv_proj);
+      RoundF16(v_proj);
+    }
     state.k.insert(state.k.end(), kv_proj.begin(), kv_proj.end());
     state.v.insert(state.v.end(), v_proj.begin(), v_proj.end());
 
@@ -177,7 +210,7 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
               swa ? c_.sliding_window : 0, attn);
 
     proj.assign(hidden, 0.0F);
-    cpu::MatVec(l.attn_output, 0, attn, proj);
+    Proj(l.attn_output, 0, attn, proj);
     cpu::RmsNorm(proj, static_cast<const float*>(l.post_attention_norm.data),
                  c_.rms_eps);
     for (std::size_t i = 0; i < hidden; ++i) {
@@ -191,13 +224,13 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     const std::size_t ffn = c_.ffn_length;
     act.assign(ffn, 0.0F);
     std::vector<float> gate(ffn, 0.0F);
-    cpu::MatVec(l.ffn_up, 0, normed, act);
-    cpu::MatVec(l.ffn_gate, 0, normed, gate);
+    Proj(l.ffn_up, 0, normed, act);
+    Proj(l.ffn_gate, 0, normed, gate);
     for (std::size_t i = 0; i < ffn; ++i) {
       act[i] = cpu::Gelu(gate[i]) * act[i];
     }
     mlp.assign(hidden, 0.0F);
-    cpu::MatVec(l.ffn_down, 0, act, mlp);
+    Proj(l.ffn_down, 0, act, mlp);
     cpu::RmsNorm(mlp, static_cast<const float*>(l.post_ffw_norm_1.data),
                  c_.rms_eps);
 
@@ -210,7 +243,7 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
       router_in[i] *= inv_sqrt * router_scale[i];
     }
     router_logits.assign(c_.num_experts, 0.0F);
-    cpu::MatVec(l.router, 0, router_in, router_logits);
+    Proj(l.router, 0, router_in, router_logits);
     cpu::Softmax(router_logits);
 
     // Top-8 experts by probability, weights renormalized over the selected
@@ -243,11 +276,11 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     std::fill(moe.begin(), moe.end(), 0.0F);
     for (std::size_t k = 0; k < used; ++k) {
       const std::uint32_t e = selected[k];
-      cpu::MatVec(l.ffn_gate_up_exps, e, normed, gu);
+      Proj(l.ffn_gate_up_exps, e, normed, gu);
       for (std::size_t i = 0; i < expert_ff; ++i) {
         act[i] = cpu::Gelu(gu[i]) * gu[expert_ff + i];
       }
-      cpu::MatVec(l.ffn_down_exps, e, act, dn);
+      Proj(l.ffn_down_exps, e, act, dn);
       const float w = router_logits[e] / wsum * down_scale[e];
       for (std::size_t i = 0; i < hidden; ++i) {
         moe[i] += w * dn[i];
@@ -277,7 +310,7 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
   }
 
   if (!logits.empty()) {
-    cpu::MatVec(w_.output, 0, cur, logits.subspan(0, c_.vocab_size));
+    Proj(w_.output, 0, cur, logits.subspan(0, c_.vocab_size));
     if (c_.logit_softcap > 0.0F) {
       const float cap = c_.logit_softcap;
       for (std::size_t i = 0; i < c_.vocab_size; ++i) {
@@ -321,7 +354,7 @@ bool ReferenceModel::DraftStep(const DraftWeights& draft, std::int32_t token,
   }
 
   std::vector<float> cur(hidden, 0.0F);
-  cpu::MatVec(draft.pre_projection, 0, xh, cur);
+  Proj(draft.pre_projection, 0, xh, cur);
 
   std::vector<float> normed(hidden), q_proj, attn, proj(hidden), attn_out, gate,
       act;
@@ -337,7 +370,7 @@ bool ReferenceModel::DraftStep(const DraftWeights& draft, std::int32_t token,
                  dc.rms_eps);
 
     q_proj.assign(static_cast<std::size_t>(num_heads) * head_dim, 0.0F);
-    cpu::MatVec(l.attn_q, 0, normed, q_proj);
+    Proj(l.attn_q, 0, normed, q_proj);
     for (std::uint32_t hh = 0; hh < num_heads; ++hh) {
       cpu::RmsNorm(Head(q_proj, hh, head_dim),
                    static_cast<const float*>(l.attn_q_norm.data), dc.rms_eps);
@@ -352,7 +385,7 @@ bool ReferenceModel::DraftStep(const DraftWeights& draft, std::int32_t token,
     Attention(attention_[target], q_proj, num_heads, dc.NumKvHeads(il),
               head_dim, swa ? dc.sliding_window : 0, attn);
 
-    cpu::MatVec(l.attn_output, 0, attn, proj);
+    Proj(l.attn_output, 0, attn, proj);
     cpu::RmsNorm(proj, static_cast<const float*>(l.post_attention_norm.data),
                  dc.rms_eps);
     attn_out.resize(hidden);
@@ -366,13 +399,13 @@ bool ReferenceModel::DraftStep(const DraftWeights& draft, std::int32_t token,
     const std::size_t ffn = dc.ffn_length;
     act.assign(ffn, 0.0F);
     gate.assign(ffn, 0.0F);
-    cpu::MatVec(l.ffn_up, 0, normed, act);
-    cpu::MatVec(l.ffn_gate, 0, normed, gate);
+    Proj(l.ffn_up, 0, normed, act);
+    Proj(l.ffn_gate, 0, normed, gate);
     for (std::size_t i = 0; i < ffn; ++i) {
       act[i] = cpu::Gelu(gate[i]) * act[i];
     }
     proj.assign(hidden, 0.0F);
-    cpu::MatVec(l.ffn_down, 0, act, proj);
+    Proj(l.ffn_down, 0, act, proj);
     cpu::RmsNorm(proj, static_cast<const float*>(l.post_ffw_norm.data),
                  dc.rms_eps);
     for (std::size_t i = 0; i < hidden; ++i) {
@@ -383,8 +416,8 @@ bool ReferenceModel::DraftStep(const DraftWeights& draft, std::int32_t token,
 
   cpu::RmsNorm(cur, static_cast<const float*>(draft.output_norm.data),
                draft.config.rms_eps);
-  cpu::MatVec(draft.token_embd, 0, cur, logits.subspan(0, c_.vocab_size));
-  cpu::MatVec(draft.post_projection, 0, cur, h_next.subspan(0, hidden_out));
+  Proj(draft.token_embd, 0, cur, logits.subspan(0, c_.vocab_size));
+  Proj(draft.post_projection, 0, cur, h_next.subspan(0, hidden_out));
   return true;
 }
 

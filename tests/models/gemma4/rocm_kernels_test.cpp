@@ -40,6 +40,16 @@ bool Check(const char* name, double worst, double tolerance) {
   return true;
 }
 
+double WorstAbsoluteHalf(const std::vector<__half>& a,
+                         const std::vector<__half>& b) {
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    worst = std::max(worst, static_cast<double>(std::fabs(__half2float(a[i]) -
+                                                          __half2float(b[i]))));
+  }
+  return worst;
+}
+
 // BF16 is the top 16 bits of a float32; encode round-to-nearest-even and
 // decode exactly so the host reference matches the kernel bit-for-bit.
 std::uint16_t FloatToBf16Bits(float f) {
@@ -443,10 +453,106 @@ bool TestNormsAndAdd() {
   for (std::uint32_t i = 0; i < kHidden; ++i) {
     ref_add[i] = single[i] + addend[i];
   }
+  q::RmsNormRows(d_x.get(), d_gamma.get(), d_out.get(), kRows, kHidden, 1e-6F,
+                 nullptr);
+  q::Add(d_out.get(), d_x.get(), kRows * kHidden, nullptr);
+  t::HipBuffer<float> d_fused(x.size());
+  q::RmsNormAddRows(d_x.get(), d_gamma.get(), d_x.get(), d_fused.get(), kRows,
+                    kHidden, 1e-6F, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RmsNormAddRows synchronization");
+  const auto two_pass = t::Download(&d_out, x.size());
+  const auto fused = t::Download(&d_fused, x.size());
+  bool bits_ok = true;
+  std::size_t ndiff = 0;
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    if (std::memcmp(&two_pass[i], &fused[i], sizeof(float)) != 0) {
+      if (ndiff < 12) {
+        std::cerr << "RmsNormAddRows bit diff at " << i << " (row "
+                  << i / kHidden << " col " << i % kHidden << "): two_pass "
+                  << two_pass[i] << " fused " << fused[i] << '\n';
+      }
+      ++ndiff;
+      bits_ok = false;
+    }
+  }
+  std::cout << "RmsNormAddRows bit-exact " << (bits_ok ? "yes" : "NO") << " ("
+            << ndiff << " diffs)\n";
+
+  // Triple norm: one launch producing the FFN-half, router and pre-FFW-half
+  // slots must be bit-identical to the three standalone launches (and the
+  // router slot to the folded RmsNormRows post_scale pass).
+  const auto gamma2 = t::MakeValues(kHidden, 0x2E2E2E2EU, 1.0F, 1.0F);
+  const auto rscale = t::MakeValues(kHidden, 0x1F1F1F1FU, 1.0F, 1.0F);
+  t::HipBuffer<float> d_gamma2(gamma2.size());
+  t::Upload(&d_gamma2, gamma2);
+  t::HipBuffer<float> d_rscale(rscale.size());
+  t::Upload(&d_rscale, rscale);
+  const float kpost = 0.01882F;
+  t::HipBuffer<__half> d_ref_ffn(x.size());
+  t::HipBuffer<float> d_ref_router(x.size());
+  t::HipBuffer<__half> d_ref_preffw(x.size());
+  q::RmsNormRowsHalf(d_x.get(), d_gamma.get(), d_ref_ffn.get(), kRows, kHidden,
+                     1e-6F, nullptr);
+  q::RmsNormRows(d_x.get(), nullptr, d_ref_router.get(), kRows, kHidden, 1e-6F,
+                 d_rscale.get(), kpost, nullptr);
+  q::RmsNormRowsHalf(d_x.get(), d_gamma2.get(), d_ref_preffw.get(), kRows,
+                     kHidden, 1e-6F, nullptr);
+  t::HipBuffer<__half> d_tri_ffn(x.size());
+  t::HipBuffer<float> d_tri_router(x.size());
+  t::HipBuffer<__half> d_tri_preffw(x.size());
+  q::RmsNormRowsTriple(d_x.get(), kRows, kHidden, 1e-6F, d_gamma.get(),
+                       d_tri_ffn.get(), d_rscale.get(), kpost,
+                       d_tri_router.get(), d_gamma2.get(), d_tri_preffw.get(),
+                       nullptr);
+  // Router-only slots (null half outputs) must run and match too.
+  t::HipBuffer<float> d_tri_router2(x.size());
+  q::RmsNormRowsTriple(d_x.get(), kRows, kHidden, 1e-6F, nullptr, nullptr,
+                       d_rscale.get(), kpost, d_tri_router2.get(), nullptr,
+                       nullptr, nullptr);
+  t::CheckHip(hipDeviceSynchronize(), "RmsNormRowsTriple synchronization");
+  bool tri_ok = true;
+  std::size_t tri_diffs = 0;
+  const auto cmp = [&](const char* name, const void* a, const void* b,
+                       std::size_t count, std::size_t elem) {
+    const auto* pa = static_cast<const unsigned char*>(a);
+    const auto* pb = static_cast<const unsigned char*>(b);
+    for (std::size_t i = 0; i < count; ++i) {
+      if (std::memcmp(pa + i * elem, pb + i * elem, elem) != 0) {
+        ++tri_diffs;
+        tri_ok = false;
+      }
+    }
+    if (!tri_ok) {
+      std::cerr << name << " Triple bit diff\n";
+    }
+  };
+  const auto dl_half = [](t::HipBuffer<__half>* buf, std::size_t n) {
+    std::vector<__half> data(n);
+    t::CheckHip(hipMemcpy(data.data(), buf->get(), n * sizeof(__half),
+                          hipMemcpyDeviceToHost),
+                "download half buffer");
+    return data;
+  };
+  const auto ref_ffn_h = dl_half(&d_ref_ffn, x.size());
+  const auto tri_ffn_h = dl_half(&d_tri_ffn, x.size());
+  const auto ref_router = t::Download(&d_ref_router, x.size());
+  const auto tri_router = t::Download(&d_tri_router, x.size());
+  const auto tri_router2 = t::Download(&d_tri_router2, x.size());
+  const auto ref_preffw_h = dl_half(&d_ref_preffw, x.size());
+  const auto tri_preffw_h = dl_half(&d_tri_preffw, x.size());
+  cmp("ffn", ref_ffn_h.data(), tri_ffn_h.data(), x.size(), sizeof(__half));
+  cmp("router", ref_router.data(), tri_router.data(), x.size(), sizeof(float));
+  cmp("router-only", ref_router.data(), tri_router2.data(), x.size(),
+      sizeof(float));
+  cmp("preffw", ref_preffw_h.data(), tri_preffw_h.data(), x.size(),
+      sizeof(__half));
+  std::cout << "RmsNormRowsTriple bit-exact " << (tri_ok ? "yes" : "NO") << " ("
+            << tri_diffs << " diffs)\n";
+
   return Check("Add",
                t::WorstRelative(ref_add, t::Download(&d_single, kHidden)),
                1e-6) &&
-         ok;
+         ok && bits_ok && tri_ok;
 }
 
 bool TestGemmShape(std::uint32_t rows, std::uint32_t batch, const char* label,
@@ -684,7 +790,7 @@ bool TestAttention() {
       t::Upload(&d_q, q);
       t::Upload(&d_g, gamma);
       q::QknormRope(d_q.get(), d_g.get(), d_o.get(), tokens, kHeads, hd,
-                    d_inv.get(), 17, nullptr);
+                    d_inv.get(), 17, kHeads * hd, nullptr);
       t::CheckHip(hipDeviceSynchronize(), "QknormRope synchronization");
       const auto got = t::Download(&d_o, q.size());
       std::vector<float> ref(q.size());
@@ -718,6 +824,31 @@ bool TestAttention() {
       ok = Check(("QknormRope " + tag).c_str(), t::WorstAbsolute(ref, got),
                  1e-5) &&
            ok;
+
+      // Fused-slice input: the same rows placed at a wider pitch (a fused
+      // qkv box's column slice with other projections around it) must give
+      // the identical output.
+      {
+        const std::uint32_t pitch = kHeads * hd + 37;
+        std::vector<float> wide(static_cast<std::size_t>(tokens) * pitch,
+                                -3.25F);
+        for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+          for (std::uint32_t i = 0; i < kHeads * hd; ++i) {
+            wide[static_cast<std::size_t>(tok) * pitch + i] =
+                q[static_cast<std::size_t>(tok) * kHeads * hd + i];
+          }
+        }
+        t::HipBuffer<float> d_wide(wide.size()), d_wide_o(q.size());
+        t::Upload(&d_wide, wide);
+        q::QknormRope(d_wide.get(), d_g.get(), d_wide_o.get(), tokens, kHeads,
+                      hd, d_inv.get(), 17, pitch, nullptr);
+        t::CheckHip(hipDeviceSynchronize(),
+                    "QknormRope pitched synchronization");
+        const auto got_wide = t::Download(&d_wide_o, q.size());
+        ok = Check(("QknormRope pitched " + tag).c_str(),
+                   t::WorstAbsolute(ref, got_wide), 1e-5) &&
+             ok;
+      }
     }
 
     // KvNormRopeWrite: 3 tokens x kvh heads into an F16 cache at start=9.
@@ -738,7 +869,7 @@ bool TestAttention() {
       t::HipBuffer<__half> d_kc(cache), d_vc(cache);
       q::KvNormRopeWrite(d_k.get(), d_v.get(), d_g.get(), d_kc.get(),
                          d_vc.get(), start, tokens, kvh, hd, d_inv.get(),
-                         nullptr);
+                         kvh * hd, nullptr);
       t::CheckHip(hipDeviceSynchronize(), "KvNormRopeWrite synchronization");
       std::vector<__half> kc(cache), vc(cache);
       t::CheckHip(
@@ -800,6 +931,147 @@ bool TestAttention() {
            ok;
       ok = Check(("KvNormRopeWrite V " + tag).c_str(),
                  t::WorstRelative(ref_v, got_v), 1e-6) &&
+           ok;
+
+      // Fused-slice input: k and v rows placed side by side at a wider pitch
+      // (a fused qkv box) must write the identical cache rows.
+      {
+        const std::uint32_t pitch = kvh * hd * 2U + 37U;
+        std::vector<float> wide_k(static_cast<std::size_t>(tokens) * pitch,
+                                  -3.25F);
+        std::vector<float> wide_v(static_cast<std::size_t>(tokens) * pitch,
+                                  -3.25F);
+        for (std::uint32_t tok = 0; tok < tokens; ++tok) {
+          for (std::uint32_t i = 0; i < kvh * hd; ++i) {
+            wide_k[static_cast<std::size_t>(tok) * pitch + i] =
+                k[static_cast<std::size_t>(tok) * kvh * hd + i];
+            wide_v[static_cast<std::size_t>(tok) * pitch + kvh * hd + i] =
+                v[static_cast<std::size_t>(tok) * kvh * hd + i];
+          }
+        }
+        t::HipBuffer<float> d_wk(wide_k.size()), d_wv(wide_v.size());
+        t::Upload(&d_wk, wide_k);
+        t::Upload(&d_wv, wide_v);
+        t::HipBuffer<__half> d_kc2(cache), d_vc2(cache);
+        q::KvNormRopeWrite(d_wk.get(), d_wv.get() + kvh * hd, d_g.get(),
+                           d_kc2.get(), d_vc2.get(), start, tokens, kvh, hd,
+                           d_inv.get(), pitch, nullptr);
+        t::CheckHip(hipDeviceSynchronize(),
+                    "KvNormRopeWrite pitched synchronization");
+        std::vector<__half> kc2(cache), vc2(cache);
+        t::CheckHip(hipMemcpy(kc2.data(), d_kc2.get(), d_kc2.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite pitched K download");
+        t::CheckHip(hipMemcpy(vc2.data(), d_vc2.get(), d_vc2.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite pitched V download");
+        // The first launch's caches are still untouched on the device, and
+        // identical launches are bit-deterministic here, so reload them and
+        // compare only the rows the kernels wrote; the pitched read must
+        // reproduce the natural one exactly. The rest of each cache is
+        // uninitialized on both sides.
+        std::vector<__half> kc_n(cache), vc_n(cache);
+        t::CheckHip(hipMemcpy(kc_n.data(), d_kc.get(), d_kc.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite natural K reload");
+        t::CheckHip(hipMemcpy(vc_n.data(), d_vc.get(), d_vc.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "KvNormRopeWrite natural V reload");
+        const std::size_t lo = static_cast<std::size_t>(start) * kvh * hd;
+        const std::size_t hi = lo + static_cast<std::size_t>(tokens) * kvh * hd;
+        const std::vector<__half> kc_w(kc_n.begin() + lo, kc_n.begin() + hi);
+        const std::vector<__half> vc_w(vc_n.begin() + lo, vc_n.begin() + hi);
+        const std::vector<__half> kc2_w(kc2.begin() + lo, kc2.begin() + hi);
+        const std::vector<__half> vc2_w(vc2.begin() + lo, vc2.begin() + hi);
+        ok = Check(("KvNormRopeWrite pitched K " + tag).c_str(),
+                   WorstAbsoluteHalf(kc_w, kc2_w), 0.0F) &&
+             ok;
+        ok = Check(("KvNormRopeWrite pitched V " + tag).c_str(),
+                   WorstAbsoluteHalf(vc_w, vc2_w), 0.0F) &&
+             ok;
+      }
+    }
+
+    // QkvPost at warp width: one launch reproduces the two standalone
+    // launches (q and V bit-identical, K within one half ulp on rope
+    // rounding ties; only the written cache slice is compared, the rest is
+    // uninitialized).
+    {
+      const std::uint32_t tokens = 40;
+      const std::uint32_t start = 9;
+      const std::size_t cache =
+          static_cast<std::size_t>(start + tokens) * kvh * hd;
+      const auto q = t::MakeValues(
+          static_cast<std::size_t>(tokens) * kHeads * hd, 71, 1.0F);
+      const auto k =
+          t::MakeValues(static_cast<std::size_t>(tokens) * kvh * hd, 73, 1.0F);
+      const auto v =
+          t::MakeValues(static_cast<std::size_t>(tokens) * kvh * hd, 79, 1.0F);
+      const auto gq = t::MakeValues(hd, 83, 1.0F);
+      const auto gk = t::MakeValues(hd, 89, 1.0F);
+      t::HipBuffer<float> d_q(q.size()), d_k(k.size()), d_v(v.size());
+      t::HipBuffer<float> d_gq(gq.size()), d_gk(gk.size());
+      t::Upload(&d_q, q);
+      t::Upload(&d_k, k);
+      t::Upload(&d_v, v);
+      t::Upload(&d_gq, gq);
+      t::Upload(&d_gk, gk);
+      t::HipBuffer<float> d_onew(q.size());
+      t::HipBuffer<__half> d_kcnew(cache), d_vcnew(cache);
+      const auto ref_q = [&](t::HipBuffer<float>* o) {
+        q::QknormRope(d_q.get(), d_gq.get(), o->get(), tokens, kHeads, hd,
+                      d_inv.get(), start, kHeads * hd, nullptr);
+      };
+      const auto ref_kv = [&](t::HipBuffer<__half>* kc,
+                              t::HipBuffer<__half>* vc) {
+        q::KvNormRopeWrite(d_k.get(), d_v.get(), d_gk.get(), kc->get(),
+                           vc->get(), start, tokens, kvh, hd, d_inv.get(),
+                           kvh * hd, nullptr);
+      };
+      // Reference outputs from the two standalone launches, candidate from
+      // the merged one.
+      t::HipBuffer<float> d_oref(q.size());
+      t::HipBuffer<__half> d_kcref(cache), d_vcref(cache);
+      ref_q(&d_oref);
+      ref_kv(&d_kcref, &d_vcref);
+      q::QkvPost(d_q.get(), d_gq.get(), d_onew.get(), d_k.get(), d_v.get(),
+                 d_gk.get(), d_kcnew.get(), d_vcnew.get(), tokens, kHeads, kvh,
+                 hd, d_inv.get(), start, kHeads * hd, kvh * hd, nullptr);
+      t::CheckHip(hipDeviceSynchronize(), "QkvPost synchronization");
+      const auto oref = t::Download(&d_oref, q.size());
+      const auto onew = t::Download(&d_onew, q.size());
+      std::vector<__half> kcref(cache), vcref(cache), kcnew(cache),
+          vcnew(cache);
+      t::CheckHip(hipMemcpy(kcref.data(), d_kcref.get(), d_kcref.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost reference K download");
+      t::CheckHip(hipMemcpy(vcref.data(), d_vcref.get(), d_vcref.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost reference V download");
+      t::CheckHip(hipMemcpy(kcnew.data(), d_kcnew.get(), d_kcnew.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost K download");
+      t::CheckHip(hipMemcpy(vcnew.data(), d_vcnew.get(), d_vcnew.bytes(),
+                            hipMemcpyDeviceToHost),
+                  "QkvPost V download");
+      const std::size_t lo = static_cast<std::size_t>(start) * kvh * hd;
+      const std::size_t hi = lo + static_cast<std::size_t>(tokens) * kvh * hd;
+      ok = Check(("QkvPost q-bits " + tag).c_str(),
+                 t::WorstAbsolute(oref, onew), 0.0) &&
+           ok;
+      // K rope stores may differ from the standalone kernel's compiler-chosen
+      // FMA shape on rounding ties: measured 2/81920 (swa) and 1/40960 (full)
+      // elements, each by exactly one half ulp. The prefill validator (task
+      // 3.4 gate) pins this as quality-neutral.
+      ok = Check(("QkvPost k-bits " + tag).c_str(),
+                 WorstAbsoluteHalf({kcref.begin() + lo, kcref.begin() + hi},
+                                   {kcnew.begin() + lo, kcnew.begin() + hi}),
+                 0.002F) &&
+           ok;
+      ok = Check(("QkvPost v-bits " + tag).c_str(),
+                 WorstAbsoluteHalf({vcref.begin() + lo, vcref.begin() + hi},
+                                   {vcnew.begin() + lo, vcnew.begin() + hi}),
+                 0.0F) &&
            ok;
     }
 
@@ -897,11 +1169,29 @@ bool TestAttention() {
                             hipMemcpyHostToDevice),
                   "prefill V upload");
       t::HipBuffer<float> d_out(q.size());
+      t::HipBuffer<__half> d_out_half(q.size());
       q::AttentionPrefillScalar(d_q.get(), d_kc.get(), d_vc.get(), d_out.get(),
                                 start, tokens, kHeads, kvh, hd, window,
-                                nullptr);
+                                d_out_half.get(), nullptr);
       t::CheckHip(hipDeviceSynchronize(), "AttentionPrefill synchronization");
       const auto got = t::Download(&d_out, q.size());
+      // The F16 twin the epilogue writes must round bit-for-bit like a
+      // separate narrowing pass of the FP32 rows (the o_proj contract).
+      {
+        std::vector<__half> twin(q.size());
+        t::CheckHip(hipMemcpy(twin.data(), d_out_half.get(), d_out_half.bytes(),
+                              hipMemcpyDeviceToHost),
+                    "prefill F16 twin download");
+        std::size_t twin_bad = 0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+          if (__half_raw(twin[i]).x != __half_raw(__float2half(got[i])).x) {
+            ++twin_bad;
+          }
+        }
+        ok = Check(("AttentionPrefillScalar HalfTwin " + tag).c_str(),
+                   static_cast<double>(twin_bad), 0.0) &&
+             ok;
+      }
       std::vector<float> ref(q.size());
       for (std::uint32_t tok = 0; tok < tokens; ++tok) {
         const std::uint32_t causal = start + tok + 1;
@@ -949,14 +1239,32 @@ bool TestAttention() {
       // uniform fixture is ~2e-3. The same kernel reaches ~4e-4 on smooth data.
       // 3e-3 leaves margin.
       t::HipBuffer<float> d_out_wmma(q.size());
+      t::HipBuffer<__half> d_out_wmma_half(q.size());
       q::AttentionPrefill(d_q.get(), d_kc.get(), d_vc.get(), d_out_wmma.get(),
-                          start, tokens, kHeads, kvh, hd, window, nullptr);
+                          start, tokens, kHeads, kvh, hd, window,
+                          d_out_wmma_half.get(), nullptr);
       t::CheckHip(hipDeviceSynchronize(),
                   "AttentionPrefillWmma synchronization");
       const auto got_wmma = t::Download(&d_out_wmma, q.size());
       ok = Check(("AttentionPrefillWmma " + tag).c_str(),
                  t::WorstRelativeToScale(ref, got_wmma), 3e-3) &&
            ok;
+      {
+        std::vector<__half> twin(q.size());
+        t::CheckHip(hipMemcpy(twin.data(), d_out_wmma_half.get(),
+                              d_out_wmma_half.bytes(), hipMemcpyDeviceToHost),
+                    "prefill WMMA F16 twin download");
+        std::size_t twin_bad = 0;
+        for (std::size_t i = 0; i < got_wmma.size(); ++i) {
+          if (__half_raw(twin[i]).x !=
+              __half_raw(__float2half(got_wmma[i])).x) {
+            ++twin_bad;
+          }
+        }
+        ok = Check(("AttentionPrefillWmma HalfTwin " + tag).c_str(),
+                   static_cast<double>(twin_bad), 0.0) &&
+             ok;
+      }
     }
   }
   return ok;

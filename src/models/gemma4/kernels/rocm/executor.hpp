@@ -177,12 +177,11 @@ private:
   /// `start`; swaps pf_cur_/pf_next_ likewise.
   bool PrefillLayer(Session& session, std::uint32_t il, std::uint32_t start,
                     std::uint32_t tokens, std::string* error_msg);
-  /// Routed F16 WMMA MoE over `tokens` rows of `x` ([tokens][hidden]) into
-  /// `out`. Downloads the expert histogram once per layer to build the tile
-  /// map on the host (the qwen36 route).
-  bool MoeBatch(const DeviceLayer& l, const float* x, const std::int32_t* ids,
-                const float* weights, float* out, std::uint32_t tokens,
-                std::string* error_msg);
+  /// Routed F16 WMMA MoE over `tokens` rows: the gate/up half rows come from
+  /// pf_x_half_ and the slot rows land in pf_expert_out_ ([tokens * used]
+  /// [hidden]); the tile map is built on the device from the expert counts.
+  bool MoeBatch(const DeviceLayer& l, const std::int32_t* ids,
+                std::uint32_t tokens, std::string* error_msg);
 
   float* AllocFloats(std::size_t n, std::string* error);
   void* AllocBytes(std::size_t bytes, std::string* error);
@@ -222,19 +221,20 @@ private:
   std::uint32_t prefill_chunk_{0};
   float* pf_next_{nullptr};
   float* pf_normed_{nullptr};
-  float* pf_q_{nullptr};
+  // One region each for the attention and gate/up projections: a fused GEMM
+  // box with the fused row pitch starts at the base, while unfused per-tensor
+  // GEMMs write natural [chunk][rows] boxes at fixed offsets.
+  float* pf_qkv_{nullptr};
   float* pf_qn_{nullptr};
-  float* pf_k_{nullptr};
-  float* pf_v_{nullptr};
   float* pf_attn_{nullptr};
+  // F16 twin of pf_attn_ written by the attention epilogue when the attention
+  // output projection runs on the binary16 dense path (replaces its FP32->F16
+  // narrowing pass; bit-identical to narrowing pf_attn_).
+  __half* pf_attn_half_{nullptr};
   float* pf_proj_{nullptr};
   float* pf_attn_out_{nullptr};
   float* pf_mlp_{nullptr};
-  float* pf_mlp1_{nullptr};
-  float* pf_moe_{nullptr};
-  float* pf_moe2_{nullptr};
-  float* pf_gate_{nullptr};
-  float* pf_up_{nullptr};
+  float* pf_gu_{nullptr};
   float* pf_act_{nullptr};
   float* pf_router_in_{nullptr};
   float* pf_router_logits_{nullptr};
@@ -252,10 +252,16 @@ private:
   // geglu act, consumed directly by the dense F16 up/gate/down GEMMs so the
   // FP32->F16 narrowing pass is skipped. Only used on the F16 dense route.
   __half* pf_normed_half_{nullptr};
+  // Attention-input norm in binary16 (shared by the q/k/v projections when all
+  // three take the half-in GEMM route), kept separate from `pf_normed_half_`
+  // (shared FFN) so the two norms never alias across a layer.
+  __half* pf_qkv_half_{nullptr};
   __half* pf_act_ffn_half_{nullptr};
   float* pf_expert_out_{nullptr};
   /// Prefill residual ping-pong: pf_cur_ alternates with pf_next_.
   float* pf_cur_{nullptr};
+  /// Device token ids for one prefill chunk (batched embedding lookup).
+  std::int32_t* pf_tok_{nullptr};
 
   // MTP draft scratch (attached on demand). cur_/other_ ping-pong the draft
   // residual; the draft attention reuses attn_scratch_ (same head geometry).

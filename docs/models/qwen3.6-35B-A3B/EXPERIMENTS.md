@@ -867,3 +867,79 @@ per-block int32→float scale chain). Recovering it would require changing the
 numerics, which the optimize-kernel contract forbids. The dense-GEMM hunt is
 closed; the remaining prefill gap is the reference's cheaper non-bit-exact
 arithmetic, not a kernel-efficiency gap we can close bit-exactly.
+
+## Retained DenseF16 tier re-budget: staged BK=2, 8×1-wave plan (retained)
+
+**Hypothesis.** The retained wide DenseF16 window (the F16-WMMA route that
+survived as production for `batch >= 96`, dense rows and `cols <= 4096`) runs
+its auto plan `DenseF16GEMMKernel<256,128,1,4,2>` at ~31 TF/s against the
+measured 55.2 TF/s WMMA ceiling, and a clean pp8192 capture put this kernel
+tier at ~3300 ms of 11037 ms busy (30 % of prefill) — enough headroom to re-
+open plan tuning even though the *arithmetic* question stayed closed.
+
+**Change.** `tests/models/qwen36_a3b/dense_f16_bench.cpp` now races five wide
+tile plans over the six production shapes (attn q/o, GDN qkv/gate/out,
+shared-expert down) at batch 2048 against a strided double reference:
+the auto 4×2-wave single-stage, `<256,128,2,4,2>`, and `<128,128,1,4,2>`
+(both kept as explicit `DenseF16Plan` enum values), plus two 8×1-wave
+variants — single-stage and staged (`BK=2`, two K blocks per `__syncthreads`).
+kAuto now selects the staged 8×1 plan when `k >= 2048` and keeps the old
+plan below that; no new switches.
+
+**Measurement (exclusive, median of 15 per launch).** Staged wins every
+`k >= 2048` shape: attn_q 2275.4→2167.9 µs, GDN qkv 2252.9→2196.1,
+GDN gate 1185.9→1163.9, attn_out 1332.5→1199.9, GDN out 1284.0→1201.1
+(0.90–0.98×; 1.02–1.11× speedup) and loses only the `k = 512` shared-expert
+down-projection (185.7→202.9). The two other staged/tile candidates were
+neutral-to-worse and were rejected from kAuto by the bench, not by argument.
+
+**Quality.** Identical per-output K accumulation order in the harness:
+max F16 error matches the auto plan on every shape. All eight
+`qwen36_a3b.rocm_*` gates pass and greedy pp512/tg128 `output_sha256` is
+bit-for-bit the `c5d1ba03` control.
+
+**Verdict: retained.** Same-window paired A/B vs the control binary, three
+alternating pairs each depth (`gufo_bench_ab18.log`): pp2048 +2.03/+0.20/
++2.08 %, pp8192 +1.51/+1.34/+0.98 % — 6/6 pairs, mean ~+1.3 %. Staged-
+through-LDS (two K blocks committed per barrier) is the new production
+default for wide dense shapes.
+
+## Native-F16 weight route: spill-free kStaged128 tile (retained)
+
+**Problem.** The wide-batch kF16 route (attention q/out and shared-expert
+down on their binary16 weights) ran the core kernel's auto 256×128 4×2-wave
+instantiation, which spills 160 B of registers per lane to scratch on this
+route: `prof45` timed it at 7686 µs per attn_q chunk (batch 2048) against
+2217 µs for the same tiles on Q8_0 bytes — half the route's speed budget
+gone to scratch traffic. The F16 fetch keeps 16 VGPR per unit (four verbatim
+uint4) where the dequant fetch keeps 9, so the 128 live accumulators plus
+the prefetch buffers break the 256-VGPR cap.
+
+**Candidate tiles.** `kStaged128` `<128,128,2,2,4>` and `kTile64`
+`<64,128,2,2,4>` (both spill-shaped: 64 live accumulators; kStaged128
+stagings two K blocks per barrier). New harness
+`tests/models/qwen36_a3b/dense_f16_w16_bench.cpp` uploads each weight twice
+(Q8_0 bytes and binary16) and races all seven plans against the Q8_0
+dequant ceiling on one double reference.
+
+**Measurement (exclusive, median of 15 per launch, batch 2048).** kStaged128
+wins the production chunk shape on both attention projections: attn_q
+6998→3705 µs (0.53×), attn_out 4083→1860 (0.46×); shexp_down 369→248
+(0.67×, the single-stage 8×1 plan micro-wins by 10 % — not worth a
+per-shape rule). At a hypothetical 8192-token chunk kStaged128 still beats
+kAuto 0.62–0.65×. Every plan's error matched the reference to 2.4e-4.
+
+**Verdict: retained.** K accumulation order per output is unchanged; all
+eight `qwen36_a3b.rocm_*` gates pass and greedy pp512/tg128
+`output_sha256` is bit-for-bit the control. Paired A/B vs the previous
+binary (`gufo_bench_ab19.log`, `gufo_bench_ab19b.log`): 10/12 alternating
+pairs positive (three order-correlated negatives in the first round), mean
++0.79 % at pp2048 and +0.63 % at pp8192.
+
+**Follow-up (closed, no change).** Porting the rule to gemma4's shared
+planner was checked and abandoned: that route is dead on every local
+artifact. GGUF dumps (pygguf) show UD-Q8_K_XL dense projections are
+Q8_0, qat-UD-Q4_K_XL Q4_0 and E4B-UD-Q6_K_XL Q6_K/Q8_0 — never BF16 —
+and gemma4's uploader retypes only BF16 sources to binary16, so no
+gemma4 dispatch reaches the spilling `weights_f16=true` instantiation.
+Qwen3.6 keeps the only live hot path.

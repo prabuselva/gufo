@@ -829,8 +829,10 @@ private:
 // tool decoding. Only a small scan state belongs to each speculative branch.
 class ReasoningLexeme final : public JsonSchemaLexeme {
 public:
-  ReasoningLexeme(std::string tool_prefix, ReasoningEnd end)
+  ReasoningLexeme(std::string tool_prefix, ReasoningEnd end,
+                  std::string explicit_end)
       : tool_prefix_(std::move(tool_prefix)),
+        explicit_end_(std::move(explicit_end)),
         end_(end),
         tool_failure_(tool_prefix_.size()) {
     for (std::size_t i = 1, matched = 0; i < tool_prefix_.size(); ++i) {
@@ -839,6 +841,14 @@ public:
       if (tool_prefix_[i] == tool_prefix_[matched])
         ++matched;
       tool_failure_[i] = matched;
+    }
+    explicit_failure_.resize(explicit_end_.size());
+    for (std::size_t i = 1, matched = 0; i < explicit_end_.size(); ++i) {
+      while (matched && explicit_end_[i] != explicit_end_[matched])
+        matched = explicit_failure_[matched - 1];
+      if (explicit_end_[i] == explicit_end_[matched])
+        ++matched;
+      explicit_failure_[i] = matched;
     }
   }
   bool CacheTransitions() const override { return true; }
@@ -862,6 +872,16 @@ public:
     Scan state{};
     if (!encoded.empty())
       std::memcpy(&state, encoded.data(), sizeof(state));
+    if (end_ == ReasoningEnd::kTool) {
+      // A required call must start at the very first token. A thought that
+      // precedes it is framed by the explicit channel end, owned by kExplicit.
+      if (byte != static_cast<std::uint8_t>(tool_prefix_[state.tool_prefix]))
+        return {false, false};
+      const auto done = ++state.tool_prefix == tool_prefix_.size();
+      if (!done)
+        encoded.assign(reinterpret_cast<const char*>(&state), sizeof(state));
+      return {!done, done};
+    }
     const bool line_start = !state.nonblank;
     if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n')
       state.nonblank = 1;
@@ -907,15 +927,15 @@ public:
         return prefix + 1;
       return std::uint32_t{0};
     };
-    constexpr std::string_view explicit_end = "</think>";
-    constexpr std::array<std::uint32_t, 8> explicit_failure{};
     state.explicit_prefix =
-        advance(state.explicit_prefix, explicit_end, explicit_failure);
+        explicit_end_.empty()
+            ? 0
+            : advance(state.explicit_prefix, explicit_end_, explicit_failure_);
     state.tool_prefix =
         state.inline_quote || state.fence
             ? 0
             : advance(state.tool_prefix, tool_prefix_, tool_failure_);
-    if (state.explicit_prefix == explicit_end.size())
+    if (!explicit_end_.empty() && state.explicit_prefix == explicit_end_.size())
       return {false, end_ == ReasoningEnd::kExplicit};
     if (state.tool_prefix == tool_prefix_.size())
       return {false, end_ == ReasoningEnd::kTool};
@@ -934,8 +954,10 @@ private:
     std::uint32_t nonblank{}, closing_fence{};
   };
   std::string tool_prefix_;
+  std::string explicit_end_;
   ReasoningEnd end_;
   std::vector<std::uint32_t> tool_failure_;
+  std::vector<std::uint32_t> explicit_failure_;
 };
 
 }  // namespace
@@ -953,8 +975,9 @@ std::shared_ptr<const JsonSchemaLexeme> JsonSchemaLexeme::Whitespace() {
   return whitespace;
 }
 std::shared_ptr<const JsonSchemaLexeme> JsonSchemaLexeme::Reasoning(
-    std::string tool_prefix, ReasoningEnd end) {
-  return std::make_shared<ReasoningLexeme>(std::move(tool_prefix), end);
+    std::string tool_prefix, ReasoningEnd end, std::string explicit_end) {
+  return std::make_shared<ReasoningLexeme>(std::move(tool_prefix), end,
+                                           std::move(explicit_end));
 }
 
 json::Value JsonSchemaLexeme::IntersectMultipleOf(const json::Value& a,

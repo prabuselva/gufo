@@ -86,7 +86,8 @@ __device__ __forceinline__ void BlockReduceMaxIndex(float value, int index,
 }
 
 __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
-                              std::uint32_t dim, float eps) {
+                              std::uint32_t dim, float eps,
+                              const float* post_scale, float post_k) {
   __shared__ double reduce[32];
   const std::size_t row = blockIdx.x;
   const float* xr = x + row * dim;
@@ -108,6 +109,9 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
                          static_cast<double>(dim)) +
                      eps);
     float4* orow = reinterpret_cast<float4*>(out + row * dim);
+    // `post_scale`/`post_k` fold the router's per-dimension scale and RMS
+    // constant into this pass; their multiply order ((v*scale)*g*s)*k matches
+    // the standalone RmsNormRows -> MulInPlace -> ScaleInPlace chain exactly.
     if (gamma != nullptr) {
       const float4* g4 = reinterpret_cast<const float4*>(gamma);
       for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
@@ -115,6 +119,13 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
         const float4 g = g4[i];
         orow[i] = {v.x * scale * g.x, v.y * scale * g.y, v.z * scale * g.z,
                    v.w * scale * g.w};
+      }
+    } else if (post_scale != nullptr) {
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 s = reinterpret_cast<const float4*>(post_scale)[i];
+        orow[i] = {(v.x * scale * s.x) * post_k, (v.y * scale * s.y) * post_k,
+                   (v.z * scale * s.z) * post_k, (v.w * scale * s.w) * post_k};
       }
     } else {
       for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
@@ -135,7 +146,8 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
                    eps);
   float* orow = out + row * dim;
   for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
-    orow[i] = xr[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+    const float v = xr[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+    orow[i] = post_scale != nullptr ? v * post_scale[i] * post_k : v;
   }
 }
 
@@ -270,6 +282,194 @@ __global__ void FusedAddRmsNormKernel(float* x, const float* addend,
   }
 }
 
+// RMSNorm with the residual accumulate folded into its store pass:
+// out[row][i] = (x[row][i]*scale*gamma[i]) + addend[row][i] (or + addend when
+// gamma is null). Same per-element values and rounding as running
+// RmsNormKernel and then AddKernel(a[i] += b[i]), minus the extra read-write
+// pass over the row.
+__global__ void RmsNormKernelAdd(const float* x, const float* gamma,
+                                 const float* addend, float* out,
+                                 std::uint32_t dim, float eps) {
+  __shared__ double reduce[32];
+  const std::size_t row = blockIdx.x;
+  const float* xr = x + row * dim;
+  if ((dim & 3U) == 0U) {
+    const float4* x4 = reinterpret_cast<const float4*>(xr);
+    const float4* a4 = reinterpret_cast<const float4*>(addend + row * dim);
+    const std::uint32_t n4 = dim / 4U;
+    float ss = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
+    float4* orow = reinterpret_cast<float4*>(out + row * dim);
+    // The store must keep the two-pass rounding chain fl(fl(v*scale*g)) + a.
+    // Default -ffp-contract contracts the final add into an FMA (ROCm's
+    // __fadd_rn/__fmul_rn are plain operator wrappers and do NOT prevent it;
+    // measured 23 % of elements off by 1 ulp), so contraction is disabled for
+    // exactly these loops. The sum-of-squares above keeps the compiler's
+    // default contraction, identical to RmsNormKernel.
+    if (gamma != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(gamma);
+      {
+#pragma clang fp contract(off)
+        for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+          const float4 v = x4[i];
+          const float4 g = g4[i];
+          const float4 a = a4[i];
+          orow[i] = {v.x * scale * g.x + a.x, v.y * scale * g.y + a.y,
+                     v.z * scale * g.z + a.z, v.w * scale * g.w + a.w};
+        }
+      }
+    } else {
+      {
+#pragma clang fp contract(off)
+        for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+          const float4 v = x4[i];
+          const float4 a = a4[i];
+          orow[i] = {v.x * scale + a.x, v.y * scale + a.y, v.z * scale + a.z,
+                     v.w * scale + a.w};
+        }
+      }
+    }
+    return;
+  }
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const double v = xr[i];
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(dim)) +
+                   eps);
+  float* orow = out + row * dim;
+  const float* ar = addend + row * dim;
+  {
+#pragma clang fp contract(off)
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      const float v = xr[i] * scale * (gamma != nullptr ? gamma[i] : 1.0F);
+      orow[i] = v + ar[i];
+    }
+  }
+}
+
+// Three RMSNorms over the same rows in one launch, sharing the per-row
+// sum-of-squares: an optional binary16 FFN-norm output, an optional FP32
+// router output (null gamma, per-dimension post-scale with the RMS constant
+// folded) and an optional binary16 pre-FFW output. Each store loop is the
+// verbatim loop from RmsNormKernelHalf / RmsNormKernel, and the sumsq uses
+// the same float partials and double block reduce, so every slot is
+// bit-identical to running the standalone kernels (same block geometry).
+__global__ void RmsNormKernelTriple(const float* x, std::uint32_t dim,
+                                    float eps, const float* ffn_gamma,
+                                    __half* ffn_half, const float* router_scale,
+                                    float router_k, float* router_out,
+                                    const float* preffw_gamma,
+                                    __half* preffw_half) {
+  __shared__ double reduce[32];
+  const std::size_t row = blockIdx.x;
+  const float* xr = x + row * dim;
+  if ((dim & 3U) == 0U) {
+    const float4* x4 = reinterpret_cast<const float4*>(xr);
+    const std::uint32_t n4 = dim / 4U;
+    float ss = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+      const float4 v = x4[i];
+      ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float scale =
+        1.0F / sqrtf(static_cast<float>(
+                         BlockReduceSum(static_cast<double>(ss), reduce) /
+                         static_cast<double>(dim)) +
+                     eps);
+    if (ffn_half != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(ffn_gamma);
+      __half* orow = ffn_half + row * dim;
+      // volatile round-trip through float before the F16 store, matching
+      // RmsNormKernelHalf (two roundings, not the contracted cvt).
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 g =
+            g4 != nullptr ? g4[i] : make_float4(1.0F, 1.0F, 1.0F, 1.0F);
+        volatile float rx = v.x * scale * g.x;
+        volatile float ry = v.y * scale * g.y;
+        volatile float rz = v.z * scale * g.z;
+        volatile float rw = v.w * scale * g.w;
+        orow[4 * i] = __float2half(rx);
+        orow[4 * i + 1] = __float2half(ry);
+        orow[4 * i + 2] = __float2half(rz);
+        orow[4 * i + 3] = __float2half(rw);
+      }
+    }
+    if (router_out != nullptr) {
+      float4* orow = reinterpret_cast<float4*>(router_out + row * dim);
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 s = reinterpret_cast<const float4*>(router_scale)[i];
+        orow[i] = {
+            (v.x * scale * s.x) * router_k, (v.y * scale * s.y) * router_k,
+            (v.z * scale * s.z) * router_k, (v.w * scale * s.w) * router_k};
+      }
+    }
+    if (preffw_half != nullptr) {
+      const float4* g4 = reinterpret_cast<const float4*>(preffw_gamma);
+      __half* orow = preffw_half + row * dim;
+      for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = x4[i];
+        const float4 g =
+            g4 != nullptr ? g4[i] : make_float4(1.0F, 1.0F, 1.0F, 1.0F);
+        volatile float rx = v.x * scale * g.x;
+        volatile float ry = v.y * scale * g.y;
+        volatile float rz = v.z * scale * g.z;
+        volatile float rw = v.w * scale * g.w;
+        orow[4 * i] = __float2half(rx);
+        orow[4 * i + 1] = __float2half(ry);
+        orow[4 * i + 2] = __float2half(rz);
+        orow[4 * i + 3] = __float2half(rw);
+      }
+    }
+    return;
+  }
+  double ss = 0.0;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const double v = xr[i];
+    ss += v * v;
+  }
+  const float scale =
+      1.0F / sqrtf(static_cast<float>(BlockReduceSum(ss, reduce) /
+                                      static_cast<double>(dim)) +
+                   eps);
+  if (ffn_half != nullptr) {
+    __half* orow = ffn_half + row * dim;
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      volatile float r =
+          xr[i] * scale * (ffn_gamma != nullptr ? ffn_gamma[i] : 1.0F);
+      orow[i] = __float2half(r);
+    }
+  }
+  if (router_out != nullptr) {
+    float* orow = router_out + row * dim;
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      const float v = xr[i] * scale * 1.0F;
+      orow[i] = v * router_scale[i] * router_k;
+    }
+  }
+  if (preffw_half != nullptr) {
+    __half* orow = preffw_half + row * dim;
+    for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+      volatile float r =
+          xr[i] * scale * (preffw_gamma != nullptr ? preffw_gamma[i] : 1.0F);
+      orow[i] = __float2half(r);
+    }
+  }
+}
+
 __global__ void AddKernel(float* a, const float* b, std::size_t count) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
@@ -368,6 +568,107 @@ __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
   }
 }
 
+// The expert layer's post-FFN chain in one launch, per row r:
+//   a = rms(mlp[r]) * norm1                                (float partials and
+//   b = combine[r]   rms-scaled by norm2                    double block reduce
+//   t = a + b                                               identical to the
+//   out[r] = (rms(t) * post_norm + residual[r]) * post_scale  separate chain)
+// where combine is MoeEpilogueKernel's weighted expert sum in the same order
+// (float per slot product, double accumulation). One block per row with the
+// block width RmsNormRows uses for the shape (`min(dim, 256)`), float4
+// striding over float partials, so every scale bit-matches a standalone
+// RmsNormRows over the same values. Rows are cached in registers between the
+// three reductions: the register holds cover dim / (4 * blockDim) float4s,
+// up to 8 per thread (dim <= 8192 at block 256).
+__global__ void MoeFinishKernel(
+    const float* __restrict__ mlp, const float* __restrict__ expert_out,
+    const float* __restrict__ weights, const std::int32_t* __restrict__ ids,
+    const float* __restrict__ expert_scale, const float* __restrict__ norm1,
+    const float* __restrict__ norm2, const float* __restrict__ post_norm,
+    float post_scale, const float* __restrict__ residual,
+    float* __restrict__ out, std::uint32_t dim, std::uint32_t used, float eps) {
+  __shared__ double red_a[32];
+  __shared__ double red_b[32];
+  const std::size_t row = blockIdx.x;
+  const std::size_t base = row * dim;
+  const float4* mlp4 = reinterpret_cast<const float4*>(mlp + base);
+  const float4* res4 = reinterpret_cast<const float4*>(residual + base);
+  const float4* norm1_4 = reinterpret_cast<const float4*>(norm1);
+  const float4* norm2_4 = reinterpret_cast<const float4*>(norm2);
+  const float4* post_4 = reinterpret_cast<const float4*>(post_norm);
+  float4* out4 = reinterpret_cast<float4*>(out + base);
+  const std::uint32_t n4 = dim / 4U;
+
+  float4 mv[8];
+  float4 cv[8];
+  float4 rv[8];
+  std::uint32_t held = 0;
+  float ss_m = 0.0F;
+  float ss_c = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+    const float4 m = mlp4[i];
+    mv[held] = m;
+    rv[held] = res4[i];
+    ss_m += m.x * m.x + m.y * m.y + m.z * m.z + m.w * m.w;
+    double acc_x = 0.0;
+    double acc_y = 0.0;
+    double acc_z = 0.0;
+    double acc_w = 0.0;
+    for (std::uint32_t s = 0; s < used; ++s) {
+      const std::size_t slot = row * used + s;
+      const float scale =
+          expert_scale != nullptr ? expert_scale[ids[slot]] : 1.0F;
+      const float4 e =
+          reinterpret_cast<const float4*>(expert_out + slot * dim)[i];
+      const double c = static_cast<double>(weights[slot]) * scale;
+      acc_x += c * e.x;
+      acc_y += c * e.y;
+      acc_z += c * e.z;
+      acc_w += c * e.w;
+    }
+    const float4 comb = {static_cast<float>(acc_x), static_cast<float>(acc_y),
+                         static_cast<float>(acc_z), static_cast<float>(acc_w)};
+    cv[held] = comb;
+    ss_c +=
+        comb.x * comb.x + comb.y * comb.y + comb.z * comb.z + comb.w * comb.w;
+    ++held;
+  }
+  // Consume the partials in ascending thread order exactly like
+  // BlockReduceSum; red_a is free again once both scales are formed.
+  const double d_m = BlockReduceSum(static_cast<double>(ss_m), red_a);
+  const double d_c = BlockReduceSum(static_cast<double>(ss_c), red_b);
+  const float scale_m =
+      1.0F / sqrtf(static_cast<float>(d_m / static_cast<double>(dim)) + eps);
+  const float scale_c =
+      1.0F / sqrtf(static_cast<float>(d_c / static_cast<double>(dim)) + eps);
+
+  float ss_t = 0.0F;
+  for (std::uint32_t j = 0; j < held; ++j) {
+    const std::uint32_t i = threadIdx.x + j * blockDim.x;
+    const float4 n1 = norm1_4[i];
+    const float4 n2 = norm2_4[i];
+    const float4 a = {mv[j].x * scale_m * n1.x, mv[j].y * scale_m * n1.y,
+                      mv[j].z * scale_m * n1.z, mv[j].w * scale_m * n1.w};
+    const float4 b = {cv[j].x * scale_c * n2.x, cv[j].y * scale_c * n2.y,
+                      cv[j].z * scale_c * n2.z, cv[j].w * scale_c * n2.w};
+    const float4 t = {a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w};
+    ss_t += t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w;
+    mv[j] = t;  // hold the summed row in registers for the final norm
+  }
+  const double d_t = BlockReduceSum(static_cast<double>(ss_t), red_a);
+  const float scale_t =
+      1.0F / sqrtf(static_cast<float>(d_t / static_cast<double>(dim)) + eps);
+  for (std::uint32_t j = 0; j < held; ++j) {
+    const std::uint32_t i = threadIdx.x + j * blockDim.x;
+    const float4 p = post_4[i];
+    const float4 u = {mv[j].x * scale_t * p.x, mv[j].y * scale_t * p.y,
+                      mv[j].z * scale_t * p.z, mv[j].w * scale_t * p.w};
+    const float4 r = rv[j];
+    out4[i] = {(u.x + r.x) * post_scale, (u.y + r.y) * post_scale,
+               (u.z + r.z) * post_scale, (u.w + r.w) * post_scale};
+  }
+}
+
 template<typename T>
 __device__ __forceinline__ T GegluPair(const T* gu, std::uint32_t ff);
 
@@ -426,13 +727,18 @@ __global__ void SoftcapKernel(float* x, float cap, std::size_t count) {
   }
 }
 
+// `pitch` is the float stride of one input row: `ff` for standalone gate/up
+// projections, or 2 * ff when they are halves of a fused gate/up GEMM output.
 __global__ void GegluSeparateKernel(const float* gate, const float* up,
-                                    float* act, std::size_t count) {
+                                    float* act, std::size_t count,
+                                    std::uint32_t ff, std::uint32_t pitch) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += stride) {
-    act[i] = DGelu(gate[i]) * up[i];
+    const std::size_t row = i / ff;
+    const std::size_t j = row * pitch + i - row * ff;
+    act[i] = DGelu(gate[j]) * up[j];
   }
 }
 
@@ -442,12 +748,15 @@ __global__ void GegluSeparateKernel(const float* gate, const float* up,
 // it the compiler fuses the final mul into the cvt and single-rounds, whereas
 // the FP32 path stores the float act and NarrowHalf rounds it again.
 __global__ void GegluSeparateHalfKernel(const float* gate, const float* up,
-                                        __half* act, std::size_t count) {
+                                        __half* act, std::size_t count,
+                                        std::uint32_t ff, std::uint32_t pitch) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t i =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += stride) {
-    volatile float r = DGelu(gate[i]) * up[i];
+    const std::size_t row = i / ff;
+    const std::size_t j = row * pitch + i - row * ff;
+    volatile float r = DGelu(gate[j]) * up[j];
     act[i] = __float2half(r);
   }
 }
@@ -487,32 +796,37 @@ void SoftcapInPlace(float* x, float cap, std::size_t count,
 }
 
 void GegluF32Separate(const float* gate, const float* up, float* act,
-                      std::size_t count, hipStream_t stream) {
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream) {
   if (count == 0) {
     return;
   }
   const std::size_t block = 256;
   const std::size_t grid =
       std::min<std::size_t>((count + block - 1) / block, 65535);
-  GegluSeparateKernel<<<grid, block, 0, stream>>>(gate, up, act, count);
+  GegluSeparateKernel<<<grid, block, 0, stream>>>(gate, up, act, count, ff,
+                                                  pitch);
 }
 
 void GegluF16Separate(const float* gate, const float* up, __half* act,
-                      std::size_t count, hipStream_t stream) {
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream) {
   if (count == 0) {
     return;
   }
   const std::size_t block = 256;
   const std::size_t grid =
       std::min<std::size_t>((count + block - 1) / block, 65535);
-  GegluSeparateHalfKernel<<<grid, block, 0, stream>>>(gate, up, act, count);
+  GegluSeparateHalfKernel<<<grid, block, 0, stream>>>(gate, up, act, count, ff,
+                                                      pitch);
 }
 
 void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
-                 hipStream_t stream) {
+                 const float* post_scale, float post_k, hipStream_t stream) {
   const dim3 block(std::min<std::uint32_t>(dim, 256U));
-  RmsNormKernel<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
+  RmsNormKernel<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps, post_scale,
+                                            post_k);
 }
 
 void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
@@ -520,6 +834,24 @@ void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
                      hipStream_t stream) {
   const dim3 block(std::min<std::uint32_t>(dim, 256U));
   RmsNormKernelHalf<<<rows, block, 0, stream>>>(x, gamma, out, dim, eps);
+}
+
+void RmsNormAddRows(const float* x, const float* gamma, const float* addend,
+                    float* out, std::uint32_t rows, std::uint32_t dim,
+                    float eps, hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  RmsNormKernelAdd<<<rows, block, 0, stream>>>(x, gamma, addend, out, dim, eps);
+}
+
+void RmsNormRowsTriple(const float* x, std::uint32_t rows, std::uint32_t dim,
+                       float eps, const float* ffn_gamma, __half* ffn_half,
+                       const float* router_scale, float router_k,
+                       float* router_out, const float* preffw_gamma,
+                       __half* preffw_half, hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  RmsNormKernelTriple<<<rows, block, 0, stream>>>(
+      x, dim, eps, ffn_gamma, ffn_half, router_scale, router_k, router_out,
+      preffw_gamma, preffw_half);
 }
 
 void FusedAddRmsNorm(float* x, const float* addend, const float* gamma,
@@ -568,6 +900,18 @@ void MoeEpilogue(const float* expert_out, const float* weights,
   const std::size_t grid = (count + block - 1) / block;
   MoeEpilogueKernel<<<grid, block, 0, stream>>>(
       expert_out, weights, ids, expert_scale, out, k, dim, count);
+}
+
+void MoeFinish(const float* mlp, const float* expert_out, const float* weights,
+               const std::int32_t* ids, const float* expert_scale,
+               const float* norm1, const float* norm2, const float* post_norm,
+               float post_scale, const float* residual, float* out,
+               std::uint32_t tokens, std::uint32_t k, std::uint32_t dim,
+               float eps, hipStream_t stream) {
+  const dim3 block(std::min<std::uint32_t>(dim, 256U));
+  MoeFinishKernel<<<tokens, block, 0, stream>>>(
+      mlp, expert_out, weights, ids, expert_scale, norm1, norm2, post_norm,
+      post_scale, residual, out, dim, k, eps);
 }
 
 void GegluF32(const float* gu, float* act, std::size_t count, std::uint32_t ff,

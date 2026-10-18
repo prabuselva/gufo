@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
+#include "src/models/gemma4/tool_syntax.hpp"
 
 namespace gufo::models::gemma4 {
 namespace {
@@ -19,6 +21,19 @@ using json::Value;
 constexpr std::string_view kBos = "<bos>";
 constexpr std::string_view kTurnOpen = "<|turn>";
 constexpr std::string_view kTurnClose = "<turn|>\n";
+/// JSON dumps stored on reconstructed arguments re-encode to the compact
+/// Gemma 4 wire form (sorted keys, `<|"|>`-delimited strings). Values that
+/// are not JSON structures pass through unchanged.
+std::string WireValue(const std::string& value) {
+  if (!value.empty() && (value.front() == '{' || value.front() == '[')) {
+    try {
+      return RenderWireValue(json::parse(value));
+    } catch (const std::exception&) {
+    }
+  }
+  return value;
+}
+
 constexpr std::string_view kChannelOpen = "<|channel>";
 constexpr std::string_view kChannelClose = "<channel|>";
 constexpr std::string_view kQuote = "<|\"|>";
@@ -484,20 +499,31 @@ std::string Render(std::span<const ChatMessage> messages,
         out += "<|tool_call>call:";
         out += call.name;
         out += '{';
-        bool first = true;
+        // The wire format renders object keys in sorted order, matching the
+        // constrained grammar at every depth.
+        std::vector<const ChatMessage::ToolArgument*> ordered;
+        ordered.reserve(call.arguments.size());
         for (const auto& argument : call.arguments) {
+          ordered.push_back(&argument);
+        }
+        std::ranges::sort(ordered, [](const ChatMessage::ToolArgument* left,
+                                      const ChatMessage::ToolArgument* right) {
+          return left->name < right->name;
+        });
+        bool first = true;
+        for (const auto* argument : ordered) {
           if (!first) {
             out += ',';
           }
           first = false;
-          out += argument.name;
+          out += argument->name;
           out += ':';
-          if (argument.is_string) {
+          if (argument->is_string) {
             out += kQuote;
-            out += argument.value;
+            out += argument->value;
             out += kQuote;
           } else {
-            out += argument.value;
+            out += WireValue(argument->value);
           }
         }
         out += "}<tool_call|>";

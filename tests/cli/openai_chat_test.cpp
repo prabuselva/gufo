@@ -1279,6 +1279,228 @@ void TestQwenToolBoundariesAndSchema() {
   }
 }
 
+void TestLingToolCalls() {
+  using gufo::json::Value;
+  const auto schema = gufo::json::parse(R"({
+    "model":"test-model", "messages":[{"role":"user","content":"use f"}],
+    "tools":[{"type":"function","function":{"name":"f","parameters":{
+      "type":"object","properties":{"text":{"type":"string"},
+      "count":{"type":"integer"},"flag":{"type":"boolean"},
+      "limit":{"type":["integer","null"]}}}}}]
+  })");
+  const std::string good =
+      "<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>42</arg_value>\n"
+      "<arg_key>count</arg_key>\n<arg_value>42</arg_value>\n</tool_call>";
+  struct Case {
+    std::string text;
+    std::size_t calls;
+    std::string argument;
+    // A frame streamed byte by byte that only fails validation after its
+    // provisional call was emitted ends the stream with a generation_failed
+    // SSE error, exactly as the Qwen canonical dialect does. Such frames
+    // test the buffered path; streaming covers accepted frames and frames
+    // that never emit a provisional call.
+    bool stream_ok = true;
+  };
+  for (const auto& item :
+       {Case{good, 1, R"({"text":"42","count":42})"},
+        // The history framing concatenates the name and the first tag with
+        // no newline; both framings the template teaches must parse.
+        Case{"<tool_call>f<arg_key>text</arg_key>\n<arg_value>a</arg_value>"
+             "</tool_call>",
+             1, R"({"text":"a"})"},
+        Case{good + "\n" + good, 2, R"({"text":"42","count":42})"},
+        // A value keeps every byte between the value tags.
+        Case{"<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>a\nb\n"
+             "</arg_value>\n</tool_call>",
+             1, R"({"text":"a\nb\n"})"},
+        // Another tag inside a value is argument data, not framing.
+        Case{"<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>literal "
+             "</tool_call> and </arg_key></arg_value>\n</tool_call>",
+             1, R"({"text":"literal </tool_call> and </arg_key>"})"},
+        Case{"<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>ok</arg_value>"
+             "\n<arg_key>count</arg_key>\n<arg_value>oops</arg_value>\n"
+             "</tool_call>",
+             0, "", false},
+        Case{"<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>ok</arg_value>"
+             "\n<arg_key>count</arg_key>\n<arg_value>oops</arg_value>\n"
+             "</tool_call>" +
+                 good,
+             1, R"({"text":"42","count":42})", false},
+        // Python literals where the schema wants JSON.
+        Case{"<tool_call>f\n<arg_key>flag</arg_key>\n<arg_value>True\n"
+             "</arg_value>\n<arg_key>limit</arg_key>\n<arg_value>None"
+             "</arg_value>\n</tool_call>",
+             1, R"({"flag":true,"limit":null})"},
+        Case{"<tool_call>g\n<arg_key>text</arg_key>\n<arg_value>a</arg_value>"
+             "\n</tool_call>",
+             0, ""},
+        // Names outside the API's [a-zA-Z0-9_-] never parse.
+        Case{"<tool_call>f(1)\n<arg_key>text</arg_key>\n<arg_value>a"
+             "</arg_value>\n</tool_call>",
+             0, ""},
+        Case{"<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>a</arg_value>"
+             "\n<arg_key>text</arg_key>\n<arg_value>b</arg_value>\n"
+             "</tool_call>",
+             0, "", false},
+        Case{"<tool_call>f\n<arg_key>text</arg_key>\n<arg_value>a</arg_value>"
+             "\n<arg_key>text</arg_key>\n<arg_value>a</arg_value>\n"
+             "</tool_call>",
+             1, R"({"text":"a"})"}}) {
+    for (bool stream : {false, true}) {
+      if (stream && !item.stream_ok)
+        continue;
+      auto body = schema;
+      body["stream"] = stream;
+      FakeBackend backend;
+      backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kLing3;
+      if (stream) {
+        for (char c : item.text)
+          backend.pieces.emplace_back(1, c);
+      } else {
+        backend.pieces.push_back(item.text);
+      }
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200, "Ling tool request succeeds");
+      std::vector<Value> calls;
+      if (!stream) {
+        const auto output = gufo::json::parse(response.body);
+        const auto& message =
+            *output.find("choices")->items()[0].find("message");
+        if (const auto* found = message.find("tool_calls"))
+          calls.assign(found->items().begin(), found->items().end());
+        if (item.calls == 0)
+          Expect(message.find("tool_calls") == nullptr,
+                 "Ling rejects leave no tool_calls field");
+      } else {
+        std::string output;
+        response.streaming_body([&](std::string_view part) {
+          output += part;
+          return true;
+        });
+        std::size_t cursor = 0;
+        while ((cursor = output.find("data: ", cursor)) !=
+               std::string_view::npos) {
+          const auto begin = cursor + 6;
+          cursor = output.find('\n', begin);
+          const auto payload = output.substr(begin, cursor - begin);
+          if (payload == "[DONE]")
+            break;
+          const auto event = gufo::json::parse(payload);
+          const auto* choices = event.find("choices");
+          if (!choices || choices->empty())
+            continue;
+          const auto* delta = choices->items()[0].find("delta");
+          if (const auto* found = delta ? delta->find("tool_calls") : nullptr)
+            AppendToolDeltas(calls, *found, stream);
+        }
+        // Accepted calls never expose framing; rejected frames survive as
+        // content in both transports, exactly as for the Qwen dialect.
+        if (item.calls > 0)
+          Expect(output.find("<arg_") == std::string::npos,
+                 "Ling call bodies never reach content deltas");
+      }
+      if (calls.size() != item.calls) {
+        std::cerr << "Ling tool input: " << item.text << " (stream=" << stream
+                  << ")\nExpected calls: " << item.calls
+                  << ", actual: " << calls.size() << '\n';
+        for (const auto& call : calls)
+          std::cerr << "  call: " << call.dump() << '\n';
+      }
+      Expect(calls.size() == item.calls, "only complete Ling calls emitted");
+      if (!calls.empty()) {
+        if (calls.back().find("function")->member_str("arguments") !=
+            item.argument)
+          std::cerr << "Ling tool input: " << item.text
+                    << "\nExpected: " << item.argument << "\nActual: "
+                    << calls.back().find("function")->member_str("arguments")
+                    << '\n';
+        Expect(calls.back().find("function")->member_str("arguments") ==
+                   item.argument,
+               "Ling argument values and schema types preserved");
+      }
+    }
+  }
+}
+
+void TestLingProseAboutTheDialectIsNotACall() {
+  using gufo::json::Value;
+  const std::string message =
+      "Ling 3.0 Flash signals a call with `<tool_call>` followed by the "
+      "function name, then one `<arg_key>` name and an `<arg_value>` value "
+      "per argument, closed by `</tool_call>`. Nothing above is a call "
+      "being made, and none of it may be cut.";
+  const auto schema = gufo::json::parse(R"({
+    "model":"test-model", "messages":[{"role":"user","content":"explain"}],
+    "tools":[{"type":"function","function":{"name":"f","parameters":{
+      "type":"object","properties":{"text":{"type":"string"}}}}}]
+  })");
+  for (bool stream : {false, true}) {
+    for (bool bytewise : {false, true}) {
+      auto body = schema;
+      body["stream"] = stream;
+      FakeBackend backend;
+      backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kLing3;
+      if (bytewise) {
+        for (char byte : message)
+          backend.pieces.emplace_back(1, byte);
+      } else {
+        backend.pieces.push_back(message);
+      }
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200,
+             "a Ling answer about the dialect is served");
+      std::vector<Value> calls;
+      std::string content;
+      if (!stream) {
+        const auto output = gufo::json::parse(response.body);
+        const auto& choice =
+            *output.find("choices")->items()[0].find("message");
+        if (const auto* text = choice.find("content");
+            text && text->is_string())
+          content = text->get_str();
+        if (const auto* found = choice.find("tool_calls"))
+          calls.assign(found->items().begin(), found->items().end());
+      } else {
+        std::string output;
+        response.streaming_body([&](std::string_view part) {
+          output += part;
+          return true;
+        });
+        std::size_t cursor = 0;
+        while ((cursor = output.find("data: ", cursor)) !=
+               std::string_view::npos) {
+          const auto begin = cursor + 6;
+          cursor = output.find('\n', begin);
+          const auto payload = output.substr(begin, cursor - begin);
+          if (payload == "[DONE]")
+            break;
+          const auto event = gufo::json::parse(payload);
+          const auto* choices = event.find("choices");
+          if (!choices || choices->empty())
+            continue;
+          const auto* delta = choices->items()[0].find("delta");
+          if (!delta)
+            continue;
+          content += delta->member_str("content");
+          if (const auto* found = delta->find("tool_calls"))
+            AppendToolDeltas(calls, *found, stream);
+        }
+      }
+      if (calls.empty() && Trimmed(content) != Trimmed(message))
+        std::cerr << "Ling prose about the dialect, stream=" << stream
+                  << " bytewise=" << bytewise
+                  << "\nExpected content: " << message
+                  << "\nActual content: " << content << '\n';
+      Expect(calls.empty(), "Ling prose that names the dialect is not a call");
+      Expect(Trimmed(content) == Trimmed(message),
+             "a Ling answer about the dialect survives in full");
+    }
+  }
+}
+
 void TestToolChoiceEnforcement() {
   for (bool stream : {false, true}) {
     for (const auto* text :
@@ -6201,6 +6423,8 @@ int main() {
   TestUnfinishedInlineReasoningFallback();
   TestProseAboutTheDialectIsNotACall();
   TestQwenToolBoundariesAndSchema();
+  TestLingToolCalls();
+  TestLingProseAboutTheDialectIsNotACall();
   TestDeepSeekToolCallsAreStructured();
   TestDeepSeekRepeatedToolParameters();
   TestDeepSeekSchemaCheckedArguments();

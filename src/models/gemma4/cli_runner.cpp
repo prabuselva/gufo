@@ -16,6 +16,7 @@ bool IsGemma4(const core::GgufReader& reader) {
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -144,6 +145,119 @@ std::string MakeTestName(std::string_view prefix, std::size_t count,
   return result;
 }
 
+struct KlReport {
+  bool finite{true};
+  bool top1_match{true};
+  double kl{0.0};
+  double tv{0.0};
+};
+
+// Same metric family as tools/gemma4/compare_logits.py: KL of the batched
+// distribution against the sequential reference sum_v p·(log p − log q), in
+// nats per position, plus total variation and the top-1 agreement.
+KlReport KlDivergence(std::span<const float> reference,
+                      std::span<const float> candidate) {
+  KlReport report;
+  double ref_max = -std::numeric_limits<double>::infinity();
+  double cand_max = -std::numeric_limits<double>::infinity();
+  for (const float value : reference) {
+    if (!std::isfinite(value)) {
+      report.finite = false;
+    }
+    ref_max = std::max(ref_max, static_cast<double>(value));
+  }
+  for (const float value : candidate) {
+    if (!std::isfinite(value)) {
+      report.finite = false;
+    }
+    cand_max = std::max(cand_max, static_cast<double>(value));
+  }
+  if (!report.finite || reference.size() != candidate.size() ||
+      reference.empty()) {
+    return report;
+  }
+  const std::size_t argmax = static_cast<std::size_t>(
+      std::max_element(reference.begin(), reference.end()) - reference.begin());
+  const std::size_t cand_argmax = static_cast<std::size_t>(
+      std::max_element(candidate.begin(), candidate.end()) - candidate.begin());
+  report.top1_match = argmax == cand_argmax;
+  double log_z_ref = 0.0;
+  double log_z_cand = 0.0;
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    log_z_ref += std::exp(static_cast<double>(reference[i]) - ref_max);
+    log_z_cand += std::exp(static_cast<double>(candidate[i]) - cand_max);
+  }
+  log_z_ref += ref_max;
+  log_z_cand += cand_max;
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    const double log_p = static_cast<double>(reference[i]) - log_z_ref;
+    const double log_q = static_cast<double>(candidate[i]) - log_z_cand;
+    const double p = std::exp(log_p);
+    report.kl += p * (log_p - log_q);
+    report.tv += 0.5 * std::abs(p - std::exp(log_q));
+  }
+  return report;
+}
+
+// Bulk batched prefill against one-token-at-a-time evaluation of the same
+// prefix; both run on the GPU, so this checks the batched kernels against
+// the exact path with KL, not only rmse/argmax.
+bool ValidateGemma4Prefill(Model& model,
+                           const std::vector<std::int32_t>& tokens,
+                           std::size_t prompt_length, std::uint32_t context,
+                           std::string* error) {
+  if (prompt_length == 0 || prompt_length >= context) {
+    *error = "--validate-prefill must be between 1 and the context size";
+    return false;
+  }
+  const auto sequential = model.CreateSession(context, error);
+  const auto batched = model.CreateSession(context, error);
+  const auto prefix = std::span(tokens).first(prompt_length);
+  if (!sequential || !batched || !sequential->Sync(prefix.first(1), error) ||
+      !batched->Sync(prefix, error)) {
+    if (error->empty()) {
+      *error = "session prefill failed";
+    }
+    return false;
+  }
+  for (const std::int32_t token : prefix.subspan(1)) {
+    if (!sequential->Evaluate(token, error)) {
+      if (error->empty()) {
+        *error = "sequential reference failed";
+      }
+      return false;
+    }
+  }
+  const auto report = KlDivergence(sequential->Logits(), batched->Logits());
+  // Known bulk-prefill drift class (fork report: bulk 0.027, top-1
+  // 1489/1542). PASS is the fork-optimized exactness level (3.7e-5 nats);
+  // drift inside the recorded baseline is reported but not a run failure;
+  // larger divergence means the bulk path actually broke.
+  constexpr double kExactKl = 3.7e-5;
+  constexpr double kRecordedBulkKl = 5e-2;
+  const char* status = "RECORDED";
+  if (!report.finite || report.kl > kRecordedBulkKl) {
+    status = "FAIL";
+  } else if (report.top1_match && report.kl <= kExactKl) {
+    status = "PASS";
+  }
+  std::cout << std::fixed << std::setprecision(10)
+            << "[Prefill Validation] tokens=" << prompt_length
+            << " finite=" << (report.finite ? "yes" : "no")
+            << " top1_match=" << (report.top1_match ? "yes" : "no")
+            << " kl=" << report.kl << " tv=" << report.tv
+            << " status=" << status << '\n';
+  if (status == std::string_view("FAIL")) {
+    std::ostringstream message;
+    message << (!report.finite ? "non-finite logits"
+                               : "bulk-vs-exact KL exceeds the recorded "
+                                 "baseline and the bulk path must be fixed");
+    *error = message.str();
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int RunGemma4Benchmark(const cli::BenchOptions& options,
@@ -162,14 +276,16 @@ int RunGemma4Benchmark(const cli::BenchOptions& options,
   const std::size_t max_depth = max_or_zero(options.n_depths);
   const std::size_t max_prompt = max_or_zero(options.n_prompts);
   const std::size_t max_generation = max_or_zero(options.n_gens);
-  if (std::max({max_depth, max_prompt, max_generation}) >
+  if (std::max({max_depth, max_prompt, max_generation,
+                options.validate_prefill_tokens}) >
       std::numeric_limits<std::uint32_t>::max()) {
     std::cerr << "Error: benchmark workload exceeds the context range\n";
     return 1;
   }
   const std::size_t required_context =
       std::max({std::size_t{4096}, max_depth + max_prompt + 1,
-                std::max<std::size_t>(max_depth, 16) + max_generation + 1});
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
+                options.validate_prefill_tokens + 1});
   const bool mtp = options.speculative_backend == "mtp";
   if (!options.speculative_backend.empty() && !mtp) {
     std::cerr << "Error: Gemma-4-26B-A4B supports only --speculative mtp or "
@@ -222,6 +338,16 @@ int RunGemma4Benchmark(const cli::BenchOptions& options,
     tokens.resize(required_context);
     for (std::size_t i = 0; i < tokens.size(); ++i) {
       tokens[i] = pattern[i % pattern.size()];
+    }
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    if (!ValidateGemma4Prefill(*model, tokens, options.validate_prefill_tokens,
+                               static_cast<std::uint32_t>(required_context),
+                               &error)) {
+      std::cerr << "Gemma-4-26B-A4B prefill validation failed: " << error
+                << '\n';
+      return 1;
     }
   }
 

@@ -51,6 +51,13 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen36_a3b_dense_f16_bench PRIVATE
     gufo_qwen36_a3b_kernels gufo_qwen38_flash_next_mmq gufo_core)
 
+  # Tile-plan comparison for the core kernel's native-F16 weight route (the
+  # wide attention projections) against its Q8_0 dequant ceiling.
+  add_executable(qwen36_a3b_dense_f16_w16_bench EXCLUDE_FROM_ALL
+    dense_f16_w16_bench.cpp)
+  target_link_libraries(qwen36_a3b_dense_f16_w16_bench PRIVATE
+    gufo_qwen36_a3b_kernels gufo_core)
+
   # End-to-end forward pass: the GPU executor's trunk and MTP logits must agree
   # with the scalar oracle over the real artifact. Skips (77) without the GGUF.
   add_executable(qwen36_a3b_rocm_forward_test EXCLUDE_FROM_ALL
@@ -71,6 +78,19 @@ if (ENGINE_ENABLE_HIP)
     gufo_qwen36_a3b_executor gufo_qwen36_a3b_reference gufo_core)
   add_test(NAME qwen36_a3b.rocm_inference COMMAND qwen36_a3b_rocm_inference_test)
   set_tests_properties(qwen36_a3b.rocm_inference PROPERTIES
+    LABELS "qwen36_a3b;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
+
+  # Width-invariance hash gate: greedy MTP speculative decode must emit the
+  # exact autoregressive token stream (drafted > 0 proves the draft block
+  # ran). Engine-level, the path serve and bench use. Skips (77) without a
+  # GGUF that carries an MTP block.
+  add_executable(qwen36_a3b_rocm_mtp_spec_test EXCLUDE_FROM_ALL
+    rocm_mtp_spec_test.cpp)
+  target_link_libraries(qwen36_a3b_rocm_mtp_spec_test PRIVATE
+    gufo_qwen36_a3b_engine)
+  add_test(NAME qwen36_a3b.rocm_mtp_spec COMMAND qwen36_a3b_rocm_mtp_spec_test)
+  set_tests_properties(qwen36_a3b.rocm_mtp_spec PROPERTIES
     LABELS "qwen36_a3b;hip;gpu;gfx1151;external-model;slow"
     SKIP_RETURN_CODE 77)
 endif()

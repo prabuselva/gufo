@@ -178,6 +178,23 @@ public:
         min_drafts_(min_drafts),
         max_drafts_(max_drafts) {}
 
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+
+  // Grammar-constrained decoding needs token-level pieces: a greedy-merge
+  // tokenizer otherwise hides the native call delimiters behind merges the
+  // sampler cannot validate against the grammar.
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->tokenizer().GetVocabSize(), [this](std::uint32_t id) {
+          const auto& tokenizer = model_->tokenizer();
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer.DecodeTokenCopy(id), tokenizer.IsStopToken(id)};
+        });
+  }
+
   [[nodiscard]] server::TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
@@ -476,9 +493,15 @@ std::shared_ptr<TextModelRunner> CreateTextRunner(
              "Qwen3.6-35B-A3B HTTP models do not support the disk cache");
     return nullptr;
   }
+  // Without an explicit --draft-tokens the server uses the measured MTP
+  // draft-count optimum for this model; a given value still reaches
+  // SetDraftLimits unchanged.
+  const auto max_drafts = speculative_config.max_draft_tokens_specified
+                              ? speculative_config.max_draft_tokens
+                              : kMtpCalibratedMaxDrafts;
   return std::make_shared<Qwen36A3BTextRunner>(
       std::move(model), per_session_context, use_mtp,
-      speculative_config.min_draft_tokens, speculative_config.max_draft_tokens);
+      speculative_config.min_draft_tokens, max_drafts);
 }
 
 }  // namespace gufo::models::qwen36_a3b

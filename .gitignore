@@ -123,5 +123,6 @@ tests/quality/compsec.json
 
 # Local build directories and editor state
 build_*
+!docs/build_optimized_kernels/
 .opencode*
 AGENTS_MINE.md

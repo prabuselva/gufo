@@ -41,3 +41,42 @@ timeout -k 60 "$inner_timeout" tools/bench/gpu_exclusive.sh --no-respawn -- "$@"
 rc=$?
 echo "END $(date -Is) rc=$rc" >> "$log"
 echo "$rc" > "$status"
+
+# Fallback respawner. bench_wait.sh owns the respawn and normally restores the
+# server immediately after the status appears. If that watchdog is killed
+# (e.g. a harness call timeout) before respawning, the resident `gufo serve`
+# stays down. This detached process outlives the harness tree, so after the
+# status exists it waits a grace period for the watchdog, then respawns itself
+# once the watchdog is proven gone and no other exclusive-GPU run is active.
+# flock serializes both respawners. Override grace/window with
+# GUFO_BENCH_FALLBACK_GRACE / GUFO_BENCH_FALLBACK_SEC.
+fallback_respawn() {
+  local url="http://127.0.0.1:${GUFO_SERVE_PORT:-8083}/v1/models"
+  local grace="${GUFO_BENCH_FALLBACK_GRACE:-120}" window="${GUFO_BENCH_FALLBACK_SEC:-1800}"
+  local elapsed=0 wp
+  while [ "$elapsed" -lt "$window" ]; do
+    sleep 10
+    elapsed=$((elapsed + 10))
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0
+    wp="$(cat "${base}.watchdog.pid" 2>/dev/null || true)"
+    if [ -n "$wp" ] && kill -0 "$wp" 2>/dev/null; then continue; fi
+    # Never contend with another gpu_exclusive run (next benchmark in flight)
+    # or with a watchdog that has not started yet within the grace period.
+    pgrep -f 'tools/bench/gpu_exclusive\.sh' >/dev/null 2>&1 && continue
+    [ "$elapsed" -lt "$grace" ] && continue
+    # gpu_respawn_server.sh exits 0 without launching when the server already
+    # serves, so racing the watchdog across the flock cannot double-start.
+    echo "FALLBACK $(date -Is) name=$name watchdog gone and server down; respawning" >>"$log"
+    if command -v flock >/dev/null 2>&1; then
+      flock "${state}/gufo_serve_respawn.lock" \
+        tools/bench/gpu_respawn_server.sh >>"$log" 2>&1 \
+        || echo "FALLBACK $(date -Is) name=$name respawn reported failure" >>"$log"
+    else
+      tools/bench/gpu_respawn_server.sh >>"$log" 2>&1 \
+        || echo "FALLBACK $(date -Is) name=$name respawn reported failure" >>"$log"
+    fi
+    return 0
+  done
+  echo "FALLBACK $(date -Is) name=$name window expired; server not checked further" >>"$log"
+}
+fallback_respawn

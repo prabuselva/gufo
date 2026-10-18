@@ -33,6 +33,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/gemma4/cli_runner.hpp"
+#include "src/models/ling3_0/cli_runner.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -223,6 +224,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
           return false;
         }
         opt.draft_tokens = count;
+        opt.draft_tokens_specified = true;
         return true;
       });
 
@@ -1278,6 +1280,9 @@ int RunBench(std::span<const char* const> args) {
   }
   if (models::gemma4::IsGemma4(*reader)) {
     return models::gemma4::RunGemma4Benchmark(opt, reader, model_load_start);
+  }
+  if (models::ling3_0::IsLing3Model(*reader)) {
+    return models::ling3_0::RunLing3Benchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

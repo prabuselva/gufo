@@ -22,7 +22,10 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
-  enum class ToolFormat { kJson, kQwen, kDeepSeek };
+  // Ling 3.0 Flash writes its native `<arg_key>` calls without a grammar;
+  // the HTTP layer recognizes the frames in the output instead. The
+  // reference project constrains this dialect with neither form.
+  enum class ToolFormat { kJson, kQwen, kDeepSeek, kGemma4, kLing3 };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;
@@ -53,8 +56,13 @@ public:
   // types. It preserves the model's native string/DSML typed-value semantics.
   static std::shared_ptr<const JsonConstraint> OpenToolParameters(
       ToolFormat format);
+  /// Any text up to and including `end` (the model's reasoning close), then
+  /// `answer`. An empty `end` selects the shared close token. A nonempty
+  /// `start` makes the reasoning optional: `answer` directly, or `start`
+  /// followed by the reasoning above.
   static std::shared_ptr<const JsonConstraint> WithReasoning(
-      std::shared_ptr<const JsonConstraint> answer);
+      std::shared_ptr<const JsonConstraint> answer, std::string_view end = "",
+      std::string_view start = {});
   using Tool = std::pair<std::string, std::shared_ptr<const JsonConstraint>>;
   static std::shared_ptr<const JsonConstraint> WithTools(
       std::shared_ptr<const JsonConstraint> answer, std::vector<Tool> tools,

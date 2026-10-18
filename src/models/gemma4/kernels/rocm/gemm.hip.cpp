@@ -9,7 +9,7 @@
 #include <cstdint>
 
 #include "qfn_mmq.h"
-#include "src/models/gemma4/kernels/rocm/dense_f16_gemm.hpp"
+#include "src/core/hip/gemm/dense_f16_gemm.hpp"
 
 namespace gufo::models::gemma4::rocm {
 namespace {
@@ -22,6 +22,23 @@ namespace {
 constexpr std::uint32_t kDenseF16MinBatch = 96;
 constexpr std::uint32_t kDenseF16MinRows = 2048;
 constexpr std::uint32_t kDenseF16MaxCols = 4096;
+
+// The binary16 GEMM plan for a Q8_0 projection of the 26B-A4B's width: eight
+// row groups, and the two-block stage over a long K. Attention output
+// (176 blocks, K = 4096) and dense MLP down (K = 2112) measured 2013 -> 1759
+// us and 605 -> 582 us per 2048 rows on the fork (measured shapes).
+using core::hip::gemm::DenseF16Gemm;
+using core::hip::gemm::DenseF16Plan;
+
+DenseF16Plan HalfPlan(std::uint32_t m, std::uint32_t k) {
+  if (m != 2816) {
+    return DenseF16Plan::kAuto;
+  }
+  if (k >= 4096) {
+    return DenseF16Plan::kStagedRowGroups8;
+  }
+  return k == 2112 ? DenseF16Plan::kRowGroups8 : DenseF16Plan::kAuto;
+}
 
 // Process-wide hipBLAS handle. The executor drives a single stream, so one
 // handle reused across calls is safe; the stream is rebound on every call.
@@ -134,7 +151,8 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
         const std::size_t block = 256;
         const std::size_t grid = (n + block - 1) / block;
         NarrowHalf<<<grid, block, 0, stream>>>(x, xh, n);
-        if (DenseF16Gemm(base, xh, out, batch, rows, cols, stream)) {
+        if (DenseF16Gemm(base, xh, out, batch, rows, cols, stream,
+                         HalfPlan(rows, cols))) {
           break;
         }
       }
@@ -170,6 +188,36 @@ void Gemm(const void* base, GemvType type, std::uint32_t rows,
           HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
       break;
     }
+    case GemvType::kF16: {
+      // Retyped BF16 dense projections (see ConvertBf16ToHalf): the same
+      // winning DenseF16 window as Q8_0, with the native F16 weights staged
+      // verbatim, so no BF16 staging kernel and no hipBLAS route inside the
+      // window. Shapes outside it keep a half hipBLASLt GEMM (narrowed
+      // activations, native F32 accumulation).
+      const std::size_t n = static_cast<std::size_t>(batch) * cols;
+      __half* xh = HalfScratch(n);
+      const std::size_t block = 256;
+      const std::size_t grid = (n + block - 1) / block;
+      NarrowHalf<<<grid, block, 0, stream>>>(x, xh, n);
+      // Native-F16 weights win int8's 8192-column shape too (the 1.41x
+      // staged8 microbench of 3.1), so this window spans attn_out (2816x8192).
+      if (batch >= kDenseF16MinBatch && rows >= kDenseF16MinRows &&
+          cols <= 2 * kDenseF16MaxCols &&
+          DenseF16Gemm(base, xh, out, batch, rows, cols, stream,
+                       HalfPlan(rows, cols), true)) {
+        break;
+      }
+      const float alpha = 1.0F;
+      const float beta = 0.0F;
+      (void)hipblasSetStream(BlasHandle(), stream);
+      (void)hipblasGemmEx(
+          BlasHandle(), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(rows),
+          static_cast<int>(batch), static_cast<int>(cols), &alpha, base,
+          HIP_R_16F, static_cast<int>(cols), xh, HIP_R_16F,
+          static_cast<int>(cols), &beta, out, HIP_R_32F, static_cast<int>(rows),
+          HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+      break;
+    }
     case GemvType::kQ4_K:
     case GemvType::kQ5_K:
       // Routed-expert encodings only. The dense GEMM tier never sees a K-quant
@@ -185,13 +233,25 @@ bool DenseF16Window(std::uint32_t batch, std::uint32_t rows,
          cols <= kDenseF16MaxCols;
 }
 
+bool HalfInWindow(GemvType type, std::uint32_t batch, std::uint32_t rows,
+                  std::uint32_t cols) {
+  if (type == GemvType::kQ8_0) {
+    return DenseF16Window(batch, rows, cols);
+  }
+  // Native-F16 (retyped BF16) weights: identical bounds to the `Gemm` kF16
+  // branch, including the 8192-column extension for the attention output.
+  return type == GemvType::kF16 && batch >= kDenseF16MinBatch &&
+         rows >= kDenseF16MinRows && cols <= 2 * kDenseF16MaxCols;
+}
+
 bool GemmHalfIn(const void* base, GemvType type, std::uint32_t rows,
                 std::uint32_t cols, const __half* xh, float* out,
                 std::uint32_t batch, hipStream_t stream) {
-  if (type != GemvType::kQ8_0 || !DenseF16Window(batch, rows, cols)) {
+  if (!HalfInWindow(type, batch, rows, cols)) {
     return false;
   }
-  return DenseF16Gemm(base, xh, out, batch, rows, cols, stream);
+  return DenseF16Gemm(base, xh, out, batch, rows, cols, stream,
+                      HalfPlan(rows, cols), type == GemvType::kF16);
 }
 
 void GemmMoe(const void* base, GemvType type, std::uint32_t rows,

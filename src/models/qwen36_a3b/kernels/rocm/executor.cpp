@@ -17,9 +17,10 @@ namespace gufo::models::qwen36_a3b::rocm {
 namespace {
 
 /// Maps the artifact's GGUF type onto the GEMV tier's row format. The dense
-/// tensors store Q8_0/F32/BF16; the routed experts additionally store the Q4_K
-/// and Q5_K super-block encodings of a Q4_K_XL artifact. Anything else is a
-/// load error (ValidateTypes).
+/// tensors store Q8_0/F32/BF16, plus binary16 for the BF16 projections the
+/// uploader retypes (see Uploader::Half); the routed experts additionally
+/// store the Q4_K and Q5_K super-block encodings of a Q4_K_XL artifact.
+/// Anything else is a load error (ValidateTypes).
 [[nodiscard]] GemvType ToGemvType(core::GgmlType t) noexcept {
   switch (t) {
     case core::GgmlType::kQ8_0:
@@ -28,6 +29,8 @@ namespace {
       return GemvType::kF32;
     case core::GgmlType::kBF16:
       return GemvType::kBF16;
+    case core::GgmlType::kF16:
+      return GemvType::kF16;
     case core::GgmlType::kQ4_K:
       return GemvType::kQ4_K;
     case core::GgmlType::kQ5_K:
@@ -39,7 +42,7 @@ namespace {
 
 [[nodiscard]] bool SupportedType(core::GgmlType t) noexcept {
   return t == core::GgmlType::kQ8_0 || t == core::GgmlType::kF32 ||
-         t == core::GgmlType::kBF16;
+         t == core::GgmlType::kBF16 || t == core::GgmlType::kF16;
 }
 
 // The routed-expert stacks (ffn_gate/up/down_exps) additionally accept the

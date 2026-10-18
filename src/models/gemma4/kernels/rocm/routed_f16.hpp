@@ -53,14 +53,16 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
   return (slots + 15 * experts) / rows + experts;
 }
 
-/// Builds the routed tile map on the device from the per-expert assignment
-/// counts: `expert | tile << 16` in expert order, entries past the last tile
-/// holding a tile index beyond every bucket, which the routed GEMM skips. The
-/// GEMM launches `capacity` tiles, so the host never reads the counts back.
-/// `experts` must be at most 256.
+/// Builds the routed tile maps of two tile heights on the device from the
+/// per-expert assignment counts: `expert | tile << 16` in expert order,
+/// entries past the last tile holding a tile index beyond every bucket, which
+/// the routed GEMMs skip. Each GEMM launches its map's capacity, so the host
+/// never reads the counts back. `experts` must be at most 256.
 void BuildRoutedTiles(const std::uint32_t* counts, std::uint32_t experts,
-                      std::uint32_t rows, std::uint32_t capacity,
-                      std::int32_t* tiles, hipStream_t stream);
+                      std::uint32_t rows_a, std::uint32_t capacity_a,
+                      std::int32_t* tiles_a, std::uint32_t rows_b,
+                      std::uint32_t capacity_b, std::int32_t* tiles_b,
+                      hipStream_t stream);
 
 /// Routed F16 WMMA expert GEMM. `w` is the [n_experts][m][k] weight tensor in
 /// `type`; `x` is the F16 activation rows indexed by `rows_in`; `tiles`

@@ -11,6 +11,7 @@
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/gemma4/kernels/rocm/gemv.hpp"
 
 namespace gufo::models::gemma4::rocm {
 namespace {
@@ -79,6 +80,69 @@ struct Uploader {
       *error = message;
     }
     ok = false;
+  }
+
+  // Dense projections uploaded as BF16 are retyped to binary16 and converted
+  // in place after the staged uploads finish. F16 gives the dense tier a
+  // native tensor-core route (no BF16 staging/conversion per call), and any
+  // weight magnitude outside the binary16 range fails the load rather than
+  // saturating silently.
+  struct HalfJob {
+    void* data;
+    std::size_t count;
+    std::string name;
+  };
+  std::vector<HalfJob> halves;
+
+  void Half(DeviceTensor& d, const std::string& name) {
+    if (!ok || d.empty() || d.type != core::GgmlType::kBF16) {
+      return;
+    }
+    halves.push_back(
+        {d.data, static_cast<std::size_t>(d.rows) * d.cols * d.experts, name});
+    d.type = core::GgmlType::kF16;
+  }
+
+  // Runs the queued in-place BF16 -> binary16 conversions. Must be called
+  // after the staging pipeline has flushed, so every source buffer holds its
+  // final bytes.
+  bool ConvertHalves() {
+    if (halves.empty() || !ok) {
+      return ok;
+    }
+    std::vector<std::uint32_t*> counters(halves.size(), nullptr);
+    for (std::size_t i = 0; i < halves.size(); ++i) {
+      if (hipMalloc(&counters[i], sizeof(std::uint32_t)) != hipSuccess ||
+          hipMemset(counters[i], 0, sizeof(std::uint32_t)) != hipSuccess) {
+        Fail("hipMalloc failed for BF16 conversion check of " + halves[i].name);
+        break;
+      }
+      ConvertBf16ToHalf(halves[i].data, halves[i].count, counters[i], nullptr);
+    }
+    if (ok && hipDeviceSynchronize() != hipSuccess) {
+      Fail("device sync failed during BF16 -> binary16 conversion");
+    }
+    for (std::size_t i = 0; ok && i < halves.size(); ++i) {
+      std::uint32_t overflow = 0;
+      if (counters[i] != nullptr) {
+        if (hipMemcpy(&overflow, counters[i], sizeof(overflow),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+          Fail("readback failed for BF16 conversion check of " +
+               halves[i].name);
+          break;
+        }
+      }
+      if (overflow > 0) {
+        Fail("tensor " + halves[i].name + " has " + std::to_string(overflow) +
+             " BF16 values outside the binary16 range");
+      }
+    }
+    for (std::uint32_t* c : counters) {
+      if (c != nullptr) {
+        (void)hipFree(c);
+      }
+    }
+    return ok;
   }
 
   DeviceTensor Copy(const TensorRef& t, bool expert = false) {
@@ -188,21 +252,155 @@ struct Uploader {
     return ptr;
   }
 
+  // Same retyping as Half() for a fused buffer: one BF16 -> binary16 job
+  // over the whole buffer, retyping the per-tensor views too. Binary16
+  // elements are the same size as BF16, so every view offset stays valid.
+  void HalfFused(DeviceTensor& fused, const std::string& name,
+                 std::initializer_list<DeviceTensor*> views) {
+    if (!ok || fused.empty() || fused.type != core::GgmlType::kBF16) {
+      return;
+    }
+    halves.push_back(
+        {fused.data, static_cast<std::size_t>(fused.rows) * fused.cols, name});
+    fused.type = core::GgmlType::kF16;
+    for (DeviceTensor* v : views) {
+      if (!v->empty()) {
+        v->type = core::GgmlType::kF16;
+      }
+    }
+  }
+
+  struct FusePart {
+    const TensorRef* t;
+    bool required;
+  };
+
+  // Uploads projections that share type and input columns as ONE row-major
+  // concatenation (q, k, v or gate, up in order) and points the per-tensor
+  // views at their column slices. GGUF stores every part as a stack of
+  // fixed-length rows over the same columns, so the concatenation is exactly
+  // the fused [sum(rows)][row_bytes] matrix every decoder already reads:
+  // a view at its start offset is indistinguishable from a standalone
+  // tensor, while prefill can run one wide GEMM instead of one per part.
+  // Returns an empty tensor (and leaves every view untouched) when the
+  // parts cannot share a buffer, so the caller stays on the per-tensor
+  // path. Optional empty parts just drop out of the fusion.
+  DeviceTensor Fuse(const std::vector<FusePart>& parts,
+                    const std::vector<DeviceTensor*>& views,
+                    const std::string& name) {
+    DeviceTensor f;
+    if (!ok || parts.size() != views.size() || parts.size() < 2) {
+      return f;
+    }
+    std::size_t total = 0;
+    core::GgmlType type{core::GgmlType::kF32};
+    std::size_t cols = 0;
+    std::size_t row_bytes = 0;
+    bool have = false;
+    for (const FusePart& p : parts) {
+      const TensorRef& t = *p.t;
+      if (t.empty()) {
+        if (p.required) {
+          return f;
+        }
+        continue;
+      }
+      // Requantized parts would change row length and per-row layout; the
+      // per-tensor path already handles those encodings.
+      const bool native =
+          t.type != core::GgmlType::kQ6_K && t.type != core::GgmlType::kQ4_0 &&
+          t.type != core::GgmlType::kQ4_K && t.type != core::GgmlType::kQ5_K;
+      if (!native || t.experts != 1) {
+        return f;
+      }
+      if (!have) {
+        type = t.type;
+        cols = t.cols;
+        row_bytes = t.RowBytes();
+        have = true;
+      } else if (t.type != type || t.cols != cols ||
+                 t.RowBytes() != row_bytes) {
+        return f;
+      }
+      total += t.SizeBytes();
+    }
+    if (!have) {
+      return f;
+    }
+    void* ptr = nullptr;
+    if (hipMalloc(&ptr, total) != hipSuccess) {
+      Fail("hipMalloc failed for " + name + " (" + std::to_string(total) +
+           " bytes)");
+      return f;
+    }
+    allocations.push_back(ptr);
+    bytes += total;
+    std::size_t off = 0;
+    std::uint32_t rows = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const TensorRef& t = *parts[i].t;
+      if (t.empty()) {
+        continue;
+      }
+      const std::size_t size = t.SizeBytes();
+      auto* dst = static_cast<std::uint8_t*>(ptr) + off;
+      if (!stager.Copy(t.shard, t.file_offset, size, dst, error)) {
+        Fail("upload failed for " + name + " part " + std::string(t.name) +
+             (error != nullptr ? ": " + *error : std::string()));
+        return f;
+      }
+      views[i]->data = dst;
+      views[i]->type = t.type;
+      views[i]->cols = static_cast<std::uint32_t>(t.cols);
+      views[i]->rows = static_cast<std::uint32_t>(t.rows);
+      views[i]->experts = 1;
+      views[i]->row_bytes = t.RowBytes();
+      rows += static_cast<std::uint32_t>(t.rows);
+      off += size;
+    }
+    f.data = ptr;
+    f.type = type;
+    f.cols = static_cast<std::uint32_t>(cols);
+    f.rows = rows;
+    f.row_bytes = row_bytes;
+    return f;
+  }
+
   DeviceLayer Layer(const LayerWeights& l, bool swa) {
     DeviceLayer d;
     d.swa = swa;
     d.attn_norm = Copy(l.attn_norm);
-    d.attn_q = Copy(l.attn_q);
-    d.attn_k = Copy(l.attn_k);
-    d.attn_v = Copy(l.attn_v);
+    d.attn_qkv =
+        Fuse({{&l.attn_q, true}, {&l.attn_k, true}, {&l.attn_v, false}},
+             {&d.attn_q, &d.attn_k, &d.attn_v}, "attn_qkv");
+    if (d.attn_qkv.empty()) {
+      d.attn_q = Copy(l.attn_q);
+      Half(d.attn_q, "attn_q");
+      d.attn_k = Copy(l.attn_k);
+      Half(d.attn_k, "attn_k");
+      d.attn_v = Copy(l.attn_v);
+      Half(d.attn_v, "attn_v");
+    } else {
+      HalfFused(d.attn_qkv, "attn_qkv", {&d.attn_q, &d.attn_k, &d.attn_v});
+    }
     d.attn_q_norm = Copy(l.attn_q_norm);
     d.attn_k_norm = Copy(l.attn_k_norm);
     d.attn_output = Copy(l.attn_output);
+    Half(d.attn_output, "attn_output");
     d.post_attention_norm = Copy(l.post_attention_norm);
     d.ffn_norm = Copy(l.ffn_norm);
-    d.ffn_gate = Copy(l.ffn_gate);
-    d.ffn_up = Copy(l.ffn_up);
+    d.ffn_gate_up = Fuse({{&l.ffn_gate, true}, {&l.ffn_up, true}},
+                         {&d.ffn_gate, &d.ffn_up}, "ffn_gate_up");
+    if (d.ffn_gate_up.empty()) {
+      d.ffn_gate = Copy(l.ffn_gate);
+      Half(d.ffn_gate, "ffn_gate");
+      d.ffn_up = Copy(l.ffn_up);
+      Half(d.ffn_up, "ffn_up");
+    } else {
+      HalfFused(d.ffn_gate_up, "ffn_gate_up", {&d.ffn_gate, &d.ffn_up});
+    }
     d.ffn_down = Copy(l.ffn_down);
+    Half(d.ffn_down, "ffn_down");
     d.post_ffw_norm = Copy(l.post_ffw_norm);
     d.router = Copy(l.router);
     d.router_scale = Copy(l.router_scale);
@@ -241,8 +439,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
   }
   Uploader up{*stager, m->allocations_, m->bytes_, error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
-  m->output_ =
-      w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
+  up.Half(m->token_embd_, "token_embd");
+  // The tied head shares the embedding buffer; retyping (and converting) it
+  // once covers both, so only an untied head gets its own job.
+  if (w.output.data == w.token_embd.data) {
+    m->output_ = m->token_embd_;
+  } else {
+    m->output_ = up.Copy(w.output);
+    up.Half(m->output_, "output");
+  }
   m->output_norm_ = up.Copy(w.output_norm);
 
   // The per-class inverse-frequency tables, computed in double exactly as the
@@ -276,7 +481,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& w,
       return nullptr;
     }
   }
-  if (!up.ok || !stager->Finish(error_msg)) {
+  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves()) {
     return nullptr;
   }
   return m;
@@ -301,8 +506,11 @@ std::unique_ptr<DeviceDraft> DeviceDraft::Upload(const DraftWeights& w,
   }
   Uploader up{*stager, m->allocations_, m->bytes_, error_msg};
   m->pre_projection_ = up.Copy(w.pre_projection);
+  up.Half(m->pre_projection_, "draft_pre_projection");
   m->post_projection_ = up.Copy(w.post_projection);
+  up.Half(m->post_projection_, "draft_post_projection");
   m->token_embd_ = up.Copy(w.token_embd);
+  up.Half(m->token_embd_, "draft_token_embd");
   m->output_norm_ = up.Copy(w.output_norm);
 
   // The draft's own inverse-frequency tables, computed exactly as the trunk's
@@ -336,7 +544,7 @@ std::unique_ptr<DeviceDraft> DeviceDraft::Upload(const DraftWeights& w,
       return nullptr;
     }
   }
-  if (!up.ok || !stager->Finish(error_msg)) {
+  if (!up.ok || !stager->Finish(error_msg) || !up.ConvertHalves()) {
     return nullptr;
   }
   return m;

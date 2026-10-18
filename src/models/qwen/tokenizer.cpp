@@ -360,7 +360,9 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     if (t == kEndOfText || t == kImStart || t == kImEnd || t == "<tool_call>" ||
         t == "</tool_call>" || t == "<tool_response>" ||
         t == "</tool_response>" || t == "<think>" || t == "</think>" ||
-        t == "<tts_pad>" || t == "<tts_text_bos>" || t == "<tts_text_eod>" ||
+        // Bailing/Ling role delimiters; absent from the other vocabularies.
+        t == "<role>" || t == "</role>" || t == "<tts_pad>" ||
+        t == "<tts_text_bos>" || t == "<tts_text_eod>" ||
         t == "<tts_text_bos_single>" || t == kObjectRefStart ||
         t == kObjectRefEnd || t == kVisionStart || t == kVisionEnd ||
         t == kImagePad || t == kVideoPad || t == kQuadStart || t == kQuadEnd ||

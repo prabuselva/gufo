@@ -34,6 +34,10 @@ namespace gufo::models::gemma4 {
 class Model;
 }
 
+namespace gufo::models::ling3_0 {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -51,6 +55,9 @@ struct TextSpeculativeConfig {
   TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
+  // False when the server default was kept, true when --draft-tokens was
+  // given; models with a measured draft limit apply their own in that case.
+  bool max_draft_tokens_specified{false};
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
@@ -137,6 +144,16 @@ public:
   /// Installs a previously loaded Gemma-4 model. The model owns a single
   /// shared executor, so it serves exactly one concurrent session.
   bool load(std::shared_ptr<models::gemma4::Model> model, std::string* error,
+            std::uint32_t max_context = 4096, std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
+
+  /// Installs a previously loaded Ling 3.0 Flash model. The model owns one
+  /// shared executor plus a private KV/recurrent state per session, bounded
+  /// to 16 concurrent sessions with a divided context window.
+  bool load(std::shared_ptr<models::ling3_0::Model> model, std::string* error,
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},

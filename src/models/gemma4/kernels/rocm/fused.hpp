@@ -16,9 +16,19 @@ namespace gufo::models::gemma4::rocm {
 
 /// out[r][d] = (x[r][d] * rsqrt(mean_d x^2 + eps)) * gamma[d]. `rows`
 /// independent norms of `dim` elements; `gamma` may be null (scale 1).
+/// When `post_scale` is not null the row is additionally scaled per element
+/// out[r][d] *= post_scale[d] * post_k, with the multiply order
+/// ((v*scale)*post_scale)*post_k of the standalone Mul/Scale pass chain (the
+/// router input fold).
 void RmsNormRows(const float* x, const float* gamma, float* out,
                  std::uint32_t rows, std::uint32_t dim, float eps,
-                 hipStream_t stream);
+                 const float* post_scale, float post_k, hipStream_t stream);
+
+inline void RmsNormRows(const float* x, const float* gamma, float* out,
+                        std::uint32_t rows, std::uint32_t dim, float eps,
+                        hipStream_t stream) {
+  RmsNormRows(x, gamma, out, rows, dim, eps, nullptr, 1.0F, stream);
+}
 
 /// Binary16-output RMSNorm: the same reduction and scale as `RmsNormRows` (the
 /// sum-of-squares stays in double, the scale in float) but the row is stored as
@@ -28,6 +38,27 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
 void RmsNormRowsHalf(const float* x, const float* gamma, __half* out,
                      std::uint32_t rows, std::uint32_t dim, float eps,
                      hipStream_t stream);
+
+/// RMSNorm with the residual accumulate folded into the store pass:
+/// out[r][d] = (x[r][d]*scale*gamma[d]) + addend[r][d]. Bit-identical to
+/// RmsNormRows followed by Add(out, addend); `gamma` may be null (scale 1).
+void RmsNormAddRows(const float* x, const float* gamma, const float* addend,
+                    float* out, std::uint32_t rows, std::uint32_t dim,
+                    float eps, hipStream_t stream);
+
+/// One launch computing the three RMS norms taken off the same `x` rows:
+/// the binary16 FFN input `ffn_half = rmsnorm(x)*ffn_gamma`, the router input
+/// `router_out = (rmsnorm(x)*router_scale)*router_k` (null `router_out`
+/// disables the slot), and the binary16 routed-expert input
+/// `preffw_half = rmsnorm(x)*preffw_gamma`. A null `ffn_half` disables that
+/// slot; `ffn_gamma`/`preffw_gamma` may be null (scale 1). Each computed slot
+/// is bit-identical to the corresponding standalone `RmsNormRowsHalf` /
+/// `RmsNormRows` (with `post_scale`) launch.
+void RmsNormRowsTriple(const float* x, std::uint32_t rows, std::uint32_t dim,
+                       float eps, const float* ffn_gamma, __half* ffn_half,
+                       const float* router_scale, float router_k,
+                       float* router_out, const float* preffw_gamma,
+                       __half* preffw_half, hipStream_t stream);
 
 /// Single-row residual add fused with the following RMSNorm: `x += addend`,
 /// then `out = rmsnorm(x) * gamma`. Bit-identical to Add then RmsNormRows with
@@ -73,6 +104,23 @@ void MoeEpilogue(const float* expert_out, const float* weights,
                  std::uint32_t tokens, std::uint32_t k, std::uint32_t dim,
                  hipStream_t stream);
 
+/// The expert layer's post-FFN chain in one launch, per row r:
+///   a = rms(mlp[r]) * norm1,
+///   b = rms(sum_s w_s * scale_s * expert_out[r * k + s]) * norm2,
+///   out[r] = (rms(a + b) * post_norm + residual[r]) * post_scale.
+/// Bit-identical to MoeEpilogue followed by the three RMSNorms, two adds,
+/// copy and output scale it replaces: the combine uses the same double
+/// accumulation per element, and every rms reduction runs with the same
+/// thread mapping, float4 float partials and double block reduce as
+/// RmsNormRows on that shape. `expert_scale` may be null (scale 1). dim is a
+/// multiple of 4 with dim / (4 * 256) <= 8 (every gemma4 projection row).
+void MoeFinish(const float* mlp, const float* expert_out, const float* weights,
+               const std::int32_t* ids, const float* expert_scale,
+               const float* norm1, const float* norm2, const float* post_norm,
+               float post_scale, const float* residual, float* out,
+               std::uint32_t tokens, std::uint32_t k, std::uint32_t dim,
+               float eps, hipStream_t stream);
+
 /// act[r][i] = gelu_tanh(gu[r][i]) * gu[r][ff + i] for the fused gate/up
 /// projection: `gu` is [rows][2 * ff] (gate rows first), `act` is [rows][ff].
 /// `count` is the number of act elements (rows * ff). F32 and F16 variants.
@@ -82,16 +130,20 @@ void GegluF16(const __half* gu, __half* act, std::size_t count,
               std::uint32_t ff, hipStream_t stream);
 
 /// The shared-FFN variant with separate gate and up projections:
-/// act[i] = gelu_tanh(gate[i]) * up[i] over `count` elements laid out as
-/// [rows][ff] rows in all three buffers.
+/// act[r][i] = gelu_tanh(gate[r][i]) * up[r][i] over `count` = rows * ff
+/// act elements. `pitch` is the float stride of one gate/up input row: `ff`
+/// for standalone projections, or 2 * ff when they are halves of a fused
+/// gate/up GEMM output (gate first). `act` is always packed [rows][ff].
 void GegluF32Separate(const float* gate, const float* up, float* act,
-                      std::size_t count, hipStream_t stream);
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream);
 
 /// Binary16-output shared-FFN geglu: reads the FP32 gate/up rows, stores the
 /// act row as F16 so the following dense F16 down GEMM consumes it directly
 /// (skipping the FP32->F16 narrowing pass and halving the act-row traffic).
 void GegluF16Separate(const float* gate, const float* up, __half* act,
-                      std::size_t count, hipStream_t stream);
+                      std::size_t count, std::uint32_t ff, std::uint32_t pitch,
+                      hipStream_t stream);
 
 }  // namespace gufo::models::gemma4::rocm
 
