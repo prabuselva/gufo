@@ -58,6 +58,13 @@ __global__ void RmsNormKernel(const float* __restrict__ x,
   }
 }
 
+__global__ void ScaleKernel(float* __restrict__ x, float s, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    x[i] *= s;
+  }
+}
+
 __global__ void AddKernel(float* __restrict__ res,
                           const float* __restrict__ add, int64_t n) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -176,6 +183,14 @@ extern "C" int nbl_rms_norm(const float* x, const float* w, float* out,
   }
   RmsNormKernel<<<rows, kBlock, 0, stream>>>(x, w, out, hidden, eps);
   return CheckLaunch(hipGetLastError(), "nbl_rms_norm");
+}
+
+extern "C" int nbl_scale(float* x, float s, int64_t n, hipStream_t stream) {
+  if (!x || n <= 0) {
+    return -1;
+  }
+  ScaleKernel<<<BlockCount(n), kBlock, 0, stream>>>(x, s, n);
+  return CheckLaunch(hipGetLastError(), "nbl_scale");
 }
 
 extern "C" int nbl_add(float* res, const float* add, int64_t n,

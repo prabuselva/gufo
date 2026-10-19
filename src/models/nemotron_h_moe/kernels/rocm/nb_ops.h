@@ -15,6 +15,9 @@ extern "C" {
 int nbl_rms_norm(const float* x, const float* w, float* out, int rows,
                  int hidden, float eps, hipStream_t stream);
 
+/// x[i] *= s
+int nbl_scale(float* x, float s, int64_t n, hipStream_t stream);
+
 /// res[i] += add[i]
 int nbl_add(float* res, const float* add, int64_t n, hipStream_t stream);
 
