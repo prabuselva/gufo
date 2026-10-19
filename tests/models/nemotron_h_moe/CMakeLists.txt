@@ -34,4 +34,14 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(nemotron_h_moe.rocm_mmq PROPERTIES
     LABELS "nemotron_h_moe;hip;gpu;gfx1151")
   add_dependencies(nemotron_h_moe_tests nemotron_h_moe_rocm_mmq_test)
+
+  # Fused elementwise kernel contracts against the scalar cpu_* oracle.
+  add_executable(nemotron_h_moe_rocm_ops_test EXCLUDE_FROM_ALL
+    rocm_ops_test.cpp)
+  target_link_libraries(nemotron_h_moe_rocm_ops_test PRIVATE
+    gufo_nemotron_h_moe_kernels gufo_nemotron_h_moe_reference)
+  add_test(NAME nemotron_h_moe.rocm_ops COMMAND nemotron_h_moe_rocm_ops_test)
+  set_tests_properties(nemotron_h_moe.rocm_ops PROPERTIES
+    LABELS "nemotron_h_moe;hip;gpu;gfx1151")
+  add_dependencies(nemotron_h_moe_tests nemotron_h_moe_rocm_ops_test)
 endif()

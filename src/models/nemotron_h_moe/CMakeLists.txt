@@ -54,4 +54,17 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_nemotron_h_moe_mmq SYSTEM PUBLIC
     ${PROJECT_SOURCE_DIR} ${NB_MMQ_DIR})
   target_link_libraries(gufo_nemotron_h_moe_mmq PUBLIC hip::host roc::hipblas)
+
+  # Fused elementwise kernels backing the GPU executor.
+  add_library(gufo_nemotron_h_moe_kernels STATIC
+    ${NB_ROCM_DIR}/nb_ops.hip.cpp)
+  set_source_files_properties(${NB_ROCM_DIR}/nb_ops.hip.cpp
+    PROPERTIES LANGUAGE HIP)
+  set_target_properties(gufo_nemotron_h_moe_kernels PROPERTIES
+    HIP_STANDARD 17
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_nemotron_h_moe_kernels SYSTEM PUBLIC
+    ${PROJECT_SOURCE_DIR})
+  target_link_libraries(gufo_nemotron_h_moe_kernels PUBLIC hip::host)
 endif()
