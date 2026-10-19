@@ -273,6 +273,12 @@ extern "C" int nmb_mmq_iq2_xxs_dense_vec(const void* W, const float* X,
                                                    W, X, out, M, N, K, stream);
 }
 
+extern "C" int nmb_mmq_q8_0_dense_vec(const void* W, const float* X, float* out,
+                                      int M, int N, int K, hipStream_t stream) {
+  return nmb_mmq_dense_vec_impl<GGML_TYPE_Q8_0>("nmb_mmq_q8_0_dense_vec", W, X,
+                                                out, M, N, K, stream);
+}
+
 template<ggml_type type>
 int nmb_mmq_moe_impl(const char* tag, const void* W, const float* X_f32,
                      const int32_t* ids, float* out_f32, int M, int K,

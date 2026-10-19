@@ -29,20 +29,18 @@ constexpr double kTolerance = 0.03;  // Q8_1 activation-quant floor.
 // given model-private format (finite scales).
 std::vector<std::uint8_t> MakeWeightBytes(int kind, int cols, int matrices,
                                           std::uint32_t seed) {
-  const std::size_t blocks = kind == 0 ? cols / 256 : cols / 64;
-  const std::size_t per_row = blocks * (kind == 0 ? 66 : 36);
+  const std::size_t block_elems = kind == 0 ? 256 : (kind == 1 ? 64 : 32);
+  const std::size_t block_bytes = kind == 0 ? 66 : (kind == 1 ? 36 : 34);
+  const std::size_t per_row = cols / block_elems * block_bytes;
   std::vector<std::uint8_t> bytes(per_row * matrices);
   for (std::uint8_t& byte : bytes) {
     byte = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFFU);
   }
   for (std::size_t i = 0; i < per_row * matrices; ++i) {
-    if (kind == 0) {
-      // block_iq2_xxs: fp16 scale head of every 66-byte block; keep it a
-      // small positive finite value.
-      if (i % 66 == 0) {
-        bytes[i] = 0x30 | static_cast<std::uint8_t>(bytes[i] & 0x01U);
-      }
-    } else if (i % 36 < 4) {
+    if (kind != 1 && i % block_bytes == 0) {
+      // fp16 scale head (IQ2_XXS / Q8_0): keep a small positive finite value.
+      bytes[i] = 0x30 | static_cast<std::uint8_t>(bytes[i] & 0x01U);
+    } else if (kind == 1 && i % 36 < 4) {
       // block_nvfp4: four UE4M3 sub-scales head every 36-byte block; clamp
       // off the NaN/Inf code points.
       bytes[i] &= 0x7EU;
@@ -55,8 +53,9 @@ TensorRef MakeRef(std::vector<std::uint8_t>* bytes, int kind, int cols,
                   int rows, int experts) {
   TensorRef t;
   t.data = bytes->data();
-  t.type =
-      kind == 0 ? gufo::core::GgmlType::kIQ2_XXS : gufo::core::GgmlType::kNVFP4;
+  t.type = kind == 0   ? gufo::core::GgmlType::kIQ2_XXS
+           : kind == 1 ? gufo::core::GgmlType::kNVFP4
+                       : gufo::core::GgmlType::kQ8_0;
   t.cols = static_cast<std::uint64_t>(cols);
   t.rows = static_cast<std::uint64_t>(rows);
   t.experts = static_cast<std::uint64_t>(experts);
@@ -120,7 +119,7 @@ bool Compare(const std::vector<float>& reference, const std::vector<float>& gpu,
 bool RunFormat(int kind, const char* fmt) {
   bool ok = true;
   const int cols = 512;
-  std::uint32_t seed = kind == 0 ? 0xB017u : 0xC0FFEu;
+  std::uint32_t seed = kind == 0 ? 0xB017u : kind == 1 ? 0xC0FFEu : 0xD0D0Fu;
 
   // Dense vector tier: N activations, one matrix.
   for (const int rows : {128, 512}) {
@@ -136,12 +135,14 @@ bool RunFormat(int kind, const char* fmt) {
       Upload(&x_dev, x);
       std::vector<std::int32_t> expert_of(static_cast<std::size_t>(tokens), 0);
       const int rc =
-          kind == 0
-              ? nmb_mmq_iq2_xxs_dense_vec(w_dev.get(), x_dev.get(),
-                                          out_dev.get(), rows, tokens, cols,
-                                          nullptr)
-              : nmb_mmq_nvfp4_dense_vec(w_dev.get(), x_dev.get(), out_dev.get(),
-                                        rows, tokens, cols, nullptr);
+          kind == 0 ? nmb_mmq_iq2_xxs_dense_vec(w_dev.get(), x_dev.get(),
+                                                out_dev.get(), rows, tokens,
+                                                cols, nullptr)
+          : kind == 1
+              ? nmb_mmq_nvfp4_dense_vec(w_dev.get(), x_dev.get(), out_dev.get(),
+                                        rows, tokens, cols, nullptr)
+              : nmb_mmq_q8_0_dense_vec(w_dev.get(), x_dev.get(), out_dev.get(),
+                                       rows, tokens, cols, nullptr);
       if (rc != 0) {
         std::printf("dense_vec %-4s rows=%d N=%d failed rc=%d\n", fmt, rows,
                     tokens, rc);
@@ -174,8 +175,11 @@ bool RunFormat(int kind, const char* fmt) {
           kind == 0
               ? nmb_mmq_iq2_xxs_dense(w_dev.get(), x_dev.get(), out_dev.get(),
                                       rows, tokens, cols, nullptr)
-              : nmb_mmq_nvfp4_dense(w_dev.get(), x_dev.get(), out_dev.get(),
-                                    rows, tokens, cols, nullptr);
+          : kind == 1
+              ? nmb_mmq_nvfp4_dense(w_dev.get(), x_dev.get(), out_dev.get(),
+                                    rows, tokens, cols, nullptr)
+              : nmb_mmq_q8_0_dense(w_dev.get(), x_dev.get(), out_dev.get(),
+                                   rows, tokens, cols, nullptr);
       if (rc != 0) {
         std::printf("dense %-4s rows=%d N=%d failed rc=%d\n", fmt, rows, tokens,
                     rc);
@@ -211,8 +215,9 @@ bool RunFormat(int kind, const char* fmt) {
     Upload(&x_dev, x);
     Upload(ids_dev.get(), expert_of.data(), ids_dev.bytes());
     const int weight_type =
-        kind == 0 ? static_cast<int>(gufo::core::GgmlType::kIQ2_XXS)
-                  : static_cast<int>(gufo::core::GgmlType::kNVFP4);
+        static_cast<int>(kind == 0   ? gufo::core::GgmlType::kIQ2_XXS
+                         : kind == 1 ? gufo::core::GgmlType::kNVFP4
+                                     : gufo::core::GgmlType::kQ8_0);
     const int rc = nmb_mmq_moe_vec(
         weight_type, w_dev.get(), x_dev.get(), ids_dev.get(), out_dev.get(),
         kRows, cols, tokens, kExperts, 1, nullptr, nullptr, nullptr);
@@ -240,6 +245,7 @@ int main() {
   bool ok = true;
   ok = RunFormat(0, "IQ2_XXS") && ok;
   ok = RunFormat(1, "NVFP4") && ok;
+  ok = RunFormat(2, "Q8_0") && ok;
   std::printf("rocm_mmq: %s\n", ok ? "ALL PASS" : "FAILURES");
   return ok ? 0 : 1;
 }

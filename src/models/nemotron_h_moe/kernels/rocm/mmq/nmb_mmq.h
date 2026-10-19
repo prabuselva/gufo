@@ -31,6 +31,10 @@ int nmb_mmq_iq2_xxs_dense_vec(const void* W_iq2_xxs, const float* X_f32,
                               float* out_f32, int M, int N, int K,
                               hipStream_t stream);
 
+int nmb_mmq_q8_0_dense_vec(const void* W_q8_0, const float* X_f32,
+                           float* out_f32, int M, int N, int K,
+                           hipStream_t stream);
+
 int nmb_mmq_q4_K_moe_pair_unique(const void* W_a, const void* W_b,
                                  const float* X_f32, const int32_t* ids,
                                  float* out_a, float* out_b, int M, int K,
