@@ -21,3 +21,17 @@ set_source_files_properties(reference_test.cpp PROPERTIES
 add_test(NAME nemotron_h_moe.reference COMMAND nemotron_h_moe_reference_test)
 set_tests_properties(nemotron_h_moe.reference PROPERTIES
   LABELS "nemotron_h_moe;cpu;external-model;slow" SKIP_RETURN_CODE 77)
+
+# Vendored MMQ/MMVQ contracts on gfx1151: synthetic IQ2_XXS/NVFP4 matrices
+# through the dense, dense-vec and routed moe-vec tiers against the scalar
+# oracle's dequantizers.
+if (ENGINE_ENABLE_HIP)
+  add_executable(nemotron_h_moe_rocm_mmq_test EXCLUDE_FROM_ALL
+    rocm_mmq_test.cpp)
+  target_link_libraries(nemotron_h_moe_rocm_mmq_test PRIVATE
+    gufo_nemotron_h_moe_mmq gufo_nemotron_h_moe_reference)
+  add_test(NAME nemotron_h_moe.rocm_mmq COMMAND nemotron_h_moe_rocm_mmq_test)
+  set_tests_properties(nemotron_h_moe.rocm_mmq PROPERTIES
+    LABELS "nemotron_h_moe;hip;gpu;gfx1151")
+  add_dependencies(nemotron_h_moe_tests nemotron_h_moe_rocm_mmq_test)
+endif()
