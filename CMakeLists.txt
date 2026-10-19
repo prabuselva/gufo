@@ -96,6 +96,10 @@ add_subdirectory(src/models/qwen3_asr)
 # Ling 3.0 Flash (bailingmoe3) — hybrid KDA + absorbed-MLA + MoE engine.
 add_subdirectory(src/models/ling3_0)
 
+# Nemotron 3.5 Bolt (nemotron_h_moe) — hybrid Mamba-2 + NoPE-GQA + latent
+# MoE engine. Model-private kernels only; no other model tree is modified.
+add_subdirectory(src/models/nemotron_h_moe)
+
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -536,6 +540,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/qwen36_a3b)
   add_subdirectory(tests/models/gemma4)
   add_subdirectory(tests/models/ling3_0)
+  add_subdirectory(tests/models/nemotron_h_moe)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test

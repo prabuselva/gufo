@@ -216,6 +216,10 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
     case core::GgmlType::kIQ3_S:
       block_bytes = sizeof(block_iq3_s);
       break;
+    case core::GgmlType::kNVFP4:
+      // 4 UE4M3 sub-scales + 32 packed E2M1 nibbles per 64-element block.
+      block_bytes = 36;
+      break;
     default:
       return 0;
   }
