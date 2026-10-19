@@ -54,4 +54,15 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(nemotron_h_moe.rocm_mamba PROPERTIES
     LABELS "nemotron_h_moe;hip;gpu;gfx1151")
   add_dependencies(nemotron_h_moe_tests nemotron_h_moe_rocm_mamba_test)
+
+  # Attention contract: decode and causal prefill versus a CPU fixture.
+  add_executable(nemotron_h_moe_rocm_attention_test EXCLUDE_FROM_ALL
+    rocm_attention_test.cpp)
+  target_link_libraries(nemotron_h_moe_rocm_attention_test PRIVATE
+    gufo_nemotron_h_moe_kernels)
+  add_test(NAME nemotron_h_moe.rocm_attention
+           COMMAND nemotron_h_moe_rocm_attention_test)
+  set_tests_properties(nemotron_h_moe.rocm_attention PROPERTIES
+    LABELS "nemotron_h_moe;hip;gpu;gfx1151")
+  add_dependencies(nemotron_h_moe_tests nemotron_h_moe_rocm_attention_test)
 endif()

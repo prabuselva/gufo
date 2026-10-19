@@ -139,13 +139,13 @@ one tool call (AGENTS protocol).
 
 ## Phase 3 — HIP engine (`kernels/rocm/`)
 
-- [ ] Mamba-2 kernels: decode recurrence + chunked prefill
+- [x] Mamba-2 kernels: decode recurrence + chunked prefill
   (dt A/d discretization; no deltanet reuse); conv-history state tail shared
   with cache design.
 - [ ] MoE: reuse vendored mmq/mmid/moe_wave64 path (already IQ2_XXS+NVFP4
   capable) for grouped expert gemm; ReLU² fused act; router top-k kernel with
   sigmoid+bias and per-layer expert counts; latent up/down dense gemms (Q8_0).
-- [ ] NoPE attention: attention prefill/decode minus rope (gemma4 closest).
+- [x] NoPE attention: attention prefill/decode minus rope (gemma4 closest).
 - [ ] Session state: per-layer tagged caches (KV for 8 attn layers,
   conv+ssm state for 40 mamba layers), snapshot/rollback for speculative later.
 - [ ] Engine `Model::Load/CreateSession` + executor prefill/step.
@@ -203,6 +203,7 @@ one tool call (AGENTS protocol).
 | 2026-10-19 | feat branch | Fused elementwise kernels `gufo_nemotron_h_moe_kernels` (`kernels/rocm/nb_ops`): nbl_rms_norm (wave-size-agnostic reduce), nbl_add, nbl_relu_sqr, nbl_dequant_row_q8_0, nbl_router (iterated argmax mirroring the oracle incl. tie-to-lowest-index, renorm by max(sum, 2⁻¹⁴)×scale, tail −1/0 pad), nbl_moe_combine; contract `nemotron_h_moe.rocm_ops` vs cpu oracle; check-format PASS | PASS (rel ≤ 1.1e-7, add/relu_sqr/dequant exact) — evidence `evidence/rocm-ops-test-gfx1151.log` |
 | 2026-10-19 | feat branch | Mamba-2 scan `kernels/rocm/nb_mamba2` (`nbl_mamba_scan`): conv kernel (thread per xBC channel, register window shift, chunk-parallel with running state) + templated SSM kernel (4-thread quads per (h,i) row, state in registers across the chunk, shfl butterfly y-reduce; stream-ordered scratch); nbl_scale added to nb_ops; contract `nemotron_h_moe.rocm_mamba` vs independent fp32 + fp64 fixtures at T=1×6/8×2/128×1 (bug found via the contract: hipMalloc state buffers were read uninitialized; the test now uploads zero-init states and the fp64 oracle bounds the summation-order noise floor); check-format PASS | PASS (y ≤ 4.9e-7 rel vs fp32+fp64, conv_state exact, ssm_state ≤ 1.4e-6 abs — expf vs std::exp in dA) — evidence `evidence/rocm-mamba-test-gfx1151.log` |
 
+| 2026-10-19 | feat branch | NoPE attention `kernels/rocm/nb_attention` (`nbl_attn_append`, `nbl_attn`): causal GQA SDPA with flash-style online softmax, 8-token rows x heads grid, 128 dim-lane threads, kTile=32 smem tiles (sq/sk/sv + se/sm/sl/sa), NoPE head->kv-group map, decode uses the guarded partial-tile path; contract `nemotron_h_moe.rocm_attention` vs independent double CPU fixture over the same cache rows for T5 prefill, decode x4, T6 midcache, T17 unaligned on three shapes incl. hd!=hdv; append checked exact | PASS (y <= 2e-5 rel, append exact) - evidence `evidence/rocm-attention-test-gfx1151.log` |
 ## Blockers / risks
 
 - IQ2_XXS×fp16 activation grouped GEMM perf for 2–9B active params is the

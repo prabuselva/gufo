@@ -58,9 +58,11 @@ if (ENGINE_ENABLE_HIP)
   # Fused elementwise kernels and the Mamba-2 scan backing the GPU executor.
   add_library(gufo_nemotron_h_moe_kernels STATIC
     ${NB_ROCM_DIR}/nb_ops.hip.cpp
-    ${NB_ROCM_DIR}/nb_mamba2.hip.cpp)
+    ${NB_ROCM_DIR}/nb_mamba2.hip.cpp
+    ${NB_ROCM_DIR}/nb_attention.hip.cpp)
   set_source_files_properties(${NB_ROCM_DIR}/nb_ops.hip.cpp
                               ${NB_ROCM_DIR}/nb_mamba2.hip.cpp
+                              ${NB_ROCM_DIR}/nb_attention.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_nemotron_h_moe_kernels PROPERTIES
     HIP_STANDARD 17
