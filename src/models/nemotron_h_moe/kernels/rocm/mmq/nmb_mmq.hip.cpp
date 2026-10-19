@@ -639,6 +639,24 @@ extern "C" int nmb_mmq_q5_K_moe_raw(const void* W, const float* X,
       n_expert_used, stream, nullptr, nullptr);
 }
 
+extern "C" int nmb_mmq_iq2_xxs_moe_raw(const void* W, const float* X,
+                                       const int32_t* ids, float* out, int M,
+                                       int K, int n_tokens, int n_experts,
+                                       int n_expert_used, hipStream_t stream) {
+  return nmb_mmq_moe_impl<GGML_TYPE_IQ2_XXS>(
+      "nmb_mmq_iq2_xxs_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
+      n_expert_used, stream, nullptr, nullptr);
+}
+
+extern "C" int nmb_mmq_nvfp4_moe_raw(const void* W, const float* X,
+                                     const int32_t* ids, float* out, int M,
+                                     int K, int n_tokens, int n_experts,
+                                     int n_expert_used, hipStream_t stream) {
+  return nmb_mmq_moe_impl<GGML_TYPE_NVFP4>(
+      "nmb_mmq_nvfp4_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
+      n_expert_used, stream, nullptr, nullptr);
+}
+
 extern "C" int nmb_mmq_q4_K_moe_pair_unique(const void* W_a, const void* W_b,
                                             const float* X, const int32_t* ids,
                                             float* out_a, float* out_b, int M,

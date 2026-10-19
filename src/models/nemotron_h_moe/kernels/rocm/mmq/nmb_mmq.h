@@ -97,4 +97,13 @@ int nmb_mmq_q5_1_moe_raw(const void* W, const float* X_f32, const int32_t* ids,
 int nmb_mmq_q5_K_moe_raw(const void* W, const float* X_f32, const int32_t* ids,
                          float* out, int M, int K, int n_tokens, int n_experts,
                          int n_expert_used, hipStream_t stream);
+
+int nmb_mmq_iq2_xxs_moe_raw(const void* W, const float* X_f32,
+                            const int32_t* ids, float* out, int M, int K,
+                            int n_tokens, int n_experts, int n_expert_used,
+                            hipStream_t stream);
+
+int nmb_mmq_nvfp4_moe_raw(const void* W, const float* X_f32, const int32_t* ids,
+                          float* out, int M, int K, int n_tokens, int n_experts,
+                          int n_expert_used, hipStream_t stream);
 }
