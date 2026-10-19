@@ -84,7 +84,8 @@ if (ENGINE_ENABLE_HIP)
   # Gufo-owned API over the ROCm runtime: one resident model with a single
   # session. Linked by the serve runner.
   add_library(gufo_nemotron_h_moe_engine STATIC EXCLUDE_FROM_ALL
-    engine.cpp)
+    engine.cpp
+    cli_runner.cpp)
   set_target_properties(gufo_nemotron_h_moe_engine PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(gufo_nemotron_h_moe_engine PUBLIC

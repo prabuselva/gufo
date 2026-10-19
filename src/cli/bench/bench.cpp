@@ -34,6 +34,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/gemma4/cli_runner.hpp"
 #include "src/models/ling3_0/cli_runner.hpp"
+#include "src/models/nemotron_h_moe/cli_runner.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -1283,6 +1284,10 @@ int RunBench(std::span<const char* const> args) {
   }
   if (models::ling3_0::IsLing3Model(*reader)) {
     return models::ling3_0::RunLing3Benchmark(opt, reader, model_load_start);
+  }
+  if (models::nemotron_h_moe::IsNemotronHBolt(*reader)) {
+    return models::nemotron_h_moe::RunNemotronBenchmark(opt, reader,
+                                                        model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {
