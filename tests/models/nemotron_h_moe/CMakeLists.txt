@@ -65,4 +65,16 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(nemotron_h_moe.rocm_attention PROPERTIES
     LABELS "nemotron_h_moe;hip;gpu;gfx1151")
   add_dependencies(nemotron_h_moe_tests nemotron_h_moe_rocm_attention_test)
+
+  # GPU executor versus the scalar oracle on the real artifact.
+  add_executable(nemotron_h_moe_device_step_test EXCLUDE_FROM_ALL
+    device_step_test.cpp)
+  target_link_libraries(nemotron_h_moe_device_step_test PRIVATE
+    gufo_nemotron_h_moe_device gufo_nemotron_h_moe_reference)
+  add_test(NAME nemotron_h_moe.device_step
+           COMMAND nemotron_h_moe_device_step_test)
+  set_tests_properties(nemotron_h_moe.device_step PROPERTIES
+    LABELS "nemotron_h_moe;hip;gpu;gfx1151;external-model;slow"
+    SKIP_RETURN_CODE 77)
+  add_dependencies(nemotron_h_moe_tests nemotron_h_moe_device_step_test)
 endif()

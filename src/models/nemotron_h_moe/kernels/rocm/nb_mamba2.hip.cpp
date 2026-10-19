@@ -61,8 +61,8 @@ __global__ void MambaSsmKernel(
     const float* __restrict__ zxbc, const float* __restrict__ cx,
     const float* __restrict__ a, const float* __restrict__ d,
     const float* __restrict__ dtb, float* __restrict__ ssm_state,
-    float* __restrict__ y, int inner, int hd, int state, int heads_per_group,
-    int xbc, int proj, int tokens) {
+    float* __restrict__ y, int inner, int hd, int state, int groups,
+    int heads_per_group, int xbc, int proj, int tokens) {
   const int tid = static_cast<int>(threadIdx.x);
   const int quad = blockIdx.x * kQuads + tid / 4;
   const int s = tid % 4;
@@ -81,11 +81,11 @@ __global__ void MambaSsmKernel(
   for (int t = 0; t < tokens; ++t) {
     const float* zt = zxbc + static_cast<int64_t>(t) * proj;
     const float* cx_t = cx + static_cast<int64_t>(t) * xbc;
-    const float dt_sp = SoftplusD(zt[2 * inner + 2 * g * state + h] + dtb_f);
+    const float dt_sp = SoftplusD(zt[proj - inner / hd + h] + dtb_f);
     const float xv = cx_t[quad] * dt_sp;
     const float dA = expf(dt_sp * af);
     const float* bx = cx_t + inner + g * state + st0;
-    const float* cc = cx_t + inner + (g + 1) * state + st0;
+    const float* cc = cx_t + inner + (groups + g) * state + st0;
     float sum = 0.0F;
     for (int j = 0; j < PER; ++j) {
       const float ns = sp[j] * dA + bx[j] * xv;
@@ -137,38 +137,38 @@ extern "C" int nbl_mamba_scan(const float* zxbc, const float* cw,
   switch (state / 4) {
     case 1:
       MambaSsmKernel<1><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
     case 2:
       MambaSsmKernel<2><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
     case 4:
       MambaSsmKernel<4><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
     case 8:
       MambaSsmKernel<8><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
     case 16:
       MambaSsmKernel<16><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
     case 32:
       MambaSsmKernel<32><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
     default:
       MambaSsmKernel<64><<<grid, kBlock, 0, stream>>>(
-          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, heads_per_group,
-          xbc, proj, tokens);
+          zxbc, cx, a, d, dtb, ssm_state, y, inner, hd, state, groups,
+          heads_per_group, xbc, proj, tokens);
       break;
   }
   hipFreeAsync(cx, stream);

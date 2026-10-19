@@ -60,7 +60,7 @@ void ReferenceStep(const Shapes& s, const float* zxbc, const float* cw,
   for (int h = 0; h < s.heads; ++h) {
     const int g = h / (s.heads / s.groups);
     const float dt_sp =
-        SoftplusD(zxbc[2 * inner + 2 * g * s.state + h] + dtb[h]);
+        SoftplusD(zxbc[2 * inner + 2 * s.groups * s.state + h] + dtb[h]);
     const float dA = std::exp(dt_sp * a[h]);
     for (int i = 0; i < s.hd; ++i) {
       const int q = h * s.hd + i;
@@ -74,7 +74,8 @@ void ReferenceStep(const Shapes& s, const float* zxbc, const float* cw,
             cx[static_cast<std::size_t>(inner + g * s.state + st)] * xv;
         sp[k] = ns;
         sum +=
-            ns * cx[static_cast<std::size_t>(inner + (g + 1) * s.state + st)];
+            ns *
+            cx[static_cast<std::size_t>(inner + (s.groups + g) * s.state + st)];
       }
       y[q] = (sum + cx[static_cast<std::size_t>(q)] * d[h]) *
              SiluD(zxbc[q]);  // z channels [0, inner)
@@ -215,10 +216,10 @@ void ReferenceStepD(const Shapes& s, const float* zxbc, const float* cw,
   for (int h = 0; h < s.heads; ++h) {
     const int g = h / (s.heads / s.groups);
     const double dt_sp =
-        zxbc[2 * inner + 2 * g * s.state + h] + dtb[h] > 20.0F
-            ? zxbc[2 * inner + 2 * g * s.state + h] + dtb[h]
+        zxbc[2 * inner + 2 * s.groups * s.state + h] + dtb[h] > 20.0F
+            ? zxbc[2 * inner + 2 * s.groups * s.state + h] + dtb[h]
             : std::log1p(std::exp(static_cast<double>(
-                  zxbc[2 * inner + 2 * g * s.state + h] + dtb[h])));
+                  zxbc[2 * inner + 2 * s.groups * s.state + h] + dtb[h])));
     const double dA = std::exp(dt_sp * static_cast<double>(a[h]));
     for (int i = 0; i < s.hd; ++i) {
       const int q = h * s.hd + i;
@@ -232,7 +233,8 @@ void ReferenceStepD(const Shapes& s, const float* zxbc, const float* cw,
             cx[static_cast<std::size_t>(inner + g * s.state + st)] * xv;
         sp[k] = ns;
         sum +=
-            ns * cx[static_cast<std::size_t>(inner + (g + 1) * s.state + st)];
+            ns *
+            cx[static_cast<std::size_t>(inner + (s.groups + g) * s.state + st)];
       }
       const double zz = zxbc[q];
       y[q] = static_cast<float>((sum + cx[static_cast<std::size_t>(q)] * d[h]) *

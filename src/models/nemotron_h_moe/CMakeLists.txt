@@ -71,4 +71,12 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_nemotron_h_moe_kernels SYSTEM PUBLIC
     ${PROJECT_SOURCE_DIR})
   target_link_libraries(gufo_nemotron_h_moe_kernels PUBLIC hip::host)
+
+  # GPU executor: uploads the quantized artifact once and runs the token
+  # graph through the nbl_/nmb_ kernel contracts above.
+  add_library(gufo_nemotron_h_moe_device STATIC ${NB_ROCM_DIR}/device_model.cpp)
+  set_target_properties(gufo_nemotron_h_moe_device PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(gufo_nemotron_h_moe_device PUBLIC
+    gufo_nemotron_h_moe gufo_nemotron_h_moe_kernels)
 endif()
