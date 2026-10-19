@@ -174,7 +174,7 @@ bool DeviceModel::Init(std::string* error_msg) {
       }
     }
   }
-  const std::uint32_t top_k = 16;
+  const std::uint32_t latent = c_.moe_latent_size;
   auto alloc = [&](float** p, std::size_t n, const char* tag) {
     if (hipMalloc(reinterpret_cast<void**>(p), n * sizeof(float)) !=
         hipSuccess) {
@@ -183,28 +183,36 @@ bool DeviceModel::Init(std::string* error_msg) {
     }
     return true;
   };
-  const std::uint32_t latent = c_.moe_latent_size;
-  bool ok = alloc(&x_, hid, "x") && alloc(&normed_, hid, "normed") &&
-            alloc(&out_, hid, "out") &&
+  const std::uint32_t t = kPrefillChunk;
+  const std::size_t top_k = 16;
+  auto nrow = [t](std::size_t w) { return t * w; };
+  bool ok = alloc(&x_, nrow(hid), "x") &&
+            alloc(&normed_, nrow(hid), "normed") &&
+            alloc(&out_, nrow(hid), "out") &&
             alloc(&logits_, c_.vocab_size, "logits") &&
-            alloc(&zxbc_, c_.SsmInProj(), "zxbc") && alloc(&y_, inner, "y") &&
-            alloc(&q_, qdim, "q") && alloc(&o_, qdim, "o");
+            alloc(&zxbc_, nrow(c_.SsmInProj()), "zxbc") &&
+            alloc(&y_, nrow(inner), "y") && alloc(&q_, nrow(qdim), "q") &&
+            alloc(&o_, nrow(qdim), "o");
   if (ok) {
-    ok = alloc(&k_, hid, "k") && alloc(&v_, hid, "v");
+    ok = alloc(&k_, nrow(hid), "k") && alloc(&v_, nrow(hid), "v");
   }
   if (ok) {
-    ok =
-        alloc(&router_logits_, static_cast<std::size_t>(max_experts_),
-              "router") &&
-        alloc(&moe_w_, top_k, "moe_w") && alloc(&lat_, latent, "lat") &&
-        alloc(&up_out_, static_cast<std::size_t>(top_k) * max_expert_ff_,
-              "up_out") &&
-        alloc(&act_, static_cast<std::size_t>(top_k) * max_expert_ff_, "act") &&
-        alloc(&down_out_, static_cast<std::size_t>(top_k) * latent, "dn") &&
-        alloc(&acc_, latent, "acc") && alloc(&moe_, hid, "moe") &&
-        alloc(&sh_, c_.shared_expert_ff, "sh") &&
-        hipMalloc(reinterpret_cast<void**>(&ids_),
-                  top_k * sizeof(std::int32_t)) == hipSuccess;
+    ok = alloc(&router_logits_, nrow(static_cast<std::size_t>(max_experts_)),
+               "router") &&
+         alloc(&moe_w_, nrow(top_k), "moe_w") &&
+         alloc(&lat_, nrow(latent), "lat") &&
+         alloc(&up_out_, nrow(top_k * static_cast<std::size_t>(max_expert_ff_)),
+               "up_out") &&
+         alloc(&act_, nrow(top_k * static_cast<std::size_t>(max_expert_ff_)),
+               "act") &&
+         alloc(&down_out_, nrow(top_k * static_cast<std::size_t>(latent)),
+               "dn") &&
+         alloc(&acc_, nrow(latent), "acc") && alloc(&moe_, nrow(hid), "moe") &&
+         alloc(&sh_, nrow(c_.shared_expert_ff), "sh") &&
+         hipMalloc(reinterpret_cast<void**>(&ids_),
+                   nrow(top_k) * sizeof(std::int32_t)) == hipSuccess &&
+         hipMalloc(reinterpret_cast<void**>(&tok_dev_),
+                   nrow(1) * sizeof(std::int32_t)) == hipSuccess;
   }
   if (!ok) {
     if (error_msg != nullptr && error_msg->empty()) {
@@ -255,6 +263,8 @@ void DeviceModel::Free() {
   freelist(normed_);
   freelist(out_);
   freelist(logits_);
+  freelist(tok_dev_);
+  tok_dev_ = nullptr;
   freelist(zxbc_);
   freelist(y_);
   freelist(q_);
@@ -291,14 +301,12 @@ void DeviceModel::Reset() {
   position_ = 0;
 }
 
-#include <cstdio>
-
-void DeviceModel::StepMamba(const LayerDev& l, hipStream_t stream) {
+void DeviceModel::PassMamba(const LayerDev& l, int t, hipStream_t stream) {
   const std::uint32_t inner = c_.ssm_inner_size;
   const std::uint32_t proj = c_.SsmInProj();
   nbl_gemv_nvfp4_f32(normed_, l.ssm_in, zxbc_, static_cast<int>(proj),
-                     static_cast<int>(c_.hidden_size), stream);
-  nbl_scale(zxbc_, l.ssm_in_scale, static_cast<int64_t>(proj), stream);
+                     static_cast<int>(c_.hidden_size), t, stream);
+  nbl_scale(zxbc_, l.ssm_in_scale, static_cast<int64_t>(t) * proj, stream);
   nbl_mamba_scan(
       zxbc_, static_cast<const float*>(l.conv_w),
       static_cast<const float*>(l.conv_b), static_cast<const float*>(l.ssm_a),
@@ -307,63 +315,101 @@ void DeviceModel::StepMamba(const LayerDev& l, hipStream_t stream) {
       static_cast<int>(c_.SsmHeadCount()), static_cast<int>(c_.SsmHeadDim()),
       static_cast<int>(c_.ssm_state_size), static_cast<int>(c_.ssm_group_count),
       static_cast<int>(c_.ssm_conv_kernel),
-      static_cast<int>(c_.SsmConvChannels()), static_cast<int>(proj), 1,
+      static_cast<int>(c_.SsmConvChannels()), static_cast<int>(proj), t,
       stream);
   nbl_rms_norm_grouped(y_, static_cast<const float*>(l.ssm_norm), y_,
-                       static_cast<int>(c_.ssm_group_count),
+                       t * static_cast<int>(c_.ssm_group_count),
                        static_cast<int>(inner / c_.ssm_group_count),
                        static_cast<int>(c_.ssm_group_count), c_.rms_eps,
                        stream);
   nbl_gemv_f32(kNblGemvNvfp4, l.ssm_out, y_, out_,
-               static_cast<int>(c_.hidden_size), static_cast<int>(inner),
+               static_cast<int>(c_.hidden_size), static_cast<int>(inner), t,
                stream);
-  nbl_scale(out_, l.ssm_out_scale, static_cast<int64_t>(c_.hidden_size),
+  nbl_scale(out_, l.ssm_out_scale, static_cast<int64_t>(t) * c_.hidden_size,
             stream);
 }
 
-void DeviceModel::StepAttn(const LayerDev& l, hipStream_t stream) {
+void DeviceModel::PassAttn(const LayerDev& l, int t, hipStream_t stream) {
   const int hid = static_cast<int>(c_.hidden_size);
   const int kvh = static_cast<int>(l.kvh);
   const int kvdim = static_cast<int>(l.kvdim);
   const int hd = static_cast<int>(c_.head_dim);
   const int hdv = static_cast<int>(c_.head_dim_v);
   nbl_gemv_f32(kNblGemvQ8_0, l.q, normed_, q_,
-               static_cast<int>(c_.AttentionQDim()), hid, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.k, normed_, k_, kvdim, hid, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.v, normed_, v_, kvdim, hid, stream);
-  nbl_attn_append(k_, v_, l.kv, static_cast<int>(position_), 1, kvdim, stream);
-  nbl_attn(q_, l.kv, static_cast<int>(position_), 1, o_,
+               static_cast<int>(c_.AttentionQDim()), hid, t, stream);
+  nbl_gemv_f32(kNblGemvQ8_0, l.k, normed_, k_, kvdim, hid, t, stream);
+  nbl_gemv_f32(kNblGemvQ8_0, l.v, normed_, v_, kvdim, hid, t, stream);
+  nbl_attn_append(k_, v_, l.kv, static_cast<int>(position_), t, kvdim, stream);
+  nbl_attn(q_, l.kv, static_cast<int>(position_), t, o_,
            static_cast<int>(c_.num_heads), hd, hdv, kvh, kvdim,
            1.0F / std::sqrt(static_cast<float>(hd)), stream);
   nbl_gemv_f32(kNblGemvQ8_0, l.attn_out, o_, out_, hid,
-               static_cast<int>(c_.AttentionQDim()), stream);
+               static_cast<int>(c_.AttentionQDim()), t, stream);
 }
 
-void DeviceModel::StepMoe(const LayerDev& l, hipStream_t stream) {
+void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
   const int hid = static_cast<int>(c_.hidden_size);
   const int latent = static_cast<int>(c_.moe_latent_size);
   const int top_k = static_cast<int>(l.top_k);
   const int n_exp = static_cast<int>(l.n_experts);
   const int expert_ff = static_cast<int>(l.expert_ff);
-  nbl_gemm_f32(normed_, static_cast<const float*>(l.router), router_logits_, 1,
+  nbl_gemm_f32(normed_, static_cast<const float*>(l.router), router_logits_, t,
                n_exp, hid, stream);
   nbl_router(router_logits_, static_cast<const float*>(l.exp_b), n_exp, top_k,
-             c_.expert_weights_norm ? 1 : 0, c_.expert_weights_scale, 1, ids_,
+             c_.expert_weights_norm ? 1 : 0, c_.expert_weights_scale, t, ids_,
              moe_w_, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid, stream);
+  nbl_gemv_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid, t,
+               stream);
   nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.up_exps, lat_, ids_, up_out_, expert_ff,
-                   latent, top_k, 0, stream);
-  nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(top_k) * expert_ff, stream);
+                   latent, top_k, 0, t, stream);
+  nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(t) * top_k * expert_ff,
+               stream);
   nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.down_exps, act_, ids_, down_out_, latent,
-                   expert_ff, top_k, expert_ff, stream);
-  nbl_moe_combine(acc_, down_out_, moe_w_, latent, top_k, 1, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent, stream);
+                   expert_ff, top_k, expert_ff, t, stream);
+  nbl_moe_combine(acc_, down_out_, moe_w_, latent, top_k, t, stream);
+  nbl_gemv_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent, t, stream);
   nbl_gemv_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
-               static_cast<int>(c_.shared_expert_ff), hid, stream);
-  nbl_relu_sqr(sh_, sh_, static_cast<int64_t>(c_.shared_expert_ff), stream);
+               static_cast<int>(c_.shared_expert_ff), hid, t, stream);
+  nbl_relu_sqr(sh_, sh_, static_cast<int64_t>(t) * c_.shared_expert_ff, stream);
   nbl_gemv_f32(kNblGemvIq2Xxs, l.down_shexp, sh_, out_, hid,
-               static_cast<int>(c_.shared_expert_ff), stream);
-  nbl_add(out_, moe_, static_cast<int64_t>(hid), stream);
+               static_cast<int>(c_.shared_expert_ff), t, stream);
+  nbl_add(out_, moe_, static_cast<int64_t>(t) * hid, stream);
+}
+
+bool DeviceModel::ForwardLayers(int t, bool with_dump, std::string* error_msg) {
+  const std::uint32_t hid = c_.hidden_size;
+  for (std::uint32_t l = 0; l < c_.num_layers; ++l) {
+    const LayerDev& ld = layers_[l];
+    if (with_dump) {
+      const std::size_t base = static_cast<std::size_t>(l) * hid;
+      layer_dump_->resize(base + hid);
+      if (hipMemcpy(layer_dump_->data() + base, x_, hid * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        return Fail(error_msg, "layer dump failed");
+      }
+    }
+    nbl_rms_norm(x_, static_cast<const float*>(ld.norm), normed_, t,
+                 static_cast<int>(hid), c_.rms_eps, nullptr);
+    switch (ld.kind) {
+      case Config::LayerKind::kMamba:
+        PassMamba(ld, t, nullptr);
+        break;
+      case Config::LayerKind::kAttention:
+        PassAttn(ld, t, nullptr);
+        break;
+      case Config::LayerKind::kMoe:
+        PassMoe(ld, t, nullptr);
+        break;
+    }
+    nbl_add(x_, out_, static_cast<int64_t>(t) * hid, nullptr);
+  }
+  nbl_rms_norm(x_, output_norm_, normed_, t, static_cast<int>(hid), c_.rms_eps,
+               nullptr);
+  position_ += static_cast<std::uint32_t>(t);
+  if (hipGetLastError() != hipSuccess) {
+    return Fail(error_msg, "kernel launch failed during forward");
+  }
+  return true;
 }
 
 bool DeviceModel::Step(std::int32_t token, std::span<float> logits,
@@ -378,47 +424,66 @@ bool DeviceModel::Step(std::int32_t token, std::span<float> logits,
   if (!check(hipGetLastError(), "pre-step")) {
     return false;
   }
+  if (position_ >= max_context_) {
+    return Fail(error_msg, "prompt exceeds KV capacity");
+  }
   const std::uint32_t hid = c_.hidden_size;
   nbl_dequant_row_q8_0(token_embd_, token, static_cast<int>(hid), x_, nullptr);
-  for (std::uint32_t l = 0; l < c_.num_layers; ++l) {
-    const LayerDev& ld = layers_[l];
-    if (layer_dump_ != nullptr) {
-      const std::size_t base = static_cast<std::size_t>(l) * hid;
-      layer_dump_->resize(base + hid);
-      if (hipMemcpy(layer_dump_->data() + base, x_, hid * sizeof(float),
-                    hipMemcpyDeviceToHost) != hipSuccess) {
-        return Fail(error_msg, "layer dump failed");
-      }
-    }
-    nbl_rms_norm(x_, static_cast<const float*>(ld.norm), normed_, 1,
-                 static_cast<int>(hid), c_.rms_eps, nullptr);
-    switch (ld.kind) {
-      case Config::LayerKind::kMamba:
-        StepMamba(ld, nullptr);
-        break;
-      case Config::LayerKind::kAttention:
-        StepAttn(ld, nullptr);
-        break;
-      case Config::LayerKind::kMoe:
-        StepMoe(ld, nullptr);
-        break;
-    }
-    nbl_add(x_, out_, static_cast<int64_t>(hid), nullptr);
+  if (!ForwardLayers(1, layer_dump_ != nullptr, error_msg)) {
+    return false;
   }
-  nbl_rms_norm(x_, output_norm_, normed_, 1, static_cast<int>(hid), c_.rms_eps,
-               nullptr);
   if (!logits.empty()) {
     nbl_gemv_f32(kNblGemvQ8_0, output_, normed_, logits_,
-                 static_cast<int>(c_.vocab_size), static_cast<int>(hid),
+                 static_cast<int>(c_.vocab_size), static_cast<int>(hid), 1,
                  nullptr);
     if (hipMemcpy(logits.data(), logits_, c_.vocab_size * sizeof(float),
                   hipMemcpyDeviceToHost) != hipSuccess) {
       return Fail(error_msg, "logits download failed");
     }
   }
-  ++position_;
   if (hipGetLastError() != hipSuccess) {
     return Fail(error_msg, "kernel launch failed during step");
+  }
+  return true;
+}
+
+bool DeviceModel::Process(std::span<const std::int32_t> tokens,
+                          std::span<float> logits, std::string* error_msg) {
+  if (tokens.empty()) {
+    return true;
+  }
+  if (hipGetLastError() != hipSuccess) {
+    return Fail(error_msg, "pre-process");
+  }
+  if (static_cast<std::uint64_t>(position_) + tokens.size() > max_context_) {
+    return Fail(error_msg, "prompt exceeds KV capacity");
+  }
+  const std::uint32_t hid = c_.hidden_size;
+  std::size_t done = 0;
+  while (done < tokens.size()) {
+    const int n = static_cast<int>(
+        std::min<std::size_t>(kPrefillChunk, tokens.size() - done));
+    if (hipMemcpyAsync(tok_dev_, tokens.data() + done, n * sizeof(std::int32_t),
+                       hipMemcpyHostToDevice, nullptr) != hipSuccess) {
+      return Fail(error_msg, "token upload failed");
+    }
+    nbl_dequant_rows_q8_0(token_embd_, tok_dev_, n, static_cast<int>(hid), x_,
+                          nullptr);
+    if (!ForwardLayers(n, false, error_msg)) {
+      return false;
+    }
+    done += static_cast<std::size_t>(n);
+  }
+  if (!logits.empty()) {
+    const float* last =
+        normed_ + static_cast<std::size_t>(tokens.size() - 1) * hid;
+    nbl_gemv_f32(kNblGemvQ8_0, output_, last, logits_,
+                 static_cast<int>(c_.vocab_size), static_cast<int>(hid), 1,
+                 nullptr);
+    if (hipMemcpy(logits.data(), logits_, c_.vocab_size * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) {
+      return Fail(error_msg, "logits download failed");
+    }
   }
   return true;
 }

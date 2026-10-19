@@ -152,6 +152,24 @@ __global__ void DequantQ8_0RowKernel(const uint8_t* __restrict__ w,
   out[i] = static_cast<float>(block[b].qs[j]) * __half2float(block[b].scale);
 }
 
+// One block row per token: out[t] = embedding row ids[t].
+__global__ void DequantQ8_0RowsKernel(const uint8_t* __restrict__ w,
+                                      const int32_t* __restrict__ ids,
+                                      float* __restrict__ out, int cols) {
+  const int t = static_cast<int>(blockIdx.y);
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= cols) {
+    return;
+  }
+  const int b = i >> 5;
+  const int j = i & 31;
+  const int64_t row = __ldg(ids + t);
+  const BlockQ8_0* block = reinterpret_cast<const BlockQ8_0*>(
+      w + row * (static_cast<int64_t>(cols) / 32 * sizeof(BlockQ8_0)));
+  out[static_cast<int64_t>(t) * cols + i] =
+      static_cast<float>(block[b].qs[j]) * __half2float(block[b].scale);
+}
+
 // ggml NVFP4: 64 values per block, one UE4M3 scale per 16 sub-block (d[4]),
 // 32 packed E2M1 nibbles; row stride = K/64 blocks.
 constexpr int kNvfp4K = 64;
@@ -177,11 +195,14 @@ __device__ __forceinline__ float Ue4m3ToF32(uint8_t v) {
 // One block per output row; thread s owns sub-block s (16 values).
 __global__ void GemvNvfp4F32Kernel(const float* __restrict__ x,
                                    const uint8_t* __restrict__ w,
-                                   float* __restrict__ out, int n_out, int k) {
+                                   float* __restrict__ out, int n_out, int k,
+                                   int tokens) {
   const int row = blockIdx.x;
+  const int token = static_cast<int>(blockIdx.y);
   const int s = static_cast<int>(threadIdx.x);
   const int n_sub = k / kNvfp4Sub;
-  const float* xr = x;
+  const float* xr = x + static_cast<int64_t>(token) * k;
+  out += static_cast<int64_t>(token) * n_out;
   const uint8_t* wr = w + static_cast<int64_t>(row) * (k / kNvfp4K) * 36;
   float acc = 0.0F;
   for (int b = s; b < n_sub; b += kBlock) {
@@ -341,16 +362,23 @@ __global__ void GemvF32Kernel(const float* __restrict__ x,
                               float* __restrict__ out, int n_out, int k,
                               int expert_stride,
                               const int32_t* __restrict__ ids, int slots,
-                              int64_t x_stride) {
+                              int64_t x_stride, int tokens) {
   const int row = static_cast<int>(blockIdx.x % static_cast<unsigned>(n_out));
+  const int token = static_cast<int>(blockIdx.y);
   int64_t w_row = row;
-  int64_t out_row = blockIdx.x;
+  int64_t out_row = static_cast<int64_t>(token) * n_out + row;
   if (slots > 1) {
     const int slot = static_cast<int>(blockIdx.x / n_out);
-    w_row = static_cast<int64_t>(__ldg(ids + slot)) * n_out + row;
-    out_row = static_cast<int64_t>(slot) * n_out + row;
+    const int64_t s = static_cast<int64_t>(token) * slots + slot;
+    w_row = static_cast<int64_t>(__ldg(ids + s)) * n_out + row;
+    out_row = s * n_out + row;
     x += static_cast<int64_t>(slot) * x_stride;
   }
+  // Shared expert inputs (x_stride == 0) are one vector per token of length k;
+  // gathered per-slot inputs are a [tokens][slots][x_stride] block.
+  x += static_cast<int64_t>(token) *
+       ((slots > 1 && x_stride > 0) ? static_cast<int64_t>(slots) * x_stride
+                                    : k);
   const uint8_t* wr = w + w_row * static_cast<int64_t>(expert_stride);
   const int n_chunk = k / GemvChunk<TYPE>();
   float acc = 0.0F;
@@ -478,12 +506,15 @@ extern "C" int nbl_gemm_f32(const float* x, const float* w, float* out,
 }
 
 extern "C" int nbl_gemv_nvfp4_f32(const float* x, const void* w, float* out,
-                                  int n_out, int k, hipStream_t stream) {
-  if (!x || !w || !out || n_out <= 0 || k <= 0 || k % kNvfp4K != 0) {
+                                  int n_out, int k, int tokens,
+                                  hipStream_t stream) {
+  if (!x || !w || !out || n_out <= 0 || k <= 0 || tokens <= 0 ||
+      k % kNvfp4K != 0) {
     return -1;
   }
-  GemvNvfp4F32Kernel<<<n_out, kBlock, 0, stream>>>(
-      x, static_cast<const uint8_t*>(w), out, n_out, k);
+  const dim3 grid(static_cast<unsigned>(n_out), static_cast<unsigned>(tokens));
+  GemvNvfp4F32Kernel<<<grid, kBlock, 0, stream>>>(
+      x, static_cast<const uint8_t*>(w), out, n_out, k, tokens);
   return CheckLaunch(hipGetLastError(), "nbl_gemv_nvfp4_f32");
 }
 
@@ -529,27 +560,32 @@ void EnsureIq2Tables() {
 template<bool kMoe>
 int LaunchGemv(int type, const void* w, const float* x, const int32_t* ids,
                float* out, int n_out, int k, int slots, int64_t x_stride,
-               hipStream_t stream) {
+               int tokens, hipStream_t stream) {
   const int64_t rows = kMoe ? static_cast<int64_t>(slots) * n_out : n_out;
   const int stride = GemvRowBytes(type, k);
   const uint8_t* wb = static_cast<const uint8_t*>(w);
+  const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(tokens));
   switch (type) {
     case kNblGemvF32:
-      GemvF32Kernel<kNblGemvF32><<<rows, kBlock, 0, stream>>>(
-          x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride);
+      GemvF32Kernel<kNblGemvF32>
+          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                        kMoe ? slots : 0, x_stride, tokens);
       break;
     case kNblGemvQ8_0:
-      GemvF32Kernel<kNblGemvQ8_0><<<rows, kBlock, 0, stream>>>(
-          x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride);
+      GemvF32Kernel<kNblGemvQ8_0>
+          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                        kMoe ? slots : 0, x_stride, tokens);
       break;
     case kNblGemvIq2Xxs:
       EnsureIq2Tables();
-      GemvF32Kernel<kNblGemvIq2Xxs><<<rows, kBlock, 0, stream>>>(
-          x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride);
+      GemvF32Kernel<kNblGemvIq2Xxs>
+          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                        kMoe ? slots : 0, x_stride, tokens);
       break;
     default:
-      GemvF32Kernel<kNblGemvNvfp4><<<rows, kBlock, 0, stream>>>(
-          x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride);
+      GemvF32Kernel<kNblGemvNvfp4>
+          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                        kMoe ? slots : 0, x_stride, tokens);
       break;
   }
   return CheckLaunch(hipGetLastError(),
@@ -557,23 +593,25 @@ int LaunchGemv(int type, const void* w, const float* x, const int32_t* ids,
 }
 
 extern "C" int nbl_gemv_f32(int type, const void* w, const float* x, float* out,
-                            int n_out, int k, hipStream_t stream) {
-  if (!x || !w || !out || n_out <= 0 || k <= 0 || !GemvTypeValid(type, k)) {
+                            int n_out, int k, int tokens, hipStream_t stream) {
+  if (!x || !w || !out || n_out <= 0 || k <= 0 || tokens <= 0 ||
+      !GemvTypeValid(type, k)) {
     return -1;
   }
-  return LaunchGemv<false>(type, w, x, nullptr, out, n_out, k, 0, 0, stream);
+  return LaunchGemv<false>(type, w, x, nullptr, out, n_out, k, 0, 0, tokens,
+                           stream);
 }
 
 extern "C" int nbl_gemv_moe_f32(int type, const void* w, const float* x,
                                 const int32_t* ids, float* out, int n_out,
-                                int k, int slots, int64_t x_stride,
+                                int k, int slots, int64_t x_stride, int tokens,
                                 hipStream_t stream) {
   if (!x || !w || !ids || !out || n_out <= 0 || k <= 0 || slots <= 0 ||
-      x_stride < 0 || !GemvTypeValid(type, k)) {
+      x_stride < 0 || tokens <= 0 || !GemvTypeValid(type, k)) {
     return -1;
   }
   return LaunchGemv<true>(type, w, x, ids, out, n_out, k, slots, x_stride,
-                          stream);
+                          tokens, stream);
 }
 
 extern "C" int nbl_scale(float* x, float s, int64_t n, hipStream_t stream) {
@@ -613,6 +651,18 @@ extern "C" int nbl_dequant_row_q8_0(const void* w, int64_t row, int cols,
   DequantQ8_0RowKernel<<<BlockCount(cols), kBlock, 0, stream>>>(base, out,
                                                                 cols);
   return CheckLaunch(hipGetLastError(), "nbl_dequant_row_q8_0");
+}
+
+extern "C" int nbl_dequant_rows_q8_0(const void* w, const int32_t* ids,
+                                     int tokens, int cols, float* out,
+                                     hipStream_t stream) {
+  if (!w || !ids || !out || tokens <= 0 || cols <= 0 || cols % 32 != 0) {
+    return -1;
+  }
+  const dim3 grid(BlockCount(cols), static_cast<unsigned>(tokens));
+  DequantQ8_0RowsKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const uint8_t*>(w), ids, out, cols);
+  return CheckLaunch(hipGetLastError(), "nbl_dequant_rows_q8_0");
 }
 
 extern "C" int nbl_router(const float* logits, const float* bias, int n_experts,

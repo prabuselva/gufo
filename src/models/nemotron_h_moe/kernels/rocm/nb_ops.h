@@ -37,6 +37,11 @@ int nbl_gemm_f32(const float* x, const float* w, float* out, int n_tokens,
 int nbl_dequant_row_q8_0(const void* w, int64_t row, int cols, float* out,
                          hipStream_t stream);
 
+/// Batched form: out[t] = row ids[t] of the Q8_0 matrix, ids device array of
+/// `tokens` rows.
+int nbl_dequant_rows_q8_0(const void* w, const int32_t* ids, int tokens,
+                          int cols, float* out, hipStream_t stream);
+
 /// Weight encodings accepted by the F32-activation GEMV family.
 enum NblGemvType {
   kNblGemvF32 = 0,
@@ -46,24 +51,27 @@ enum NblGemvType {
 };
 
 /// F32-activation GEMV on dequantized weights of the given encoding:
-/// out[n] = dot(x[k], w[n]). Activations stay exact f32, matching the
-/// oracle; Q8_1-quantized activations are far too lossy end to end.
+/// out[t][n] = dot(x[t][k], w[n]) for `tokens` rows of x. Activations stay
+/// exact f32, matching the oracle; Q8_1-quantized activations are far too
+/// lossy end to end.
 int nbl_gemv_f32(int type, const void* w, const float* x, float* out, int n_out,
-                 int k, hipStream_t stream);
+                 int k, int tokens, hipStream_t stream);
 
-/// Same as nbl_gemv_f32 over gathered experts: expert for slot t is ids[t],
-/// out[t * n_out + n] = dot(x[t * x_stride ..], w_expert[expert][n]);
-/// `slots` slots; x_stride is the per-slot element stride of x (0 shares one
-/// vector across slots).
+/// Same as nbl_gemv_f32 over gathered experts: expert for slot s of token t is
+/// ids[t * slots + s], out[(t * slots + s) * n_out + n] =
+/// dot(x[t, s, ..], w_expert[expert][n]); `slots` slots per token; x_stride is
+/// the per-slot element stride of x (0 shares one k-vector across slots of a
+/// token; tokens are separated by k in that case, by slots * x_stride else).
 int nbl_gemv_moe_f32(int type, const void* w, const float* x,
                      const int32_t* ids, float* out, int n_out, int k,
-                     int slots, int64_t x_stride, hipStream_t stream);
+                     int slots, int64_t x_stride, int tokens,
+                     hipStream_t stream);
 
 /// F32-activation GEMV over ggml NVFP4 weights [n_out][k/64]:
-/// out[n] = dot(x[K], w[n]). Keeps activations exact (no Q8_1 rounding):
-/// mamba projections amplify weight-only noise through conv/dt.
+/// out[t][n] = dot(x[t][k], w[n]). Keeps activations exact (no Q8_1
+/// rounding): mamba projections amplify weight-only noise through conv/dt.
 int nbl_gemv_nvfp4_f32(const float* x, const void* w, float* out, int n_out,
-                       int k, hipStream_t stream);
+                       int k, int tokens, hipStream_t stream);
 
 /// One block per token. scores = sigmoid(logits) + bias; ids receives the
 /// indices of the highest `top_k` scores (ties resolve to the lower index);

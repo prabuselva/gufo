@@ -31,6 +31,14 @@ public:
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits,
                           std::string* error_msg = nullptr);
 
+  /// Advances a prompt in prefill chunks; `logits` (vocab floats) receives the
+  /// distribution of the last token when non-empty. The recurrent state and
+  /// the KV rows advance token by token, so the result matches stepping the
+  /// same tokens one at a time.
+  [[nodiscard]] bool Process(std::span<const std::int32_t> tokens,
+                             std::span<float> logits,
+                             std::string* error_msg = nullptr);
+
   /// Zeroes conv/SSM state and rewinds the position. Attention caches keep
   /// their bytes; every row is rewritten before it is read again.
   void Reset();
@@ -84,10 +92,19 @@ private:
                             std::string* error_msg);
   [[nodiscard]] bool UploadScalar(float* dst, const TensorRef& src,
                                   float* host_value, std::string* error_msg);
-  void StepMamba(const LayerDev& l, hipStream_t stream);
-  void StepAttn(const LayerDev& l, hipStream_t stream);
-  void StepMoe(const LayerDev& l, hipStream_t stream);
+  // Layer passes over `t` token rows of x_/normed_; out_ receives the
+  // per-token layer output ([t][hidden]).
+  void PassMamba(const LayerDev& l, int t, hipStream_t stream);
+  void PassAttn(const LayerDev& l, int t, hipStream_t stream);
+  void PassMoe(const LayerDev& l, int t, hipStream_t stream);
+  /// Runs norm + all layers over `t` token rows already in x_; on return
+  /// normed_ holds the final RMS-normalized rows. Advances position_.
+  [[nodiscard]] bool ForwardLayers(int t, bool with_dump,
+                                   std::string* error_msg);
   void Free();
+
+  // Tokens are prefilled in chunks of at most this many rows.
+  static constexpr std::uint32_t kPrefillChunk = 256U;
 
   const ModelWeights& w_;
   const Config& c_;
@@ -98,11 +115,12 @@ private:
   void* token_embd_{nullptr};
   void* output_{nullptr};
   float* output_norm_{nullptr};
-  // Single-token activations.
+  // Activation scratch, one row per prefill chunk token.
   float* x_{nullptr};
   float* normed_{nullptr};
   float* out_{nullptr};
   float* logits_{nullptr};
+  std::int32_t* tok_dev_{nullptr};
   // Mamba scratch.
   float* zxbc_{nullptr};
   float* y_{nullptr};

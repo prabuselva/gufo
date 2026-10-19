@@ -97,6 +97,52 @@ int main() {
                  static_cast<std::streamsize>(dump_gpu.size() * sizeof(float)));
     }
   }
+  // A batched prefill of the same prompt must yield the step-by-step final
+  // distribution, and leave the state identical for the next decode step.
+  device.Reset();
+  reference.Reset();
+  std::vector<float> logits_batch(c.vocab_size);
+  for (const std::int32_t tok : prompt) {
+    if (!reference.Step(tok, logits_ref, &error)) {
+      std::cerr << "reference rebuild step: " << error << "\n";
+      return 1;
+    }
+  }
+  if (!device.Process(prompt, logits_batch, &error)) {
+    std::cerr << "device process: " << error << "\n";
+    return 1;
+  }
+  {
+    const std::size_t arg_ref = Argmax(logits_ref);
+    const std::size_t arg_gpu = Argmax(logits_batch);
+    double scale = 0.0;
+    double worst = 0.0;
+    for (std::size_t j = 0; j < logits_ref.size(); ++j) {
+      scale = std::max(scale, std::abs(static_cast<double>(logits_ref[j])));
+      worst = std::max(worst, std::abs(static_cast<double>(logits_ref[j]) -
+                                       static_cast<double>(logits_batch[j])));
+    }
+    const double rel = worst / std::max(scale, 1e-30);
+    const bool batch_ok = arg_ref == arg_gpu && rel < 0.02;
+    std::printf(
+        "batched prefill     %s  argmax ref=%zu gpu=%zu  "
+        "rel_logits=%.3e\n",
+        batch_ok ? "PASS" : "FAIL", arg_ref, arg_gpu, rel);
+    ok = ok && batch_ok;
+  }
+  // Decode from the prefilled prompt must match a step-by-step continuation.
+  if (!reference.Step(prompt[2], logits_ref, &error) ||
+      !device.Step(prompt[2], logits_batch, &error)) {
+    std::cerr << "post-prefill step failed: " << error << "\n";
+    return 1;
+  }
+  {
+    const bool cont_ok = Argmax(logits_ref) == Argmax(logits_batch);
+    std::printf("prefill + decode    %s  argmax ref=%zu gpu=%zu\n",
+                cont_ok ? "PASS" : "FAIL", Argmax(logits_ref),
+                Argmax(logits_batch));
+    ok = ok && cont_ok;
+  }
   // Reset must replay the identical first-step distribution.
   device.Reset();
   reference.Reset();
