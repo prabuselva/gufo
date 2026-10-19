@@ -45,6 +45,18 @@ public:
 
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
 
+  /// Device footprint split for serve resource accounting.
+  [[nodiscard]] std::size_t WeightBytes() const noexcept {
+    return weight_bytes_;
+  }
+  /// Attention KV rows for `context` tokens plus the mamba conv/SSM state.
+  [[nodiscard]] std::size_t StateBytes(std::uint32_t context) const noexcept {
+    return kv_bytes_ / max_context_ * context + state_bytes_;
+  }
+  [[nodiscard]] std::size_t ScratchBytes() const noexcept {
+    return scratch_bytes_;
+  }
+
   /// Parity hook: when set, every `Step` overwrites `dump` with the residual
   /// stream before each layer, mirroring `ReferenceModel::SetLayerDump`.
   void SetLayerDump(std::vector<float>* dump) noexcept { layer_dump_ = dump; }
@@ -110,6 +122,10 @@ private:
   const Config& c_;
   std::uint32_t max_context_;
   std::uint32_t position_{0};
+  std::size_t weight_bytes_{0};
+  std::size_t kv_bytes_{0};
+  std::size_t state_bytes_{0};
+  std::size_t scratch_bytes_{0};
   std::vector<LayerDev> layers_;
   // Global weights.
   void* token_embd_{nullptr};

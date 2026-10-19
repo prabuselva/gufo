@@ -38,6 +38,7 @@ bool DeviceModel::Upload(void** dst, const TensorRef& src,
   if (hipMemcpy(*dst, src.data, bytes, hipMemcpyHostToDevice) != hipSuccess) {
     return Fail(error_msg, "hipMemcpy failed for " + std::string(src.name));
   }
+  weight_bytes_ += bytes;
   return true;
 }
 
@@ -69,6 +70,7 @@ bool DeviceModel::Init(std::string* error_msg) {
       hipSuccess) {
     return Fail(error_msg, "output alloc");
   }
+  weight_bytes_ += out_t.SizeBytes();
   if (hipMemcpy(output_, out_t.data, out_t.SizeBytes(),
                 hipMemcpyHostToDevice) != hipSuccess) {
     return Fail(error_msg, "output upload");
@@ -111,6 +113,7 @@ bool DeviceModel::Init(std::string* error_msg) {
         if (hipMemsetAsync(ld.kv, 0, kv_bytes, nullptr) != hipSuccess) {
           return Fail(error_msg, "kv memset");
         }
+        kv_bytes_ += kv_bytes;
         break;
       }
       case Config::LayerKind::kMamba: {
@@ -150,6 +153,7 @@ bool DeviceModel::Init(std::string* error_msg) {
             hipMemsetAsync(ld.ssm_state, 0, ssm_bytes, nullptr) != hipSuccess) {
           return Fail(error_msg, "mamba state memset");
         }
+        state_bytes_ += conv_bytes + ssm_bytes;
         break;
       }
       case Config::LayerKind::kMoe: {
@@ -181,6 +185,7 @@ bool DeviceModel::Init(std::string* error_msg) {
       Fail(error_msg, std::string("scratch alloc ") + tag);
       return false;
     }
+    scratch_bytes_ += n * sizeof(float);
     return true;
   };
   const std::uint32_t t = kPrefillChunk;
@@ -213,6 +218,7 @@ bool DeviceModel::Init(std::string* error_msg) {
                    nrow(top_k) * sizeof(std::int32_t)) == hipSuccess &&
          hipMalloc(reinterpret_cast<void**>(&tok_dev_),
                    nrow(1) * sizeof(std::int32_t)) == hipSuccess;
+    scratch_bytes_ += (nrow(top_k) + nrow(1)) * sizeof(std::int32_t);
   }
   if (!ok) {
     if (error_msg != nullptr && error_msg->empty()) {
@@ -283,6 +289,10 @@ void DeviceModel::Free() {
   freelist(sh_);
   token_embd_ = nullptr;
   output_ = nullptr;
+  weight_bytes_ = 0;
+  kv_bytes_ = 0;
+  state_bytes_ = 0;
+  scratch_bytes_ = 0;
 }
 
 void DeviceModel::Reset() {

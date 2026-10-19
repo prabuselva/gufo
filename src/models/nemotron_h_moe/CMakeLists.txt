@@ -5,6 +5,7 @@
 # nothing here modifies another model tree (see docs/models/
 # nvidia-nemotron-bolt-74B-A9B/STATUS.md golden rules).
 add_library(gufo_nemotron_h_moe STATIC
+  chat_template.cpp
   config.cpp
   tokenizer.cpp
   weights.cpp)
@@ -79,4 +80,13 @@ if (ENGINE_ENABLE_HIP)
     POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(gufo_nemotron_h_moe_device PUBLIC
     gufo_nemotron_h_moe gufo_nemotron_h_moe_kernels)
+
+  # Gufo-owned API over the ROCm runtime: one resident model with a single
+  # session. Linked by the serve runner.
+  add_library(gufo_nemotron_h_moe_engine STATIC EXCLUDE_FROM_ALL
+    engine.cpp)
+  set_target_properties(gufo_nemotron_h_moe_engine PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(gufo_nemotron_h_moe_engine PUBLIC
+    gufo_nemotron_h_moe_device gufo_nemotron_h_moe gufo_core)
 endif()
