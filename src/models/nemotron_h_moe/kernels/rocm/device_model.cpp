@@ -220,6 +220,19 @@ bool DeviceModel::Init(std::string* error_msg) {
                    nrow(1) * sizeof(std::int32_t)) == hipSuccess;
     scratch_bytes_ += (nrow(top_k) + nrow(1)) * sizeof(std::int32_t);
   }
+  if (ok) {
+    // list: one slot rank per (token, slot); desc: tile table with at most
+    // ceil(slots/NBL_ROW_NT) + 512 tiles of 3 ints; n_desc: device tile count.
+    const std::size_t slots = nrow(top_k);
+    const std::size_t tiles = slots / NBL_ROW_NT + 512U;
+    ok = hipMalloc(reinterpret_cast<void**>(&exp_list_),
+                   slots * sizeof(std::int32_t)) == hipSuccess &&
+         hipMalloc(reinterpret_cast<void**>(&exp_desc_),
+                   3 * tiles * sizeof(std::int32_t)) == hipSuccess &&
+         hipMalloc(reinterpret_cast<void**>(&exp_ndesc_),
+                   sizeof(std::int32_t)) == hipSuccess;
+    scratch_bytes_ += (slots + 3 * tiles + 1) * sizeof(std::int32_t);
+  }
   if (!ok) {
     if (error_msg != nullptr && error_msg->empty()) {
       *error_msg = "scratch alloc failed";
@@ -287,6 +300,12 @@ void DeviceModel::Free() {
   freelist(acc_);
   freelist(moe_);
   freelist(sh_);
+  freelist(exp_list_);
+  freelist(exp_desc_);
+  freelist(exp_ndesc_);
+  exp_list_ = nullptr;
+  exp_desc_ = nullptr;
+  exp_ndesc_ = nullptr;
   token_embd_ = nullptr;
   output_ = nullptr;
   weight_bytes_ = 0;
@@ -314,8 +333,15 @@ void DeviceModel::Reset() {
 void DeviceModel::PassMamba(const LayerDev& l, int t, hipStream_t stream) {
   const std::uint32_t inner = c_.ssm_inner_size;
   const std::uint32_t proj = c_.SsmInProj();
-  nbl_gemv_nvfp4_f32(normed_, l.ssm_in, zxbc_, static_cast<int>(proj),
-                     static_cast<int>(c_.hidden_size), t, stream);
+  const bool wide = t >= static_cast<int>(kRowsBatchMin);
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvNvfp4, l.ssm_in, normed_, zxbc_,
+                      static_cast<int>(proj), static_cast<int>(c_.hidden_size),
+                      static_cast<int>(c_.hidden_size), t, stream);
+  } else {
+    nbl_gemv_nvfp4_f32(normed_, l.ssm_in, zxbc_, static_cast<int>(proj),
+                       static_cast<int>(c_.hidden_size), t, stream);
+  }
   nbl_scale(zxbc_, l.ssm_in_scale, static_cast<int64_t>(t) * proj, stream);
   nbl_mamba_scan(
       zxbc_, static_cast<const float*>(l.conv_w),
@@ -332,9 +358,15 @@ void DeviceModel::PassMamba(const LayerDev& l, int t, hipStream_t stream) {
                        static_cast<int>(inner / c_.ssm_group_count),
                        static_cast<int>(c_.ssm_group_count), c_.rms_eps,
                        stream);
-  nbl_gemv_f32(kNblGemvNvfp4, l.ssm_out, y_, out_,
-               static_cast<int>(c_.hidden_size), static_cast<int>(inner), t,
-               stream);
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvNvfp4, l.ssm_out, y_, out_,
+                      static_cast<int>(c_.hidden_size), static_cast<int>(inner),
+                      static_cast<int>(inner), t, stream);
+  } else {
+    nbl_gemv_f32(kNblGemvNvfp4, l.ssm_out, y_, out_,
+                 static_cast<int>(c_.hidden_size), static_cast<int>(inner), t,
+                 stream);
+  }
   nbl_scale(out_, l.ssm_out_scale, static_cast<int64_t>(t) * c_.hidden_size,
             stream);
 }
@@ -345,16 +377,33 @@ void DeviceModel::PassAttn(const LayerDev& l, int t, hipStream_t stream) {
   const int kvdim = static_cast<int>(l.kvdim);
   const int hd = static_cast<int>(c_.head_dim);
   const int hdv = static_cast<int>(c_.head_dim_v);
-  nbl_gemv_f32(kNblGemvQ8_0, l.q, normed_, q_,
-               static_cast<int>(c_.AttentionQDim()), hid, t, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.k, normed_, k_, kvdim, hid, t, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.v, normed_, v_, kvdim, hid, t, stream);
+  const bool wide = t >= static_cast<int>(kRowsBatchMin);
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvQ8_0, l.q, normed_, q_,
+                      static_cast<int>(c_.AttentionQDim()), hid, hid, t,
+                      stream);
+    nbl_gemv_rows_f32(kNblGemvQ8_0, l.k, normed_, k_, kvdim, hid, hid, t,
+                      stream);
+    nbl_gemv_rows_f32(kNblGemvQ8_0, l.v, normed_, v_, kvdim, hid, hid, t,
+                      stream);
+  } else {
+    nbl_gemv_f32(kNblGemvQ8_0, l.q, normed_, q_,
+                 static_cast<int>(c_.AttentionQDim()), hid, t, stream);
+    nbl_gemv_f32(kNblGemvQ8_0, l.k, normed_, k_, kvdim, hid, t, stream);
+    nbl_gemv_f32(kNblGemvQ8_0, l.v, normed_, v_, kvdim, hid, t, stream);
+  }
   nbl_attn_append(k_, v_, l.kv, static_cast<int>(position_), t, kvdim, stream);
   nbl_attn(q_, l.kv, static_cast<int>(position_), t, o_,
            static_cast<int>(c_.num_heads), hd, hdv, kvh, kvdim,
            1.0F / std::sqrt(static_cast<float>(hd)), stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.attn_out, o_, out_, hid,
-               static_cast<int>(c_.AttentionQDim()), t, stream);
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvQ8_0, l.attn_out, o_, out_, hid,
+                      static_cast<int>(c_.AttentionQDim()),
+                      static_cast<int>(c_.AttentionQDim()), t, stream);
+  } else {
+    nbl_gemv_f32(kNblGemvQ8_0, l.attn_out, o_, out_, hid,
+                 static_cast<int>(c_.AttentionQDim()), t, stream);
+  }
 }
 
 void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
@@ -363,26 +412,66 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
   const int top_k = static_cast<int>(l.top_k);
   const int n_exp = static_cast<int>(l.n_experts);
   const int expert_ff = static_cast<int>(l.expert_ff);
+  const bool wide = t >= static_cast<int>(kRowsBatchMin);
+  const int grid_tiles = (t * top_k + NBL_ROW_NT - 1) / NBL_ROW_NT + n_exp;
   nbl_gemm_f32(normed_, static_cast<const float*>(l.router), router_logits_, t,
                n_exp, hid, stream);
   nbl_router(router_logits_, static_cast<const float*>(l.exp_b), n_exp, top_k,
              c_.expert_weights_norm ? 1 : 0, c_.expert_weights_scale, t, ids_,
              moe_w_, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid, t,
-               stream);
-  nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.up_exps, lat_, ids_, up_out_, expert_ff,
-                   latent, top_k, 0, t, stream);
+  if (wide) {
+    nbl_expert_index(ids_, n_exp, t * top_k, NBL_ROW_NT, exp_list_, exp_desc_,
+                     exp_ndesc_, stream);
+  }
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid,
+                      hid, t, stream);
+  } else {
+    nbl_gemv_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid, t,
+                 stream);
+  }
+  if (wide) {
+    nbl_gemv_rows_moe(kNblGemvIq2Xxs, l.up_exps, lat_, exp_list_, exp_desc_,
+                      exp_ndesc_, grid_tiles, top_k, up_out_, expert_ff, latent,
+                      stream);
+  } else {
+    nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.up_exps, lat_, ids_, up_out_, expert_ff,
+                     latent, top_k, 0, t, stream);
+  }
   nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(t) * top_k * expert_ff,
                stream);
-  nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.down_exps, act_, ids_, down_out_, latent,
-                   expert_ff, top_k, expert_ff, t, stream);
+  if (wide) {
+    nbl_gemv_rows_moe(kNblGemvIq2Xxs, l.down_exps, act_, exp_list_, exp_desc_,
+                      exp_ndesc_, grid_tiles, 0, down_out_, latent, expert_ff,
+                      stream);
+  } else {
+    nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.down_exps, act_, ids_, down_out_, latent,
+                     expert_ff, top_k, expert_ff, t, stream);
+  }
   nbl_moe_combine(acc_, down_out_, moe_w_, latent, top_k, t, stream);
-  nbl_gemv_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent, t, stream);
-  nbl_gemv_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
-               static_cast<int>(c_.shared_expert_ff), hid, t, stream);
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent,
+                      latent, t, stream);
+  } else {
+    nbl_gemv_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent, t, stream);
+  }
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
+                      static_cast<int>(c_.shared_expert_ff), hid, hid, t,
+                      stream);
+  } else {
+    nbl_gemv_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
+                 static_cast<int>(c_.shared_expert_ff), hid, t, stream);
+  }
   nbl_relu_sqr(sh_, sh_, static_cast<int64_t>(t) * c_.shared_expert_ff, stream);
-  nbl_gemv_f32(kNblGemvIq2Xxs, l.down_shexp, sh_, out_, hid,
-               static_cast<int>(c_.shared_expert_ff), t, stream);
+  if (wide) {
+    nbl_gemv_rows_f32(kNblGemvIq2Xxs, l.down_shexp, sh_, out_, hid,
+                      static_cast<int>(c_.shared_expert_ff),
+                      static_cast<int>(c_.shared_expert_ff), t, stream);
+  } else {
+    nbl_gemv_f32(kNblGemvIq2Xxs, l.down_shexp, sh_, out_, hid,
+                 static_cast<int>(c_.shared_expert_ff), t, stream);
+  }
   nbl_add(out_, moe_, static_cast<int64_t>(t) * hid, stream);
 }
 

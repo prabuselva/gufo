@@ -117,6 +117,9 @@ private:
 
   // Tokens are prefilled in chunks of at most this many rows.
   static constexpr std::uint32_t kPrefillChunk = 256U;
+  // Chunks at least this wide run the row-batched GEMV family; narrower
+  // chunks and decode keep the wave-coverage (row, token)-grid kernels.
+  static constexpr std::uint32_t kRowsBatchMin = 64U;
 
   const ModelWeights& w_;
   const Config& c_;
@@ -156,6 +159,10 @@ private:
   float* acc_{nullptr};
   float* moe_{nullptr};
   float* sh_{nullptr};
+  // Expert-sorted slot list/table for the row-batched wide prefill paths.
+  std::int32_t* exp_list_{nullptr};
+  std::int32_t* exp_desc_{nullptr};
+  std::int32_t* exp_ndesc_{nullptr};
   int max_experts_{0};
   int max_expert_ff_{0};
   std::vector<float>* layer_dump_{nullptr};

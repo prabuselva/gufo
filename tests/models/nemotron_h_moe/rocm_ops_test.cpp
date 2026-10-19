@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <random>
 #include <vector>
 
 #include "src/models/nemotron_h_moe/cpu_ops.hpp"
@@ -265,6 +266,209 @@ bool RunMoeCombine() {
   return ok;
 }
 
+float DotRow(const std::vector<float>& w, const float* x) {
+  double acc = 0.0;
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    acc += static_cast<double>(w[i]) * static_cast<double>(x[i]);
+  }
+  return static_cast<float>(acc);
+}
+
+// Scale/suffix bytes masked so no half or UE4M3 code decodes to NaN, which
+// would defeat WorstRel even when kernel and oracle agree.
+std::vector<std::uint8_t> MaskScales(std::vector<std::uint8_t> bytes,
+                                     int type) {
+  const int span = type == kNblGemvQ8_0 ? 34 : type == kNblGemvIq2Xxs ? 66 : 36;
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    if (i % static_cast<std::size_t>(span) < 4) {
+      bytes[i] = type == kNblGemvNvfp4
+                     ? static_cast<std::uint8_t>(bytes[i] & 0x2FU)
+                     : static_cast<std::uint8_t>(0x30U | (bytes[i] & 0x01U));
+    }
+  }
+  return bytes;
+}
+
+std::size_t RowBytes(int type, int k) {
+  return type == kNblGemvQ8_0     ? static_cast<std::size_t>(k) / 32 * 34
+         : type == kNblGemvIq2Xxs ? static_cast<std::size_t>(k) / 256 * 66
+                                  : static_cast<std::size_t>(k) / 64 * 36;
+}
+
+gufo::core::GgmlType GgmlFor(int type) {
+  return type == kNblGemvQ8_0     ? gufo::core::GgmlType::kQ8_0
+         : type == kNblGemvIq2Xxs ? gufo::core::GgmlType::kIQ2_XXS
+                                  : gufo::core::GgmlType::kNVFP4;
+}
+
+// Dense row-batched GEMV versus dequantize + double-dot, covering token
+// tails (len < NBL_ROW_NT tiles) and partial output-row blocks.
+bool RunGemvRowsDense() {
+  bool ok = true;
+  std::uint32_t seed = 0xB00C0Au;
+  struct Case {
+    int type;
+    int n_out;
+    int k;
+    int tokens;
+  };
+  for (const Case& c :
+       {Case{kNblGemvQ8_0, 130, 4096, 1}, Case{kNblGemvQ8_0, 130, 1024, 65},
+        Case{kNblGemvIq2Xxs, 257, 1024, 17},
+        Case{kNblGemvNvfp4, 300, 1024, 33}}) {
+    auto bytes = MaskScales(
+        MakeBytes(static_cast<std::size_t>(c.n_out) * RowBytes(c.type, c.k),
+                  seed++),
+        c.type);
+    auto x = MakeValues(static_cast<std::size_t>(c.tokens) * c.k, seed++, 1.0F);
+    TensorRef w;
+    w.data = bytes.data();
+    w.type = GgmlFor(c.type);
+    w.cols = c.k;
+    w.rows = c.n_out;
+    std::vector<float> wq(static_cast<std::size_t>(c.k));
+    std::vector<float> reference(static_cast<std::size_t>(c.tokens) * c.n_out);
+    for (int n = 0; n < c.n_out; ++n) {
+      gufo::models::nemotron_h_moe::cpu::DequantizeRow(
+          w, 0, static_cast<std::uint64_t>(n), wq.data());
+      for (int t = 0; t < c.tokens; ++t) {
+        reference[static_cast<std::size_t>(t) * c.n_out + n] =
+            DotRow(wq, x.data() + static_cast<std::size_t>(t) * c.k);
+      }
+    }
+    HipBuffer<std::uint8_t> w_dev(bytes.size());
+    HipBuffer<float> x_dev(x.size());
+    HipBuffer<float> out_dev(reference.size());
+    Upload(w_dev.get(), bytes.data(), bytes.size());
+    Upload(&x_dev, x);
+    if (nbl_gemv_rows_f32(c.type, w_dev.get(), x_dev.get(), out_dev.get(),
+                          c.n_out, c.k, c.k, c.tokens, nullptr) != 0) {
+      std::printf("gemv_rows type=%d rc!=0\n", c.type);
+      return false;
+    }
+    char name[64];
+    std::snprintf(name, sizeof name, "gemv_rows t=%-4d n=%-4d N=%d", c.type,
+                  c.n_out, c.tokens);
+    ok = Check(name, WorstRel(reference, Download(&out_dev)), 1e-4) && ok;
+  }
+  return ok;
+}
+
+// Expert index table versus its contract, then the LIST row-batched GEMV
+// against dequantize + double-dot with expert gather for both xdiv modes.
+bool RunExpertIndexAndMoeRows() {
+  bool ok = true;
+  std::uint32_t seed = 0x1DEA0Bu;
+  const std::vector<int> counts = {7, 0, 9, 4, 0, 3, 1, 12};
+  std::vector<std::int32_t> ids;
+  for (std::size_t e = 0; e < counts.size(); ++e) {
+    for (int i = 0; i < counts[e]; ++i) {
+      ids.push_back(static_cast<std::int32_t>(e));
+    }
+  }
+  std::shuffle(ids.begin(), ids.end(), std::mt19937(0x2BE1u));
+  const int n_exp = static_cast<int>(counts.size());
+  const int slots = static_cast<int>(ids.size());
+  const int grid_tiles = slots / NBL_ROW_NT + n_exp;
+  HipBuffer<std::int32_t> ids_dev(ids.size());
+  HipBuffer<std::int32_t> list_dev(static_cast<std::size_t>(slots));
+  HipBuffer<std::int32_t> desc_dev(3ULL * static_cast<std::size_t>(grid_tiles));
+  HipBuffer<std::int32_t> ndesc_dev(1);
+  Upload(ids_dev.get(), ids.data(), ids.size() * sizeof(std::int32_t));
+  if (nbl_expert_index(ids_dev.get(), n_exp, slots, NBL_ROW_NT, list_dev.get(),
+                       desc_dev.get(), ndesc_dev.get(), nullptr) != 0) {
+    std::printf("expert_index rc!=0\n");
+    return false;
+  }
+  const std::vector<std::int32_t> list = Download(&list_dev);
+  const std::vector<std::int32_t> desc = Download(&desc_dev);
+  const std::vector<std::int32_t> n_desc = Download(&ndesc_dev);
+  bool table_ok = !n_desc.empty() && n_desc[0] >= 0;
+  if (table_ok) {
+    std::vector<std::int32_t> seen(static_cast<std::size_t>(slots), 0);
+    for (std::size_t r = 0; r < static_cast<std::size_t>(slots) && table_ok;
+         ++r) {
+      table_ok = list[r] >= 0 && list[r] < slots &&
+                 ++seen[static_cast<std::size_t>(list[r])] == 1;
+    }
+    std::vector<int> placed(static_cast<std::size_t>(n_exp), 0);
+    std::int64_t tiles = 0;
+    for (int i = 0; i < n_desc[0] && table_ok; ++i) {
+      const int e = desc[3 * i];
+      const int begin = desc[3 * i + 1];
+      const int len = desc[3 * i + 2];
+      table_ok = e >= 0 && e < n_exp && len >= 1 && len <= NBL_ROW_NT;
+      for (int j = 0; j < len && table_ok; ++j) {
+        table_ok = ids[static_cast<std::size_t>(
+                       list[static_cast<std::size_t>(begin + j)])] == e;
+      }
+      placed[static_cast<std::size_t>(e)] += len;
+      tiles += (len + NBL_ROW_NT - 1) / NBL_ROW_NT;
+    }
+    for (int e = 0; e < n_exp && table_ok; ++e) {
+      table_ok = placed[static_cast<std::size_t>(e)] ==
+                 counts[static_cast<std::size_t>(e)];
+    }
+    table_ok = table_ok && tiles == n_desc[0];
+  }
+  std::printf("%-36s %s\n", "expert_index table", table_ok ? "PASS" : "FAIL");
+  if (!table_ok) {
+    g_fail = "expert_index table";
+    return false;
+  }
+  const int k = 1024;
+  for (const int xdiv : {0, 4}) {
+    const int n_out = xdiv == 0 ? 257 : 1024;
+    const int type = kNblGemvIq2Xxs;
+    auto bytes = MaskScales(
+        MakeBytes(static_cast<std::size_t>(n_exp) * n_out * RowBytes(type, k),
+                  seed++),
+        type);
+    const int x_tokens = xdiv > 0 ? slots / xdiv : slots;
+    auto x = MakeValues(static_cast<std::size_t>(x_tokens) * k, seed++, 1.0F);
+    TensorRef w;
+    w.data = bytes.data();
+    w.type = GgmlFor(type);
+    w.cols = k;
+    w.rows = n_out;
+    std::vector<float> wq(static_cast<std::size_t>(k));
+    std::vector<float> reference(static_cast<std::size_t>(slots) * n_out);
+    for (int i = 0; i < n_desc[0]; ++i) {
+      const int e = desc[3 * i];
+      const int begin = desc[3 * i + 1];
+      const int len = desc[3 * i + 2];
+      for (int j = 0; j < len; ++j) {
+        const std::int32_t slot = list[static_cast<std::size_t>(begin + j)];
+        const float* xv =
+            x.data() +
+            static_cast<std::size_t>(xdiv > 0 ? slot / xdiv : slot) * k;
+        for (int n = 0; n < n_out; ++n) {
+          gufo::models::nemotron_h_moe::cpu::DequantizeRow(
+              w, static_cast<std::uint64_t>(e), static_cast<std::uint64_t>(n),
+              wq.data());
+          reference[static_cast<std::size_t>(slot) * n_out + n] =
+              DotRow(wq, xv);
+        }
+      }
+    }
+    HipBuffer<std::uint8_t> w_dev(bytes.size());
+    HipBuffer<float> x_dev(x.size());
+    HipBuffer<float> out_dev(reference.size());
+    Upload(w_dev.get(), bytes.data(), bytes.size());
+    Upload(&x_dev, x);
+    if (nbl_gemv_rows_moe(type, w_dev.get(), x_dev.get(), list_dev.get(),
+                          desc_dev.get(), ndesc_dev.get(), grid_tiles, xdiv,
+                          out_dev.get(), n_out, k, nullptr) != 0) {
+      std::printf("gemv_rows_moe rc!=0\n");
+      return false;
+    }
+    char name[64];
+    std::snprintf(name, sizeof name, "gemv_rows_moe iq2 xdiv=%d", xdiv);
+    ok = Check(name, WorstRel(reference, Download(&out_dev)), 1e-4) && ok;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -274,6 +478,8 @@ int main() {
   ok = RunDequantRow() && ok;
   ok = RunRouter(0xB0BAu) && ok;
   ok = RunMoeCombine() && ok;
+  ok = RunGemvRowsDense() && ok;
+  ok = RunExpertIndexAndMoeRows() && ok;
   if (ok) {
     std::printf("rocm_ops: ALL PASS\n");
   } else {

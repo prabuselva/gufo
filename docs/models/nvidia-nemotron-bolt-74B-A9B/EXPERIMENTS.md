@@ -21,6 +21,9 @@ tool call; iteration happens at ≤16K context per AGENTS policy before any
 
 | lever | scope | result | decision |
 | --- | --- | --- | --- |
+| Row-batched F32-activation prefill GEMMs (Q8/IQ2 block-per-row + tile LDS; NVFP4 k-split reuse; IQ2 experts sorted by `nbl_expert_index`) | end-to-end pp2048/pp16384 exclusive, matched | pp2048 30.81 → 63.19 (2.05×), pp16384 53.89 vs 28.41 baseline (1.90×), tg64 14.37 unchanged; stage profile: NVFP4 rows 55.3 %, IQ2 rows 28.9 %, router F32 5.9 % | adopt (default ≥64 tokens) |
+| NVFP4 rows: LDS-tiled warp-per-row (4 x rows staged per k slice) | microbench | bank-conflict/swizzle redesign pending; device wave-64 (`-mwavefrontsize64`) breaks wave-32 lane math — derive from `warpSize` | open |
+| Router GEMM (F32) | 5.9 % of rows-stage time (3.8 s / 63.7 s) | open |
 | Mamba-2 decode: warp-per-head vs lane-per-head state layout | microbench | — | — |
 | Chunked Mamba-2 prefill chunk size (256/512/1024/2048) | end-to-end pp8192 | — | — |
 | MoE decode: per-layer n_expert (240…496) mmid launch params | microbench | — | — |
