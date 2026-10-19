@@ -23,3 +23,35 @@ target_link_libraries(gufo_nemotron_h_moe_reference PUBLIC
 # even as an oracle, so it keeps -O2 in every configuration.
 set_source_files_properties(cpu_ops.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
+
+if (ENGINE_ENABLE_HIP)
+  set(NB_ROCM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm")
+  set(NB_MMQ_DIR "${NB_ROCM_DIR}/mmq")
+
+  # HIP quantized matrix kernels adapted from llama.cpp (vendored per
+  # kernels/rocm/mmq/VENDOR.md), isolated in the nmb_mmq namespace. IQ2_XXS
+  # and NVFP4 instantiations back the Bolt experts and Mamba-2 projections.
+  set(NB_MMQ_SOURCES
+    ${NB_MMQ_DIR}/nmb_ggml_stubs.hip.cpp
+    ${NB_MMQ_DIR}/nmb_mmq.hip.cpp
+    ${NB_MMQ_DIR}/mmid.hip.cpp
+    ${NB_MMQ_DIR}/mmvq.hip.cpp
+    ${NB_MMQ_DIR}/moe_wave64.hip.cpp
+    ${NB_MMQ_DIR}/quantize.hip.cpp)
+
+  add_library(gufo_nemotron_h_moe_mmq STATIC ${NB_MMQ_SOURCES})
+  set_source_files_properties(${NB_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${NB_MMQ_DIR}/moe_wave64.hip.cpp
+    PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
+  set_target_properties(gufo_nemotron_h_moe_mmq PROPERTIES
+    HIP_STANDARD 17
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_compile_definitions(gufo_nemotron_h_moe_mmq PRIVATE
+    GGML_HIP_NO_VMM ENGINE_ENABLE_HIP=1)
+  target_compile_options(gufo_nemotron_h_moe_mmq PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+  target_include_directories(gufo_nemotron_h_moe_mmq SYSTEM PUBLIC
+    ${PROJECT_SOURCE_DIR} ${NB_MMQ_DIR})
+  target_link_libraries(gufo_nemotron_h_moe_mmq PUBLIC hip::host roc::hipblas)
+endif()

@@ -196,6 +196,7 @@ one tool call (AGENTS protocol).
 | 2026-10-19 | feat branch | Real 24GB GGUF oracle probe (exclusive RAM via bench_bg/bench_wait): 3-token greedy steps + replay — argmax 103288 → 48756 → 70587, logit sums -436497/-355020/-283120, all finite, replay bit-stable; evidence `evidence/reference-cpu-oracle-2026-10-19.log` | SUPERSEDED by the two `DequantizeIq2Xxs` fixes below — those sums/argmax came from the broken IQ2 path |
 | 2026-10-19 | feat branch | IQ2_XXS dequant fixes in `src/models/nemotron_h_moe/cpu_ops.cpp` vs ggml ground truth (byte-level probe on real expert rows decoded by `dequantize_row_iq2_xxs`): sub-block code stride `qs+4*ib32` (uint8) → `qs+8*ib32` (ggml field is `uint16_t qs[32]`); output pointer advanced `+32` per `ib32` (was rewriting each 256-block's first 32 floats, leaving 87.5% zeros). Post-fix oracle matches ggml element-for-element (up_r0 norm 0.427721 nz 2048/2048; shexp norm 0.548900). check-format PASS | PASS; nemotron ctest suite 2/2 green (with `LD_LIBRARY_PATH=/opt/rocm/lib`) |
 | 2026-10-19 | feat branch | llama.cpp parity (exclusive RAM, probe @ pin `ff5a23376` incl. Nemotron Bolt support): per-layer bisection `parity_layers.py` — all 88 layer inputs match cos ≥ 0.99 for 3 steps; logits `parity_compare.py` (gate now top-100 rel ≤ 5%, cos ≥ 0.99, argmax): step argmax 1044/1010/1010 MATCH both sides, top-100 rel ≤ 0.0295, cos ≥ 0.999988, top-10 overlap 9–10; tail max_rel(all) ≤ 0.074 is summation-order noise on rank>100 logits. Evidence `evidence/llama-parity-{run-parity5-full,layers-parity5,compare-parity5}.log` | PASS — oracle valid as Phase-3 quality reference |
+| 2026-10-19 | feat branch | Phase-3 vendored mmq: qwen38 tree copied to `kernels/rocm/mmq` renamed `qfn_`→`nmb_`; NVFP4+IQ2_XXS wired into MMVQ dispatch and dense/dense-vec adapter entries; `gufo_nemotron_h_moe_mmq` builds clean (gpu-test, release); `tools/nvfp4_probe.hip` rerun against the vendored library (exclusive GPU): 7/7 PASS rel/scale ≤ 3.81e-3, ssm_in-shape 5.267 ms / ssm_out-shape 2.960 ms — matches the pre-vendoring evidence | PASS — evidence `evidence/rocm-mmq-nvfp4-probe-vendored.log` |
 
 ## Blockers / risks
 
@@ -207,8 +208,9 @@ one tool call (AGENTS protocol).
 - [resolved 2026-10-18] NVFP4 hardware path: probed end-to-end (generic Q8_1
   MMQ/MMVQ path via `mul_mat_q_case<GGML_TYPE_NVFP4>`, no FP4 tensor cores on
   gfx1151 — see ledger). Proven with a temporary additive instantiation in
-  deepseek's mmq, since **reverted** per Golden rule; the same instantiation
-  will be vendored into `src/models/nemotron_h_moe/kernels/rocm/mmq/`.
+  deepseek's mmq, since **reverted** per Golden rule; vendored into
+  `src/models/nemotron_h_moe/kernels/rocm/mmq/` on 2026-10-19 and re-proven
+  there (see ledger).
   Tensor-scale (`ssm_in.scale`/`ssm_out.scale`, per-tensor f32) is applied as
   a nemotron-side output epilogue multiply, never inside vendored mmq common
   code paths shared with other quant types.
