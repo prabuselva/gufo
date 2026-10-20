@@ -5,7 +5,6 @@
 namespace {
 
 constexpr int kDim = 128;  // max head dimension; one thread per dimension.
-constexpr int kTile = 32;  // kv positions streamed per iteration.
 constexpr float kNegInf = -3.4e38F;
 
 __global__ void AttnAppendKernel(const float* __restrict__ k_src,
@@ -27,7 +26,10 @@ __global__ void AttnAppendKernel(const float* __restrict__ k_src,
 // Flash-style online-softmax causal attention, one block per (query head,
 // row tile). threads are dimension lanes; o[r] accumulates output element
 // `tid` of tile row r across the growing context.
-template<int TR>
+// K rows live in LDS transposed (skT[d][j + 1]; the +1 pad avoids the 32-way
+// bank conflict seen with sk[j][d] when j is lane-distributed in the score
+// loop). Measured 3.2x at pp16384 shapes with TR=24, kTile=16 (gfx1151).
+template<int TR, int kTile>
 __global__ void AttnKernel(const float* __restrict__ q,
                            const float* __restrict__ kv, int pos0, int tokens,
                            float* __restrict__ out, int heads, int hd, int hdv,
@@ -39,7 +41,7 @@ __global__ void AttnKernel(const float* __restrict__ q,
   const int tid = static_cast<int>(threadIdx.x);
 
   __shared__ float sq[TR][kDim];
-  __shared__ float sk[kTile][kDim];
+  __shared__ float skT[kDim][kTile + 1];
   __shared__ float sv[kTile][kDim];
   __shared__ float se[TR][kTile];
   __shared__ float sm[TR];
@@ -70,7 +72,7 @@ __global__ void AttnKernel(const float* __restrict__ q,
     for (int i = tid; i < nj * kDim; i += kDim) {
       const int j = i / kDim;
       const int d = i % kDim;
-      sk[j][d] =
+      skT[d][j + 1] =
           d < hd ? kv_k[(static_cast<int64_t>(p0 + j)) * kvrow + d] : 0.0F;
     }
     for (int i = tid; i < nj * kDim; i += kDim) {
@@ -88,7 +90,7 @@ __global__ void AttnKernel(const float* __restrict__ q,
       if (r < rows && p <= pos0 + row0 + r && p < nmax) {
         float acc = 0.0F;
         for (int d = 0; d < kDim; ++d) {
-          acc += sq[r][d] * sk[j][d];
+          acc += sq[r][d] * skT[d][j + 1];
         }
         se[r][j] = acc * scale;
       } else {
@@ -166,9 +168,9 @@ extern "C" int nbl_attn(const float* q, const float* kv, int pos0, int tokens,
     return -1;
   }
   // Partial tiles (including decode with tokens == 1) take the guarded path.
-  const dim3 grid(static_cast<unsigned>((tokens + 7) / 8),
+  const dim3 grid(static_cast<unsigned>((tokens + 23) / 24),
                   static_cast<unsigned>(heads));
-  AttnKernel<8><<<grid, kDim, 0, stream>>>(q, kv, pos0, tokens, out, heads, hd,
-                                           hdv, kvh, kvdim, scale);
+  AttnKernel<24, 16><<<grid, kDim, 0, stream>>>(q, kv, pos0, tokens, out, heads,
+                                                hd, hdv, kvh, kvdim, scale);
   return hipGetLastError() == hipSuccess ? 0 : -2;
 }

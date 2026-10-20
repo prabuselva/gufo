@@ -20,9 +20,9 @@ by default in Gufo; text recipe temp 1.0 / top-p 0.95 is a serve default, not
 | depth | gufo | reference | date/rev |
 | --- | --- | --- | --- |
 | pp512 | — | — | — |
-| pp2048 | 293.09 ± 0.00 | — | 2026-10-20 (MMQ wide path) |
+| pp2048 | 304.63 ± 0.00 | — | 2026-10-20 (attention skT tr24) |
 | pp8192 | — | — | — |
-| pp16384 | 165.30 ± 0.00 | 488.80 | 2026-10-20 (MMQ wide path) |
+| pp16384 | 240.69 ± 0.00 | 488.80 | 2026-10-20 (attention skT tr24) |
 | pp32768 | — | — | — |
 | pp65536 | — | — | — |
 | pp102400 | — | — | — |
