@@ -99,6 +99,8 @@ __global__ void RmsNormGroupedKernel(const float* __restrict__ x,
   }
 }
 
+// Fallback for k not divisible by the tile k-step (never hit by Nemotron
+// Bolt, whose router k is the 4096-wide hidden size).
 __global__ void GemmF32Kernel(const float* __restrict__ x,
                               const float* __restrict__ w,
                               float* __restrict__ out, int n_out, int k) {
@@ -114,6 +116,108 @@ __global__ void GemmF32Kernel(const float* __restrict__ x,
     acc += xr[i] * wr[i];
   }
   out[static_cast<int64_t>(t) * n_out + r] = acc;
+}
+
+// Router GEMM: out[m, n_out] = x[m, k] w[n_out, k]^T with float32 inputs.
+// A block covers 64 tokens x 64 experts with a 32-wide LDS k-stage, 256
+// threads and 8 tokens x 2 experts of register accumulation per thread.
+// This tile was the winner of a gfx1151 sweep (see
+// tools/bench/nem_router_bench.hip): ~20x the thread-per-output mapping at
+// pp16384, because each LDS load feeds 16 FMAs instead of one.
+namespace {
+
+constexpr int kGemmTileTokens = 64;
+constexpr int kGemmTileExperts = 64;
+constexpr int kGemmKStep = 32;
+constexpr int kGemmThreads = 256;
+constexpr int kGemmThreadGridR = 32;  // expert groups of 2 across 32 lanes
+constexpr int kGemmThreadGridT = kGemmThreads / kGemmThreadGridR;
+constexpr int kGemmThreadTokensN = kGemmTileTokens / kGemmThreadGridT;
+constexpr int kGemmThreadExpertsN = kGemmTileExperts / kGemmThreadGridR;
+
+}  // namespace
+
+__global__ void GemmF32TiledKernel(const float* __restrict__ x,
+                                   const float* __restrict__ w,
+                                   float* __restrict__ out, int n_out, int k,
+                                   int n_tokens) {
+  const int t0 = blockIdx.x * kGemmTileTokens;
+  const int r0 = blockIdx.y * kGemmTileExperts;
+  const int tid = threadIdx.x;
+  const int ty = tid / kGemmThreadGridR;
+  const int tx = tid % kGemmThreadGridR;
+  __shared__ float xs[kGemmTileTokens][kGemmKStep + 1];
+  __shared__ float ws[kGemmTileExperts][kGemmKStep + 1];
+  const float4* xp =
+      reinterpret_cast<const float4*>(x + static_cast<int64_t>(t0) * k);
+  const float4* wp =
+      reinterpret_cast<const float4*>(w + static_cast<int64_t>(r0) * k);
+  float acc[kGemmThreadTokensN][kGemmThreadExpertsN] = {};
+  for (int kc = 0; kc < k; kc += kGemmKStep) {
+    for (int i = tid; i < kGemmTileTokens * (kGemmKStep / 4);
+         i += kGemmThreads) {
+      const int row = i / (kGemmKStep / 4);
+      const int c4 = i % (kGemmKStep / 4);
+      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      if (t0 + row < n_tokens) {
+        v = *reinterpret_cast<const float4*>(
+            xp + static_cast<int64_t>(row) * (k / 4) + (kc / 4) + c4);
+      }
+      xs[row][c4 * 4 + 0] = v.x;
+      xs[row][c4 * 4 + 1] = v.y;
+      xs[row][c4 * 4 + 2] = v.z;
+      xs[row][c4 * 4 + 3] = v.w;
+    }
+    for (int i = tid; i < kGemmTileExperts * (kGemmKStep / 4);
+         i += kGemmThreads) {
+      const int row = i / (kGemmKStep / 4);
+      const int c4 = i % (kGemmKStep / 4);
+      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      if (r0 + row < n_out) {
+        v = *reinterpret_cast<const float4*>(
+            wp + static_cast<int64_t>(row) * (k / 4) + (kc / 4) + c4);
+      }
+      ws[row][c4 * 4 + 0] = v.x;
+      ws[row][c4 * 4 + 1] = v.y;
+      ws[row][c4 * 4 + 2] = v.z;
+      ws[row][c4 * 4 + 3] = v.w;
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int e = 0; e < kGemmKStep; ++e) {
+      float ra[kGemmThreadTokensN], rb[kGemmThreadExpertsN];
+#pragma unroll
+      for (int i = 0; i < kGemmThreadTokensN; ++i) {
+        ra[i] = xs[ty * kGemmThreadTokensN + i][e];
+      }
+#pragma unroll
+      for (int j = 0; j < kGemmThreadExpertsN; ++j) {
+        rb[j] = ws[tx * kGemmThreadExpertsN + j][e];
+      }
+#pragma unroll
+      for (int i = 0; i < kGemmThreadTokensN; ++i) {
+#pragma unroll
+        for (int j = 0; j < kGemmThreadExpertsN; ++j) {
+          acc[i][j] += ra[i] * rb[j];
+        }
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll 1
+  for (int i = 0; i < kGemmThreadTokensN; ++i) {
+    const int t = t0 + ty * kGemmThreadTokensN + i;
+    if (t >= n_tokens) {
+      break;
+    }
+#pragma unroll
+    for (int j = 0; j < kGemmThreadExpertsN; ++j) {
+      const int r = r0 + tx * kGemmThreadExpertsN + j;
+      if (r < n_out) {
+        out[static_cast<int64_t>(t) * n_out + r] = acc[i][j];
+      }
+    }
+  }
 }
 
 __global__ void ScaleKernel(float* __restrict__ x, float s, int64_t n) {
@@ -754,8 +858,15 @@ extern "C" int nbl_gemm_f32(const float* x, const float* w, float* out,
   if (!x || !w || !out || n_tokens <= 0 || n_out <= 0 || k <= 0) {
     return -1;
   }
-  const dim3 grid((n_out + kBlock - 1) / kBlock, n_tokens);
-  GemmF32Kernel<<<grid, kBlock, 0, stream>>>(x, w, out, n_out, k);
+  if (k % kGemmKStep == 0) {
+    const dim3 grid((n_tokens + kGemmTileTokens - 1) / kGemmTileTokens,
+                    (n_out + kGemmTileExperts - 1) / kGemmTileExperts);
+    GemmF32TiledKernel<<<grid, kGemmThreads, 0, stream>>>(x, w, out, n_out, k,
+                                                          n_tokens);
+  } else {
+    const dim3 grid((n_out + kBlock - 1) / kBlock, n_tokens);
+    GemmF32Kernel<<<grid, kBlock, 0, stream>>>(x, w, out, n_out, k);
+  }
   return CheckLaunch(hipGetLastError(), "nbl_gemm_f32");
 }
 
