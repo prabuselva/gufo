@@ -115,8 +115,11 @@ private:
                                    std::string* error_msg);
   void Free();
 
-  // Tokens are prefilled in chunks of at most this many rows.
-  static constexpr std::uint32_t kPrefillChunk = 256U;
+  // Tokens are prefilled in chunks of at most this many rows. Wide chunks
+  // amortize the per-chunk weight streams of the row-batched GEMMs and cut
+  // per-chunk state round-trips; numerics are unchanged because every kernel
+  // keeps its per-output K-chain order and the Mamba scan is token-sequential.
+  static constexpr std::uint32_t kPrefillChunk = 2048U;
   // Chunks at least this wide run the row-batched GEMV family; narrower
   // chunks and decode keep the wave-coverage (row, token)-grid kernels.
   static constexpr std::uint32_t kRowsBatchMin = 64U;
