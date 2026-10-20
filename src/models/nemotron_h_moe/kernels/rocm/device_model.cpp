@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "src/models/nemotron_h_moe/kernels/rocm/mmq/nmb_mmq.h"
 #include "src/models/nemotron_h_moe/kernels/rocm/nb_attention.h"
 #include "src/models/nemotron_h_moe/kernels/rocm/nb_mamba2.h"
 #include "src/models/nemotron_h_moe/kernels/rocm/nb_ops.h"
@@ -56,6 +57,10 @@ bool DeviceModel::UploadScalar(float* dst, const TensorRef& src,
 }
 
 bool DeviceModel::Init(std::string* error_msg) {
+  int device = 0;
+  if (hipGetDevice(&device) != hipSuccess || nmb_mmq_init(device) != 0) {
+    return Fail(error_msg, "mmq init failed");
+  }
   layers_.assign(c_.num_layers, LayerDev{});
   if (hipMalloc(reinterpret_cast<void**>(&token_embd_),
                 w_.token_embd.SizeBytes()) != hipSuccess) {
@@ -335,9 +340,8 @@ void DeviceModel::PassMamba(const LayerDev& l, int t, hipStream_t stream) {
   const std::uint32_t proj = c_.SsmInProj();
   const bool wide = t >= static_cast<int>(kRowsBatchMin);
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvNvfp4, l.ssm_in, normed_, zxbc_,
-                      static_cast<int>(proj), static_cast<int>(c_.hidden_size),
-                      static_cast<int>(c_.hidden_size), t, stream);
+    (void)nmb_mmq_nvfp4_dense(l.ssm_in, normed_, zxbc_, static_cast<int>(proj),
+                              t, static_cast<int>(c_.hidden_size), stream);
   } else {
     nbl_gemv_nvfp4_f32(normed_, l.ssm_in, zxbc_, static_cast<int>(proj),
                        static_cast<int>(c_.hidden_size), t, stream);
@@ -359,9 +363,9 @@ void DeviceModel::PassMamba(const LayerDev& l, int t, hipStream_t stream) {
                        static_cast<int>(c_.ssm_group_count), c_.rms_eps,
                        stream);
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvNvfp4, l.ssm_out, y_, out_,
-                      static_cast<int>(c_.hidden_size), static_cast<int>(inner),
-                      static_cast<int>(inner), t, stream);
+    (void)nmb_mmq_nvfp4_dense(l.ssm_out, y_, out_,
+                              static_cast<int>(c_.hidden_size), t,
+                              static_cast<int>(inner), stream);
   } else {
     nbl_gemv_f32(kNblGemvNvfp4, l.ssm_out, y_, out_,
                  static_cast<int>(c_.hidden_size), static_cast<int>(inner), t,
@@ -379,13 +383,10 @@ void DeviceModel::PassAttn(const LayerDev& l, int t, hipStream_t stream) {
   const int hdv = static_cast<int>(c_.head_dim_v);
   const bool wide = t >= static_cast<int>(kRowsBatchMin);
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvQ8_0, l.q, normed_, q_,
-                      static_cast<int>(c_.AttentionQDim()), hid, hid, t,
-                      stream);
-    nbl_gemv_rows_f32(kNblGemvQ8_0, l.k, normed_, k_, kvdim, hid, hid, t,
-                      stream);
-    nbl_gemv_rows_f32(kNblGemvQ8_0, l.v, normed_, v_, kvdim, hid, hid, t,
-                      stream);
+    (void)nmb_mmq_q8_0_dense(
+        l.q, normed_, q_, static_cast<int>(c_.AttentionQDim()), t, hid, stream);
+    (void)nmb_mmq_q8_0_dense(l.k, normed_, k_, kvdim, t, hid, stream);
+    (void)nmb_mmq_q8_0_dense(l.v, normed_, v_, kvdim, t, hid, stream);
   } else {
     nbl_gemv_f32(kNblGemvQ8_0, l.q, normed_, q_,
                  static_cast<int>(c_.AttentionQDim()), hid, t, stream);
@@ -397,9 +398,8 @@ void DeviceModel::PassAttn(const LayerDev& l, int t, hipStream_t stream) {
            static_cast<int>(c_.num_heads), hd, hdv, kvh, kvdim,
            1.0F / std::sqrt(static_cast<float>(hd)), stream);
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvQ8_0, l.attn_out, o_, out_, hid,
-                      static_cast<int>(c_.AttentionQDim()),
-                      static_cast<int>(c_.AttentionQDim()), t, stream);
+    (void)nmb_mmq_q8_0_dense(l.attn_out, o_, out_, hid, t,
+                             static_cast<int>(c_.AttentionQDim()), stream);
   } else {
     nbl_gemv_f32(kNblGemvQ8_0, l.attn_out, o_, out_, hid,
                  static_cast<int>(c_.AttentionQDim()), t, stream);
@@ -424,16 +424,15 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
                      exp_ndesc_, stream);
   }
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid,
-                      hid, t, stream);
+    (void)nmb_mmq_q8_0_dense(l.latent_down, normed_, lat_, latent, t, hid,
+                             stream);
   } else {
     nbl_gemv_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid, t,
                  stream);
   }
   if (wide) {
-    nbl_gemv_rows_moe(kNblGemvIq2Xxs, l.up_exps, lat_, exp_list_, exp_desc_,
-                      exp_ndesc_, grid_tiles, top_k, up_out_, expert_ff, latent,
-                      stream);
+    (void)nmb_mmq_iq2_xxs_moe_raw(l.up_exps, lat_, ids_, up_out_, expert_ff,
+                                  latent, t, n_exp, top_k, stream);
   } else {
     nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.up_exps, lat_, ids_, up_out_, expert_ff,
                      latent, top_k, 0, t, stream);
@@ -450,24 +449,22 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
   }
   nbl_moe_combine(acc_, down_out_, moe_w_, latent, top_k, t, stream);
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent,
-                      latent, t, stream);
+    (void)nmb_mmq_q8_0_dense(l.latent_up, acc_, moe_, hid, t, latent, stream);
   } else {
     nbl_gemv_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent, t, stream);
   }
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
-                      static_cast<int>(c_.shared_expert_ff), hid, hid, t,
-                      stream);
+    (void)nmb_mmq_iq2_xxs_dense(l.up_shexp, normed_, sh_,
+                                static_cast<int>(c_.shared_expert_ff), t, hid,
+                                stream);
   } else {
     nbl_gemv_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
                  static_cast<int>(c_.shared_expert_ff), hid, t, stream);
   }
   nbl_relu_sqr(sh_, sh_, static_cast<int64_t>(t) * c_.shared_expert_ff, stream);
   if (wide) {
-    nbl_gemv_rows_f32(kNblGemvIq2Xxs, l.down_shexp, sh_, out_, hid,
-                      static_cast<int>(c_.shared_expert_ff),
-                      static_cast<int>(c_.shared_expert_ff), t, stream);
+    (void)nmb_mmq_iq2_xxs_dense(l.down_shexp, sh_, out_, hid, t,
+                                static_cast<int>(c_.shared_expert_ff), stream);
   } else {
     nbl_gemv_f32(kNblGemvIq2Xxs, l.down_shexp, sh_, out_, hid,
                  static_cast<int>(c_.shared_expert_ff), t, stream);

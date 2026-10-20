@@ -233,81 +233,85 @@ bool RunFormat(int kind, const char* fmt) {
          ok;
   }
 
-  // Routed MMQ tier: several experts per token from a stack of four. Q8_0
-  // raw already has upstream coverage and no model expert uses it.
+  // Routed MMQ tier: several experts per token from a stack. Q8_0 raw
+  // already has upstream coverage and no model expert uses it. The 512-expert
+  // case keeps the real model's expert-id range (ids > 255) under test.
   if (kind != 2) {
-    for (const int tokens : {16, 32}) {
-      for (const int used : {1, 3}) {
-        constexpr int kRows = 192;
-        constexpr int kExperts = 4;
-        auto bytes = MakeWeightBytes(kind, cols, kRows * kExperts, seed ^ 11);
-        auto x = MakeValues(static_cast<std::size_t>(tokens) * cols, seed ^ 12,
-                            1.0F);
-        std::vector<std::int32_t> expert_of(static_cast<std::size_t>(tokens) *
-                                            used);
-        for (std::int32_t& e : expert_of) {
-          e = static_cast<std::int32_t>(NextRandom(&seed) % kExperts);
-        }
-        TensorRef w = MakeRef(&bytes, kind, cols, kRows, kExperts);
-        HipBuffer<std::uint8_t> w_dev(bytes.size());
-        HipBuffer<float> x_dev(x.size());
-        HipBuffer<std::int32_t> ids_dev(expert_of.size());
-        HipBuffer<float> out_dev(static_cast<std::size_t>(kRows) * tokens *
-                                 used);
-        Upload(w_dev.get(), bytes.data(), bytes.size());
-        Upload(&x_dev, x);
-        Upload(ids_dev.get(), expert_of.data(), ids_dev.bytes());
-        const int rc =
-            kind == 0
-                ? nmb_mmq_iq2_xxs_moe_raw(w_dev.get(), x_dev.get(),
-                                          ids_dev.get(), out_dev.get(), kRows,
-                                          cols, tokens, kExperts, used, nullptr)
-                : nmb_mmq_nvfp4_moe_raw(w_dev.get(), x_dev.get(), ids_dev.get(),
-                                        out_dev.get(), kRows, cols, tokens,
-                                        kExperts, used, nullptr);
-        if (rc != 0) {
-          std::printf("moe_raw %-4s N=%d used=%d failed rc=%d\n", fmt, tokens,
-                      used, rc);
-          ok = false;
-          continue;
-        }
-        const std::vector<float> gpu = Download(&out_dev);
-        // reference[(t * used + u) * kRows + r] =
-        //     dot(dequant(expert_of[t * used + u], row r), x[t])
-        std::vector<float> reference(gpu.size(), 0.0F);
-        std::vector<float> row(cols);
-        double scale = 0.0;
-        double worst = 0.0;
-        for (int t = 0; t < tokens; ++t) {
-          for (int u = 0; u < used; ++u) {
-            const std::size_t pair = static_cast<std::size_t>(t) * used + u;
-            for (int r = 0; r < kRows; ++r) {
-              DequantizeRow(w, static_cast<std::uint64_t>(expert_of[pair]),
-                            static_cast<std::uint64_t>(r), row.data());
-              double sum = 0.0;
-              for (int c = 0; c < cols; ++c) {
-                sum += static_cast<double>(row[c]) *
-                       static_cast<double>(
-                           x[static_cast<std::size_t>(t) * cols + c]);
+    for (const int experts : {4, 512}) {
+      for (const int tokens : {16, 32}) {
+        for (const int used : {1, 3}) {
+          constexpr int kRows = 192;
+          const int kExperts = experts;
+          auto bytes = MakeWeightBytes(kind, cols, kRows * kExperts, seed ^ 11);
+          auto x = MakeValues(static_cast<std::size_t>(tokens) * cols,
+                              seed ^ 12, 1.0F);
+          std::vector<std::int32_t> expert_of(static_cast<std::size_t>(tokens) *
+                                              used);
+          for (std::int32_t& e : expert_of) {
+            e = static_cast<std::int32_t>(NextRandom(&seed) % kExperts);
+          }
+          TensorRef w = MakeRef(&bytes, kind, cols, kRows, kExperts);
+          HipBuffer<std::uint8_t> w_dev(bytes.size());
+          HipBuffer<float> x_dev(x.size());
+          HipBuffer<std::int32_t> ids_dev(expert_of.size());
+          HipBuffer<float> out_dev(static_cast<std::size_t>(kRows) * tokens *
+                                   used);
+          Upload(w_dev.get(), bytes.data(), bytes.size());
+          Upload(&x_dev, x);
+          Upload(ids_dev.get(), expert_of.data(), ids_dev.bytes());
+          const int rc =
+              kind == 0
+                  ? nmb_mmq_iq2_xxs_moe_raw(
+                        w_dev.get(), x_dev.get(), ids_dev.get(), out_dev.get(),
+                        kRows, cols, tokens, kExperts, used, nullptr)
+                  : nmb_mmq_nvfp4_moe_raw(
+                        w_dev.get(), x_dev.get(), ids_dev.get(), out_dev.get(),
+                        kRows, cols, tokens, kExperts, used, nullptr);
+          if (rc != 0) {
+            std::printf("moe_raw %-4s N=%d used=%d failed rc=%d\n", fmt, tokens,
+                        used, rc);
+            ok = false;
+            continue;
+          }
+          const std::vector<float> gpu = Download(&out_dev);
+          // reference[(t * used + u) * kRows + r] =
+          //     dot(dequant(expert_of[t * used + u], row r), x[t])
+          std::vector<float> reference(gpu.size(), 0.0F);
+          std::vector<float> row(cols);
+          double scale = 0.0;
+          double worst = 0.0;
+          for (int t = 0; t < tokens; ++t) {
+            for (int u = 0; u < used; ++u) {
+              const std::size_t pair = static_cast<std::size_t>(t) * used + u;
+              for (int r = 0; r < kRows; ++r) {
+                DequantizeRow(w, static_cast<std::uint64_t>(expert_of[pair]),
+                              static_cast<std::uint64_t>(r), row.data());
+                double sum = 0.0;
+                for (int c = 0; c < cols; ++c) {
+                  sum += static_cast<double>(row[c]) *
+                         static_cast<double>(
+                             x[static_cast<std::size_t>(t) * cols + c]);
+                }
+                const std::size_t i = pair * kRows + r;
+                reference[i] = static_cast<float>(sum);
+                scale = std::max(scale, std::abs(sum));
               }
-              const std::size_t i = pair * kRows + r;
-              reference[i] = static_cast<float>(sum);
-              scale = std::max(scale, std::abs(sum));
             }
           }
+          for (std::size_t i = 0; i < gpu.size(); ++i) {
+            worst = std::max(worst, std::abs(static_cast<double>(reference[i]) -
+                                             static_cast<double>(gpu[i])));
+          }
+          const double rel = worst / std::max(scale, 1e-30);
+          char name[96];
+          std::snprintf(name, sizeof name,
+                        "moe_raw %s N=%-2d used=%d experts=%d", fmt, tokens,
+                        used, kExperts);
+          const bool raw_ok = rel < kTolerance;
+          std::printf("%-44s %s  rel/scale=%.3e\n", name,
+                      raw_ok ? "PASS" : "FAIL", rel);
+          ok = raw_ok && ok;
         }
-        for (std::size_t i = 0; i < gpu.size(); ++i) {
-          worst = std::max(worst, std::abs(static_cast<double>(reference[i]) -
-                                           static_cast<double>(gpu[i])));
-        }
-        const double rel = worst / std::max(scale, 1e-30);
-        char name[96];
-        std::snprintf(name, sizeof name, "moe_raw %s N=%-2d used=%d experts=4",
-                      fmt, tokens, used);
-        const bool raw_ok = rel < kTolerance;
-        std::printf("%-44s %s  rel/scale=%.3e\n", name,
-                    raw_ok ? "PASS" : "FAIL", rel);
-        ok = raw_ok && ok;
       }
     }
   }

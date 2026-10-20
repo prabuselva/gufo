@@ -22,7 +22,9 @@ tool call; iteration happens at ≤16K context per AGENTS policy before any
 | lever | scope | result | decision |
 | --- | --- | --- | --- |
 | Row-batched F32-activation prefill GEMMs (Q8/IQ2 block-per-row + tile LDS; NVFP4 k-split reuse; IQ2 experts sorted by `nbl_expert_index`) | end-to-end pp2048/pp16384 exclusive, matched | pp2048 30.81 → 63.19 (2.05×), pp16384 53.89 vs 28.41 baseline (1.90×), tg64 14.37 unchanged; stage profile: NVFP4 rows 55.3 %, IQ2 rows 28.9 %, router F32 5.9 % | adopt (default ≥64 tokens) |
-| NVFP4 rows: LDS-tiled warp-per-row (4 x rows staged per k slice) | microbench | bank-conflict/swizzle redesign pending; device wave-64 (`-mwavefrontsize64`) breaks wave-32 lane math — derive from `warpSize` | open |
+| `NBL_ROW_NT` 4 → 8 (row-batch tile rows per block) | end-to-end pp2048 exclusive | pp2048 63.19 → 90.06 (1.42×), decode untouched (narrow path) | adopt |
+| Vendored MMQ prefill tiers in the wide branch (`nmb_mmq_nvfp4_dense` ssm_in/out; `nmb_mmq_q8_0_dense` q/k/v/attn_out/latent; `nmb_mmq_iq2_xxs_dense` shared experts; `nmb_mmq_iq2_xxs_moe_raw` `up_exps` with per-token expert ids; `down_experts` keeps `nbl_gemv_rows_moe` on per-slot activations) | end-to-end pp2048/pp16384/tg64 exclusive + `device_step` wide gate (2 prompts, 132/197 tok, margin-aware rule) + `rocm_mmq` routed tier extended to 512 experts | pp2048 90.06 → 293.09 (3.25×), pp16384 53.89 → 165.30 (3.07×), tg64 14.44 unchanged; wide gate rel 1.4–1.5e-2 (q8_1-activation noise accumulation on oracle near-ties, margin 0.03–0.08; per-GEMM sites ≤4e-3), `nemotron_h_moe.*` contracts 7/7 | adopt (default ≥64 tokens) |
+| NVFP4 rows: LDS-tiled warp-per-row (4 x rows staged per k slice) | microbench | superseded by MMQ prefill tiers for the wide path; rows kernels remain the decode/small-batch tier | closed (superseded) |
 | Router GEMM (F32) | 5.9 % of rows-stage time (3.8 s / 63.7 s) | open |
 | Mamba-2 decode: warp-per-head vs lane-per-head state layout | microbench | — | — |
 | Chunked Mamba-2 prefill chunk size (256/512/1024/2048) | end-to-end pp8192 | — | — |

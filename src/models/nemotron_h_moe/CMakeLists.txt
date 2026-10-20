@@ -79,7 +79,7 @@ if (ENGINE_ENABLE_HIP)
   set_target_properties(gufo_nemotron_h_moe_device PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(gufo_nemotron_h_moe_device PUBLIC
-    gufo_nemotron_h_moe gufo_nemotron_h_moe_kernels)
+    gufo_nemotron_h_moe gufo_nemotron_h_moe_kernels gufo_nemotron_h_moe_mmq)
 
   # Gufo-owned API over the ROCm runtime: one resident model with a single
   # session. Linked by the serve runner.

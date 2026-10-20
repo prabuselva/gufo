@@ -69,7 +69,7 @@ int nbl_gemv_moe_f32(int type, const void* w, const float* x,
 
 /// Token-tile width of the row-batched GEMV kernels: nbl_expert_index `nt`
 /// and every nbl_gemv_rows_* caller must use this value.
-#define NBL_ROW_NT 4
+#define NBL_ROW_NT 8
 
 /// Routed-expert token index. `ids[s]` is the expert selected by flat slot
 /// s in [0, slots). Writes `list` (rank -> slot, grouped by expert) and a
