@@ -8,6 +8,11 @@ template, 3 repetitions, per-request phases; margins 5 % / 3 ms per
 AGENTS.md). No cell is filled until the implementation lands; see
 [STATUS.md](STATUS.md) for progress.
 
+Exclusive windows drift ±5 % in absolute t/s from session to session
+(2026-10-20: same binary 485–509 t/s at pp2048), so lever deltas are taken
+from matched same-window interleaved A/B runs, never from table history
+across sessions.
+
 Artifact: `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (~23 GiB, IQ2_XXS
 experts + NVFP4 Mamba + Q8_0 attention, 262144-token context, 74B total /
 ~9B active). Reference runtime for parity checks: latest llama.cpp master
@@ -20,9 +25,9 @@ by default in Gufo; text recipe temp 1.0 / top-p 0.95 is a serve default, not
 | depth | gufo | reference | date/rev |
 | --- | --- | --- | --- |
 | pp512 | — | — | — |
-| pp2048 | 508.61 ± 0.00 | — | 2026-10-20 (down_exps MQ id-tier) |
+| pp2048 | 486.51 ± 0.00 | — | 2026-10-20 (attn score 2x2 tile; matched A/B +1.2 %) |
 | pp8192 | — | — | — |
-| pp16384 | 357.58 ± 0.00 | 488.80 | 2026-10-20 (down_exps MQ id-tier) |
+| pp16384 | 354.24 ± 0.00 | 488.80 | 2026-10-20 (attn score 2x2 tile; matched A/B parity) |
 | pp32768 | — | — | — |
 | pp65536 | — | — | — |
 | pp102400 | — | — | — |

@@ -83,19 +83,42 @@ __global__ void AttnKernel(const float* __restrict__ q,
     }
     __syncthreads();
 
-    for (int i = tid; i < TR * kTile; i += kDim) {
-      const int r = i / kTile;
-      const int j = i % kTile;
-      const int p = p0 + j;
-      if (r < rows && p <= pos0 + row0 + r && p < nmax) {
-        float acc = 0.0F;
-        for (int d = 0; d < kDim; ++d) {
-          acc += sq[r][d] * skT[d][j + 1];
-        }
-        se[r][j] = acc * scale;
-      } else {
-        se[r][j] = kNegInf;
+    // 2x2 register tile: each thread computes rows (r0, r0+1) x cols
+    // (j0, j0+1) so every LDS word feeds two FFMAs; the dot-product chain
+    // per output stays d-ascending and matches the scalar-loop result.
+    for (int i = tid; i < (TR / 2) * (kTile / 2); i += kDim) {
+      const int r0 = (i / (kTile / 2)) * 2;
+      const int j0 = (i % (kTile / 2)) * 2;
+      float a00 = 0.0F;
+      float a01 = 0.0F;
+      float a10 = 0.0F;
+      float a11 = 0.0F;
+      for (int d = 0; d < kDim; ++d) {
+        const float k0 = skT[d][j0 + 1];
+        const float k1 = skT[d][j0 + 2];
+        const float q0 = sq[r0][d];
+        a00 += q0 * k0;
+        a01 += q0 * k1;
+        const float q1 = sq[r0 + 1][d];
+        a10 += q1 * k0;
+        a11 += q1 * k1;
       }
+      const int p00 = p0 + j0;
+      const int p01 = p0 + j0 + 1;
+      se[r0][j0] = r0 < rows && p00 <= pos0 + row0 + r0 && p00 < nmax
+                       ? a00 * scale
+                       : kNegInf;
+      se[r0][j0 + 1] = r0 < rows && p01 <= pos0 + row0 + r0 && p01 < nmax
+                           ? a01 * scale
+                           : kNegInf;
+      se[r0 + 1][j0] =
+          r0 + 1 < rows && p00 <= pos0 + row0 + r0 + 1 && p00 < nmax
+              ? a10 * scale
+              : kNegInf;
+      se[r0 + 1][j0 + 1] =
+          r0 + 1 < rows && p01 <= pos0 + row0 + r0 + 1 && p01 < nmax
+              ? a11 * scale
+              : kNegInf;
     }
     __syncthreads();
 

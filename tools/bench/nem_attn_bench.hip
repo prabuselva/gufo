@@ -3,13 +3,16 @@
 // Production shape: q [tokens, heads=32, hd=128] f32, kv rows
 // [tokens][2*kvdim] with kvdim = kvh*hd = 256 (K0 K1 V0 V1), kvh=2, causal,
 // scale 1/sqrt(128). One block per (query head, row tile), 128 threads.
-// Baseline = production AttnKernel<8>; variants probe the score-phase LDS
-// bank conflict (sk(j,d) with j lane-distributed) and the token tile width.
+// gfx1151 has no v_pk_fma_f32: 2x FP32 needs VOPD dual-issue, which LLVM's
+// GCNCreateVOPD only folds from two *independent* adjacent VOP3 FFMA pairs.
+// Variants probe score-phase register tiling over KJ key columns (the
+// LDS-issue cap), the skT staging transpose (SKT) and the tile sizes.
 //
 // tools/bench/build.sh nem_attn_bench && /tmp/nem_attn_bench [L...]
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -38,8 +41,8 @@ constexpr int kHdv = 128;
 constexpr int kKvdim = kKvh * kHd;  // 256 float per row per half
 constexpr float kScale = 0.08838834764831845F;
 
-// ---------------- variant kernel (production copy + skT/TR knobs) ----------
-template <int TR, int kTile, int SKT>
+// ---------------- variant kernel (production copy + score 2-D register tile)
+template <int TR, int kTile, int SKT, int RP, int JP>
 __global__ void AttnKernel(const float* __restrict__ q,
                            const float* __restrict__ kv, int pos0, int tokens,
                            float* __restrict__ out, int heads, int hd, int hdv,
@@ -106,21 +109,41 @@ __global__ void AttnKernel(const float* __restrict__ q,
     }
     __syncthreads();
 
-    for (int i = tid; i < TR * kTile; i += kDim) {
-      const int r = i / kTile;
-      const int j = i % kTile;
-      const int p = p0 + j;
-      if (r < rows && p <= pos0 + row0 + r && p < nmax) {
-        float acc = 0.0F;
-        if (SKT) {
-          for (int d = 0; d < kDim; ++d) acc += sq[r][d] * skT(d, j);
-        } else {
-          for (int d = 0; d < kDim; ++d) acc += sq[r][d] * sk(j, d);
+    // Score register tile: each thread computes an RP x JP block (same rows
+    // for JP columns), so each LDS word feeds JP or RP FMAs. Bytes per FMA
+    // drop from (RP+JP)*4/(RP*JP) toward the LDS-bandwidth-limited optimum;
+    // RP=JP=1 reproduces the production scalar dot.
+    constexpr int kC = kTile / JP;
+    for (int i = tid; i < (TR / RP) * kC; i += kDim) {
+      const int r0 = (i / kC) * RP;
+      const int j0 = (i % kC) * JP;
+      float acc[RP][JP];
+#pragma unroll
+      for (int a = 0; a < RP; ++a)
+#pragma unroll
+        for (int k = 0; k < JP; ++k) acc[a][k] = 0.0F;
+      for (int d = 0; d < kDim; ++d) {
+        float kk[JP];
+#pragma unroll
+        for (int k = 0; k < JP; ++k) kk[k] = SKT ? skT(d, j0 + k) : sk(j0 + k, d);
+#pragma unroll
+        for (int a = 0; a < RP; ++a) {
+          const float qv = sq[r0 + a][d];
+#pragma unroll
+          for (int k = 0; k < JP; ++k) acc[a][k] += qv * kk[k];
         }
-        se[r][j] = acc * scale;
-      } else {
-        se[r][j] = kNeg;
       }
+#pragma unroll
+      for (int a = 0; a < RP; ++a)
+#pragma unroll
+        for (int k = 0; k < JP; ++k) {
+          const int r = r0 + a;
+          const int j = j0 + k;
+          const int p = p0 + j;
+          se[r][j] = (r < rows && p <= pos0 + row0 + r && p < nmax)
+                         ? acc[a][k] * scale
+                         : kNeg;
+        }
     }
     __syncthreads();
 
@@ -170,11 +193,11 @@ __global__ void AttnKernel(const float* __restrict__ q,
 #undef skT
 }
 
-template <int TR, int kTile, int SKT>
+template <int TR, int kTile, int SKT, int RP, int JP>
 void launch(const float* q, const float* kv, int tokens, float* out,
             hipStream_t s) {
   const dim3 grid(static_cast<unsigned>((tokens + TR - 1) / TR), kHeads);
-  AttnKernel<TR, kTile, SKT><<<grid, kDim, 0, s>>>(
+  AttnKernel<TR, kTile, SKT, RP, JP><<<grid, kDim, 0, s>>>(
       q, kv, 0, tokens, out, kHeads, kHd, kHdv, kKvh, kKvdim, kScale);
 }
 
@@ -276,11 +299,13 @@ int main(int argc, char** argv) {
       void (*run)(const float*, const float*, int, float*, hipStream_t);
     };
     const V variants[] = {
-      {"A tr8 kt32        ", launch<8, 32, 0>},
-      {"G tr24 kt16 skT   ", launch<24, 16, 1>},
-      {"H tr20 kt16 skT   ", launch<20, 16, 1>},
-      {"I tr28 kt16 skT   ", launch<28, 16, 1>},
-      };
+      {"G  tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
+      {"T22 tr24 r2j2     ", launch<24, 16, 1, 2, 2>},
+      {"T41 tr24 r4j1     ", launch<24, 16, 1, 4, 1>},
+      {"T12 tr24 r1j2     ", launch<24, 16, 1, 1, 2>},
+      {"E22 tr32 r2j2     ", launch<32, 16, 1, 2, 2>},
+      {"G2 tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
+    };
     double worst = 0.0;
     for (auto& v : variants) {
       CHECK(hipMemset(dcand, 0, cand.size() * sizeof(float)));
@@ -336,17 +361,44 @@ int main(int argc, char** argv) {
     void (*run)(const float*, const float*, int, float*, hipStream_t);
   };
   const V variants[] = {
-      {"A tr8 kt32        ", launch<8, 32, 0>},
-      {"G tr24 kt16 skT   ", launch<24, 16, 1>},
-      {"H tr20 kt16 skT   ", launch<20, 16, 1>},
-      {"I tr28 kt16 skT   ", launch<28, 16, 1>},
+    {"G  tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
+    {"T22 tr24 r2j2     ", launch<24, 16, 1, 2, 2>},
+    {"T41 tr24 r4j1     ", launch<24, 16, 1, 4, 1>},
+    {"T12 tr24 r1j2     ", launch<24, 16, 1, 1, 2>},
+    {"E22 tr32 r2j2     ", launch<32, 16, 1, 2, 2>},
+    {"G2 tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
   };
-  for (auto& v : variants) {
-    std::printf("%-16s", v.name);
-    for (int L : lens) {
-      int reps = L >= 16384 ? 3 : 10;
-      auto r = timeit([&] { v.run(dq, dkv, L, dout, nullptr); }, reps);
-      std::printf("%10.1f", L / (r.ms * 1e-3));
+  std::vector<std::vector<double>> best(sizeof(variants) / sizeof(V),
+                                        std::vector<double>());
+  const int kRounds = 3;
+  for (int round = 0; round < kRounds; ++round) {
+    for (size_t vi = 0; vi < sizeof(variants) / sizeof(V); ++vi) {
+      auto& v = variants[vi];
+      std::printf("%-16s r%d", v.name, round);
+      for (int L : lens) {
+        int reps = L >= 16384 ? 2 : L >= 8192 ? 3 : 6;
+        auto r = timeit([&] { v.run(dq, dkv, L, dout, nullptr); }, reps);
+        const double ts = L / (r.ms * 1e-3);
+        best[vi].push_back(ts);
+        std::printf("%10.1f", ts);
+      }
+      std::printf("\n");
+    }
+  }
+  // best[vi] holds one entry per (round,length) interleaved; take the median
+  // over rounds for each length to cancel thermal/ordering drift.
+  std::printf("\n%-16s", "MEDIAN");
+  for (int L : lens) std::printf("%10s", "t/s");
+  std::printf("\n");
+  std::vector<double> med(lens.size());
+  for (size_t vi = 0; vi < best.size(); ++vi) {
+    std::printf("%-16s    ", variants[vi].name);
+    for (size_t li = 0; li < lens.size(); ++li) {
+      std::vector<double> col;
+      for (int r = 0; r < kRounds; ++r) col.push_back(best[vi][r * lens.size() + li]);
+      std::sort(col.begin(), col.end());
+      med[li] = col[col.size() / 2];
+      std::printf("%10.1f", med[li]);
     }
     std::printf("\n");
   }
