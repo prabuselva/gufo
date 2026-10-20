@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define CHECK(cmd)                                                    \
@@ -42,7 +43,10 @@ constexpr int kKvdim = kKvh * kHd;  // 256 float per row per half
 constexpr float kScale = 0.08838834764831845F;
 
 // ---------------- variant kernel (production copy + score 2-D register tile)
-template <int TR, int kTile, int SKT, int RP, int JP>
+// MODE: 3 = full production; 2 = skip the V accumulation phase; 0 = skip
+// expf too (numerically wrong, timing-only, prices the softmax pass);
+// 1 = KV/q staging only (roofline: same grid, same global loads, no math).
+template <int TR, int kTile, int SKT, int RP, int JP, int MODE = 3>
 __global__ void AttnKernel(const float* __restrict__ q,
                            const float* __restrict__ kv, int pos0, int tokens,
                            float* __restrict__ out, int heads, int hd, int hdv,
@@ -80,6 +84,7 @@ __global__ void AttnKernel(const float* __restrict__ q,
   float o[TR];
 #pragma unroll 1
   for (int r = 0; r < TR; ++r) o[r] = 0.0F;
+  float chk = 0.0F;
   const int64_t kvrow = 2 * kvdim;
   const float* kv_k = kv + g * hd;
   const float* kv_v = kv + kvdim + g * hdv;
@@ -109,6 +114,7 @@ __global__ void AttnKernel(const float* __restrict__ q,
     }
     __syncthreads();
 
+    if constexpr (MODE >= 2) {
     // Score register tile: each thread computes an RP x JP block (same rows
     // for JP columns), so each LDS word feeds JP or RP FMAs. Bytes per FMA
     // drop from (RP+JP)*4/(RP*JP) toward the LDS-bandwidth-limited optimum;
@@ -157,10 +163,12 @@ __global__ void AttnKernel(const float* __restrict__ q,
     }
     __syncthreads();
 
-    for (int i = tid; i < TR * kTile; i += kDim) {
-      const int r = i / kTile;
-      const int j = i % kTile;
-      se[r][j] = expf(se[r][j] - sm[r]);
+    if constexpr (MODE != 0) {
+      for (int i = tid; i < TR * kTile; i += kDim) {
+        const int r = i / kTile;
+        const int j = i % kTile;
+        se[r][j] = expf(se[r][j] - sm[r]);
+      }
     }
     __syncthreads();
 
@@ -172,33 +180,60 @@ __global__ void AttnKernel(const float* __restrict__ q,
       sl[tid] = sl[tid] * sa[tid] + ssum;
     }
 
-    for (int r = 0; r < TR; ++r) {
-      o[r] *= sa[r];
-    }
-    for (int j = 0; j < nj; ++j) {
+    if constexpr (MODE == 3) {
       for (int r = 0; r < TR; ++r) {
-        o[r] += se[r][j] * sv[j][tid];
+        o[r] *= sa[r];
       }
+      for (int j = 0; j < nj; ++j) {
+        for (int r = 0; r < TR; ++r) {
+          o[r] += se[r][j] * sv[j][tid];
+        }
+      }
+    } else {
+      if (tid == 0) chk += se[0][0];
+    }
+    }
+    if constexpr (MODE == 1) {
+      // Staging-only roofline: tiny sink so the loads cannot be eliminated.
+      if (tid == 0) chk += (SKT ? skTb[0] : skb[0]) + sv[0][0];
     }
     __syncthreads();
   }
 
-  if (tid < hdv) {
-    for (int r = 0; r < rows; ++r) {
-      out[static_cast<int64_t>(row0 + r) * heads * hdv + h * hdv + tid] =
-          o[r] / sl[r];
+  if constexpr (MODE == 3) {
+    if (tid < hdv) {
+      for (int r = 0; r < rows; ++r) {
+        out[static_cast<int64_t>(row0 + r) * heads * hdv + h * hdv + tid] =
+            o[r] / sl[r];
+      }
     }
+  } else if (tid == 0 && chk == 1234.5678F) {
+    out[static_cast<int64_t>(row0) * heads * hdv + h * hdv] = chk;
   }
 #undef sk
 #undef skT
 }
 
-template <int TR, int kTile, int SKT, int RP, int JP>
+template <int TR, int kTile, int SKT, int RP, int JP, int MODE = 3>
 void launch(const float* q, const float* kv, int tokens, float* out,
             hipStream_t s) {
   const dim3 grid(static_cast<unsigned>((tokens + TR - 1) / TR), kHeads);
-  AttnKernel<TR, kTile, SKT, RP, JP><<<grid, kDim, 0, s>>>(
+  AttnKernel<TR, kTile, SKT, RP, JP, MODE><<<grid, kDim, 0, s>>>(
       q, kv, 0, tokens, out, kHeads, kHd, kHdv, kKvh, kKvdim, kScale);
+}
+
+// KV float words loaded by the staging phase for a full causal pass (per
+// head), used to convert roofline timings into a load-side GB/s.
+double stage_bytes(int L) {
+  double words = 0.0;
+  for (int r0 = 0; r0 < L; r0 += 24) {
+    const int rows = std::min(24, L - r0);
+    const int nmax = r0 + rows;
+    for (int p0 = 0; p0 < nmax; p0 += 16) {
+      words += std::min(16, nmax - p0) * 2 * kHd;  // K + V staging
+    }
+  }
+  return words * kHeads * 4.0;
 }
 
 // ------------- CPU f64 reference (causal GQA SDPA) -------------
@@ -363,9 +398,8 @@ int main(int argc, char** argv) {
   const V variants[] = {
     {"G  tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
     {"T22 tr24 r2j2     ", launch<24, 16, 1, 2, 2>},
-    {"T41 tr24 r4j1     ", launch<24, 16, 1, 4, 1>},
-    {"T12 tr24 r1j2     ", launch<24, 16, 1, 1, 2>},
-    {"E22 tr32 r2j2     ", launch<32, 16, 1, 2, 2>},
+    {"NV tr24 no-V      ", launch<24, 16, 1, 2, 2, 2>},
+    {"RF tr24 roofline  ", launch<24, 16, 1, 2, 2, 1>},
     {"G2 tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
   };
   std::vector<std::vector<double>> best(sizeof(variants) / sizeof(V),
@@ -401,6 +435,15 @@ int main(int argc, char** argv) {
       std::printf("%10.1f", med[li]);
     }
     std::printf("\n");
+    if (std::string(variants[vi].name).find("roofline") != std::string::npos) {
+      std::printf("%-16s    ", "RF GB/s load");
+      for (size_t li = 0; li < lens.size(); ++li) {
+        const double gbs = stage_bytes(lens[li]) * med[li] /
+                           (static_cast<double>(lens[li]) * 1e9);
+        std::printf("%10.1f", gbs);
+      }
+      std::printf("\n");
+    }
   }
 
   CHECK(hipFree(dq));
