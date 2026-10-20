@@ -103,6 +103,13 @@ int nmb_mmq_iq2_xxs_moe_raw(const void* W, const float* X_f32,
                             int n_tokens, int n_experts, int n_expert_used,
                             hipStream_t stream);
 
+// nmb_mmq_iq2_xxs_moe_raw with SqReLU (x > 0 ? x * x : 0) folded into the
+// activation quantize: X_f32 holds the pre-activation rows.
+int nmb_mmq_iq2_xxs_moe_raw_sqract(const void* W, const float* X_f32,
+                                   const int32_t* ids, float* out, int M, int K,
+                                   int n_tokens, int n_experts,
+                                   int n_expert_used, hipStream_t stream);
+
 int nmb_mmq_nvfp4_moe_raw(const void* W, const float* X_f32, const int32_t* ids,
                           float* out, int M, int K, int n_tokens, int n_experts,
                           int n_expert_used, hipStream_t stream);

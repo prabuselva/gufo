@@ -111,7 +111,11 @@ __launch_bounds__(HIP_QUANTIZE_BLOCK_SIZE, 1) static __global__
   y[ib].ds = make_half2(d, sum);
 }
 
-template<mmq_q8_1_ds_layout ds_layout>
+// ReluSqr transforms each loaded activation v -> (v > 0 ? v * v : 0) before
+// the q8_1 block statistics. Applied in-register this is exactly the element
+// sequence ReluSqrKernel (nb_ops) writes, so a fused SqReLU pass produces
+// bit-identical results while skipping the intermediate float round-trip.
+template<mmq_q8_1_ds_layout ds_layout, bool ReluSqr = false>
 static __global__ void quantize_mmq_q8_1(const float* __restrict__ x,
                                          const int32_t* __restrict__ ids,
                                          void* __restrict__ vy,
@@ -149,9 +153,14 @@ static __global__ void quantize_mmq_q8_1(const float* __restrict__ x,
   const int64_t iqs = i0 % (4 * QK8_1);             // quant index in block
 
   // Load 4 floats per thread and calculate max. abs. value between them:
-  const float4 xi = i0 < ne00
-                        ? x4[(i03 * s03 + i02 * s02 + i01 * s01 + i00) / 4]
+  float4 xi = i0 < ne00 ? x4[(i03 * s03 + i02 * s02 + i01 * s01 + i00) / 4]
                         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if constexpr (ReluSqr) {
+    xi.x = xi.x > 0.0f ? xi.x * xi.x : 0.0f;
+    xi.y = xi.y > 0.0f ? xi.y * xi.y : 0.0f;
+    xi.z = xi.z > 0.0f ? xi.z * xi.z : 0.0f;
+    xi.w = xi.w > 0.0f ? xi.w * xi.w : 0.0f;
+  }
   float amax = fabsf(xi.x);
   amax = fmaxf(amax, fabsf(xi.y));
   amax = fmaxf(amax, fabsf(xi.z));
@@ -251,15 +260,14 @@ void quantize_row_q8_1_by_expert_hip(const float* x, const int32_t* ids,
       x, ids, vy, sorted_ids, slot_of_rank, ne00, s01, ne0, slots);
 }
 
-void quantize_mmq_q8_1_hip(const float* x, const int32_t* ids, void* vy,
-                           const ggml_type type_src0, const int64_t ne00,
-                           const int64_t s01, const int64_t s02,
-                           const int64_t s03, const int64_t ne0,
-                           const int64_t ne1, const int64_t ne2,
-                           const int64_t ne3, hipStream_t stream) {
-  GGML_ASSERT(ne00 % 4 == 0);
-  GGML_ASSERT(ne0 % (4 * QK8_1) == 0);
-
+template<bool ReluSqr>
+static void quantize_mmq_q8_1_dispatch(const float* x, const int32_t* ids,
+                                       void* vy, const ggml_type type_src0,
+                                       const int64_t ne00, const int64_t s01,
+                                       const int64_t s02, const int64_t s03,
+                                       const int64_t ne0, const int64_t ne1,
+                                       const int64_t ne2, const int64_t ne3,
+                                       hipStream_t stream) {
   // ne1 tends to assume the highest values, therefore use it as the "x"
   // dimension of the HIP grid:
   const int64_t block_num_y = (ne0 + 4 * HIP_QUANTIZE_BLOCK_SIZE_MMQ - 1) /
@@ -268,17 +276,17 @@ void quantize_mmq_q8_1_hip(const float* x, const int32_t* ids, void* vy,
   const dim3 block_size(HIP_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
   switch (mmq_get_q8_1_ds_layout(type_src0)) {
     case MMQ_Q8_1_DS_LAYOUT_D4:
-      quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
+      quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, ReluSqr>
           <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02,
                                                   s03, ne0, ne1, ne2);
       break;
     case MMQ_Q8_1_DS_LAYOUT_DS4:
-      quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
+      quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, ReluSqr>
           <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02,
                                                   s03, ne0, ne1, ne2);
       break;
     case MMQ_Q8_1_DS_LAYOUT_D2S6:
-      quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
+      quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, ReluSqr>
           <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02,
                                                   s03, ne0, ne1, ne2);
       break;
@@ -286,6 +294,31 @@ void quantize_mmq_q8_1_hip(const float* x, const int32_t* ids, void* vy,
       GGML_ABORT("fatal error");
       break;
   }
+}
+
+void quantize_mmq_q8_1_hip(const float* x, const int32_t* ids, void* vy,
+                           const ggml_type type_src0, const int64_t ne00,
+                           const int64_t s01, const int64_t s02,
+                           const int64_t s03, const int64_t ne0,
+                           const int64_t ne1, const int64_t ne2,
+                           const int64_t ne3, hipStream_t stream) {
+  GGML_ASSERT(ne00 % 4 == 0);
+  GGML_ASSERT(ne0 % (4 * QK8_1) == 0);
+  quantize_mmq_q8_1_dispatch<false>(x, ids, vy, type_src0, ne00, s01, s02, s03,
+                                    ne0, ne1, ne2, ne3, stream);
+}
+
+void quantize_mmq_q8_1_relu_sqr_hip(const float* x, const int32_t* ids,
+                                    void* vy, const ggml_type type_src0,
+                                    const int64_t ne00, const int64_t s01,
+                                    const int64_t s02, const int64_t s03,
+                                    const int64_t ne0, const int64_t ne1,
+                                    const int64_t ne2, const int64_t ne3,
+                                    hipStream_t stream) {
+  GGML_ASSERT(ne00 % 4 == 0);
+  GGML_ASSERT(ne0 % (4 * QK8_1) == 0);
+  quantize_mmq_q8_1_dispatch<true>(x, ids, vy, type_src0, ne00, s01, s02, s03,
+                                   ne0, ne1, ne2, ne3, stream);
 }
 
 }  // namespace nmb_mmq

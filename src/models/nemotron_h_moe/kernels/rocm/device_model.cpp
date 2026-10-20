@@ -413,12 +413,15 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
     nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.up_exps, lat_, ids_, up_out_, expert_ff,
                      latent, top_k, 0, t, stream);
   }
-  nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(t) * top_k * expert_ff,
-               stream);
   if (wide) {
-    (void)nmb_mmq_iq2_xxs_moe_raw(l.down_exps, act_, ids_, down_out_, latent,
-                                  expert_ff, t * top_k, n_exp, 1, stream);
+    // SqReLU is folded into the down-projection activation quantize
+    // (bit-identical), skipping the act_ materialization pass.
+    (void)nmb_mmq_iq2_xxs_moe_raw_sqract(l.down_exps, up_out_, ids_, down_out_,
+                                         latent, expert_ff, t * top_k, n_exp, 1,
+                                         stream);
   } else {
+    nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(t) * top_k * expert_ff,
+                 stream);
     nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.down_exps, act_, ids_, down_out_, latent,
                      expert_ff, top_k, expert_ff, t, stream);
   }

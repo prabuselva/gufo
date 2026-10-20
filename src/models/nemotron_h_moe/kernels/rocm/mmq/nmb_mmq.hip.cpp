@@ -284,7 +284,7 @@ int nmb_mmq_moe_impl(const char* tag, const void* W, const float* X_f32,
                      const int32_t* ids, float* out_f32, int M, int K,
                      int n_tokens, int n_experts, int n_expert_used,
                      hipStream_t stream, const void* W_b = nullptr,
-                     float* out_b = nullptr) {
+                     float* out_b = nullptr, bool act_relu_sqr = false) {
   if (!W || !X_f32 || !ids || !out_f32) {
     fprintf(stderr, "%s: null pointer\n", tag);
     return -1;
@@ -355,9 +355,15 @@ int nmb_mmq_moe_impl(const char* tag, const void* W, const float* X_f32,
   const int64_t s12_src = (int64_t)K * ne11;
   const int64_t s13_src = (int64_t)K * ne11 * ne12;
 
-  quantize_mmq_q8_1_hip(X_f32, ids_src1.get(), (void*)src1_q8_1.get(), type, K,
-                        s11_src, s12_src, s13_src, ne10_padded, ne_get_rows, 1,
-                        1, stream);
+  if (act_relu_sqr) {
+    quantize_mmq_q8_1_relu_sqr_hip(
+        X_f32, ids_src1.get(), (void*)src1_q8_1.get(), type, K, s11_src,
+        s12_src, s13_src, ne10_padded, ne_get_rows, 1, 1, stream);
+  } else {
+    quantize_mmq_q8_1_hip(X_f32, ids_src1.get(), (void*)src1_q8_1.get(), type,
+                          K, s11_src, s12_src, s13_src, ne10_padded,
+                          ne_get_rows, 1, 1, stream);
+  }
 
   err = hipGetLastError();
   if (err != hipSuccess) {
@@ -646,6 +652,19 @@ extern "C" int nmb_mmq_iq2_xxs_moe_raw(const void* W, const float* X,
   return nmb_mmq_moe_impl<GGML_TYPE_IQ2_XXS>(
       "nmb_mmq_iq2_xxs_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
       n_expert_used, stream, nullptr, nullptr);
+}
+
+// nmb_mmq_iq2_xxs_moe_raw with SqReLU folded into the activation quantize:
+// X holds the pre-activation rows and the kernel quantizes (x > 0 ? x * x : 0)
+// bit-identically to a separate relu_sqr pass feeding nmb_mmq_moe_raw.
+extern "C" int nmb_mmq_iq2_xxs_moe_raw_sqract(const void* W, const float* X,
+                                              const int32_t* ids, float* out,
+                                              int M, int K, int n_tokens,
+                                              int n_experts, int n_expert_used,
+                                              hipStream_t stream) {
+  return nmb_mmq_moe_impl<GGML_TYPE_IQ2_XXS>(
+      "nmb_mmq_iq2_xxs_moe_raw_sqract", W, X, ids, out, M, K, n_tokens,
+      n_experts, n_expert_used, stream, nullptr, nullptr, true);
 }
 
 extern "C" int nmb_mmq_nvfp4_moe_raw(const void* W, const float* X,

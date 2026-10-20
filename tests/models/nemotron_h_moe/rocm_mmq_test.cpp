@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "nmb_mmq.h"
@@ -314,6 +315,52 @@ bool RunFormat(int kind, const char* fmt) {
         }
       }
     }
+  }
+
+  // Fused SqReLU activation quantize: for IQ2, _sqract on raw activations
+  // must equal plain _moe_raw on a materialized relu_sqr pass bit for bit.
+  if (kind == 0) {
+    constexpr int kRows = 192;
+    constexpr int kExperts = 4;
+    constexpr int kTokens = 16;
+    constexpr int kUsed = 3;
+    auto bytes = MakeWeightBytes(kind, cols, kRows * kExperts, seed ^ 23);
+    auto x =
+        MakeValues(static_cast<std::size_t>(kTokens) * cols, seed ^ 29, 1.0F);
+    std::vector<float> sq = x;
+    for (float& v : sq) {
+      v = v > 0.0F ? v * v : 0.0F;
+    }
+    std::vector<std::int32_t> expert_of(static_cast<std::size_t>(kTokens) *
+                                        kUsed);
+    for (std::int32_t& e : expert_of) {
+      e = static_cast<std::int32_t>(NextRandom(&seed) % kExperts);
+    }
+    const std::size_t out_n = static_cast<std::size_t>(kRows) * kTokens * kUsed;
+    HipBuffer<std::uint8_t> w_dev(bytes.size());
+    HipBuffer<float> x_dev(x.size());
+    HipBuffer<float> sq_dev(sq.size());
+    HipBuffer<std::int32_t> ids_dev(expert_of.size());
+    HipBuffer<float> out_mat(out_n);
+    HipBuffer<float> out_fused(out_n);
+    Upload(w_dev.get(), bytes.data(), bytes.size());
+    Upload(&x_dev, x);
+    Upload(&sq_dev, sq);
+    Upload(ids_dev.get(), expert_of.data(), ids_dev.bytes());
+    const int rc_mat = nmb_mmq_iq2_xxs_moe_raw(
+        w_dev.get(), sq_dev.get(), ids_dev.get(), out_mat.get(), kRows, cols,
+        kTokens, kExperts, kUsed, nullptr);
+    const int rc_fused = nmb_mmq_iq2_xxs_moe_raw_sqract(
+        w_dev.get(), x_dev.get(), ids_dev.get(), out_fused.get(), kRows, cols,
+        kTokens, kExperts, kUsed, nullptr);
+    const std::vector<float> g_mat = Download(&out_mat);
+    const std::vector<float> g_fused = Download(&out_fused);
+    const bool fused_ok =
+        rc_mat == 0 && rc_fused == 0 &&
+        std::memcmp(g_mat.data(), g_fused.data(), out_n * sizeof(float)) == 0;
+    std::printf("%-44s %s\n", "moe_raw_sqract IQ2_XXS == relu_sqr+raw",
+                fused_ok ? "PASS" : "FAIL");
+    ok = fused_ok && ok;
   }
   return ok;
 }

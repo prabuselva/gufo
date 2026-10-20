@@ -30,3 +30,12 @@ void quantize_mmq_q8_1_hip(const float* x, const int32_t* ids, void* vy,
                            ggml_type type_src0, int64_t ne00, int64_t s01,
                            int64_t s02, int64_t s03, int64_t ne0, int64_t ne1,
                            int64_t ne2, int64_t ne3, hipStream_t stream);
+
+// quantize_mmq_q8_1_hip with SqReLU applied in-register to each source
+// element before the block statistics: bit-identical to quantizing a
+// separately materialized relu_sqr pass, without the float round-trip.
+void quantize_mmq_q8_1_relu_sqr_hip(const float* x, const int32_t* ids,
+                                    void* vy, ggml_type type_src0, int64_t ne00,
+                                    int64_t s01, int64_t s02, int64_t s03,
+                                    int64_t ne0, int64_t ne1, int64_t ne2,
+                                    int64_t ne3, hipStream_t stream);
