@@ -25,9 +25,9 @@ by default in Gufo; text recipe temp 1.0 / top-p 0.95 is a serve default, not
 | depth | gufo | reference | date/rev |
 | --- | --- | --- | --- |
 | pp512 | — | — | — |
-| pp2048 | 617.06 ± 0.00 | — | 2026-10-20 (SqReLU folded into down-expert quantize; matched interleaved A/B +1.1/+2.0 %) |
-| pp8192 | 546.34 ± 0.00 | — | 2026-10-20 (SqReLU folded into down-expert quantize; matched interleaved A/B +0.2/+0.6 %) |
-| pp16384 | 455.37 ± 0.00 | 488.80 | 2026-10-20 (SqReLU folded into down-expert quantize; matched interleaved A/B +0.2/+0.7 %; pre-fuse −13.3 % vs ref, absolute windows drift ±5 %) |
+| pp2048 | 623.80 ± 0.00 | — | 2026-10-20 (prefill chunk 2048 → 8192; single-chunk depth, matched A/B flat −1.1..+2.2 % over 5 pairs) |
+| pp8192 | 560.28 ± 0.00 | — | 2026-10-20 (prefill chunk 2048 → 8192 halves MoE weight re-streams; matched interleaved A/B +2.5/+2.4 %) |
+| pp16384 | 464.20 ± 0.00 | 488.80 | 2026-10-20 (prefill chunk 2048 → 8192; matched interleaved A/B +3.3/+0.6 %; −5.0 % vs ref, absolute windows drift ±5 %) |
 | pp32768 | — | — | — |
 | pp65536 | — | — | — |
 | pp102400 | — | — | — |

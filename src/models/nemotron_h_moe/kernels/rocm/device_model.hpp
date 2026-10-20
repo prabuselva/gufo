@@ -119,7 +119,7 @@ private:
   // amortize the per-chunk weight streams of the row-batched GEMMs and cut
   // per-chunk state round-trips; numerics are unchanged because every kernel
   // keeps its per-output K-chain order and the Mamba scan is token-sequential.
-  static constexpr std::uint32_t kPrefillChunk = 2048U;
+  static constexpr std::uint32_t kPrefillChunk = 8192U;
   // Chunks at least this wide run the row-batched GEMV family; narrower
   // chunks and decode keep the wave-coverage (row, token)-grid kernels.
   static constexpr std::uint32_t kRowsBatchMin = 64U;
