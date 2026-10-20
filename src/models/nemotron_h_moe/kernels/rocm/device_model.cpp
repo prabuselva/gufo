@@ -225,19 +225,6 @@ bool DeviceModel::Init(std::string* error_msg) {
                    nrow(1) * sizeof(std::int32_t)) == hipSuccess;
     scratch_bytes_ += (nrow(top_k) + nrow(1)) * sizeof(std::int32_t);
   }
-  if (ok) {
-    // list: one slot rank per (token, slot); desc: tile table with at most
-    // ceil(slots/NBL_ROW_NT) + 512 tiles of 3 ints; n_desc: device tile count.
-    const std::size_t slots = nrow(top_k);
-    const std::size_t tiles = slots / NBL_ROW_NT + 512U;
-    ok = hipMalloc(reinterpret_cast<void**>(&exp_list_),
-                   slots * sizeof(std::int32_t)) == hipSuccess &&
-         hipMalloc(reinterpret_cast<void**>(&exp_desc_),
-                   3 * tiles * sizeof(std::int32_t)) == hipSuccess &&
-         hipMalloc(reinterpret_cast<void**>(&exp_ndesc_),
-                   sizeof(std::int32_t)) == hipSuccess;
-    scratch_bytes_ += (slots + 3 * tiles + 1) * sizeof(std::int32_t);
-  }
   if (!ok) {
     if (error_msg != nullptr && error_msg->empty()) {
       *error_msg = "scratch alloc failed";
@@ -305,12 +292,6 @@ void DeviceModel::Free() {
   freelist(acc_);
   freelist(moe_);
   freelist(sh_);
-  freelist(exp_list_);
-  freelist(exp_desc_);
-  freelist(exp_ndesc_);
-  exp_list_ = nullptr;
-  exp_desc_ = nullptr;
-  exp_ndesc_ = nullptr;
   token_embd_ = nullptr;
   output_ = nullptr;
   weight_bytes_ = 0;
@@ -413,16 +394,11 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
   const int n_exp = static_cast<int>(l.n_experts);
   const int expert_ff = static_cast<int>(l.expert_ff);
   const bool wide = t >= static_cast<int>(kRowsBatchMin);
-  const int grid_tiles = (t * top_k + NBL_ROW_NT - 1) / NBL_ROW_NT + n_exp;
   nbl_gemm_f32(normed_, static_cast<const float*>(l.router), router_logits_, t,
                n_exp, hid, stream);
   nbl_router(router_logits_, static_cast<const float*>(l.exp_b), n_exp, top_k,
              c_.expert_weights_norm ? 1 : 0, c_.expert_weights_scale, t, ids_,
              moe_w_, stream);
-  if (wide) {
-    nbl_expert_index(ids_, n_exp, t * top_k, NBL_ROW_NT, exp_list_, exp_desc_,
-                     exp_ndesc_, stream);
-  }
   if (wide) {
     (void)nmb_mmq_q8_0_dense(l.latent_down, normed_, lat_, latent, t, hid,
                              stream);
@@ -440,9 +416,8 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
   nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(t) * top_k * expert_ff,
                stream);
   if (wide) {
-    nbl_gemv_rows_moe(kNblGemvIq2Xxs, l.down_exps, act_, exp_list_, exp_desc_,
-                      exp_ndesc_, grid_tiles, 0, down_out_, latent, expert_ff,
-                      stream);
+    (void)nmb_mmq_iq2_xxs_moe_raw(l.down_exps, act_, ids_, down_out_, latent,
+                                  expert_ff, t * top_k, n_exp, 1, stream);
   } else {
     nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.down_exps, act_, ids_, down_out_, latent,
                      expert_ff, top_k, expert_ff, t, stream);

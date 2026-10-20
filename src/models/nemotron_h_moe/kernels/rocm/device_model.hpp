@@ -160,9 +160,6 @@ private:
   float* moe_{nullptr};
   float* sh_{nullptr};
   // Expert-sorted slot list/table for the row-batched wide prefill paths.
-  std::int32_t* exp_list_{nullptr};
-  std::int32_t* exp_desc_{nullptr};
-  std::int32_t* exp_ndesc_{nullptr};
   int max_experts_{0};
   int max_expert_ff_{0};
   std::vector<float>* layer_dump_{nullptr};

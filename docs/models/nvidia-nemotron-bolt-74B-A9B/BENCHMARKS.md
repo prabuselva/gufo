@@ -20,9 +20,9 @@ by default in Gufo; text recipe temp 1.0 / top-p 0.95 is a serve default, not
 | depth | gufo | reference | date/rev |
 | --- | --- | --- | --- |
 | pp512 | — | — | — |
-| pp2048 | 425.83 ± 0.00 | — | 2026-10-20 (router tiled F32 GEMM) |
+| pp2048 | 508.61 ± 0.00 | — | 2026-10-20 (down_exps MQ id-tier) |
 | pp8192 | — | — | — |
-| pp16384 | 318.66 ± 0.00 | 488.80 | 2026-10-20 (router tiled F32 GEMM) |
+| pp16384 | 357.58 ± 0.00 | 488.80 | 2026-10-20 (down_exps MQ id-tier) |
 | pp32768 | — | — | — |
 | pp65536 | — | — | — |
 | pp102400 | — | — | — |
