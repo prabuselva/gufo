@@ -2,6 +2,7 @@
 
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
@@ -496,6 +497,81 @@ __global__ void GemvF32Kernel(const float* __restrict__ x,
   }
 }
 
+// Row-packed variant of GemvF32Kernel for small-k decode rows. The
+// one-row-per-block kernel activates only n_chunk of kBlock threads on decode
+// shapes (k=1024 IQ2: 32 of 256) and launches a block per output row, so the
+// MoE up-projection streams ~264 B per block through launch and reduce
+// overhead. Here one block covers several rows: a row owns
+// R = ceil(n_chunk / warpSize) consecutive warps and the block holds
+// rows = blockDim / (warpSize * R) rows; warp i lane l of a row owns chunk
+// warpSize * i + l -- the same chunk production thread warpSize * i + l
+// owned -- and each lane holds at most one chunk while n_chunk <= kBlock. The
+// per-warp shfl_down tree and the seeded ascending fold sum (zero-initialized
+// entries reproduce the +0.0F padding warps) mirror BlockReduceSum bitwise,
+// so every output is identical to GemvF32Kernel. Probe:
+// tools/bench/nem_decode_iq2_bench.hip (1.2x-4.9x, bitwise across shapes).
+template<int TYPE>
+__global__ void GemvF32PackedKernel(const float* __restrict__ x,
+                                    const uint8_t* __restrict__ w,
+                                    float* __restrict__ out, int n_out, int k,
+                                    int expert_stride,
+                                    const int32_t* __restrict__ ids, int slots,
+                                    int64_t x_stride, int tokens,
+                                    int warps_per_row, int blocks_per_slot) {
+  const int warp = static_cast<int>(threadIdx.x) / warpSize;
+  const int lane = static_cast<int>(threadIdx.x) % warpSize;
+  const int row_local = warp / warps_per_row;
+  const int warp_in_row = warp % warps_per_row;
+  __shared__ float fold[64];  // [row][fold entry], 8 entries per row
+  if (static_cast<int>(threadIdx.x) < 64) {
+    fold[threadIdx.x] = 0.0F;
+  }
+  __syncthreads();
+  const int gid = static_cast<int>(blockIdx.x);
+  const int slot = gid / blocks_per_slot;
+  const int row = (gid % blocks_per_slot) * (static_cast<int>(blockDim.x) /
+                                             warpSize / warps_per_row) +
+                  row_local;
+  const bool active = (row < n_out);
+  const int token = static_cast<int>(blockIdx.y);
+  float acc = 0.0F;
+  int64_t out_row = 0;
+  if (active) {
+    // Slot and token addressing identical to GemvF32Kernel.
+    const float* xr = x;
+    int64_t w_row = row;
+    out_row = static_cast<int64_t>(token) * n_out + row;
+    if (slots > 1) {
+      const int64_t s = static_cast<int64_t>(token) * slots + slot;
+      w_row = static_cast<int64_t>(__ldg(ids + s)) * n_out + row;
+      out_row = s * n_out + row;
+      xr += static_cast<int64_t>(slot) * x_stride;
+    }
+    xr += static_cast<int64_t>(token) *
+          ((slots > 1 && x_stride > 0) ? static_cast<int64_t>(slots) * x_stride
+                                       : k);
+    const uint8_t* wr = w + w_row * static_cast<int64_t>(expert_stride);
+    const int c = lane + warpSize * warp_in_row;
+    if (c < k / GemvChunk<TYPE>()) {
+      acc = GemvChunkDot<TYPE>(wr, xr, c, k);
+    }
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(~0ULL, acc, off);
+  }
+  if (lane == 0) {
+    fold[row_local * 8 + warp_in_row] = acc;
+  }
+  __syncthreads();
+  if (active && lane == 0 && warp_in_row == 0) {
+    float sum = 0.0F;
+    for (int j = 0; j < kBlock / warpSize; ++j) {
+      sum += fold[row_local * 8 + j];
+    }
+    out[out_row] = sum;
+  }
+}
+
 __global__ void RouterKernel(const float* __restrict__ logits,
                              const float* __restrict__ bias, int n_experts,
                              int top_k, int norm, float scale,
@@ -673,35 +749,96 @@ void EnsureIq2Tables() {
   }
 }
 
+int GemvChunkHost(int type) {
+  switch (type) {
+    case kNblGemvF32:
+      return 16;
+    case kNblGemvQ8_0:
+      return kQ8_0Elems;
+    case kNblGemvIq2Xxs:
+      return kIq2Sub;
+    default:
+      return kNvfp4Sub;
+  }
+}
+
+int DeviceWarpSize() {
+  static int warp = [] {
+    int w = 32;
+    (void)hipDeviceGetAttribute(&w, hipDeviceAttributeWarpSize, 0);
+    return w > 0 ? w : 32;
+  }();
+  return warp;
+}
+
 template<bool kMoe>
 int LaunchGemv(int type, const void* w, const float* x, const int32_t* ids,
                float* out, int n_out, int k, int slots, int64_t x_stride,
                int tokens, hipStream_t stream) {
-  const int64_t rows = kMoe ? static_cast<int64_t>(slots) * n_out : n_out;
   const int stride = GemvRowBytes(type, k);
   const uint8_t* wb = static_cast<const uint8_t*>(w);
-  const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(tokens));
+  // Small-k rows run the row-packed kernel: one row per R warps instead of
+  // one row per 256-thread block. Bitwise identical fold (see the kernel).
+  const int warp = DeviceWarpSize();
+  const int n_chunk = k / GemvChunkHost(type);
+  const bool packed = n_chunk <= kBlock;
+  const int warps_per_row = packed ? (n_chunk + warp - 1) / warp : 1;
+  const int rows_per_block =
+      packed ? std::max(1, kBlock / (warp * warps_per_row)) : 1;
+  const int blocks_per_slot =
+      packed ? (n_out + rows_per_block - 1) / rows_per_block : n_out;
+  const unsigned grid_x = kMoe ? static_cast<unsigned>(slots) *
+                                     static_cast<unsigned>(blocks_per_slot)
+                               : static_cast<unsigned>(blocks_per_slot);
+  const dim3 grid(grid_x, static_cast<unsigned>(tokens));
+  const dim3 block(static_cast<unsigned>(
+                       packed ? warp * warps_per_row * rows_per_block : kBlock),
+                   1);
   switch (type) {
     case kNblGemvF32:
-      GemvF32Kernel<kNblGemvF32>
-          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
-                                        kMoe ? slots : 0, x_stride, tokens);
+      if (packed) {
+        GemvF32PackedKernel<kNblGemvF32><<<grid, block, 0, stream>>>(
+            x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride,
+            tokens, warps_per_row, blocks_per_slot);
+      } else {
+        GemvF32Kernel<kNblGemvF32>
+            <<<grid, block, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                         kMoe ? slots : 0, x_stride, tokens);
+      }
       break;
     case kNblGemvQ8_0:
-      GemvF32Kernel<kNblGemvQ8_0>
-          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
-                                        kMoe ? slots : 0, x_stride, tokens);
+      if (packed) {
+        GemvF32PackedKernel<kNblGemvQ8_0><<<grid, block, 0, stream>>>(
+            x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride,
+            tokens, warps_per_row, blocks_per_slot);
+      } else {
+        GemvF32Kernel<kNblGemvQ8_0>
+            <<<grid, block, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                         kMoe ? slots : 0, x_stride, tokens);
+      }
       break;
     case kNblGemvIq2Xxs:
       EnsureIq2Tables();
-      GemvF32Kernel<kNblGemvIq2Xxs>
-          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
-                                        kMoe ? slots : 0, x_stride, tokens);
+      if (packed) {
+        GemvF32PackedKernel<kNblGemvIq2Xxs><<<grid, block, 0, stream>>>(
+            x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride,
+            tokens, warps_per_row, blocks_per_slot);
+      } else {
+        GemvF32Kernel<kNblGemvIq2Xxs>
+            <<<grid, block, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                         kMoe ? slots : 0, x_stride, tokens);
+      }
       break;
     default:
-      GemvF32Kernel<kNblGemvNvfp4>
-          <<<grid, kBlock, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
-                                        kMoe ? slots : 0, x_stride, tokens);
+      if (packed) {
+        GemvF32PackedKernel<kNblGemvNvfp4><<<grid, block, 0, stream>>>(
+            x, wb, out, n_out, k, stride, ids, kMoe ? slots : 0, x_stride,
+            tokens, warps_per_row, blocks_per_slot);
+      } else {
+        GemvF32Kernel<kNblGemvNvfp4>
+            <<<grid, block, 0, stream>>>(x, wb, out, n_out, k, stride, ids,
+                                         kMoe ? slots : 0, x_stride, tokens);
+      }
       break;
   }
   return CheckLaunch(hipGetLastError(),
