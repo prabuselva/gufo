@@ -36,8 +36,8 @@ by default in Gufo; text recipe temp 1.0 / top-p 0.95 is a serve default, not
 
 | context | gufo | reference | date/rev |
 | --- | --- | --- | --- |
-| tg128 @0 | 17.34 ± 0.09 | — | 2026-10-21 (packed-row decode gemv; n-prompt 1; matched interleaved A/B +19.6 % vs row-gemv 14.44) |
-| tg128 @16K | 17.20 ± 0.03 | — | 2026-10-21 (n-prompt 16384; matched interleaved A/B +20.2 % vs row-gemv 14.29) |
+| tg128 @0 | 22.00 ± 0.07 | — | 2026-10-21 (ring-staged decode router gemm; n-prompt 1; matched interleaved A/B +25.8 % vs packed-gemv 17.48; tg512 21.13, pp16384 flat) |
+| tg128 @16K | 21.28 ± 0.03 | — | 2026-10-21 (n-prompt 16384; matched interleaved A/B +23.5 % vs packed-gemv 17.22) |
 | tg128 @64K | — | — | — |
 
 ## Memory

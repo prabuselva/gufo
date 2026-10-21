@@ -119,6 +119,78 @@ __global__ void GemmF32Kernel(const float* __restrict__ x,
   out[static_cast<int64_t>(t) * n_out + r] = acc;
 }
 
+namespace {
+
+constexpr int kRingRows = 8;      // expert rows owned by one block
+constexpr int kRingStageK = 128;  // k-width of one cooperative float tile
+constexpr int kRingDepth = 2;     // tiles in flight (double buffered)
+
+}  // namespace
+
+// Decode router GEMM for one few-token pass: a block owns kRingRows expert
+// rows; all 256 threads float4-stream kRingStageK-wide tiles into LDS with a
+// kRingDepth-deep prefetch, while the first kRingRows threads fold their row
+// from LDS in ascending k. The FMA order matches GemmF32Kernel exactly, so
+// results are bitwise identical, but the serial row chain runs at LDS/FMA
+// latency with the next tile's HBM round trip already in flight instead of
+// stalling on each weight load. Probe:
+// tools/bench/nem_decode_router_gemm_bench.hip (L2-cold 368x4096: 357us ->
+// 73us, 4.9x; all shapes bitwise identical).
+__global__ void GemmF32RingKernel(const float* __restrict__ x,
+                                  const float* __restrict__ w,
+                                  float* __restrict__ out, int n_out, int k) {
+  const int t = blockIdx.y;
+  const int r0 = blockIdx.x * kRingRows;
+  const int tid = static_cast<int>(threadIdx.x);
+  __shared__ float ws[kRingDepth][kRingRows][kRingStageK + 1];
+  const float* xr = x + static_cast<int64_t>(t) * k;
+
+  const bool adder = (tid < kRingRows) && (r0 + tid < n_out);
+  float acc = 0.0F;
+  const int g = tid / 32;
+  const int kl = (tid % 32) * 4;
+  const int loader_ok = (r0 + g) < n_out ? 1 : 0;
+  const float* wrow = w + static_cast<int64_t>(r0 + g) * k + kl;
+  const int npass = k / kRingStageK;
+  float4 v[kRingDepth];
+  v[0] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+#pragma unroll
+  for (int d = 0; d < kRingDepth; ++d) {
+    v[d] = (loader_ok && npass > d)
+               ? *reinterpret_cast<const float4*>(wrow + d * kRingStageK)
+               : v[0];
+  }
+  for (int p = 0; p < npass; ++p) {
+    const int cur = p % kRingDepth;
+    ws[cur][g][kl] = v[0].x;
+    ws[cur][g][kl + 1] = v[0].y;
+    ws[cur][g][kl + 2] = v[0].z;
+    ws[cur][g][kl + 3] = v[0].w;
+    __syncthreads();
+    v[0] = v[1];
+    if (p + kRingDepth < npass && loader_ok) {
+      v[1] = *reinterpret_cast<const float4*>(wrow +
+                                              (p + kRingDepth) * kRingStageK);
+    }
+    if (adder) {
+      const float* wr = ws[cur][tid];
+      const float* xrk = xr + p * kRingStageK;
+#pragma unroll
+      for (int q = 0; q < kRingStageK / 4; ++q) {
+        const float4 xv = *reinterpret_cast<const float4*>(xrk + 4 * q);
+        acc += xv.x * wr[4 * q];
+        acc += xv.y * wr[4 * q + 1];
+        acc += xv.z * wr[4 * q + 2];
+        acc += xv.w * wr[4 * q + 3];
+      }
+    }
+    __syncthreads();
+  }
+  if (adder) {
+    out[static_cast<int64_t>(t) * n_out + r0 + tid] = acc;
+  }
+}
+
 // Router GEMM: out[m, n_out] = x[m, k] w[n_out, k]^T with float32 inputs.
 // A block covers 64 tokens x 64 experts with a 32-wide LDS k-stage, 256
 // threads and 8 tokens x 2 experts of register accumulation per thread.
@@ -690,6 +762,9 @@ extern "C" int nbl_gemm_f32(const float* x, const float* w, float* out,
                     (n_out + kGemmTileExperts - 1) / kGemmTileExperts);
     GemmF32TiledKernel<<<grid, kGemmThreads, 0, stream>>>(x, w, out, n_out, k,
                                                           n_tokens);
+  } else if (k % kRingStageK == 0) {
+    const dim3 grid((n_out + kRingRows - 1) / kRingRows, n_tokens);
+    GemmF32RingKernel<<<grid, kBlock, 0, stream>>>(x, w, out, n_out, k);
   } else {
     const dim3 grid((n_out + kBlock - 1) / kBlock, n_tokens);
     GemmF32Kernel<<<grid, kBlock, 0, stream>>>(x, w, out, n_out, k);
