@@ -604,7 +604,12 @@ extern "C" int nbl_gemm_f32(const float* x, const float* w, float* out,
   if (!x || !w || !out || n_tokens <= 0 || n_out <= 0 || k <= 0) {
     return -1;
   }
-  if (k % kGemmKStep == 0) {
+  // The tiled tile wins from 64 tokens up; below one tile the masked token
+  // slots stream the same weights through the LDS pipeline for nothing. The
+  // thread-per-output kernel folds each row in the same ascending-k order, so
+  // switching here and below a full tile is bitwise identical (probe:
+  // tools/bench/nem_decode_router_bench.hip, 280us -> 44us per decode router).
+  if (k % kGemmKStep == 0 && n_tokens >= kGemmTileTokens) {
     const dim3 grid((n_tokens + kGemmTileTokens - 1) / kGemmTileTokens,
                     (n_out + kGemmTileExperts - 1) / kGemmTileExperts);
     GemmF32TiledKernel<<<grid, kGemmThreads, 0, stream>>>(x, w, out, n_out, k,
