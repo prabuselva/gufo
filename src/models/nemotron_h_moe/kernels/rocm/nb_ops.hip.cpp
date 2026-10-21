@@ -16,6 +16,8 @@ namespace {
 constexpr int kBlock = 256;
 constexpr int kRouterBlock = 512;
 constexpr int kRouterMaxExperts = 512;
+constexpr int kRouterWarpCount =
+    kRouterBlock / 32;  // gfx1151 warpSize is 32 (runtime value is not const)
 
 // ggml block_q8_0 layout, kept local to avoid pulling the vendored headers.
 struct BlockQ8_0 {
@@ -651,36 +653,75 @@ __global__ void RouterKernel(const float* __restrict__ logits,
                              float* __restrict__ weights) {
   const int token = blockIdx.x;
   const float* lg = logits + static_cast<int64_t>(token) * n_experts;
-  __shared__ float scores[kRouterMaxExperts];
+  __shared__ float score[kRouterMaxExperts];
+  __shared__ float sigv[kRouterMaxExperts];
+  __shared__ float wval[kRouterWarpCount];
+  __shared__ int widx[kRouterWarpCount];
   __shared__ int sel[16];
   __shared__ float num[16];
-  for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
-    scores[e] = 1.0F / (1.0F + expf(-lg[e])) + bias[e];
+  __shared__ int gidx;
+  __shared__ int stop_k;
+  const int tid = static_cast<int>(threadIdx.x);
+  for (int e = tid; e < n_experts; e += blockDim.x) {
+    const float sig = 1.0F / (1.0F + expf(-lg[e]));
+    sigv[e] = sig;
+    score[e] = sig + bias[e];
+  }
+  bool alive = tid < n_experts && score[tid] != -FLT_MAX;
+  if (tid == 0) {
+    stop_k = -1;
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    int total = 0;
-    for (int k = 0; k < top_k; ++k) {
-      // Serial top-k selection on one thread mirrors the oracle loop
-      // exactly, including the tie-to-lowest-index rule.
-      int best = -1;
-      for (int e = 0; e < n_experts; ++e) {
-        const float v = scores[e];
-        if (v == -FLT_MAX) {
-          continue;
-        }
-        if (best < 0 || v > scores[best]) {
-          best = e;
-        }
-      }
-      sel[k] = best;
-      if (best < 0) {
-        break;
-      }
-      total = k + 1;
-      scores[best] = -FLT_MAX;
-      num[k] = 1.0F / (1.0F + expf(-lg[best]));
+  for (int k = 0; k < top_k; ++k) {
+    // Each round re-reads the immutable shared score and the per-thread
+    // alive bit (the fold itself clobbers registers) and reduces the
+    // (score, index) pair: strict '>' with descending lanes mirrors the
+    // oracle's ascending scan whose first maximal element keeps the lowest
+    // index, and masked candidates (idx < 0) never win.
+    float val = alive ? score[tid] : -FLT_MAX;
+    int idx = alive ? tid : -1;
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      const float oval = __shfl_down_sync(~0ULL, val, off);
+      const int oidx = __shfl_down_sync(~0ULL, idx, off);
+      const bool keep = idx >= 0 && (oidx < 0 || val > oval);
+      val = keep ? val : oval;
+      idx = keep ? idx : oidx;
     }
+    if ((tid & (warpSize - 1)) == 0) {
+      wval[tid / warpSize] = val;
+      widx[tid / warpSize] = idx;
+    }
+    __syncthreads();
+    if (tid < warpSize) {
+      float mval = tid < kRouterWarpCount ? wval[tid] : -FLT_MAX;
+      int midx = tid < kRouterWarpCount ? widx[tid] : -1;
+      for (int off = warpSize / 2; off > 0; off >>= 1) {
+        const float oval = __shfl_down_sync(~0ULL, mval, off);
+        const int oidx = __shfl_down_sync(~0ULL, midx, off);
+        const bool keep = midx >= 0 && (oidx < 0 || mval > oval);
+        mval = keep ? mval : oval;
+        midx = keep ? midx : oidx;
+      }
+      if (tid == 0) {
+        gidx = midx;
+        if (midx >= 0) {
+          sel[k] = midx;
+          num[k] = sigv[midx];  // same expf expression as the oracle recompute
+        } else {
+          stop_k = k;
+        }
+      }
+    }
+    __syncthreads();
+    if (gidx < 0) {
+      break;
+    }
+    if (tid == gidx) {
+      alive = false;  // per-index mask; equal-valued peers stay eligible
+    }
+  }
+  if (tid == 0) {
+    const int total = stop_k >= 0 ? stop_k : top_k;
     float sum = 0.0F;
     for (int k = 0; k < total; ++k) {
       sum += num[k];
