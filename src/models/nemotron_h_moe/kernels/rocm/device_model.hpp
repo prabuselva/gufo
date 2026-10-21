@@ -140,6 +140,8 @@ private:
   // Activation scratch, one row per prefill chunk token.
   float* x_{nullptr};
   float* normed_{nullptr};
+  // Shared Q8_1(D4) staging of normed_ for the wide dense projections.
+  void* normed_q8_{nullptr};
   float* out_{nullptr};
   float* logits_{nullptr};
   std::int32_t* tok_dev_{nullptr};

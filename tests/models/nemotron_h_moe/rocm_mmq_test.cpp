@@ -196,6 +196,66 @@ bool RunFormat(int kind, const char* fmt) {
     }
   }
 
+  // Shared pre-quantized activations must be bit-identical to the per-call
+  // quantize of the *_dense entries (same kernel, same input bytes).
+  for (const int rows : {64, 256}) {
+    for (const int tokens : {16, 32}) {
+      auto bytes = MakeWeightBytes(kind, cols, rows, seed ^ 9);
+      auto x =
+          MakeValues(static_cast<std::size_t>(tokens) * cols, seed ^ 6, 1.0F);
+      HipBuffer<std::uint8_t> w_dev(bytes.size());
+      HipBuffer<float> x_dev(x.size());
+      HipBuffer<float> out_dev(static_cast<std::size_t>(rows) * tokens);
+      HipBuffer<float> preq_dev(static_cast<std::size_t>(rows) * tokens);
+      HipBuffer<std::uint8_t> xq8_dev(nmb_mmq_dense_q8_1_bytes(tokens, cols));
+      Upload(w_dev.get(), bytes.data(), bytes.size());
+      Upload(&x_dev, x);
+      int rc =
+          kind == 0
+              ? nmb_mmq_iq2_xxs_dense(w_dev.get(), x_dev.get(), out_dev.get(),
+                                      rows, tokens, cols, nullptr)
+          : kind == 1
+              ? nmb_mmq_nvfp4_dense(w_dev.get(), x_dev.get(), out_dev.get(),
+                                    rows, tokens, cols, nullptr)
+              : nmb_mmq_q8_0_dense(w_dev.get(), x_dev.get(), out_dev.get(),
+                                   rows, tokens, cols, nullptr);
+      if (rc != 0) {
+        std::printf("dense %-4s rows=%d N=%d failed rc=%d\n", fmt, rows, tokens,
+                    rc);
+        ok = false;
+        continue;
+      }
+      rc = nmb_mmq_dense_q8_1_quantize(x_dev.get(), xq8_dev.get(), tokens, cols,
+                                       nullptr);
+      if (rc == 0) {
+        rc = kind == 0 ? nmb_mmq_iq2_xxs_dense_preq(w_dev.get(), xq8_dev.get(),
+                                                    preq_dev.get(), rows,
+                                                    tokens, cols, nullptr)
+             : kind == 1 ? nmb_mmq_nvfp4_dense_preq(w_dev.get(), xq8_dev.get(),
+                                                    preq_dev.get(), rows,
+                                                    tokens, cols, nullptr)
+                         : nmb_mmq_q8_0_dense_preq(w_dev.get(), xq8_dev.get(),
+                                                   preq_dev.get(), rows, tokens,
+                                                   cols, nullptr);
+      }
+      char name[96];
+      std::snprintf(name, sizeof name, "dense(preq) %s rows=%-3d N=%d", fmt,
+                    rows, tokens);
+      if (rc != 0) {
+        std::printf("%-44s FAIL rc=%d\n", name, rc);
+        ok = false;
+        continue;
+      }
+      const auto ref = Download(&out_dev);
+      const auto got = Download(&preq_dev);
+      const bool bits =
+          ref.size() == got.size() &&
+          std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) == 0;
+      std::printf("%-44s %s\n", name, bits ? "PASS" : "FAIL");
+      ok = bits && ok;
+    }
+  }
+
   // Routed vector tier: one selected expert per token from a stack of four.
   for (const int tokens : {1, 3, 4}) {
     constexpr int kRows = 192;

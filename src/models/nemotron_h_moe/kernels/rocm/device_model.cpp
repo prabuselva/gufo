@@ -225,6 +225,16 @@ bool DeviceModel::Init(std::string* error_msg) {
                    nrow(1) * sizeof(std::int32_t)) == hipSuccess;
     scratch_bytes_ += (nrow(top_k) + nrow(1)) * sizeof(std::int32_t);
   }
+  if (ok) {
+    const size_t q8_bytes = nmb_mmq_dense_q8_1_bytes(t, static_cast<int>(hid));
+    ok = hipMalloc(reinterpret_cast<void**>(&normed_q8_), q8_bytes) ==
+         hipSuccess;
+    if (ok) {
+      scratch_bytes_ += q8_bytes;
+    } else {
+      Fail(error_msg, "scratch alloc normed_q8");
+    }
+  }
   if (!ok) {
     if (error_msg != nullptr && error_msg->empty()) {
       *error_msg = "scratch alloc failed";
@@ -272,6 +282,8 @@ void DeviceModel::Free() {
   freelist(output_norm_);
   freelist(x_);
   freelist(normed_);
+  freelist(normed_q8_);
+  normed_q8_ = nullptr;
   freelist(out_);
   freelist(logits_);
   freelist(tok_dev_);
@@ -321,8 +333,9 @@ void DeviceModel::PassMamba(const LayerDev& l, int t, hipStream_t stream) {
   const std::uint32_t proj = c_.SsmInProj();
   const bool wide = t >= static_cast<int>(kRowsBatchMin);
   if (wide) {
-    (void)nmb_mmq_nvfp4_dense(l.ssm_in, normed_, zxbc_, static_cast<int>(proj),
-                              t, static_cast<int>(c_.hidden_size), stream);
+    (void)nmb_mmq_nvfp4_dense_preq(l.ssm_in, normed_q8_, zxbc_,
+                                   static_cast<int>(proj), t,
+                                   static_cast<int>(c_.hidden_size), stream);
   } else {
     nbl_gemv_nvfp4_f32(normed_, l.ssm_in, zxbc_, static_cast<int>(proj),
                        static_cast<int>(c_.hidden_size), t, stream);
@@ -364,10 +377,11 @@ void DeviceModel::PassAttn(const LayerDev& l, int t, hipStream_t stream) {
   const int hdv = static_cast<int>(c_.head_dim_v);
   const bool wide = t >= static_cast<int>(kRowsBatchMin);
   if (wide) {
-    (void)nmb_mmq_q8_0_dense(
-        l.q, normed_, q_, static_cast<int>(c_.AttentionQDim()), t, hid, stream);
-    (void)nmb_mmq_q8_0_dense(l.k, normed_, k_, kvdim, t, hid, stream);
-    (void)nmb_mmq_q8_0_dense(l.v, normed_, v_, kvdim, t, hid, stream);
+    (void)nmb_mmq_q8_0_dense_preq(l.q, normed_q8_, q_,
+                                  static_cast<int>(c_.AttentionQDim()), t, hid,
+                                  stream);
+    (void)nmb_mmq_q8_0_dense_preq(l.k, normed_q8_, k_, kvdim, t, hid, stream);
+    (void)nmb_mmq_q8_0_dense_preq(l.v, normed_q8_, v_, kvdim, t, hid, stream);
   } else {
     nbl_gemv_f32(kNblGemvQ8_0, l.q, normed_, q_,
                  static_cast<int>(c_.AttentionQDim()), hid, t, stream);
@@ -400,8 +414,8 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
              c_.expert_weights_norm ? 1 : 0, c_.expert_weights_scale, t, ids_,
              moe_w_, stream);
   if (wide) {
-    (void)nmb_mmq_q8_0_dense(l.latent_down, normed_, lat_, latent, t, hid,
-                             stream);
+    (void)nmb_mmq_q8_0_dense_preq(l.latent_down, normed_q8_, lat_, latent, t,
+                                  hid, stream);
   } else {
     nbl_gemv_f32(kNblGemvQ8_0, l.latent_down, normed_, lat_, latent, hid, t,
                  stream);
@@ -432,9 +446,9 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
     nbl_gemv_f32(kNblGemvQ8_0, l.latent_up, acc_, moe_, hid, latent, t, stream);
   }
   if (wide) {
-    (void)nmb_mmq_iq2_xxs_dense(l.up_shexp, normed_, sh_,
-                                static_cast<int>(c_.shared_expert_ff), t, hid,
-                                stream);
+    (void)nmb_mmq_iq2_xxs_dense_preq(l.up_shexp, normed_q8_, sh_,
+                                     static_cast<int>(c_.shared_expert_ff), t,
+                                     hid, stream);
   } else {
     nbl_gemv_f32(kNblGemvIq2Xxs, l.up_shexp, normed_, sh_,
                  static_cast<int>(c_.shared_expert_ff), hid, t, stream);
@@ -464,6 +478,12 @@ bool DeviceModel::ForwardLayers(int t, bool with_dump, std::string* error_msg) {
     }
     nbl_rms_norm(x_, static_cast<const float*>(ld.norm), normed_, t,
                  static_cast<int>(hid), c_.rms_eps, nullptr);
+    if (t >= static_cast<int>(kRowsBatchMin)) {
+      if (nmb_mmq_dense_q8_1_quantize(normed_, normed_q8_, t,
+                                      static_cast<int>(hid), nullptr) != 0) {
+        return Fail(error_msg, "shared activation quantize failed");
+      }
+    }
     switch (ld.kind) {
       case Config::LayerKind::kMamba:
         PassMamba(ld, t, nullptr);

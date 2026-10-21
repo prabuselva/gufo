@@ -89,11 +89,15 @@ ggml_backend_hip_context* get_ctx_for_device(int device) {
   return cached[device].get();
 }
 
+// X_q8 optionally holds the rows of X_f32 already in the D4 activation
+// layout produced by nmb_mmq_dense_q8_1_quantize; all dense weight types use
+// that same layout (mmq_get_q8_1_ds_layout), so sharing one staging buffer
+// across projections on the same activation tensor is bit-identical.
 template<ggml_type type>
 int nmb_mmq_dense_impl(const char* tag, const void* W, const float* X_f32,
-                       float* out_f32, int M, int N, int K,
+                       const void* X_q8, float* out_f32, int M, int N, int K,
                        hipStream_t stream) {
-  if (!W || !X_f32 || !out_f32) {
+  if (!W || (!X_f32 && !X_q8) || !out_f32) {
     fprintf(stderr, "%s: null pointer\n", tag);
     return -1;
   }
@@ -127,16 +131,20 @@ int nmb_mmq_dense_impl(const char* tag, const void* W, const float* X_f32,
       ne13 * ne12 * ne11 * ne10_padded * y_block_size / y_values_per_block +
       get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
 
-  ggml_hip_pool_alloc<char> src1_q8_1_pool(ctx->pool(), nbytes_src1_q8_1);
-  char* src1_q8_1 = src1_q8_1_pool.get();
+  const char* src1_q8_1 = static_cast<const char*>(X_q8);
+  hipError_t err = hipSuccess;
+  if (src1_q8_1 == nullptr) {
+    ggml_hip_pool_alloc<char> src1_q8_1_pool(ctx->pool(), nbytes_src1_q8_1);
+    src1_q8_1 = src1_q8_1_pool.get();
 
-  quantize_mmq_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1, type, K, (int64_t)K,
-                        0, 0, ne10_padded, ne11, ne12, ne13, stream);
+    quantize_mmq_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1, type, K, (int64_t)K,
+                          0, 0, ne10_padded, ne11, ne12, ne13, stream);
 
-  hipError_t err = hipGetLastError();
-  if (err != hipSuccess) {
-    fprintf(stderr, "%s: quantize failed: %s\n", tag, hipGetErrorString(err));
-    return -2;
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "%s: quantize failed: %s\n", tag, hipGetErrorString(err));
+      return -2;
+    }
   }
 
   const int64_t blck = ggml_blck_size(type);
@@ -193,20 +201,64 @@ int nmb_mmq_dense_impl(const char* tag, const void* W, const float* X_f32,
 
 extern "C" int nmb_mmq_q8_0_dense(const void* W, const float* X, float* out,
                                   int M, int N, int K, hipStream_t stream) {
-  return nmb_mmq_dense_impl<GGML_TYPE_Q8_0>("nmb_mmq_q8_0_dense", W, X, out, M,
-                                            N, K, stream);
+  return nmb_mmq_dense_impl<GGML_TYPE_Q8_0>("nmb_mmq_q8_0_dense", W, X, nullptr,
+                                            out, M, N, K, stream);
+}
+
+extern "C" int nmb_mmq_q8_0_dense_preq(const void* W, const void* X_q8,
+                                       float* out, int M, int N, int K,
+                                       hipStream_t stream) {
+  return nmb_mmq_dense_impl<GGML_TYPE_Q8_0>(
+      "nmb_mmq_q8_0_dense_preq", W, nullptr, X_q8, out, M, N, K, stream);
 }
 
 extern "C" int nmb_mmq_nvfp4_dense(const void* W, const float* X, float* out,
                                    int M, int N, int K, hipStream_t stream) {
-  return nmb_mmq_dense_impl<GGML_TYPE_NVFP4>("nmb_mmq_nvfp4_dense", W, X, out,
-                                             M, N, K, stream);
+  return nmb_mmq_dense_impl<GGML_TYPE_NVFP4>("nmb_mmq_nvfp4_dense", W, X,
+                                             nullptr, out, M, N, K, stream);
+}
+
+extern "C" int nmb_mmq_nvfp4_dense_preq(const void* W, const void* X_q8,
+                                        float* out, int M, int N, int K,
+                                        hipStream_t stream) {
+  return nmb_mmq_dense_impl<GGML_TYPE_NVFP4>(
+      "nmb_mmq_nvfp4_dense_preq", W, nullptr, X_q8, out, M, N, K, stream);
 }
 
 extern "C" int nmb_mmq_iq2_xxs_dense(const void* W, const float* X, float* out,
                                      int M, int N, int K, hipStream_t stream) {
   return nmb_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("nmb_mmq_iq2_xxs_dense", W, X,
-                                               out, M, N, K, stream);
+                                               nullptr, out, M, N, K, stream);
+}
+
+extern "C" int nmb_mmq_iq2_xxs_dense_preq(const void* W, const void* X_q8,
+                                          float* out, int M, int N, int K,
+                                          hipStream_t stream) {
+  return nmb_mmq_dense_impl<GGML_TYPE_IQ2_XXS>(
+      "nmb_mmq_iq2_xxs_dense_preq", W, nullptr, X_q8, out, M, N, K, stream);
+}
+
+extern "C" size_t nmb_mmq_dense_q8_1_bytes(int rows, int K) {
+  if (rows <= 0 || K <= 0 || K % 32 != 0) {
+    return 0;
+  }
+  const int cc = ggml_hip_info().devices[ggml_hip_get_device()].cc;
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  return (size_t)rows * ne10_padded * sizeof(block_q8_1_mmq) / (4 * QK8_1) +
+         (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+}
+
+extern "C" int nmb_mmq_dense_q8_1_quantize(const float* X, void* X_q8, int rows,
+                                           int K, hipStream_t stream) {
+  if (!X || !X_q8 || rows <= 0 || K <= 0 || K % 32 != 0) {
+    fprintf(stderr, "nmb_mmq_dense_q8_1_quantize: bad arguments rows=%d K=%d\n",
+            rows, K);
+    return -1;
+  }
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  quantize_mmq_q8_1_hip(X, nullptr, X_q8, GGML_TYPE_Q8_0, K, (int64_t)K, 0, 0,
+                        ne10_padded, rows, 1, 1, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
 // Decodes X to Q8_1 and runs the MMVQ vector tier with a single expert of

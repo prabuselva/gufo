@@ -23,6 +23,27 @@ int nmb_mmq_iq2_xxs_dense(const void* W_iq2_xxs, const float* X_f32,
                           float* out_f32, int M, int N, int K,
                           hipStream_t stream);
 
+// Staging for N_token rows of a shared [rows, K] activation: quantize once
+// into nmb_mmq_dense_q8_1_bytes(rows, K) and feed any *_dense_preq entry.
+// Dense weight types all use the same activation layout, so a pre-quantized
+// buffer is bit-identical to the per-call quantize of the *_dense entries.
+size_t nmb_mmq_dense_q8_1_bytes(int rows, int K);
+
+int nmb_mmq_dense_q8_1_quantize(const float* X_f32, void* X_q8, int rows, int K,
+                                hipStream_t stream);
+
+int nmb_mmq_q8_0_dense_preq(const void* W_q8_0, const void* X_q8,
+                            float* out_f32, int M, int N, int K,
+                            hipStream_t stream);
+
+int nmb_mmq_nvfp4_dense_preq(const void* W_nvfp4, const void* X_q8,
+                             float* out_f32, int M, int N, int K,
+                             hipStream_t stream);
+
+int nmb_mmq_iq2_xxs_dense_preq(const void* W_iq2_xxs, const void* X_q8,
+                               float* out_f32, int M, int N, int K,
+                               hipStream_t stream);
+
 int nmb_mmq_nvfp4_dense_vec(const void* W_nvfp4, const float* X_f32,
                             float* out_f32, int M, int N, int K,
                             hipStream_t stream);
