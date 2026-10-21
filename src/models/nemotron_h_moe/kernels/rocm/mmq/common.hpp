@@ -553,7 +553,12 @@ static __device__ __forceinline__ int ggml_hip_dp4a(const int a, const int b,
                                                     int c) {
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
   c = __builtin_amdgcn_sdot4(a, b, c, false);
-#elif defined(RDNA3) || defined(RDNA4)
+#elif defined(RDNA3) || defined(RDNA4) || defined(__GFX11__)
+  // Vendored fix: the upstream build passes bare -DRDNA3; this build selects
+  // the target only through --offload-arch=gfx1151, whose device predefines
+  // (__GFX11__/__gfx1151__) left the scalar emulation branch active for every
+  // MMQ/MMVQ dot. V_SUDOT4 (signed x signed) is bit-identical to the int8x4
+  // emulation, verified over 4M random words incl. 0x80 sign-byte edges.
   c = __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #elif defined(RDNA1) || defined(__gfx900__)
   int tmp1;
