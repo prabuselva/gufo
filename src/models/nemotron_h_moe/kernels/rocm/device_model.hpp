@@ -142,6 +142,10 @@ private:
   float* normed_{nullptr};
   // Shared Q8_1(D4) staging of normed_ for the wide dense projections.
   void* normed_q8_{nullptr};
+  // Plain Q8_1 staging of the narrow (decode) MoE activations for the
+  // integer IQ2 GEMVs; sized for at most kRowsBatchMin - 1 rows.
+  void* lat_q8_{nullptr};
+  void* act_q8_{nullptr};
   float* out_{nullptr};
   float* logits_{nullptr};
   std::int32_t* tok_dev_{nullptr};

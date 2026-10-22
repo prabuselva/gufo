@@ -47,13 +47,21 @@ enum NblGemvType {
   kNblGemvF32 = 0,
   kNblGemvQ8_0 = 1,
   kNblGemvIq2Xxs = 2,
-  kNblGemvNvfp4 = 3
+  kNblGemvNvfp4 = 3,
+  kNblGemvIq2XxsQ8_1 = 4
 };
 
-/// F32-activation GEMV on dequantized weights of the given encoding:
-/// out[t][n] = dot(x[t][k], w[n]) for `tokens` rows of x. Activations stay
-/// exact f32, matching the oracle; Q8_1-quantized activations are far too
-/// lossy end to end.
+/// Quantize `elems` (multiple of 32) contiguous f32 values into Q8_1 blocks
+/// (36 bytes per 32 elements: half2 (d, sum) followed by int8 qs[32]).
+int nbl_quantize_q8_1(const float* x, void* xq, int64_t elems,
+                      hipStream_t stream);
+
+/// GEMV on dequantized weights of the given encoding:
+/// out[t][n] = dot(x[t][k], w[n]) for `tokens` rows of x. Types 0/1/2/3 read
+/// exact f32 activations. kNblGemvIq2XxsQ8_1 pre-quantizes activations with
+/// nbl_quantize_q8_1 (pass the xq buffer cast to const float*) and evaluates
+/// the IQ2_XXS dot with integer dot4 instructions; per-GEMV relative error is
+/// ~0.5%, within the device_step margin.
 int nbl_gemv_f32(int type, const void* w, const float* x, float* out, int n_out,
                  int k, int tokens, hipStream_t stream);
 

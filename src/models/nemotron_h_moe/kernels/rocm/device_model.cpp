@@ -235,6 +235,28 @@ bool DeviceModel::Init(std::string* error_msg) {
       Fail(error_msg, "scratch alloc normed_q8");
     }
   }
+  if (ok) {
+    // Plain Q8_1 is 36 bytes per 32 values; the narrow iq2-integer arms see
+    // at most kRowsBatchMin - 1 rows.
+    constexpr std::size_t kQ8_1Elems = 32U;
+    constexpr std::size_t kQ8_1Block = 36U;
+    const std::size_t rows = kRowsBatchMin;
+    const auto q8_bytes = [rows](std::size_t elems) {
+      return rows * elems / kQ8_1Elems * kQ8_1Block;
+    };
+    ok =
+        hipMalloc(&lat_q8_, q8_bytes(latent)) == hipSuccess &&
+        hipMalloc(&act_q8_,
+                  q8_bytes(top_k * static_cast<std::size_t>(max_expert_ff_))) ==
+            hipSuccess;
+    if (ok) {
+      scratch_bytes_ +=
+          q8_bytes(latent) +
+          q8_bytes(top_k * static_cast<std::size_t>(max_expert_ff_));
+    } else {
+      Fail(error_msg, "scratch alloc moe q8");
+    }
+  }
   if (!ok) {
     if (error_msg != nullptr && error_msg->empty()) {
       *error_msg = "scratch alloc failed";
@@ -304,6 +326,10 @@ void DeviceModel::Free() {
   freelist(acc_);
   freelist(moe_);
   freelist(sh_);
+  freelist(lat_q8_);
+  lat_q8_ = nullptr;
+  freelist(act_q8_);
+  act_q8_ = nullptr;
   token_embd_ = nullptr;
   output_ = nullptr;
   weight_bytes_ = 0;
@@ -424,8 +450,12 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
     (void)nmb_mmq_iq2_xxs_moe_raw(l.up_exps, lat_, ids_, up_out_, expert_ff,
                                   latent, t, n_exp, top_k, stream);
   } else {
-    nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.up_exps, lat_, ids_, up_out_, expert_ff,
-                     latent, top_k, 0, t, stream);
+    // Decode keeps the integer IQ2 path: quantize the shared latent once
+    // and run all four iq2 GEMVs with dot4 (probe 1.44x-1.80x, rel <= 0.0063).
+    nbl_quantize_q8_1(lat_, lat_q8_, static_cast<int64_t>(t) * latent, stream);
+    nbl_gemv_moe_f32(kNblGemvIq2XxsQ8_1, l.up_exps,
+                     reinterpret_cast<const float*>(lat_q8_), ids_, up_out_,
+                     expert_ff, latent, top_k, 0, t, stream);
   }
   if (wide) {
     // SqReLU is folded into the down-projection activation quantize
@@ -436,8 +466,11 @@ void DeviceModel::PassMoe(const LayerDev& l, int t, hipStream_t stream) {
   } else {
     nbl_relu_sqr(up_out_, act_, static_cast<int64_t>(t) * top_k * expert_ff,
                  stream);
-    nbl_gemv_moe_f32(kNblGemvIq2Xxs, l.down_exps, act_, ids_, down_out_, latent,
-                     expert_ff, top_k, expert_ff, t, stream);
+    nbl_quantize_q8_1(act_, act_q8_,
+                      static_cast<int64_t>(t) * top_k * expert_ff, stream);
+    nbl_gemv_moe_f32(kNblGemvIq2XxsQ8_1, l.down_exps,
+                     reinterpret_cast<const float*>(act_q8_), ids_, down_out_,
+                     latent, expert_ff, top_k, expert_ff, t, stream);
   }
   nbl_moe_combine(acc_, down_out_, moe_w_, latent, top_k, t, stream);
   if (wide) {

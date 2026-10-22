@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <random>
+#include <span>
 #include <vector>
 
 #include "src/models/nemotron_h_moe/cpu_ops.hpp"
@@ -266,6 +268,202 @@ bool RunMoeCombine() {
   return ok;
 }
 
+float F16ToF32(std::uint16_t h) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16;
+  const std::uint32_t exp = (h >> 10) & 0x1FU;
+  const std::uint32_t man = h & 0x3FFU;
+  if (exp == 0U) {
+    const float val = static_cast<float>(man) / 1024.0F * (1.0F / 16384.0F);
+    return sign != 0U ? -val : val;
+  }
+  const std::uint32_t bits = sign | ((exp - 15U + 127U) << 23) | (man << 13);
+  float out = 0.0F;
+  std::memcpy(&out, &bits, sizeof out);
+  return out;
+}
+
+// Q8_1 staging: block scale must be amax / 127 (in f16), the codes must
+// reconstruct every value within half a quantum, the stored sum must match
+// sum(qs) within one f16 ulp, and the amax element must saturate.
+bool RunQuantQ8_1() {
+  bool ok = true;
+  std::uint32_t seed = 0x08E1u;
+  for (const int n : {32, 1024, 5376}) {
+    auto x = MakeValues(static_cast<std::size_t>(n), seed++, 1.0F);
+    HipBuffer<float> x_dev(x.size());
+    HipBuffer<std::uint8_t> q_dev(static_cast<std::size_t>(n) / 32 * 36);
+    Upload(&x_dev, x);
+    if (nbl_quantize_q8_1(x_dev.get(), q_dev.get(), n, nullptr) != 0) {
+      std::printf("quant_q8_1 n=%d rc!=0\n", n);
+      return false;
+    }
+    const std::vector<std::uint8_t> q = Download(&q_dev);
+    bool block_ok = true;
+    for (int b = 0; b < n / 32; ++b) {
+      const std::uint8_t* blk = q.data() + static_cast<std::size_t>(b) * 36;
+      std::uint16_t dh = 0;
+      std::uint16_t sh = 0;
+      std::memcpy(&dh, blk, 2);
+      std::memcpy(&sh, blk + 2, 2);
+      const float d = F16ToF32(dh);
+      int sum = 0;
+      int amax_idx = 0;
+      float amax = 0.0F;
+      for (int j = 0; j < 32; ++j) {
+        const float v = x[static_cast<std::size_t>(b) * 32 + j];
+        if (std::abs(v) > amax) {
+          amax = std::abs(v);
+          amax_idx = j;
+        }
+        const std::int8_t qv = static_cast<std::int8_t>(blk[4 + j]);
+        sum += qv;
+        // Reconstruction must stay within half a quantum (0.5), plus the
+        // scale's f16 rounding propagated through q (<=127*2^-11 = 0.062)
+        // and the float product rounding: 0.513 -> 0.58 with margin.
+        if (std::abs(static_cast<double>(v) - static_cast<double>(d) * qv) >
+            std::abs(static_cast<double>(d)) * 0.58) {
+          block_ok = false;
+        }
+      }
+      const double sat = std::abs(
+          static_cast<double>(x[static_cast<std::size_t>(b) * 32 + amax_idx]) -
+          d * static_cast<double>(static_cast<std::int8_t>(blk[4 + amax_idx])));
+      if (sat > std::abs(static_cast<double>(d)) *
+                    1.02) {  // amax element must saturate to +-127
+        block_ok = false;
+      }
+      const float sum_f = F16ToF32(sh);
+      const double sum_tol =
+          std::max(1e-3, std::abs(static_cast<double>(sum)) * 9.8e-4);
+      if (std::abs(static_cast<double>(sum_f) - sum) > sum_tol) {
+        block_ok = false;
+      }
+    }
+    char name[64];
+    std::snprintf(name, sizeof name, "quant_q8_1 n=%d", n);
+    if (!block_ok) {
+      std::printf("%-36s FAIL  quantize bound mismatch\n", name);
+      g_fail = name;
+      ok = false;
+    } else {
+      Report(name, 0.0, 0.0);
+    }
+  }
+  return ok;
+}
+
+// IQ2_XXS x Q8_1 integer GEMV versus the CPU oracle (dequantized rows,
+// double accumulation) on the exact activation values fed to the kernel.
+bool RunGemvIq2Q8() {
+  constexpr int kRowsTokens = 3;
+  bool ok = true;
+  namespace cpu = gufo::models::nemotron_h_moe::cpu;
+  std::uint32_t seed = 0x102Du;
+  struct GemvCase {
+    int n_out;
+    int k;
+    int experts;
+    int slots;
+    int stride;  // 0 = one k-vector shared across slots
+  };
+  const GemvCase cases[] = {{256, 256, 4, 1, 0},
+                            {768, 512, 4, 1, 0},
+                            {1536, 1024, 4, 2, 0},
+                            {1024, 512, 4, 2, 512},
+                            {256, 1024, 4, 2, 1024}};
+  for (const GemvCase& gc : cases) {
+    const int n_out = gc.n_out;
+    const int k = gc.k;
+    const int experts = gc.experts;
+    const int slots = gc.slots;
+    const int stride = gc.stride;
+    const int rows_per_token = stride > 0 ? slots : 1;
+    const std::size_t x_elems =
+        static_cast<std::size_t>(kRowsTokens) * rows_per_token * k;
+    const std::size_t w_rows = static_cast<std::size_t>(experts) * n_out;
+    const std::size_t w_bytes =
+        w_rows * (static_cast<std::size_t>(k) / 256 * 66);
+    auto w = MakeBytes(w_bytes, seed++);
+    // Keep the f16 block scales normal (+-(0.25..2)) so random codewords
+    // dequantize to finite values.
+    for (std::size_t off = 0; off < w_bytes; off += 66) {
+      w[off] = static_cast<std::uint8_t>(0x00 | (seed++ & 0x3FU) << 2);
+      w[off + 1] = static_cast<std::uint8_t>(0x3E | ((seed++ & 1U) << 7));
+    }
+    auto x = MakeValues(x_elems, seed++, 1.0F);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kRowsTokens) *
+                                  slots);
+    for (auto& id : ids) {
+      id = static_cast<std::int32_t>(seed++ %
+                                     static_cast<std::uint32_t>(experts));
+    }
+    TensorRef wt;
+    wt.data = w.data();
+    wt.type = gufo::core::GgmlType::kIQ2_XXS;
+    wt.cols = static_cast<std::uint64_t>(k);
+    wt.rows = static_cast<std::uint64_t>(n_out);
+    wt.experts = static_cast<std::uint64_t>(experts);
+    std::vector<float> reference(static_cast<std::size_t>(kRowsTokens) * slots *
+                                 n_out);
+    std::vector<float> y(n_out);
+    for (int t = 0; t < kRowsTokens; ++t) {
+      for (int s = 0; s < slots; ++s) {
+        const std::size_t xb =
+            static_cast<std::size_t>(t) * rows_per_token * k +
+            (stride > 0 ? static_cast<std::size_t>(s) * k : 0U);
+        std::span<const float> xv(x.data() + xb, static_cast<std::size_t>(k));
+        // The non-MoE entry point ignores ids (row `row` of expert 0 is
+        // the weight); the MoE one gathers through ids[t * slots + s].
+        const std::uint64_t expert =
+            slots > 1 ? static_cast<std::uint64_t>(
+                            ids[static_cast<std::size_t>(t) * slots + s])
+                      : 0U;
+        cpu::MatVec(
+            wt, expert, xv,
+            std::span<float>(y.data(), static_cast<std::size_t>(n_out)));
+        std::copy(y.begin(), y.end(),
+                  reference.begin() +
+                      static_cast<std::ptrdiff_t>(
+                          (static_cast<std::size_t>(t) * slots + s) * n_out));
+      }
+    }
+    HipBuffer<float> x_dev(x.size());
+    HipBuffer<std::uint8_t> w_dev(w.size());
+    HipBuffer<std::uint8_t> xq_dev(x_elems / 32 * 36);
+    HipBuffer<std::int32_t> ids_dev(ids.size());
+    HipBuffer<float> out_dev(reference.size());
+    Upload(&x_dev, x);
+    Upload(w_dev.get(), w.data(), w.size());
+    Upload(ids_dev.get(), ids.data(), ids.size() * sizeof(std::int32_t));
+    if (nbl_quantize_q8_1(x_dev.get(), xq_dev.get(),
+                          static_cast<std::int64_t>(x_elems), nullptr) != 0) {
+      std::printf("gemv_iq2_q8 n=%d k=%d quantize rc!=0\n", n_out, k);
+      return false;
+    }
+    int rc = 0;
+    if (slots > 1) {
+      rc = nbl_gemv_moe_f32(kNblGemvIq2XxsQ8_1, w_dev.get(),
+                            reinterpret_cast<const float*>(xq_dev.get()),
+                            ids_dev.get(), out_dev.get(), n_out, k, slots,
+                            stride, kRowsTokens, nullptr);
+    } else {
+      rc = nbl_gemv_f32(kNblGemvIq2XxsQ8_1, w_dev.get(),
+                        reinterpret_cast<const float*>(xq_dev.get()),
+                        out_dev.get(), n_out, k, kRowsTokens, nullptr);
+    }
+    if (rc != 0) {
+      std::printf("gemv_iq2_q8 n=%d k=%d rc=%d\n", n_out, k, rc);
+      return false;
+    }
+    char name[64];
+    std::snprintf(name, sizeof name, "gemv_iq2_q8 n=%-4d k=%-4d s=%d", n_out, k,
+                  slots);
+    const std::vector<float> got = Download(&out_dev);
+    ok = Check(name, WorstRel(reference, got), 0.02) && ok;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -275,6 +473,8 @@ int main() {
   ok = RunDequantRow() && ok;
   ok = RunRouter(0xB0BAu) && ok;
   ok = RunMoeCombine() && ok;
+  ok = RunQuantQ8_1() && ok;
+  ok = RunGemvIq2Q8() && ok;
   if (ok) {
     std::printf("rocm_ops: ALL PASS\n");
   } else {

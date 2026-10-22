@@ -427,6 +427,39 @@ constexpr int kIq2Sub = 32;     // 8 B of codes per 32-value sub-block
 
 __device__ __constant__ uint64_t cIq2Grid[256];
 __device__ __constant__ uint8_t cIq2Signs[128];
+// [aux] -> XOR of the grid word with its byte-negated word. With the
+// 0xFF-byte sign-mask table below, the signed grid word is R = G ^ (m & X):
+// a byte-lane select of g and -g with no per-lane subtraction or carry.
+__device__ __constant__ uint64_t cIq2Xor[256];
+// [7-bit sign index] -> {byte i = 0xFF iff element i (i=0..3) flips,
+//                        byte i = 0xFF iff element i+4 flips}: spreads the
+// packed uint8 sign bits of kSignsIq2Xs for the XOR-negate grid trick.
+__device__ __constant__ uint2 cIq2SignMasks[128];
+
+// ggml block_q8_1: half2 (d, sum) followed by 32 int8 values. Produced by
+// nbl_quantize_q8_1 for the kNblGemvIq2XxsQ8_1 GEMV.
+struct NblQ8_1 {
+  __half2 ds;
+  int8_t qs[kIq2Sub];
+};
+static_assert(sizeof(NblQ8_1) == kIq2Sub + 4, "q8_1 block must be 36 bytes");
+
+// Signed int8x4 dot via the native unsigned byte dot; the compiler inserts
+// the sign fix-ups for the signed operands (on gfx1151 this lowers to
+// v_dot4_i32_iu8, matching the vendored mmq iq2 path).
+__device__ __forceinline__ int Dp4a(int a, int b, int c) {
+#if defined(__GFX11__)
+  return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+  const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
+  const int8_t* pb = reinterpret_cast<const int8_t*>(&b);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    c += static_cast<int>(pa[i]) * static_cast<int>(pb[i]);
+  }
+  return c;
+#endif
+}
 
 __device__ __forceinline__ float BlockReduceSum(float acc) {
   for (int off = warpSize / 2; off > 0; off >>= 1) {
@@ -533,6 +566,41 @@ __device__ __forceinline__ float GemvChunkDot(const uint8_t* __restrict__ w,
     }
   }
   return acc;
+}
+
+// IQ2_XXS x Q8_1 integer chunk dot (llama b11721 vec_dot_iq2_xxs_q8_1 on the
+// production word layout). The signed grid word is built with the XOR blend
+// (cIq2Xor/cIq2SignMasks) and contracted against the quantized activation
+// with dot4 instructions; scale factors apply once per chunk. Probe:
+// tools/bench/nem_decode_iq2_dp4a_bench.hip (1.44x-1.80x on the MoE decode
+// shapes, per-GEMV rel <= 0.0063 vs the float path).
+__device__ __forceinline__ float GemvChunkDotIq2Q8_1(
+    const uint8_t* __restrict__ w, const NblQ8_1* __restrict__ xq, int chunk) {
+  const uint8_t* blk = w + static_cast<int64_t>(chunk / 8) * 66;
+  uint16_t dh = 0;
+  uint32_t aux32[2] = {0, 0};
+  __builtin_memcpy(&dh, blk, sizeof(dh));
+  __builtin_memcpy(aux32, blk + 2 + (chunk % 8) * 8, sizeof(aux32));
+  const float d = __half2float(*reinterpret_cast<__half*>(&dh));
+  const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(aux32);
+  const NblQ8_1* xb = xq + chunk;
+  const float da = __low2float(xb->ds);
+  int sumi = 0;
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+    const uint64_t grid = cIq2Grid[aux8[l]];
+    const uint64_t xw = cIq2Xor[aux8[l]];
+    const uint2 msk = cIq2SignMasks[(aux32[1] >> (7 * l)) & 127];
+    const int lo = static_cast<int>(static_cast<uint32_t>(grid) ^
+                                    (msk.x & static_cast<uint32_t>(xw)));
+    const int hi = static_cast<int>(static_cast<uint32_t>(grid >> 32) ^
+                                    (msk.y & static_cast<uint32_t>(xw >> 32)));
+    const int8_t* q = xb->qs + l * 8;
+    sumi = Dp4a(lo, *reinterpret_cast<const int*>(q), sumi);
+    sumi = Dp4a(hi, *reinterpret_cast<const int*>(q + 4), sumi);
+  }
+  const float db = d * (0.5F + static_cast<float>(aux32[1] >> 28)) * 0.25F;
+  return da * db * static_cast<float>(sumi);
 }
 
 template<int TYPE>
@@ -643,6 +711,100 @@ __global__ void GemvF32PackedKernel(const float* __restrict__ x,
       sum += fold[row_local * 8 + j];
     }
     out[out_row] = sum;
+  }
+}
+
+// Row-packed GEMV for IQ2 weights against nbl_quantize_q8_1 activations.
+// Geometry and fold identical to GemvF32PackedKernel; the activation rows
+// are 36-byte Q8_1 blocks, so x_stride is passed in blocks (not elements)
+// and the shared-token step is k / kIq2Sub blocks.
+__global__ void GemvIq2Q8_1PackedKernel(
+    const NblQ8_1* __restrict__ x, const uint8_t* __restrict__ w,
+    float* __restrict__ out, int n_out, int k, int expert_stride,
+    const int32_t* __restrict__ ids, int slots, int64_t x_stride, int tokens,
+    int warps_per_row, int blocks_per_slot) {
+  const int warp = static_cast<int>(threadIdx.x) / warpSize;
+  const int lane = static_cast<int>(threadIdx.x) % warpSize;
+  const int row_local = warp / warps_per_row;
+  const int warp_in_row = warp % warps_per_row;
+  __shared__ float fold[64];  // [row][fold entry], 8 entries per row
+  if (static_cast<int>(threadIdx.x) < 64) {
+    fold[threadIdx.x] = 0.0F;
+  }
+  __syncthreads();
+  const int gid = static_cast<int>(blockIdx.x);
+  const int slot = gid / blocks_per_slot;
+  const int row = (gid % blocks_per_slot) * (static_cast<int>(blockDim.x) /
+                                             warpSize / warps_per_row) +
+                  row_local;
+  const bool active = (row < n_out);
+  const int token = static_cast<int>(blockIdx.y);
+  float acc = 0.0F;
+  int64_t out_row = 0;
+  if (active) {
+    const NblQ8_1* xr = x;
+    int64_t w_row = row;
+    out_row = static_cast<int64_t>(token) * n_out + row;
+    if (slots > 1) {
+      const int64_t s = static_cast<int64_t>(token) * slots + slot;
+      w_row = static_cast<int64_t>(__ldg(ids + s)) * n_out + row;
+      out_row = s * n_out + row;
+      xr += static_cast<int64_t>(slot) * x_stride;
+    }
+    xr += static_cast<int64_t>(token) *
+          ((slots > 1 && x_stride > 0) ? static_cast<int64_t>(slots) * x_stride
+                                       : static_cast<int64_t>(k) / kIq2Sub);
+    const uint8_t* wr = w + w_row * static_cast<int64_t>(expert_stride);
+    const int c = lane + warpSize * warp_in_row;
+    if (c < k / kIq2Sub) {
+      acc = GemvChunkDotIq2Q8_1(wr, xr, c);
+    }
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(~0ULL, acc, off);
+  }
+  if (lane == 0) {
+    fold[row_local * 8 + warp_in_row] = acc;
+  }
+  __syncthreads();
+  if (active && lane == 0 && warp_in_row == 0) {
+    float sum = 0.0F;
+    for (int j = 0; j < kBlock / warpSize; ++j) {
+      sum += fold[row_local * 8 + j];
+    }
+    out[out_row] = sum;
+  }
+}
+
+// One warp per 32-value sub-block: d = amax / 127, q = round(x / d) (llama
+// quantize_row_q8_1_generic parity), ds packs (d, sum(q)).
+__global__ void QuantQ8_1Kernel(const float* __restrict__ x,
+                                NblQ8_1* __restrict__ q, int64_t sub_blocks) {
+  const int64_t gtid =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t sub = gtid / warpSize;
+  const int lane = static_cast<int>(threadIdx.x) % warpSize;
+  if (sub >= sub_blocks) {
+    return;
+  }
+  const float* xb = x + sub * kIq2Sub;
+  const float v = xb[lane];
+  float a = fabsf(v);
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    a = fmaxf(a, __shfl_xor_sync(~0ULL, a, off));
+  }
+  const float d = a / 127.0F;
+  const float id = a != 0.0F ? 127.0F / a : 0.0F;
+  const int8_t qv = a == 0.0F ? 0 : static_cast<int8_t>(roundf(v * id));
+  int sum = static_cast<int>(qv);
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    sum += __shfl_xor_sync(~0ULL, sum, off);
+  }
+  q[sub].qs[lane] = qv;
+  if (lane == 0) {
+    q[sub].ds = __floats2half2_rn(d, static_cast<float>(sum));
   }
 }
 
@@ -834,6 +996,8 @@ int GemvRowBytes(int type, int k) {
       return k / kQ8_0Elems * kQ8_0Block;
     case kNblGemvIq2Xxs:
       return k / kIq2Elems * 66;
+    case kNblGemvIq2XxsQ8_1:
+      return k / kIq2Elems * 66;
     default:
       return k / kNvfp4K * 36;
   }
@@ -846,6 +1010,8 @@ bool GemvTypeValid(int type, int k) {
     case kNblGemvQ8_0:
       return k % kQ8_0Elems == 0;
     case kNblGemvIq2Xxs:
+      return k % kIq2Elems == 0;
+    case kNblGemvIq2XxsQ8_1:
       return k % kIq2Elems == 0;
     case kNblGemvNvfp4:
       return k % kNvfp4K == 0;
@@ -861,6 +1027,28 @@ void EnsureIq2Tables() {
                             sizeof(cpu::kIq2XxsGrid));
     (void)hipMemcpyToSymbol(cIq2Signs, cpu::kSignsIq2Xs,
                             sizeof(cpu::kSignsIq2Xs));
+    uint64_t xors[256];
+    uint2 masks[128];
+    for (int i = 0; i < 256; ++i) {
+      uint64_t neg = 0;
+      for (int j = 0; j < 8; ++j) {
+        const uint8_t v = static_cast<uint8_t>(cpu::kIq2XxsGrid[i] >> (8 * j));
+        neg |= static_cast<uint64_t>(static_cast<uint8_t>(0u - v)) << (8 * j);
+      }
+      xors[i] = cpu::kIq2XxsGrid[i] ^ neg;
+    }
+    for (int i = 0; i < 128; ++i) {
+      const uint32_t s = cpu::kSignsIq2Xs[i];
+      uint32_t lo = 0;
+      uint32_t hi = 0;
+      for (int j = 0; j < 4; ++j) {
+        lo |= (((s >> j) & 1u) != 0u ? 0xFFu : 0u) << (8 * j);
+        hi |= (((s >> (j + 4)) & 1u) != 0u ? 0xFFu : 0u) << (8 * j);
+      }
+      masks[i] = make_uint2(lo, hi);
+    }
+    (void)hipMemcpyToSymbol(cIq2Xor, xors, sizeof(xors));
+    (void)hipMemcpyToSymbol(cIq2SignMasks, masks, sizeof(masks));
     loaded = true;
   }
 }
@@ -872,6 +1060,8 @@ int GemvChunkHost(int type) {
     case kNblGemvQ8_0:
       return kQ8_0Elems;
     case kNblGemvIq2Xxs:
+      return kIq2Sub;
+    case kNblGemvIq2XxsQ8_1:
       return kIq2Sub;
     default:
       return kNvfp4Sub;
@@ -945,6 +1135,22 @@ int LaunchGemv(int type, const void* w, const float* x, const int32_t* ids,
                                          kMoe ? slots : 0, x_stride, tokens);
       }
       break;
+    case kNblGemvIq2XxsQ8_1: {
+      EnsureIq2Tables();
+      if (!packed) {
+        return -1;  // decode-only path; large-k rows must use kNblGemvIq2Xxs
+      }
+      // x holds nbl_quantize_q8_1 blocks; its row stride is in elements on
+      // this API boundary and in blocks for the kernel.
+      if (x_stride % kIq2Sub != 0) {
+        return -1;
+      }
+      GemvIq2Q8_1PackedKernel<<<grid, block, 0, stream>>>(
+          reinterpret_cast<const NblQ8_1*>(x), wb, out, n_out, k, stride, ids,
+          kMoe ? slots : 0, x_stride / kIq2Sub, tokens, warps_per_row,
+          blocks_per_slot);
+      break;
+    }
     default:
       if (packed) {
         GemvF32PackedKernel<kNblGemvNvfp4><<<grid, block, 0, stream>>>(
@@ -1007,6 +1213,18 @@ extern "C" int nbl_relu_sqr(const float* src, float* dst, int64_t n,
   }
   ReluSqrKernel<<<BlockCount(n), kBlock, 0, stream>>>(src, dst, n);
   return CheckLaunch(hipGetLastError(), "nbl_relu_sqr");
+}
+
+extern "C" int nbl_quantize_q8_1(const float* x, void* xq, int64_t elems,
+                                 hipStream_t stream) {
+  const int warp = DeviceWarpSize();
+  if (!x || !xq || elems <= 0 || elems % kIq2Sub != 0 || warp != kIq2Sub) {
+    return -1;
+  }
+  const int64_t subs = elems / kIq2Sub;
+  QuantQ8_1Kernel<<<BlockCount(subs * warp), kBlock, 0, stream>>>(
+      x, static_cast<NblQ8_1*>(xq), subs);
+  return CheckLaunch(hipGetLastError(), "nbl_quantize_q8_1");
 }
 
 extern "C" int nbl_dequant_row_q8_0(const void* w, int64_t row, int cols,
