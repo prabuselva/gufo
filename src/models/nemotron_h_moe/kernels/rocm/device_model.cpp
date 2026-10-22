@@ -18,6 +18,20 @@ bool Fail(std::string* error_msg, const std::string& msg) {
   return false;
 }
 
+/// The device runs fixed gemv/mmq tiers, so each role only decodes the one
+/// format it was written for. The binder accepts the requantized formats for
+/// the CPU reference; reject them here until a tier exists.
+[[nodiscard]] bool CheckTier(const TensorRef& t, const char* role,
+                             core::GgmlType want, std::string* error_msg) {
+  if (!t.empty() && t.type != want) {
+    return Fail(error_msg, std::string(role) + " '" + std::string(t.name) +
+                               "' needs " + std::string(core::ToString(want)) +
+                               " on the device tier, artifact has " +
+                               std::string(core::ToString(t.type)));
+  }
+  return true;
+}
+
 }  // namespace
 
 DeviceModel::DeviceModel(const ModelWeights& weights, std::uint32_t max_context)
@@ -62,6 +76,11 @@ bool DeviceModel::Init(std::string* error_msg) {
     return Fail(error_msg, "mmq init failed");
   }
   layers_.assign(c_.num_layers, LayerDev{});
+  if (!CheckTier(w_.token_embd, "token_embd", core::GgmlType::kQ8_0,
+                 error_msg) ||
+      !CheckTier(w_.output, "output", core::GgmlType::kQ8_0, error_msg)) {
+    return false;
+  }
   if (hipMalloc(reinterpret_cast<void**>(&token_embd_),
                 w_.token_embd.SizeBytes()) != hipSuccess) {
     return Fail(error_msg, "token_embd alloc");
@@ -103,6 +122,13 @@ bool DeviceModel::Init(std::string* error_msg) {
       case Config::LayerKind::kAttention: {
         ld.kvh = c_.head_count_kv[l];
         ld.kvdim = c_.AttentionKvDim(l);
+        if (!CheckTier(lw.attn_q, "attn_q", core::GgmlType::kQ8_0, error_msg) ||
+            !CheckTier(lw.attn_k, "attn_k", core::GgmlType::kQ8_0, error_msg) ||
+            !CheckTier(lw.attn_v, "attn_v", core::GgmlType::kQ8_0, error_msg) ||
+            !CheckTier(lw.attn_out, "attn_out", core::GgmlType::kQ8_0,
+                       error_msg)) {
+          return false;
+        }
         if (!Upload(&ld.q, lw.attn_q, error_msg) ||
             !Upload(&ld.k, lw.attn_k, error_msg) ||
             !Upload(&ld.v, lw.attn_v, error_msg) ||
@@ -122,6 +148,12 @@ bool DeviceModel::Init(std::string* error_msg) {
         break;
       }
       case Config::LayerKind::kMamba: {
+        if (!CheckTier(lw.ssm_in, "ssm_in", core::GgmlType::kNVFP4,
+                       error_msg) ||
+            !CheckTier(lw.ssm_out, "ssm_out", core::GgmlType::kNVFP4,
+                       error_msg)) {
+          return false;
+        }
         if (!Upload(&ld.ssm_in, lw.ssm_in, error_msg) ||
             !Upload(&ld.ssm_out, lw.ssm_out, error_msg) ||
             !Upload(&ld.conv_w, lw.ssm_conv, error_msg) ||
@@ -169,6 +201,20 @@ bool DeviceModel::Init(std::string* error_msg) {
             std::max(static_cast<std::uint64_t>(max_experts_), lw.n_experts));
         max_expert_ff_ = static_cast<int>(std::max(
             static_cast<std::uint32_t>(max_expert_ff_), c_.ExpertFf(l)));
+        if (!CheckTier(lw.ffn_up_exps, "ffn_up_exps", core::GgmlType::kIQ2_XXS,
+                       error_msg) ||
+            !CheckTier(lw.ffn_down_exps, "ffn_down_exps",
+                       core::GgmlType::kIQ2_XXS, error_msg) ||
+            !CheckTier(lw.ffn_up_shexp, "ffn_up_shexp",
+                       core::GgmlType::kIQ2_XXS, error_msg) ||
+            !CheckTier(lw.ffn_down_shexp, "ffn_down_shexp",
+                       core::GgmlType::kIQ2_XXS, error_msg) ||
+            !CheckTier(lw.ffn_latent_up, "ffn_latent_up", core::GgmlType::kQ8_0,
+                       error_msg) ||
+            !CheckTier(lw.ffn_latent_down, "ffn_latent_down",
+                       core::GgmlType::kQ8_0, error_msg)) {
+          return false;
+        }
         if (!Upload(&ld.router, lw.router, error_msg) ||
             !Upload(&ld.exp_b, lw.exp_probs_b, error_msg) ||
             !Upload(&ld.up_exps, lw.ffn_up_exps, error_msg) ||

@@ -17,7 +17,8 @@ struct Format {
 /// Storage geometry of the formats this artifact carries. Unknown types get
 /// a zero block, which every validation below rejects. NVFP4 = 36 B per
 /// 64-element block (4 UE4M3 sub-scales + 32 B packed E2M1); IQ2_XXS = 66 B
-/// per 256-element block.
+/// per 256-element block. K-quant and IQ4_XS sizes match the vendored
+/// block structs in core/quant/ggml_dequant.hpp (256-element blocks).
 [[nodiscard]] Format FormatOf(GgmlType type) noexcept {
   switch (type) {
     case GgmlType::kF32:
@@ -27,8 +28,16 @@ struct Format {
       return {1, 2};
     case GgmlType::kQ8_0:
       return {32, 34};
+    case GgmlType::kQ4_K:
+      return {256, 144};
+    case GgmlType::kQ5_K:
+      return {256, 176};
+    case GgmlType::kQ6_K:
+      return {256, 210};
     case GgmlType::kIQ2_XXS:
       return {256, 66};
+    case GgmlType::kIQ4_XS:
+      return {256, 136};
     case GgmlType::kNVFP4:
       return {64, 36};
     default:
@@ -133,7 +142,8 @@ struct Binder {
     const std::string p = "blk." + std::to_string(il) + ".";
     const std::uint64_t hidden = c.hidden_size;
     static constexpr auto dense = {GgmlType::kQ8_0, GgmlType::kF16,
-                                   GgmlType::kBF16, GgmlType::kF32};
+                                   GgmlType::kBF16, GgmlType::kF32,
+                                   GgmlType::kQ6_K};
     static constexpr auto norm = {GgmlType::kF32};
     l.attn_norm = Get(p + "attn_norm.weight", hidden, 1, 1, norm);
 
@@ -148,9 +158,14 @@ struct Binder {
     }
 
     if (l.kind == Config::LayerKind::kMamba) {
-      const auto nvfp4 = {GgmlType::kNVFP4};
-      l.ssm_in = Get(p + "ssm_in.weight", hidden, c.SsmInProj(), 1, nvfp4);
-      l.ssm_in_s = Get(p + "ssm_in.scale", 1, 1, 1, norm);
+      // The shipped artifact stores the projections as NVFP4, which needs a
+      // scalar F32 companion; requantized artifacts (e.g. UD-Q4_K_XL) carry
+      // self-describing blocks instead and have no .scale tensors.
+      const auto ssm = {GgmlType::kNVFP4, GgmlType::kQ8_0, GgmlType::kQ6_K};
+      l.ssm_in = Get(p + "ssm_in.weight", hidden, c.SsmInProj(), 1, ssm);
+      if (l.ssm_in.type == GgmlType::kNVFP4) {
+        l.ssm_in_s = Get(p + "ssm_in.scale", 1, 1, 1, norm);
+      }
       // Bolt stores the depthwise conv transposed relative to a linear layer:
       // cols is the tap index, rows the x+2*groups*state channel.
       l.ssm_conv = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
@@ -163,14 +178,19 @@ struct Binder {
       l.ssm_norm =
           Get(p + "ssm_norm.weight", c.ssm_inner_size / c.ssm_group_count,
               c.ssm_group_count, 1, norm);
-      l.ssm_out = Get(p + "ssm_out.weight", c.ssm_inner_size, hidden, 1, nvfp4);
-      l.ssm_out_s = Get(p + "ssm_out.scale", 1, 1, 1, norm);
+      l.ssm_out = Get(p + "ssm_out.weight", c.ssm_inner_size, hidden, 1, ssm);
+      if (l.ssm_out.type == GgmlType::kNVFP4) {
+        l.ssm_out_s = Get(p + "ssm_out.scale", 1, 1, 1, norm);
+      }
       return l;
     }
 
     // latent MoE. Routed experts run in the latent space with ReLU^2 and no
     // gate matrix; one shared expert runs at full width outside the latent.
-    const auto iq2 = {GgmlType::kIQ2_XXS};
+    // The shipped artifact quantizes them to IQ2_XXS; requantized artifacts
+    // carry per-tensor K-quant/IQ4_XS mixes instead.
+    const auto exp = {GgmlType::kIQ2_XXS, GgmlType::kQ8_0, GgmlType::kQ4_K,
+                      GgmlType::kQ5_K,    GgmlType::kQ6_K, GgmlType::kIQ4_XS};
     const std::string router_name = p + "ffn_gate_inp.weight";
     l.n_experts = ExpertCount(router_name, hidden);
     if (l.n_experts == 0 || l.n_experts > c.max_experts) {
@@ -183,13 +203,13 @@ struct Binder {
     l.router = Get(router_name, hidden, l.n_experts, 1, {GgmlType::kF32});
     l.exp_probs_b =
         Get(p + "exp_probs_b.bias", l.n_experts, 1, 1, {GgmlType::kF32});
-    l.ffn_up_exps = Get(p + "ffn_up_exps.weight", latent, ff, l.n_experts, iq2);
+    l.ffn_up_exps = Get(p + "ffn_up_exps.weight", latent, ff, l.n_experts, exp);
     l.ffn_down_exps =
-        Get(p + "ffn_down_exps.weight", ff, latent, l.n_experts, iq2);
+        Get(p + "ffn_down_exps.weight", ff, latent, l.n_experts, exp);
     l.ffn_up_shexp =
-        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, iq2);
+        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, exp);
     l.ffn_down_shexp =
-        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, iq2);
+        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, exp);
     // The latent projections follow the same [reduction -> output] binding:
     // up is [latent -> hidden] (cols = latent) and down is
     // [hidden -> latent] (cols = hidden), so both run as plain mat-vecs.
@@ -221,7 +241,8 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   w.config = *config;
   const Config& c = w.config;
   static constexpr auto dense = {GgmlType::kQ8_0, GgmlType::kF16,
-                                 GgmlType::kBF16, GgmlType::kF32};
+                                 GgmlType::kBF16, GgmlType::kF32,
+                                 GgmlType::kQ6_K};
 
   w.token_embd =
       b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, dense);
