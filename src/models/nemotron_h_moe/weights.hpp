@@ -89,6 +89,9 @@ struct ModelWeights {
   TensorRef output;       ///< [hidden -> vocab]; falls back to token_embd.
   TensorRef output_norm;  ///< [hidden] F32, before the LM head.
   std::vector<LayerWeights> layers;
+  /// Mapped GGUF shards backing the tensor offsets; descriptors are borrowed
+  /// from the binding reader and stay valid for its lifetime.
+  std::vector<core::GgufMappedRegion> regions;
 
   /// Binds and validates the trunk artifact against `Config::Kind`. Tensor
   /// payloads stay mapped and untouched; only headers are read.

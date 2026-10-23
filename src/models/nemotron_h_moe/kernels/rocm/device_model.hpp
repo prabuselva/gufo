@@ -7,11 +7,16 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "src/models/nemotron_h_moe/weights.hpp"
+
+namespace gufo::hip {
+class WeightUpload;
+}  // namespace gufo::hip
 
 namespace gufo::models::nemotron_h_moe {
 
@@ -95,11 +100,28 @@ private:
     void* down_shexp{nullptr};
     void* latent_up{nullptr};
     void* latent_down{nullptr};
+    // Device gemv tier per weight tensor (kNblGemv* in nb_ops.h). Init maps
+    // each GGUF type once; the passes dispatch on these, so one artifact may
+    // mix Q8_0, NVFP4, IQ2_XXS, K-quant and IQ4_XS tensors across roles.
+    int gemv_q{0};
+    int gemv_k{0};
+    int gemv_v{0};
+    int gemv_attn_out{0};
+    int gemv_ssm_in{0};
+    int gemv_ssm_out{0};
+    int gemv_up_exps{0};
+    int gemv_down_exps{0};
+    int gemv_up_shexp{0};
+    int gemv_down_shexp{0};
+    int gemv_latent_up{0};
+    int gemv_latent_down{0};
     std::uint64_t n_experts{0};
     std::uint32_t expert_ff{0};
     std::uint32_t top_k{0};
   };
 
+  /// Allocates and stages every weight, then the recurrent state and scratch.
+  [[nodiscard]] bool InitWeights(std::string* error_msg);
   [[nodiscard]] bool Upload(void** dst, const TensorRef& src,
                             std::string* error_msg);
   [[nodiscard]] bool UploadScalar(float* dst, const TensorRef& src,
@@ -126,6 +148,8 @@ private:
 
   const ModelWeights& w_;
   const Config& c_;
+  // Bounded disk-to-device weight pipeline, alive only inside Init.
+  std::unique_ptr<hip::WeightUpload> stager_;
   std::uint32_t max_context_;
   std::uint32_t position_{0};
   std::size_t weight_bytes_{0};

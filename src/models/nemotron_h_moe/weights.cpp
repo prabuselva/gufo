@@ -260,6 +260,8 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   if (!b.ok) {
     return std::nullopt;
   }
+  const auto regions = reader.GetMappedRegions();
+  w.regions.assign(regions.begin(), regions.end());
   return w;
 }
 

@@ -494,8 +494,9 @@ static int moe_vector_projection(int weight_type, const void* W,
   constexpr const char* tag = "nmb_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0 &&
-      type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_NVFP4) {
+      type != GGML_TYPE_Q6_K && type != GGML_TYPE_Q5_1 &&
+      type != GGML_TYPE_Q8_0 && type != GGML_TYPE_IQ2_XXS &&
+      type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_NVFP4) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
@@ -869,6 +870,174 @@ extern "C" int nmb_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                           out_f32, K, M, N, input_stride, stream);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+// ----------------------------------------------------------------------------
+// K-quant (Q4_K/Q5_K/Q6_K/IQ4_XS) entries dispatched at runtime by the GGML
+// weight type code. UD artifacts mix formats per tensor, so one entry per
+// pass shape keeps the model-side glue small. A non-zero return means the
+// role stays on the gemv tier; the shape check here is silent so a permanent
+// fallback does not print on every call.
+// ----------------------------------------------------------------------------
+
+static bool nmb_mmq_kq_supported(int weight_type, int K) {
+  switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q4_K:
+    case GGML_TYPE_Q5_K:
+    case GGML_TYPE_Q6_K:
+    case GGML_TYPE_IQ4_XS:
+      return K > 0 &&
+             K % ggml_blck_size(static_cast<ggml_type>(weight_type)) == 0;
+    default:
+      return false;
+  }
+}
+
+// The mmq/mmvq family quantizes activations to Q8_1; over sequential decode
+// steps that noise accumulates in the residual stream and KV and breaches
+// the device-step contract (worst-|delta| logit < 2e-2 vs the fp32 oracle,
+// measured rel 2.1e-2 at step 1). Decode therefore stays on fp32-activation
+// kernels; only these two vector entries are gated, wide (mmq) paths keep
+// the Q8_1 activations their shipped wide reference also uses.
+static constexpr bool kKqDecodeViaMmvq = false;
+
+extern "C" int nmb_mmq_kq_dense(int weight_type, const void* W, const float* X,
+                                float* out, int M, int N, int K,
+                                hipStream_t stream) {
+  if (!nmb_mmq_kq_supported(weight_type, K)) {
+    return -1;
+  }
+  constexpr const char* tag = "nmb_mmq_kq_dense";
+  switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q4_K:
+      return nmb_mmq_dense_impl<GGML_TYPE_Q4_K>(tag, W, X, nullptr, out, M, N,
+                                                K, stream);
+    case GGML_TYPE_Q5_K:
+      return nmb_mmq_dense_impl<GGML_TYPE_Q5_K>(tag, W, X, nullptr, out, M, N,
+                                                K, stream);
+    case GGML_TYPE_Q6_K:
+      return nmb_mmq_dense_impl<GGML_TYPE_Q6_K>(tag, W, X, nullptr, out, M, N,
+                                                K, stream);
+    case GGML_TYPE_IQ4_XS:
+      return nmb_mmq_dense_impl<GGML_TYPE_IQ4_XS>(tag, W, X, nullptr, out, M, N,
+                                                  K, stream);
+    default:
+      return -1;
+  }
+}
+
+extern "C" int nmb_mmq_kq_dense_preq(int weight_type, const void* W,
+                                     const void* X_q8, const float* X_f32,
+                                     float* out, int M, int N, int K,
+                                     hipStream_t stream) {
+  if (!nmb_mmq_kq_supported(weight_type, K)) {
+    return -1;
+  }
+  // The shared staging buffer is written with the D4 layout, which only the
+  // weight types reading a bare float4 d accept. Q4_K/Q5_K kernels read a
+  // DS4 half2(d,sum), so for those types quantize X_f32 internally (the
+  // launcher picks the per-type layout) and keep the shared buffer for the
+  // D4 types. Without an f32 twin a mismatched pre-quantization is refused;
+  // the caller then falls back (gemv) rather than reading a wrong layout.
+  const ggml_type type = static_cast<ggml_type>(weight_type);
+  const bool use_q8 =
+      X_q8 != nullptr && mmq_get_q8_1_ds_layout(type) == MMQ_Q8_1_DS_LAYOUT_D4;
+  if (!use_q8 && X_f32 == nullptr) {
+    return -1;
+  }
+  const void* x_q8 = use_q8 ? X_q8 : nullptr;
+  const float* x_f32 = use_q8 ? nullptr : X_f32;
+  constexpr const char* tag = "nmb_mmq_kq_dense_preq";
+  switch (type) {
+    case GGML_TYPE_Q4_K:
+      return nmb_mmq_dense_impl<GGML_TYPE_Q4_K>(tag, W, x_f32, x_q8, out, M, N,
+                                                K, stream);
+    case GGML_TYPE_Q5_K:
+      return nmb_mmq_dense_impl<GGML_TYPE_Q5_K>(tag, W, x_f32, x_q8, out, M, N,
+                                                K, stream);
+    case GGML_TYPE_Q6_K:
+      return nmb_mmq_dense_impl<GGML_TYPE_Q6_K>(tag, W, x_f32, x_q8, out, M, N,
+                                                K, stream);
+    case GGML_TYPE_IQ4_XS:
+      return nmb_mmq_dense_impl<GGML_TYPE_IQ4_XS>(tag, W, x_f32, x_q8, out, M,
+                                                  N, K, stream);
+    default:
+      return -1;
+  }
+}
+
+extern "C" int nmb_mmq_kq_dense_vec(int weight_type, const void* W,
+                                    const float* X, float* out, int M, int N,
+                                    int K, hipStream_t stream) {
+  if (!kKqDecodeViaMmvq || !nmb_mmq_kq_supported(weight_type, K)) {
+    return -1;
+  }
+  constexpr const char* tag = "nmb_mmq_kq_dense_vec";
+  switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q4_K:
+      return nmb_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(tag, W, X, out, M, N, K,
+                                                    stream);
+    case GGML_TYPE_Q5_K:
+      return nmb_mmq_dense_vec_impl<GGML_TYPE_Q5_K>(tag, W, X, out, M, N, K,
+                                                    stream);
+    case GGML_TYPE_Q6_K:
+      return nmb_mmq_dense_vec_impl<GGML_TYPE_Q6_K>(tag, W, X, out, M, N, K,
+                                                    stream);
+    case GGML_TYPE_IQ4_XS:
+      return nmb_mmq_dense_vec_impl<GGML_TYPE_IQ4_XS>(tag, W, X, out, M, N, K,
+                                                      stream);
+    default:
+      return -1;
+  }
+}
+
+extern "C" int nmb_mmq_kq_moe_raw(int weight_type, const void* W,
+                                  const float* X, const int32_t* ids,
+                                  float* out, int M, int K, int n_tokens,
+                                  int n_experts, int n_expert_used,
+                                  hipStream_t stream) {
+  if (!nmb_mmq_kq_supported(weight_type, K)) {
+    return -1;
+  }
+  constexpr const char* tag = "nmb_mmq_kq_moe_raw";
+  switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q4_K:
+      return nmb_mmq_moe_impl<GGML_TYPE_Q4_K>(
+          tag, W, X, ids, out, M, K, n_tokens, n_experts, n_expert_used, stream,
+          nullptr, nullptr);
+    case GGML_TYPE_Q5_K:
+      return nmb_mmq_moe_impl<GGML_TYPE_Q5_K>(
+          tag, W, X, ids, out, M, K, n_tokens, n_experts, n_expert_used, stream,
+          nullptr, nullptr);
+    case GGML_TYPE_Q6_K:
+      return nmb_mmq_moe_impl<GGML_TYPE_Q6_K>(
+          tag, W, X, ids, out, M, K, n_tokens, n_experts, n_expert_used, stream,
+          nullptr, nullptr);
+    case GGML_TYPE_IQ4_XS:
+      return nmb_mmq_moe_impl<GGML_TYPE_IQ4_XS>(
+          tag, W, X, ids, out, M, K, n_tokens, n_experts, n_expert_used, stream,
+          nullptr, nullptr);
+    default:
+      return -1;
+  }
+}
+
+extern "C" int nmb_mmq_kq_moe_vec(int weight_type, const void* W,
+                                  const float* X, const int32_t* ids,
+                                  float* out, int M, int K, int n_tokens,
+                                  int n_experts, int n_expert_used,
+                                  hipStream_t stream) {
+  if (!kKqDecodeViaMmvq || !nmb_mmq_kq_supported(weight_type, K)) {
+    return -1;
+  }
+  return moe_vector_projection(weight_type, W, X, ids, out, M, K, n_tokens,
+                               n_experts, n_expert_used, stream, nullptr,
+                               nullptr, false);
+}
+
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(ggml_backend_hip_context&,
+                                             const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(ggml_backend_hip_context&,
+                                               const mmq_args&, hipStream_t);
+
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(ggml_backend_hip_context&,
                                              const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(ggml_backend_hip_context&,

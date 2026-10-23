@@ -134,4 +134,27 @@ int nmb_mmq_iq2_xxs_moe_raw_sqract(const void* W, const float* X_f32,
 int nmb_mmq_nvfp4_moe_raw(const void* W, const float* X_f32, const int32_t* ids,
                           float* out, int M, int K, int n_tokens, int n_experts,
                           int n_expert_used, hipStream_t stream);
+
+// K-quant entries dispatched by GGML weight type code (12/13/14 =
+// Q4_K/Q5_K/Q6_K, 23 = IQ4_XS). Anything else, or a K that is not a whole
+// weight block, returns -1 so the caller keeps the gemv tier.
+int nmb_mmq_kq_dense(int weight_type, const void* W, const float* X_f32,
+                     float* out, int M, int N, int K, hipStream_t stream);
+// X_q8 is the shared D4 staging buffer; it is used only when the weight type
+// reads the D4 layout (see mmq_get_q8_1_ds_layout). X_f32 is the matching
+// fp32 twin, quantized internally per type for DS4-layout weights (Q4_K,
+// Q5_K). Returns -1 when neither source can be used for the type.
+int nmb_mmq_kq_dense_preq(int weight_type, const void* W, const void* X_q8,
+                          const float* X_f32, float* out, int M, int N, int K,
+                          hipStream_t stream);
+int nmb_mmq_kq_dense_vec(int weight_type, const void* W, const float* X_f32,
+                         float* out, int M, int N, int K, hipStream_t stream);
+int nmb_mmq_kq_moe_raw(int weight_type, const void* W, const float* X_f32,
+                       const int32_t* ids, float* out, int M, int K,
+                       int n_tokens, int n_experts, int n_expert_used,
+                       hipStream_t stream);
+int nmb_mmq_kq_moe_vec(int weight_type, const void* W, const float* X_f32,
+                       const int32_t* ids, float* out, int M, int K,
+                       int n_tokens, int n_experts, int n_expert_used,
+                       hipStream_t stream);
 }
