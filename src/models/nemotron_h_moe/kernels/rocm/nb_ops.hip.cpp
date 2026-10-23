@@ -444,6 +444,350 @@ struct NblQ8_1 {
 };
 static_assert(sizeof(NblQ8_1) == kIq2Sub + 4, "q8_1 block must be 36 bytes");
 
+// K-quant / IQ4_XS super-blocks (ggml block_q*_K / block_iq4_xs, 256 values
+// per block) accepted by the F32-activation GEMV tiers for the requantized
+// (Unsloth UD) artifacts. Layouts and value semantics mirror
+// src/core/quant/ggml_dequant.hpp verbatim (verified against GGUF bytes).
+constexpr int kKqElems = 256;
+struct NblQ4_K {
+  uint16_t d;
+  uint16_t dmin;
+  uint8_t scales[12];
+  uint8_t qs[128];
+};
+struct NblQ5_K {
+  uint16_t d;
+  uint16_t dmin;
+  uint8_t scales[12];
+  uint8_t qh[32];
+  uint8_t qs[128];
+};
+struct NblQ6_K {
+  uint8_t ql[128];
+  uint8_t qh[64];
+  int8_t scales[16];
+  uint16_t d;
+};
+struct NblIq4Xs {
+  uint16_t d;
+  uint16_t scales_h;
+  uint8_t scales_l[4];
+  uint8_t qs[128];
+};
+static_assert(sizeof(NblQ4_K) == 144, "q4_K block must be 144 bytes");
+static_assert(sizeof(NblQ5_K) == 176, "q5_K block must be 176 bytes");
+static_assert(sizeof(NblQ6_K) == 210, "q6_K block must be 210 bytes");
+static_assert(sizeof(NblIq4Xs) == 136, "iq4_xs block must be 136 bytes");
+
+// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS (ggml values_iq4_nl).
+constexpr float kIq4Nl[16] = {-127.0F, -104.0F, -83.0F, -65.0F, -49.0F, -35.0F,
+                              -22.0F,  -10.0F,  1.0F,   13.0F,  25.0F,  38.0F,
+                              53.0F,   69.0F,   89.0F,  113.0F};
+
+__device__ __forceinline__ float Fp16ToF32(uint16_t h) {
+  return __half2float(*reinterpret_cast<__half*>(&h));
+}
+
+// Unpack the 6-bit sub-block scale/minimum of a Q4_K/Q5_K block (ggml
+// get_scale_min_k4): index 0..7, two nibble fields plus the two-bit tail.
+__device__ __forceinline__ void QScaleMin(int index, const uint8_t* packed,
+                                          float d, float dmin, float& scale,
+                                          float& minimum) {
+  if (index < 4) {
+    scale = d * static_cast<float>(packed[index] & 0x3FU);
+    minimum = dmin * static_cast<float>(packed[index + 4] & 0x3FU);
+    return;
+  }
+  scale = d * static_cast<float>((packed[index + 4] & 0x0FU) |
+                                 ((packed[index - 4] >> 6U) << 4U));
+  minimum = dmin * static_cast<float>((packed[index + 4] >> 4U) |
+                                      ((packed[index] >> 6U) << 4U));
+}
+
+// One GEMV chunk is one 256-value super-block, thread-owned; the value
+// extraction order follows the CPU oracle exactly.
+__device__ __forceinline__ float GemvChunkDotQ4_K(const uint8_t* w,
+                                                  const float* x, int chunk) {
+  const NblQ4_K* b = reinterpret_cast<const NblQ4_K*>(w) + chunk;
+  const float d = Fp16ToF32(b->d);
+  const float dmin = Fp16ToF32(b->dmin);
+  const float* xv = x + static_cast<int64_t>(chunk) * kKqElems;
+  float acc = 0.0F;
+  for (int g = 0; g < 8; ++g) {
+    float s = 0.0F;
+    float m = 0.0F;
+    QScaleMin(g, b->scales, d, dmin, s, m);
+    const uint8_t* q = b->qs + (g / 2) * 32;
+    if ((g & 1) == 0) {
+      for (int l = 0; l < 32; ++l) {
+        acc += (s * static_cast<float>(q[l] & 0x0FU) - m) * xv[g * 32 + l];
+      }
+    } else {
+      for (int l = 0; l < 32; ++l) {
+        acc += (s * static_cast<float>(q[l] >> 4U) - m) * xv[g * 32 + l];
+      }
+    }
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float GemvChunkDotQ5_K(const uint8_t* w,
+                                                  const float* x, int chunk) {
+  const NblQ5_K* b = reinterpret_cast<const NblQ5_K*>(w) + chunk;
+  const float d = Fp16ToF32(b->d);
+  const float dmin = Fp16ToF32(b->dmin);
+  const float* xv = x + static_cast<int64_t>(chunk) * kKqElems;
+  float acc = 0.0F;
+  for (int gg = 0; gg < 4; ++gg) {
+    for (int half = 0; half < 2; ++half) {
+      float s = 0.0F;
+      float m = 0.0F;
+      QScaleMin(2 * gg + half, b->scales, d, dmin, s, m);
+      const uint8_t* q = b->qs + gg * 32;
+      for (int l = 0; l < 32; ++l) {
+        const int qb = q[l];
+        const int low = half == 0 ? (qb & 0x0F) : (qb >> 4U);
+        const int hi = (b->qh[l] >> (2 * gg + half)) & 1;
+        acc += (s * static_cast<float>(low + (hi << 4)) - m) *
+               xv[gg * 64 + half * 32 + l];
+      }
+    }
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float GemvChunkDotQ6_K(const uint8_t* w,
+                                                  const float* x, int chunk) {
+  const NblQ6_K* b = reinterpret_cast<const NblQ6_K*>(w) + chunk;
+  const float d = Fp16ToF32(b->d);
+  const float* xv = x + static_cast<int64_t>(chunk) * kKqElems;
+  float acc = 0.0F;
+  for (int half = 0; half < 2; ++half) {
+    for (int lane = 0; lane < 32; ++lane) {
+      const uint8_t qh = b->qh[half * 32 + lane];
+      const uint8_t b0 = b->ql[half * 64 + lane];
+      const uint8_t b1 = b->ql[half * 64 + 32 + lane];
+      const int hi16 = lane >= 16 ? 1 : 0;
+      const float s0 = d * static_cast<float>(b->scales[half * 8 + 0 + hi16]);
+      const float s1 = d * static_cast<float>(b->scales[half * 8 + 2 + hi16]);
+      const float s2 = d * static_cast<float>(b->scales[half * 8 + 4 + hi16]);
+      const float s3 = d * static_cast<float>(b->scales[half * 8 + 6 + hi16]);
+      const int base = half * 128 + lane;
+      acc += s0 *
+                 static_cast<float>(static_cast<int>((qh & 0x03U) << 4) +
+                                    static_cast<int>(b0 & 0x0FU) - 32) *
+                 xv[base] +
+             s1 *
+                 static_cast<float>(static_cast<int>((qh >> 2U & 0x03U) << 4) +
+                                    static_cast<int>(b1 & 0x0FU) - 32) *
+                 xv[base + 32] +
+             s2 *
+                 static_cast<float>(static_cast<int>((qh >> 4U & 0x03U) << 4) +
+                                    static_cast<int>(b0 >> 4U) - 32) *
+                 xv[base + 64] +
+             s3 *
+                 static_cast<float>(static_cast<int>((qh >> 6U) << 4) +
+                                    static_cast<int>(b1 >> 4U) - 32) *
+                 xv[base + 96];
+    }
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float GemvChunkDotIq4Xs(const uint8_t* w,
+                                                   const float* x, int chunk) {
+  const NblIq4Xs* b = reinterpret_cast<const NblIq4Xs*>(w) + chunk;
+  const float d = Fp16ToF32(b->d);
+  const float* xv = x + static_cast<int64_t>(chunk) * kKqElems;
+  float acc = 0.0F;
+  for (int ib = 0; ib < 8; ++ib) {
+    const int ls =
+        static_cast<int>((b->scales_l[ib / 2] >> (4U * (ib % 2))) & 0x0FU) |
+        static_cast<int>(((b->scales_h >> (2U * ib)) & 0x03U) << 4U);
+    const float s = d * static_cast<float>(ls - 32);
+    const uint8_t* q = b->qs + ib * 16;
+    for (int l = 0; l < 16; ++l) {
+      const uint8_t p = q[l];
+      acc += s * (kIq4Nl[p & 0x0FU] * xv[ib * 32 + l] +
+                  kIq4Nl[p >> 4U] * xv[ib * 32 + 16 + l]);
+    }
+  }
+  return acc;
+}
+
+// Warp-parallel super-block dots: lane owns the eight consecutive values
+// v = 8*lane + p of one 256-value block, so the weight bytes of a lane are
+// one contiguous 8-byte window and the activations two float4 loads. The
+// thread-owned chunk dots above fetch every byte and value scalar-wise,
+// which caps the wide decode rows (Q6_K ssm_in at ~16 GB/s) far below the
+// measured ~240 GB/s ceiling. The per-warp accumulation order differs from
+// the chunk dots; the deviation is ULP-scale, orders of magnitude inside
+// the pinned device_step contract.
+//
+// LoadBytes8 re-aligns the lane window: the Q6_K ggml block stride is 210
+// bytes, so block-relative offsets hit every 4-byte residue; the funnel
+// shift reads the enclosing dword window (hipMalloc rounds allocations to
+// pages, so the <=4-byte edge slack stays inside the buffer). The residue
+// is warp-uniform because the per-lane offset is a multiple of 8.
+
+// Fetch bytes w8[0..7] from a possibly dword-misaligned global pointer.
+__device__ __forceinline__ uint2 LoadBytes8(const uint8_t* w8) {
+  const uintptr_t a = reinterpret_cast<uintptr_t>(w8);
+  const uint32_t* const wd =
+      reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+  const uint32_t sh = static_cast<uint32_t>(a & 3U) * 8U;
+  const uint32_t d0 = wd[0];
+  const uint32_t d1 = wd[1];
+  if (sh == 0U) {
+    return make_uint2(d0, d1);
+  }
+  const uint32_t d2 = wd[2];
+  return make_uint2(__funnelshift_r(d0, d1, sh), __funnelshift_r(d1, d2, sh));
+}
+
+__device__ __forceinline__ float GemvWarpDotQ4_K(const uint8_t* w,
+                                                 const float* x, int block,
+                                                 int lane) {
+  const NblQ4_K* b = reinterpret_cast<const NblQ4_K*>(w) + block;
+  const float d = Fp16ToF32(b->d);
+  const float dmin = Fp16ToF32(b->dmin);
+  const int g = lane >> 2;
+  float s = 0.0F;
+  float m = 0.0F;
+  QScaleMin(g, b->scales, d, dmin, s, m);
+  const uint2 q8 = LoadBytes8(b->qs + (g >> 1) * 32 + (lane & 3) * 8);
+  const int sh = (g & 1) * 4;
+  const float* xv = x + static_cast<int64_t>(block) * kKqElems + lane * 8;
+  const float4 xa = *reinterpret_cast<const float4*>(xv);
+  const float4 xb = *reinterpret_cast<const float4*>(xv + 4);
+  const uint32_t qw[2] = {q8.x, q8.y};
+  float acc = 0.0F;
+#pragma unroll
+  for (int p = 0; p < 8; ++p) {
+    const uint32_t byte = qw[p >> 2] >> (8 * (p & 3));
+    const float xv8 = p < 4 ? (&xa.x)[p] : (&xb.x)[p - 4];
+    acc += (s * static_cast<float>((byte >> sh) & 0x0FU) - m) * xv8;
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float GemvWarpDotQ5_K(const uint8_t* w,
+                                                 const float* x, int block,
+                                                 int lane) {
+  const NblQ5_K* b = reinterpret_cast<const NblQ5_K*>(w) + block;
+  const float d = Fp16ToF32(b->d);
+  const float dmin = Fp16ToF32(b->dmin);
+  const int v0 = lane * 8;
+  const int gg = v0 >> 6;
+  const int half = (v0 >> 5) & 1;
+  const int l0 = v0 & 31;
+  float s = 0.0F;
+  float m = 0.0F;
+  QScaleMin(2 * gg + half, b->scales, d, dmin, s, m);
+  const uint2 q8 = LoadBytes8(b->qs + gg * 32 + l0);
+  const uint2 h8 = LoadBytes8(b->qh + l0);
+  const int sh = 2 * gg + half;
+  const uint32_t qw[2] = {q8.x, q8.y};
+  const uint32_t hw[2] = {h8.x, h8.y};
+  const float* xv = x + static_cast<int64_t>(block) * kKqElems + lane * 8;
+  const float4 xa = *reinterpret_cast<const float4*>(xv);
+  const float4 xb = *reinterpret_cast<const float4*>(xv + 4);
+  float acc = 0.0F;
+#pragma unroll
+  for (int p = 0; p < 8; ++p) {
+    const int b8 = 8 * (p & 3);
+    const uint32_t q = (qw[p >> 2] >> b8) & 0xFFU;
+    const uint32_t hi = (hw[p >> 2] >> (b8 + sh)) & 1U;
+    const int v = static_cast<int>(half ? (q >> 4) : (q & 0x0FU)) +
+                  static_cast<int>(hi << 4U);
+    const float xv8 = p < 4 ? (&xa.x)[p] : (&xb.x)[p - 4];
+    acc += (s * static_cast<float>(v) - m) * xv8;
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float GemvWarpDotQ6_K(const uint8_t* w,
+                                                 const float* x, int block,
+                                                 int lane) {
+  const NblQ6_K* b = reinterpret_cast<const NblQ6_K*>(w) + block;
+  // Values v of a half are laid out as v = c*128 + k*32 + l (c = half,
+  // sub-quant k, l 0..31); lane owns 8 consecutive l of one (c, k), so the
+  // 6-bit term bits (2k..2k+1 of the qh byte), the ql nibble shift (k >= 2)
+  // and the scale index c*8 + 2k + hi16 are lane constants.
+  const int c = lane >> 4;
+  const int k = (lane >> 2) & 3;
+  const int hi16 = (lane >> 1) & 1;
+  const int j0 = (lane & 3) * 8;
+  const uint2 h8 = LoadBytes8(b->qh + c * 32 + j0);
+  const uint2 q8 = LoadBytes8(b->ql + c * 64 + (k & 1) * 32 + j0);
+  const float ds =
+      Fp16ToF32(b->d) * static_cast<float>(b->scales[c * 8 + 2 * k + hi16]);
+  const int sh_h = 2 * k;
+  const int sh_q = (k >> 1) * 4;
+  const float* xv = x + static_cast<int64_t>(block) * kKqElems + lane * 8;
+  const float4 xa = *reinterpret_cast<const float4*>(xv);
+  const float4 xb = *reinterpret_cast<const float4*>(xv + 4);
+  const uint32_t hw[2] = {h8.x, h8.y};
+  const uint32_t qw[2] = {q8.x, q8.y};
+  float acc = 0.0F;
+#pragma unroll
+  for (int p = 0; p < 8; ++p) {
+    const uint32_t h56 = hw[p >> 2] >> (8 * (p & 3));
+    const uint32_t lo4 = qw[p >> 2] >> (8 * (p & 3));
+    const int t = static_cast<int>(((h56 >> sh_h) & 0x3U) << 4U) +
+                  static_cast<int>((lo4 >> sh_q) & 0x0FU) - 32;
+    const float xv8 = p < 4 ? (&xa.x)[p] : (&xb.x)[p - 4];
+    acc += ds * static_cast<float>(t) * xv8;
+  }
+  return acc;
+}
+
+__device__ __forceinline__ float GemvWarpDotIq4Xs(const uint8_t* w,
+                                                  const float* x, int block,
+                                                  int lane) {
+  const NblIq4Xs* b = reinterpret_cast<const NblIq4Xs*>(w) + block;
+  const float d = Fp16ToF32(b->d);
+  // Values v = ib*32 + u: qs[ib*16 + (u % 16)] holds the nibble, low for
+  // u < 16 and high above. Lane windows of 8 start at u = (lane&3)*8, so
+  // the byte slot is the u%16 residue (lane&1) and the nibble half is
+  // whether u reached 16 ((lane>>1)&1).
+  const int ib = lane >> 2;
+  const int ls =
+      static_cast<int>((b->scales_l[ib / 2] >> (4U * (ib % 2))) & 0x0FU) |
+      static_cast<int>(((b->scales_h >> (2U * ib)) & 0x03U) << 4U);
+  const float s = d * static_cast<float>(ls - 32);
+  const uint2 q8 = LoadBytes8(b->qs + ib * 16 + (lane & 1) * 8);
+  const int sh = ((lane >> 1) & 1) * 4U;
+  const float* xv = x + static_cast<int64_t>(block) * kKqElems + lane * 8;
+  const float4 xa = *reinterpret_cast<const float4*>(xv);
+  const float4 xb = *reinterpret_cast<const float4*>(xv + 4);
+  const uint32_t qw[2] = {q8.x, q8.y};
+  float acc = 0.0F;
+#pragma unroll
+  for (int p = 0; p < 8; ++p) {
+    const uint32_t byte = qw[p >> 2] >> (8 * (p & 3));
+    const float xv8 = p < 4 ? (&xa.x)[p] : (&xb.x)[p - 4];
+    acc += s * (kIq4Nl[(byte >> sh) & 0x0FU] * xv8);
+  }
+  return acc;
+}
+
+template<int TYPE>
+__device__ __forceinline__ float GemvWarpDot(const uint8_t* __restrict__ w,
+                                             const float* __restrict__ x,
+                                             int block, int lane) {
+  if (TYPE == kNblGemvQ4_K) {
+    return GemvWarpDotQ4_K(w, x, block, lane);
+  }
+  if (TYPE == kNblGemvQ5_K) {
+    return GemvWarpDotQ5_K(w, x, block, lane);
+  }
+  if (TYPE == kNblGemvQ6_K) {
+    return GemvWarpDotQ6_K(w, x, block, lane);
+  }
+  return GemvWarpDotIq4Xs(w, x, block, lane);
+}
+
 // Signed int8x4 dot via the native unsigned byte dot; the compiler inserts
 // the sign fix-ups for the signed operands (on gfx1151 this lowers to
 // v_dot4_i32_iu8, matching the vendored mmq iq2 path).
@@ -499,6 +843,22 @@ template<>
 __device__ __forceinline__ int GemvChunk<3>() {
   return kNvfp4Sub;
 }
+template<>
+__device__ __forceinline__ int GemvChunk<5>() {
+  return kKqElems;
+}
+template<>
+__device__ __forceinline__ int GemvChunk<6>() {
+  return kKqElems;
+}
+template<>
+__device__ __forceinline__ int GemvChunk<7>() {
+  return kKqElems;
+}
+template<>
+__device__ __forceinline__ int GemvChunk<8>() {
+  return kKqElems;
+}
 
 // Thread `t` owns chunk c of one row; each chunk covers GemvChunk<TYPE>
 // dot products accumulated per-thread into a block reduce.
@@ -551,6 +911,14 @@ __device__ __forceinline__ float GemvChunkDot(const uint8_t* __restrict__ w,
                ((signs & (1u << j)) != 0 ? -xv[l * 8 + j] : xv[l * 8 + j]);
       }
     }
+  } else if (TYPE == kNblGemvQ4_K) {
+    acc = GemvChunkDotQ4_K(w, x, chunk);
+  } else if (TYPE == kNblGemvQ5_K) {
+    acc = GemvChunkDotQ5_K(w, x, chunk);
+  } else if (TYPE == kNblGemvQ6_K) {
+    acc = GemvChunkDotQ6_K(w, x, chunk);
+  } else if (TYPE == kNblGemvIq4Xs) {
+    acc = GemvChunkDotIq4Xs(w, x, chunk);
   } else {
     const int blk = chunk / (kNvfp4K / kNvfp4Sub);
     const int sub = chunk % (kNvfp4K / kNvfp4Sub);
@@ -696,6 +1064,74 @@ __global__ void GemvF32PackedKernel(const float* __restrict__ x,
     const int c = lane + warpSize * warp_in_row;
     if (c < k / GemvChunk<TYPE>()) {
       acc = GemvChunkDot<TYPE>(wr, xr, c, k);
+    }
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(~0ULL, acc, off);
+  }
+  if (lane == 0) {
+    fold[row_local * 8 + warp_in_row] = acc;
+  }
+  __syncthreads();
+  if (active && lane == 0 && warp_in_row == 0) {
+    float sum = 0.0F;
+    for (int j = 0; j < kBlock / warpSize; ++j) {
+      sum += fold[row_local * 8 + j];
+    }
+    out[out_row] = sum;
+  }
+}
+
+// Row-packed GEMV for K-quant / IQ4_XS weights with warp-owned
+// super-blocks. Same block geometry, slot addressing and fold tree as
+// GemvF32PackedKernel (whose thread-owned chunk reads every weight byte and
+// activation scalar-wise); warp i of a row walks super-blocks
+// i, i + warps_per_row, ... and a lane covers eight values per block. The
+// x pointer must keep 16-byte alignment (enforced by the launcher).
+template<int TYPE>
+__global__ void GemvKqPackedKernel(const float* __restrict__ x,
+                                   const uint8_t* __restrict__ w,
+                                   float* __restrict__ out, int n_out, int k,
+                                   int expert_stride,
+                                   const int32_t* __restrict__ ids, int slots,
+                                   int64_t x_stride, int tokens,
+                                   int warps_per_row, int blocks_per_slot) {
+  const int warp = static_cast<int>(threadIdx.x) / warpSize;
+  const int lane = static_cast<int>(threadIdx.x) % warpSize;
+  const int row_local = warp / warps_per_row;
+  const int warp_in_row = warp % warps_per_row;
+  __shared__ float fold[64];  // [row][fold entry], 8 entries per row
+  if (static_cast<int>(threadIdx.x) < 64) {
+    fold[threadIdx.x] = 0.0F;
+  }
+  __syncthreads();
+  const int gid = static_cast<int>(blockIdx.x);
+  const int slot = gid / blocks_per_slot;
+  const int row = (gid % blocks_per_slot) * (static_cast<int>(blockDim.x) /
+                                             warpSize / warps_per_row) +
+                  row_local;
+  const bool active = (row < n_out);
+  const int token = static_cast<int>(blockIdx.y);
+  float acc = 0.0F;
+  int64_t out_row = 0;
+  if (active) {
+    // Slot and token addressing identical to GemvF32Kernel.
+    const float* xr = x;
+    int64_t w_row = row;
+    out_row = static_cast<int64_t>(token) * n_out + row;
+    if (slots > 1) {
+      const int64_t s = static_cast<int64_t>(token) * slots + slot;
+      w_row = static_cast<int64_t>(__ldg(ids + s)) * n_out + row;
+      out_row = s * n_out + row;
+      xr += static_cast<int64_t>(slot) * x_stride;
+    }
+    xr += static_cast<int64_t>(token) *
+          ((slots > 1 && x_stride > 0) ? static_cast<int64_t>(slots) * x_stride
+                                       : static_cast<int64_t>(k));
+    const uint8_t* wr = w + w_row * static_cast<int64_t>(expert_stride);
+    const int n_super = k / kKqElems;
+    for (int s = warp_in_row; s < n_super; s += warps_per_row) {
+      acc += GemvWarpDot<TYPE>(wr, xr, s, lane);
     }
   }
   for (int off = warpSize / 2; off > 0; off >>= 1) {
@@ -998,6 +1434,14 @@ int GemvRowBytes(int type, int k) {
       return k / kIq2Elems * 66;
     case kNblGemvIq2XxsQ8_1:
       return k / kIq2Elems * 66;
+    case kNblGemvQ4_K:
+      return k / kKqElems * static_cast<int>(sizeof(NblQ4_K));
+    case kNblGemvQ5_K:
+      return k / kKqElems * static_cast<int>(sizeof(NblQ5_K));
+    case kNblGemvQ6_K:
+      return k / kKqElems * static_cast<int>(sizeof(NblQ6_K));
+    case kNblGemvIq4Xs:
+      return k / kKqElems * static_cast<int>(sizeof(NblIq4Xs));
     default:
       return k / kNvfp4K * 36;
   }
@@ -1015,6 +1459,11 @@ bool GemvTypeValid(int type, int k) {
       return k % kIq2Elems == 0;
     case kNblGemvNvfp4:
       return k % kNvfp4K == 0;
+    case kNblGemvQ4_K:
+    case kNblGemvQ5_K:
+    case kNblGemvQ6_K:
+    case kNblGemvIq4Xs:
+      return k % kKqElems == 0;
     default:
       return false;
   }
@@ -1063,6 +1512,11 @@ int GemvChunkHost(int type) {
       return kIq2Sub;
     case kNblGemvIq2XxsQ8_1:
       return kIq2Sub;
+    case kNblGemvQ4_K:
+    case kNblGemvQ5_K:
+    case kNblGemvQ6_K:
+    case kNblGemvIq4Xs:
+      return kKqElems;
     default:
       return kNvfp4Sub;
   }
@@ -1075,6 +1529,35 @@ int DeviceWarpSize() {
     return w > 0 ? w : 32;
   }();
   return warp;
+}
+
+template<int TYPE>
+void LaunchGemvF32Type(bool packed, const dim3& grid, const dim3& block,
+                       hipStream_t stream, const float* x, const uint8_t* wb,
+                       float* out, int n_out, int k, int stride,
+                       const int32_t* ids, int slots, int64_t x_stride,
+                       int tokens, int warps_per_row, int blocks_per_slot) {
+  if (packed) {
+    // kNblGemvQ4_K..kNblGemvIq4Xs take the warp-dot kernel when x keeps the
+    // per-lane float4 windows 16-byte aligned; every tier type still
+    // compiles both branches, and non-K-quant tiers pass kq_vec == false.
+    const bool kq_tier = (TYPE == kNblGemvQ4_K) || (TYPE == kNblGemvQ5_K) ||
+                         (TYPE == kNblGemvQ6_K) || (TYPE == kNblGemvIq4Xs);
+    const bool vec = kq_tier && (reinterpret_cast<uintptr_t>(x) & 15U) == 0 &&
+                     x_stride % 4 == 0;
+    if (vec) {
+      GemvKqPackedKernel<TYPE><<<grid, block, 0, stream>>>(
+          x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens,
+          warps_per_row, blocks_per_slot);
+    } else {
+      GemvF32PackedKernel<TYPE><<<grid, block, 0, stream>>>(
+          x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens,
+          warps_per_row, blocks_per_slot);
+    }
+  } else {
+    GemvF32Kernel<TYPE><<<grid, block, 0, stream>>>(
+        x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens);
+  }
 }
 
 template<bool kMoe>
@@ -1151,6 +1634,26 @@ int LaunchGemv(int type, const void* w, const float* x, const int32_t* ids,
           blocks_per_slot);
       break;
     }
+    case kNblGemvQ4_K:
+      LaunchGemvF32Type<kNblGemvQ4_K>(
+          packed, grid, block, stream, x, wb, out, n_out, k, stride, ids,
+          kMoe ? slots : 0, x_stride, tokens, warps_per_row, blocks_per_slot);
+      break;
+    case kNblGemvQ5_K:
+      LaunchGemvF32Type<kNblGemvQ5_K>(
+          packed, grid, block, stream, x, wb, out, n_out, k, stride, ids,
+          kMoe ? slots : 0, x_stride, tokens, warps_per_row, blocks_per_slot);
+      break;
+    case kNblGemvQ6_K:
+      LaunchGemvF32Type<kNblGemvQ6_K>(
+          packed, grid, block, stream, x, wb, out, n_out, k, stride, ids,
+          kMoe ? slots : 0, x_stride, tokens, warps_per_row, blocks_per_slot);
+      break;
+    case kNblGemvIq4Xs:
+      LaunchGemvF32Type<kNblGemvIq4Xs>(
+          packed, grid, block, stream, x, wb, out, n_out, k, stride, ids,
+          kMoe ? slots : 0, x_stride, tokens, warps_per_row, blocks_per_slot);
+      break;
     default:
       if (packed) {
         GemvF32PackedKernel<kNblGemvNvfp4><<<grid, block, 0, stream>>>(

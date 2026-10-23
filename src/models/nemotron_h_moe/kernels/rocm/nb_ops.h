@@ -48,7 +48,11 @@ enum NblGemvType {
   kNblGemvQ8_0 = 1,
   kNblGemvIq2Xxs = 2,
   kNblGemvNvfp4 = 3,
-  kNblGemvIq2XxsQ8_1 = 4
+  kNblGemvIq2XxsQ8_1 = 4,
+  kNblGemvQ4_K = 5,
+  kNblGemvQ5_K = 6,
+  kNblGemvQ6_K = 7,
+  kNblGemvIq4Xs = 8
 };
 
 /// Quantize `elems` (multiple of 32) contiguous f32 values into Q8_1 blocks

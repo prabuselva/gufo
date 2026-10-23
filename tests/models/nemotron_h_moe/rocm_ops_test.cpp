@@ -11,6 +11,7 @@
 #include <span>
 #include <vector>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/nemotron_h_moe/cpu_ops.hpp"
 #include "src/models/nemotron_h_moe/kernels/rocm/nb_ops.h"
 #include "src/models/nemotron_h_moe/weights.hpp"
@@ -464,6 +465,135 @@ bool RunGemvIq2Q8() {
   return ok;
 }
 
+// Block-scale gemv tiers (Q4_K/Q5_K/Q6_K/IQ4_XS) versus the core oracle dot
+// products on random weight bytes. Only the f16 block scales (and, for
+// Q4_K/Q5_K, the 6-bit scale deltas) are constrained so every random block
+// dequantizes to finite values; the kernels and the oracle share the same
+// decode formulas, so any layout or indexing mistake shows as a mismatch.
+bool RunGemvKQuant() {
+  namespace quant = gufo::quant;
+  using DotFn = float (*)(const void*, std::span<const float>, std::size_t);
+  struct KqCase {
+    int type;
+    int row_bytes;  // bytes per 256-value block
+    int scale_off;  // f16 d (+ dmin at scale_off+2 when two_scales)
+    bool two_scales;
+    DotFn dot;
+    int n_out;
+    int k;
+    int experts;
+    int slots;
+    int stride;  // 0 = one k-vector shared across slots
+  };
+  const KqCase cases[] = {
+      {kNblGemvQ4_K, 144, 0, true, &quant::DotProductQ4_K, 256, 256, 1, 1, 0},
+      {kNblGemvQ5_K, 176, 0, true, &quant::DotProductQ5_K, 256, 256, 1, 1, 0},
+      {kNblGemvQ6_K, 210, 208, false, &quant::DotProductQ6_K, 256, 256, 1, 1,
+       0},
+      {kNblGemvIq4Xs, 136, 0, false, &quant::DotProductIQ4_XS, 256, 256, 1, 1,
+       0},
+      {kNblGemvQ4_K, 144, 0, true, &quant::DotProductQ4_K, 512, 512, 1, 1, 0},
+      {kNblGemvQ5_K, 176, 0, true, &quant::DotProductQ5_K, 320, 1024, 1, 1, 0},
+      {kNblGemvQ6_K, 210, 208, false, &quant::DotProductQ6_K, 256, 768, 1, 1,
+       0},
+      {kNblGemvIq4Xs, 136, 0, false, &quant::DotProductIQ4_XS, 512, 512, 1, 1,
+       0},
+      {kNblGemvQ4_K, 144, 0, true, &quant::DotProductQ4_K, 256, 512, 4, 2, 512},
+      {kNblGemvQ5_K, 176, 0, true, &quant::DotProductQ5_K, 256, 512, 4, 2, 512},
+      {kNblGemvQ6_K, 210, 208, false, &quant::DotProductQ6_K, 256, 512, 4, 2,
+       512},
+      {kNblGemvIq4Xs, 136, 0, false, &quant::DotProductIQ4_XS, 256, 512, 4, 2,
+       512},
+  };
+  constexpr int kTokens = 2;
+  bool ok = true;
+  std::uint32_t seed = 0x4C1Du;
+  for (const KqCase& gc : cases) {
+    const int blocks = gc.k / 256;
+    const std::size_t rows = static_cast<std::size_t>(gc.experts) *
+                             static_cast<std::size_t>(gc.n_out);
+    const std::size_t w_bytes = rows * static_cast<std::size_t>(gc.row_bytes) *
+                                static_cast<std::size_t>(blocks);
+    auto w = MakeBytes(w_bytes, seed++);
+    for (std::size_t off = 0; off < w_bytes;
+         off += static_cast<std::size_t>(gc.row_bytes) *
+                static_cast<std::size_t>(blocks)) {
+      const std::size_t d0 = off + static_cast<std::size_t>(gc.scale_off);
+      w[d0] = static_cast<std::uint8_t>((seed++ & 0x3FU) << 2);
+      w[d0 + 1] = static_cast<std::uint8_t>(0x3E | ((seed++ & 1U) << 7));
+      if (gc.two_scales) {
+        w[d0 + 2] = static_cast<std::uint8_t>((seed++ & 0x3FU) << 2);
+        w[d0 + 3] = static_cast<std::uint8_t>(0x3E | ((seed++ & 1U) << 7));
+        // Q4_K/Q5_K 6-bit scale deltas: keep them small so the bit-shifted
+        // d/dmin exponents stay finite for random blocks.
+        for (int b = 0; b < 8; ++b) {
+          w[off + 4 + static_cast<std::size_t>(b)] =
+              static_cast<std::uint8_t>(seed++ & 0x03U);
+        }
+      }
+    }
+    const int rows_per_token = gc.stride > 0 ? gc.slots : 1;
+    const std::size_t x_elems = static_cast<std::size_t>(kTokens) *
+                                rows_per_token * static_cast<std::size_t>(gc.k);
+    auto x = MakeValues(x_elems, seed++, 1.0F);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kTokens) * gc.slots);
+    for (auto& id : ids) {
+      id = static_cast<std::int32_t>(seed++ %
+                                     static_cast<std::uint32_t>(gc.experts));
+    }
+    const std::size_t out_elems =
+        static_cast<std::size_t>(kTokens) * gc.slots * gc.n_out;
+    std::vector<float> reference(out_elems);
+    const std::size_t row_stride = static_cast<std::size_t>(gc.row_bytes) *
+                                   static_cast<std::size_t>(blocks);
+    for (int t = 0; t < kTokens; ++t) {
+      for (int s = 0; s < gc.slots; ++s) {
+        const std::size_t xb =
+            static_cast<std::size_t>(t) * rows_per_token * gc.k +
+            (gc.stride > 0 ? static_cast<std::size_t>(s) * gc.k : 0U);
+        std::span<const float> xv(x.data() + xb,
+                                  static_cast<std::size_t>(gc.k));
+        const std::size_t expert =
+            gc.slots > 1 ? static_cast<std::size_t>(
+                               ids[static_cast<std::size_t>(t) * gc.slots + s])
+                         : 0U;
+        float* y = reference.data() +
+                   (static_cast<std::size_t>(t) * gc.slots + s) * gc.n_out;
+        for (int r = 0; r < gc.n_out; ++r) {
+          y[r] = gc.dot(w.data() + (expert * gc.n_out + r) * row_stride, xv,
+                        static_cast<std::size_t>(gc.k));
+        }
+      }
+    }
+    HipBuffer<float> x_dev(x.size());
+    HipBuffer<std::uint8_t> w_dev(w.size());
+    HipBuffer<std::int32_t> ids_dev(ids.size());
+    HipBuffer<float> out_dev(reference.size());
+    Upload(&x_dev, x);
+    Upload(w_dev.get(), w.data(), w.size());
+    Upload(ids_dev.get(), ids.data(), ids.size() * sizeof(std::int32_t));
+    int rc = 0;
+    if (gc.slots > 1) {
+      rc = nbl_gemv_moe_f32(gc.type, w_dev.get(), x_dev.get(), ids_dev.get(),
+                            out_dev.get(), gc.n_out, gc.k, gc.slots, gc.stride,
+                            kTokens, nullptr);
+    } else {
+      rc = nbl_gemv_f32(gc.type, w_dev.get(), x_dev.get(), out_dev.get(),
+                        gc.n_out, gc.k, kTokens, nullptr);
+    }
+    if (rc != 0) {
+      std::printf("gemv_kq type=%d n=%d k=%d rc=%d\n", gc.type, gc.n_out, gc.k,
+                  rc);
+      return false;
+    }
+    char name[64];
+    std::snprintf(name, sizeof name, "gemv_kq t=%d n=%-4d k=%-4d s=%d", gc.type,
+                  gc.n_out, gc.k, gc.slots);
+    ok = Check(name, WorstRel(reference, Download(&out_dev)), 2e-3) && ok;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -475,6 +605,7 @@ int main() {
   ok = RunMoeCombine() && ok;
   ok = RunQuantQ8_1() && ok;
   ok = RunGemvIq2Q8() && ok;
+  ok = RunGemvKQuant() && ok;
   if (ok) {
     std::printf("rocm_ops: ALL PASS\n");
   } else {
