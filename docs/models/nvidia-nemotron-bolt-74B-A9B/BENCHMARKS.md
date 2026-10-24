@@ -83,6 +83,24 @@ measured depth. The remaining ≥65K falloff is KV read traffic
 Quality gates on the WMMA build: extended `rocm_attention` (≤2e-5 rel),
 `rocm_ops`, and shipped-artifact `reference` + `device_step` all PASS.
 
+## UD-Q4_K_XL decode vs llama.cpp (46.77 GiB artifact, batch 1)
+
+Same artifact and bench command as the prefill sections, windows 2026-10-24/25
+evening. "gufo pre" is `a8bb20dd` + WMMA; "gufo ILP" adds the two-chain Q6_K
+decode gemv ([EXPERIMENTS.md](EXPERIMENTS.md)); llama ROCm is
+`build_b11721_rocm` `llama-bench -fa on -ngl 99 -r 2` with the prompt depth set
+explicitly (earlier single cells were depth-ambiguous).
+
+| context | gufo pre | gufo ILP | matched A/B | llama ROCm | ILP vs llama |
+| --- | --- | --- | --- | --- | --- |
+| tg128 @0 | 19.05/19.07/18.98 | 19.78/19.92/19.90 | +4.4 %, 3/3 pairs | 22.23 ± 0.06 | −10.5 % |
+| tg128 @16K | 18.96/18.88 | 19.61/19.58 | +3.6 %, 2/2 pairs | 22.27 ± 0.10 | −12.0 % |
+| pp16384 control | 615.4/610.0 | 610.2/612.9 | flat | 490.26 ± 0.39 | +24.7 % |
+
+`device_step` (UD artifact, exclusive) PASS on the ILP build; decode remains
+10–12 % behind llama ROCm, the remaining profiled cost being Q8_0 gemv traffic
+(33 % busy) and the Q5_K/funnel remainder around the ~240 GB/s ceiling.
+
 ## Decode (t/s, batch 1)
 
 | context | gufo | reference | date/rev |

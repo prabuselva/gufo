@@ -617,6 +617,8 @@ struct Shape {
 constexpr Shape kShapes[] = {
     {"ssm_in  18560x10240 Q6", kQ6, 18560, 10240},
     {"ssm_out 10240x8192  Q6", kQ6, 10240, 8192},
+    {"ud_exp_up   1024x2048 Q6", kQ6, 1024, 2048},
+    {"ud_exp_down 2048x1024 Q6", kQ6, 2048, 1024},
     {"up_shexp 5376x10240 Q5", kQ5, 5376, 10240},
     {"qkv     5376x10240  Q4", kQ4, 5376, 10240},
 };
@@ -759,7 +761,9 @@ int main() {
   printf("device: %s\n", prop.name);
   RunShape<kQ6>(kShapes[0]);
   RunShape<kQ6>(kShapes[1]);
-  RunShape<kQ5>(kShapes[2]);
-  RunShape<kQ4>(kShapes[3]);
+  RunShape<kQ6>(kShapes[2]);
+  RunShape<kQ6>(kShapes[3]);
+  RunShape<kQ5>(kShapes[4]);
+  RunShape<kQ4>(kShapes[5]);
   return 0;
 }
