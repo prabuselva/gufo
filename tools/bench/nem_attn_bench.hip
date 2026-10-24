@@ -1,15 +1,26 @@
-// Nemotron Bolt NoPE attention prefill microbench (gfx1151).
+// Standalone microbenchmark for the Nemotron-3.5-Bolt-74B prefill attention.
 //
-// Production shape: q [tokens, heads=32, hd=128] f32, kv rows
-// [tokens][2*kvdim] with kvdim = kvh*hd = 256 (K0 K1 V0 V1), kvh=2, causal,
-// scale 1/sqrt(128). One block per (query head, row tile), 128 threads.
-// gfx1151 has no v_pk_fma_f32: 2x FP32 needs VOPD dual-issue, which LLVM's
-// GCNCreateVOPD only folds from two *independent* adjacent VOP3 FFMA pairs.
-// Variants probe score-phase register tiling over KJ key columns (the
-// LDS-issue cap), the skT staging transpose (SKT) and the tile sizes.
+// Self-contained (no repository headers) so it compiles directly with hipcc on
+// the supported gfx1151 host for fast kernel-design iteration.
 //
-// tools/bench/build.sh nem_attn_bench && /tmp/nem_attn_bench [L...]
-
+//   tools/bench/build.sh nem_attn_bench
+//   /tmp/nem_attn_bench -c                     // correctness vs FP64 CPU ref
+//   /tmp/nem_attn_bench -b 8192 -s 24576 -i 3  // pp32768 last-chunk shape
+//
+// Shape is the production attention layer: 32 query heads over 2 KV heads
+// (GQA 16), head_dim 128, an FP32 KV cache with one token-interleaved row
+// [position][2*kvdim] (K of head g at g*128, V at kvdim + g*128), and FP32
+// queries/output laid out [token][head][dim].
+//
+// Variants:
+//   base   AttnKernel<24, 16> copied verbatim from nb_attention.hip.cpp.
+//   plain  WMMA flash attention with a single F16 product per dot; shows the
+//          matrix-core ceiling but its FP16 rounding cannot meet the 2e-5
+//          model contract (reference point only).
+//   split  WMMA flash attention with the FP32 operands carried as hi+lo FP16
+//          pairs (Ootomo fp16x3: ah*bh + ah*bl + al*bh), which keeps the
+//          per-product error near 2^-22 and inside the contract.
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -18,35 +29,39 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
-#define CHECK(cmd)                                                    \
-  do {                                                                \
-    hipError_t err__ = (cmd);                                         \
-    if (err__ != hipSuccess) {                                        \
-      fprintf(stderr, "HIP error %s at %s:%d\n",                      \
-              hipGetErrorString(err__), __FILE__, __LINE__);          \
-      exit(1);                                                        \
-    }                                                                 \
+#define HIP_OK(expr)                                                    \
+  do {                                                                  \
+    hipError_t err_ = (expr);                                           \
+    if (err_ != hipSuccess) {                                           \
+      std::fprintf(stderr, "%s:%d hip error: %s\n", __FILE__, __LINE__, \
+                   hipGetErrorString(err_));                            \
+      std::exit(1);                                                     \
+    }                                                                   \
   } while (0)
 
-namespace {
+constexpr std::uint32_t kQueryHeads = 32;
+constexpr std::uint32_t kKvHeads = 2;
+constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
+constexpr std::uint32_t kHeadDim = 128;
+constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
+constexpr std::uint32_t kKvdim = kKvHeads * kHeadDim;
+constexpr std::uint32_t kKvRow = 2 * kKvdim;  // floats per KV cache row
+constexpr float kScale = 0.08838834764831845F;  // 1 / sqrt(128)
+
+// ---------------------------------------------------------------------------
+// Baseline: the production tiled kernel (src/models/nemotron_h_moe/kernels/
+// rocm/nb_attention.hip.cpp, AttnKernel<24, 16>) copied verbatim.
+// ---------------------------------------------------------------------------
 
 constexpr int kDim = 128;
-constexpr float kNeg = -3.4e38F;
-constexpr int kHeads = 32;
-constexpr int kKvh = 2;
-constexpr int kHd = 128;
-constexpr int kHdv = 128;
-constexpr int kKvdim = kKvh * kHd;  // 256 float per row per half
-constexpr float kScale = 0.08838834764831845F;
+constexpr float kNegInf = -3.4e38F;
 
-// ---------------- variant kernel (production copy + score 2-D register tile)
-// MODE: 3 = full production; 2 = skip the V accumulation phase; 0 = skip
-// expf too (numerically wrong, timing-only, prices the softmax pass);
-// 1 = KV/q staging only (roofline: same grid, same global loads, no math).
-template <int TR, int kTile, int SKT, int RP, int JP, int MODE = 3>
+template<int TR, int kTile>
 __global__ void AttnKernel(const float* __restrict__ q,
                            const float* __restrict__ kv, int pos0, int tokens,
                            float* __restrict__ out, int heads, int hd, int hdv,
@@ -58,15 +73,12 @@ __global__ void AttnKernel(const float* __restrict__ q,
   const int tid = static_cast<int>(threadIdx.x);
 
   __shared__ float sq[TR][kDim];
-  __shared__ float skb[SKT ? 1 : kTile * kDim];
-  __shared__ float skTb[SKT ? kDim * (kTile + 1) : 1];
+  __shared__ float skT[kDim][kTile + 1];
   __shared__ float sv[kTile][kDim];
   __shared__ float se[TR][kTile];
   __shared__ float sm[TR];
   __shared__ float sl[TR];
   __shared__ float sa[TR];
-#define sk(j, d) skb[(j) * kDim + (d)]
-#define skT(d, j) skTb[(d) * (kTile + 1) + (j)]
 
   for (int i = tid; i < TR * kDim; i += kDim) {
     const int r = i / kDim;
@@ -76,35 +88,24 @@ __global__ void AttnKernel(const float* __restrict__ q,
                    : 0.0F;
   }
   if (tid < TR) {
-    sm[tid] = kNeg;
+    sm[tid] = kNegInf;
     sl[tid] = 0.0F;
   }
   __syncthreads();
 
-  float o[TR];
-#pragma unroll 1
-  for (int r = 0; r < TR; ++r) o[r] = 0.0F;
-  float chk = 0.0F;
+  float o[TR] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
   const int64_t kvrow = 2 * kvdim;
   const float* kv_k = kv + g * hd;
   const float* kv_v = kv + kvdim + g * hdv;
-  const int nmax = pos0 + row0 + rows;
+  const int nmax = pos0 + row0 + rows;  // exclusive causal bound for this tile
 
   for (int p0 = 0; p0 < nmax; p0 += kTile) {
     const int nj = nmax - p0 < kTile ? nmax - p0 : kTile;
-    if (SKT) {
-      for (int i = tid; i < nj * kDim; i += kDim) {
-        const int j = i / kDim;
-        const int d = i % kDim;
-        skT(d, j) = kv_k[(static_cast<int64_t>(p0 + j)) * kvrow + d];
-      }
-    } else {
-      for (int i = tid; i < nj * kDim; i += kDim) {
-        const int j = i / kDim;
-        const int d = i % kDim;
-        sk(j, d) =
-            d < hd ? kv_k[(static_cast<int64_t>(p0 + j)) * kvrow + d] : 0.0F;
-      }
+    for (int i = tid; i < nj * kDim; i += kDim) {
+      const int j = i / kDim;
+      const int d = i % kDim;
+      skT[d][j + 1] =
+          d < hd ? kv_k[(static_cast<int64_t>(p0 + j)) * kvrow + d] : 0.0F;
     }
     for (int i = tid; i < nj * kDim; i += kDim) {
       const int j = i / kDim;
@@ -114,42 +115,39 @@ __global__ void AttnKernel(const float* __restrict__ q,
     }
     __syncthreads();
 
-    if constexpr (MODE >= 2) {
-    // Score register tile: each thread computes an RP x JP block (same rows
-    // for JP columns), so each LDS word feeds JP or RP FMAs. Bytes per FMA
-    // drop from (RP+JP)*4/(RP*JP) toward the LDS-bandwidth-limited optimum;
-    // RP=JP=1 reproduces the production scalar dot.
-    constexpr int kC = kTile / JP;
-    for (int i = tid; i < (TR / RP) * kC; i += kDim) {
-      const int r0 = (i / kC) * RP;
-      const int j0 = (i % kC) * JP;
-      float acc[RP][JP];
-#pragma unroll
-      for (int a = 0; a < RP; ++a)
-#pragma unroll
-        for (int k = 0; k < JP; ++k) acc[a][k] = 0.0F;
+    for (int i = tid; i < (TR / 2) * (kTile / 2); i += kDim) {
+      const int r0 = (i / (kTile / 2)) * 2;
+      const int j0 = (i % (kTile / 2)) * 2;
+      float a00 = 0.0F;
+      float a01 = 0.0F;
+      float a10 = 0.0F;
+      float a11 = 0.0F;
       for (int d = 0; d < kDim; ++d) {
-        float kk[JP];
-#pragma unroll
-        for (int k = 0; k < JP; ++k) kk[k] = SKT ? skT(d, j0 + k) : sk(j0 + k, d);
-#pragma unroll
-        for (int a = 0; a < RP; ++a) {
-          const float qv = sq[r0 + a][d];
-#pragma unroll
-          for (int k = 0; k < JP; ++k) acc[a][k] += qv * kk[k];
-        }
+        const float k0 = skT[d][j0 + 1];
+        const float k1 = skT[d][j0 + 2];
+        const float q0 = sq[r0][d];
+        a00 += q0 * k0;
+        a01 += q0 * k1;
+        const float q1 = sq[r0 + 1][d];
+        a10 += q1 * k0;
+        a11 += q1 * k1;
       }
-#pragma unroll
-      for (int a = 0; a < RP; ++a)
-#pragma unroll
-        for (int k = 0; k < JP; ++k) {
-          const int r = r0 + a;
-          const int j = j0 + k;
-          const int p = p0 + j;
-          se[r][j] = (r < rows && p <= pos0 + row0 + r && p < nmax)
-                         ? acc[a][k] * scale
-                         : kNeg;
-        }
+      const int p00 = p0 + j0;
+      const int p01 = p0 + j0 + 1;
+      se[r0][j0] = r0 < rows && p00 <= pos0 + row0 + r0 && p00 < nmax
+                       ? a00 * scale
+                       : kNegInf;
+      se[r0][j0 + 1] = r0 < rows && p01 <= pos0 + row0 + r0 && p01 < nmax
+                           ? a01 * scale
+                           : kNegInf;
+      se[r0 + 1][j0] =
+          r0 + 1 < rows && p00 <= pos0 + row0 + r0 + 1 && p00 < nmax
+              ? a10 * scale
+              : kNegInf;
+      se[r0 + 1][j0 + 1] =
+          r0 + 1 < rows && p01 <= pos0 + row0 + r0 + 1 && p01 < nmax
+              ? a11 * scale
+              : kNegInf;
     }
     __syncthreads();
 
@@ -163,12 +161,10 @@ __global__ void AttnKernel(const float* __restrict__ q,
     }
     __syncthreads();
 
-    if constexpr (MODE != 0) {
-      for (int i = tid; i < TR * kTile; i += kDim) {
-        const int r = i / kTile;
-        const int j = i % kTile;
-        se[r][j] = expf(se[r][j] - sm[r]);
-      }
+    for (int i = tid; i < TR * kTile; i += kDim) {
+      const int r = i / kTile;
+      const int j = i % kTile;
+      se[r][j] = expf(se[r][j] - sm[r]);
     }
     __syncthreads();
 
@@ -180,274 +176,686 @@ __global__ void AttnKernel(const float* __restrict__ q,
       sl[tid] = sl[tid] * sa[tid] + ssum;
     }
 
-    if constexpr (MODE == 3) {
+    for (int r = 0; r < TR; ++r) {
+      o[r] *= sa[r];
+    }
+    for (int j = 0; j < nj; ++j) {
       for (int r = 0; r < TR; ++r) {
-        o[r] *= sa[r];
+        o[r] += se[r][j] * sv[j][tid];
       }
-      for (int j = 0; j < nj; ++j) {
-        for (int r = 0; r < TR; ++r) {
-          o[r] += se[r][j] * sv[j][tid];
-        }
-      }
-    } else {
-      if (tid == 0) chk += se[0][0];
-    }
-    }
-    if constexpr (MODE == 1) {
-      // Staging-only roofline: tiny sink so the loads cannot be eliminated.
-      if (tid == 0) chk += (SKT ? skTb[0] : skb[0]) + sv[0][0];
     }
     __syncthreads();
   }
 
-  if constexpr (MODE == 3) {
-    if (tid < hdv) {
-      for (int r = 0; r < rows; ++r) {
-        out[static_cast<int64_t>(row0 + r) * heads * hdv + h * hdv + tid] =
-            o[r] / sl[r];
-      }
-    }
-  } else if (tid == 0 && chk == 1234.5678F) {
-    out[static_cast<int64_t>(row0) * heads * hdv + h * hdv] = chk;
-  }
-#undef sk
-#undef skT
-}
-
-template <int TR, int kTile, int SKT, int RP, int JP, int MODE = 3>
-void launch(const float* q, const float* kv, int tokens, float* out,
-            hipStream_t s) {
-  const dim3 grid(static_cast<unsigned>((tokens + TR - 1) / TR), kHeads);
-  AttnKernel<TR, kTile, SKT, RP, JP, MODE><<<grid, kDim, 0, s>>>(
-      q, kv, 0, tokens, out, kHeads, kHd, kHdv, kKvh, kKvdim, kScale);
-}
-
-// KV float words loaded by the staging phase for a full causal pass (per
-// head), used to convert roofline timings into a load-side GB/s.
-double stage_bytes(int L) {
-  double words = 0.0;
-  for (int r0 = 0; r0 < L; r0 += 24) {
-    const int rows = std::min(24, L - r0);
-    const int nmax = r0 + rows;
-    for (int p0 = 0; p0 < nmax; p0 += 16) {
-      words += std::min(16, nmax - p0) * 2 * kHd;  // K + V staging
+  if (tid < hdv) {
+    for (int r = 0; r < rows; ++r) {
+      out[static_cast<int64_t>(row0 + r) * heads * hdv + h * hdv + tid] =
+          o[r] / sl[r];
     }
   }
-  return words * kHeads * 4.0;
 }
 
-// ------------- CPU f64 reference (causal GQA SDPA) -------------
-std::vector<double> cpu_attn(const std::vector<float>& q,
-                             const std::vector<float>& kv, int tokens) {
-  const int64_t kvrow = 2 * kKvdim;
-  std::vector<double> out(static_cast<int64_t>(tokens) * kHeads * kHdv, 0.0);
-  for (int t = 0; t < tokens; ++t) {
-    for (int h = 0; h < kHeads; ++h) {
-      const int g = h * kKvh / kHeads;
-      std::vector<double> e(t + 1);
-      double mx = -1e300;
-      for (int j = 0; j <= t; ++j) {
-        double acc = 0.0;
-        for (int d = 0; d < kHd; ++d) {
-          acc += static_cast<double>(
-                     q[static_cast<int64_t>(t) * kHeads * kHd + h * kHd + d]) *
-                 static_cast<double>(kv[j * kvrow + g * kHd + d]);
+// ---------------------------------------------------------------------------
+// Candidate: masked flash attention on the WMMA matrix cores.
+//
+// Ported from tools/bench/attn_causal_bench_v2.hip (WmmaCausalAttention<32,
+// 16, 8>) to the Nemotron geometry: 32x over 2 KV heads, head_dim 128 and the
+// FP32 token-interleaved KV rows. Fragment layout (verified against the CPU
+// reference there): A holds row L%16 and 16 contiguous k, B holds column
+// L%16 and 16 contiguous k (so B is fed a transposed tile), C element i is
+// row 2i + L/16, column L%16.
+//
+// kSplit selects the numerics: false keeps a single F16 product per dot;
+// true carries Q, K, P and V as hi+lo FP16 pairs and chains three WMMA
+// accumulations per 16-step (ah*bh + ah*bl + al*bh), so the FP32 operands
+// stay inside the 2e-5 model contract.
+// ---------------------------------------------------------------------------
+
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+__device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+__device__ __forceinline__ v16h LoadFrag(const __half* p) {
+  union {
+    v16h f;
+    uint4 u[2];
+  } cvt;
+  cvt.u[0] = *reinterpret_cast<const uint4*>(p);
+  cvt.u[1] = *reinterpret_cast<const uint4*>(p + 8);
+  return cvt.f;
+}
+
+constexpr std::uint32_t kWmmaHeads = 2;  // query heads per block
+constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
+
+template<bool kSplit>
+__device__ __forceinline__ void Split8(const float4 lo_in, const float4 hi_in,
+                                       __half* hi, __half* lo) {
+  const float f[8] = {lo_in.x, lo_in.y, lo_in.z, lo_in.w,
+                      hi_in.x, hi_in.y, hi_in.z, hi_in.w};
+#pragma unroll
+  for (std::uint32_t i = 0; i < 8; ++i) {
+    const __half h = __float2half_rn(f[i]);
+    hi[i] = h;
+    if constexpr (kSplit) {
+      lo[i] = __float2half_rn(f[i] - __half2float(h));
+    }
+  }
+}
+
+template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
+         bool kSplitQK, bool kSplitPV>
+__launch_bounds__(kWaves * 32, 1) __global__
+    void WmmaCausalAttention(const float* __restrict__ q,
+                             const float* __restrict__ kv,
+                             float* __restrict__ out, std::uint32_t start_pos,
+                             std::uint32_t batch_size) {
+  constexpr bool kSplit = kSplitQK || kSplitPV;
+  constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
+  constexpr std::uint32_t kKeyBlocks = kKeys / 16;
+  constexpr std::uint32_t kThreads = kWaves * 32;
+  constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
+  constexpr std::uint32_t kWmmaKSteps = kHeadDim / 16;
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (kWaves / kSTiles);
+  constexpr std::uint32_t kRows = kRowBlocks * 16;
+  constexpr std::uint32_t kDimTilesPerWave = kWmmaKSteps / kWaves;
+  constexpr std::uint32_t kSoftmaxLanes = kThreads / kRows;
+  constexpr std::uint32_t kVtStride = kKeys + 8;
+  static_assert(kSTiles * 2 == kWaves,
+                "the waves cover the S tiles in two head-dimension halves");
+  static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
+  static_assert(kKStepsPerWave * (kWaves / kSTiles) == kWmmaKSteps, "k split");
+  static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31u;
+  const std::uint32_t wave = tid >> 5u;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t half_id = lane >> 4u;
+
+  const std::uint32_t query_start = blockIdx.x * kQueryRows;
+  const std::uint32_t head_pair = blockIdx.y;
+  const std::uint32_t kv_head = head_pair / (kGqa / kWmmaHeads);
+  const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
+  const std::uint32_t first_query_head =
+      (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
+
+  const auto row_block_head = [&](std::uint32_t rb) {
+    return first_query_head + (rb % kWmmaHeads);
+  };
+  const auto row_block_offset = [&](std::uint32_t rb) {
+    return (rb / kWmmaHeads) * 16;
+  };
+
+  // K lives [key][dim] and V transposed [dim][key], each bank in a hi and a lo
+  // FP16 copy; S is complete before PV starts, so both phases share the
+  // staging space.
+  constexpr std::uint32_t kKvLdsHalves =
+      (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? (kKeys * kWmmaKStride)
+                                                    : (kHeadDim * kVtStride);
+  __shared__ __half kv_hi[kKvLdsHalves];
+  __shared__ __half kv_lo[kSplit ? kKvLdsHalves : 1];  // K lo if kSplitQK,
+                                                       // V^T lo if kSplitPV
+  __shared__ float s_lds[2][kSTiles][16][16];
+  // +8 half row pad: keeps P fragment rows 16-byte aligned and makes the
+  // 16-row LDS128 read bank-rotation cover 16 distinct banks.
+  __shared__ __half p_hi[kRows][kKeys + 8];
+  __shared__ __half p_lo[kSplitPV ? kRows : 1][kKeys + 8];
+  __shared__ float row_max[kRows];
+  __shared__ float row_sum[kRows];
+  __shared__ float row_scale[kRows];
+
+  const std::uint32_t s_tile = wave % kSTiles;
+  const std::uint32_t s_kh = wave / kSTiles;
+  const std::uint32_t s_rb = s_tile % kRowBlocks;
+  const std::uint32_t s_kb = s_tile / kRowBlocks;
+
+  v16h qh[kKStepsPerWave];
+  v16h ql[kSplitQK ? kKStepsPerWave : 1];
+  {
+    const std::uint32_t local_query =
+        query_start + row_block_offset(s_rb) + sub;
+    const bool live = local_query < batch_size;
+    const float* q_row =
+        q + (static_cast<std::size_t>(local_query) * kAttnWidth) +
+        (static_cast<std::uint32_t>(row_block_head(s_rb)) * kHeadDim);
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+      const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+      const auto* qp = reinterpret_cast<const float4*>(q_row + d0);
+#pragma unroll
+      for (std::uint32_t v = 0; v < 2; ++v) {
+        const float4 fa = live ? qp[v * 2] : make_float4(0, 0, 0, 0);
+        const float4 fb = live ? qp[v * 2 + 1] : make_float4(0, 0, 0, 0);
+        const float f[8] = {fa.x * kScale, fa.y * kScale, fa.z * kScale,
+                            fa.w * kScale, fb.x * kScale, fb.y * kScale,
+                            fb.z * kScale, fb.w * kScale};
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          const _Float16 h = _Float16(f[i]);
+          qh[ks][(v * 8) + i] = h;
+          if constexpr (kSplitQK) {
+            ql[ks][(v * 8) + i] = _Float16(f[i] - static_cast<float>(h));
+          }
         }
-        e[j] = acc * kScale;
-        mx = e[j] > mx ? e[j] : mx;
-      }
-      double s = 0.0;
-      for (int j = 0; j <= t; ++j) s += std::exp(e[j] - mx);
-      for (int d = 0; d < kHdv; ++d) {
-        double acc = 0.0;
-        for (int j = 0; j <= t; ++j) {
-          acc += std::exp(e[j] - mx) *
-                 static_cast<double>(
-                     kv[j * kvrow + kKvdim + g * kHdv + d]);
-        }
-        out[static_cast<int64_t>(t) * kHeads * kHdv + h * kHdv + d] = acc / s;
       }
     }
   }
-  return out;
+
+  v8f o_acc[kRowBlocks][kDimTilesPerWave] = {};
+  for (std::uint32_t r = tid; r < kRows; r += kThreads) {
+    row_max[r] = -INFINITY;
+    row_sum[r] = 0.0F;
+  }
+
+  const std::uint32_t context_end =
+      start_pos + static_cast<std::uint32_t>(batch_size);
+  const std::uint32_t max_visible =
+      min(context_end, start_pos + query_start + kQueryRows);
+
+  constexpr std::uint32_t kVF32 = (kKeys * kHeadDim) / (kThreads * 8);
+  for (std::uint32_t key_start = 0; key_start < max_visible;
+       key_start += kKeys) {
+    // Prefetch V (FP32) before the S phase; parked in registers until the
+    // transpose (mirrors attn_causal_bench_v2).
+    uint4 v_raw[kVF32 * 2];
+    {
+      const std::uint32_t v_key = lane % kKeys;
+      const std::uint32_t v_slice = (tid / kKeys) * (kVF32 * 8);
+      const std::uint32_t key_position = key_start + v_key;
+      const float* src = kv + kKvdim + (static_cast<std::size_t>(kv_head) *
+                                        kHeadDim) +
+                         v_slice +
+                         (static_cast<std::size_t>(key_position) * kKvRow);
+      const bool live = key_position < context_end;
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVF32; ++j) {
+        v_raw[j * 2] =
+            live ? *reinterpret_cast<const uint4*>(src + (j * 8))
+                 : make_uint4(0u, 0u, 0u, 0u);
+        v_raw[j * 2 + 1] =
+            live ? *reinterpret_cast<const uint4*>(src + (j * 8) + 4)
+                 : make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+
+    // --- stage K [key][dim] with the FP32->F16 (hi[,lo]) split.
+    __syncthreads();
+    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8);
+         idx += kThreads) {
+      const std::uint32_t key_row = idx / (kHeadDim / 8);
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      const std::uint32_t key_position = key_start + key_row;
+      const bool live = key_position < context_end;
+      const float* src = kv + (static_cast<std::size_t>(kv_head) * kHeadDim) +
+                         d8 + (static_cast<std::size_t>(key_position) * kKvRow);
+      float4 fa = live ? *reinterpret_cast<const float4*>(src)
+                       : make_float4(0, 0, 0, 0);
+      float4 fb = live ? *reinterpret_cast<const float4*>(src + 4)
+                       : make_float4(0, 0, 0, 0);
+      __half hi[8];
+      __half lo[8] = {};
+      Split8<kSplitQK>(fa, fb, hi, lo);
+      *reinterpret_cast<uint4*>(&kv_hi[(key_row * kWmmaKStride) + d8]) =
+          *reinterpret_cast<const uint4*>(hi);
+      if constexpr (kSplitQK) {
+        *reinterpret_cast<uint4*>(&kv_lo[(key_row * kWmmaKStride) + d8]) =
+            *reinterpret_cast<const uint4*>(lo);
+      }
+    }
+    __syncthreads();
+
+    // --- S = Q K^T
+    {
+      v8f s_acc = {};
+      v8f s_lo_acc = {};
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+        const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+        const uint32_t koff = (((s_kb * 16) + sub) * kWmmaKStride) + d0;
+        if constexpr (kSplitQK) {
+          const v16h bh = LoadFrag(&kv_hi[koff]);
+          const v16h bl = LoadFrag(&kv_lo[koff]);
+          s_acc = Wmma(qh[ks], bh, s_acc);
+          s_lo_acc = Wmma(qh[ks], bl, s_lo_acc);
+          s_lo_acc = Wmma(ql[ks], bh, s_lo_acc);
+        } else {
+          const v16h bh = LoadFrag(&kv_hi[koff]);
+          s_acc = Wmma(qh[ks], bh, s_acc);
+        }
+      }
+      if constexpr (kSplitQK) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) s_acc[i] += s_lo_acc[i];
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
+      }
+    }
+    __syncthreads();
+
+    // --- online softmax: kSoftmaxLanes threads per query row
+    {
+      const std::uint32_t rg = tid / kSoftmaxLanes;
+      const std::uint32_t seg = tid % kSoftmaxLanes;
+      constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
+      const std::uint32_t rb = rg / 16;
+      const std::uint32_t row = rg % 16;
+      const std::uint32_t local_query =
+          query_start + row_block_offset(rb) + row;
+      const std::uint32_t absolute_query = start_pos + local_query;
+      float part_max = -INFINITY;
+      float vals[kPerLane];
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const std::uint32_t col = (seg * kPerLane) + m;
+        const std::uint32_t key_position = key_start + col;
+        const bool valid = local_query < batch_size &&
+                           key_position <= absolute_query &&
+                           key_position < context_end;
+        const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
+        vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
+                           s_lds[1][tile][row][col % 16])
+                        : -INFINITY;
+        part_max = fmaxf(part_max, vals[m]);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+        part_max = fmaxf(part_max, __shfl_xor(part_max, off));
+      }
+      const float prev_max = row_max[rg];
+      const float next_max = fmaxf(prev_max, part_max);
+      const float prior_scale =
+          isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
+      float part_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const float w =
+            isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
+        part_sum += w;
+        const __half h = __float2half_rn(w);
+        p_hi[rg][(seg * kPerLane) + m] = h;
+        if constexpr (kSplitPV) {
+          p_lo[rg][(seg * kPerLane) + m] = __float2half_rn(w - __half2float(h));
+        }
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+        part_sum += __shfl_xor(part_sum, off);
+      }
+      if (seg == 0) {
+        row_max[rg] = next_max;
+        row_sum[rg] = (row_sum[rg] * prior_scale) + part_sum;
+        row_scale[rg] = prior_scale;
+      }
+    }
+    __syncthreads();
+
+    // --- rescale the running O by the new maximum.
+#pragma unroll
+    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+      float scale8[8];
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        scale8[i] = row_scale[(rb * 16) + (2 * i) + half_id];
+      }
+#pragma unroll
+      for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          o_acc[rb][t][i] *= scale8[i];
+        }
+      }
+    }
+
+    // --- stage V transposed [dim][key] with the FP16 (hi[,lo]) split.
+    {
+      const std::uint32_t v_key = lane % kKeys;
+      const std::uint32_t v_slice = (tid / kKeys) * (kVF32 * 8);
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVF32; ++j) {
+        const float4 fa = *reinterpret_cast<const float4*>(&v_raw[j * 2]);
+        const float4 fb = *reinterpret_cast<const float4*>(&v_raw[j * 2 + 1]);
+        const float f[8] = {fa.x, fa.y, fa.z, fa.w, fb.x, fb.y, fb.z, fb.w};
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          const std::uint32_t d = v_slice + (j * 8) + i;
+          const __half h = __float2half_rn(f[i]);
+          kv_hi[(d * kVtStride) + v_key] = h;
+          if constexpr (kSplitPV) {
+            kv_lo[(d * kVtStride) + v_key] =
+                __float2half_rn(f[i] - __half2float(h));
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // --- O += P V
+#pragma unroll
+    for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
+      const std::uint32_t dim_tile = wave + (t * kWaves);
+      v16h vh[kKeyBlocks];
+      v16h vl[kSplitPV ? kKeyBlocks : 1];
+#pragma unroll
+      for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
+        vh[kb] = LoadFrag(&kv_hi[((dim_tile * 16) + sub) * kVtStride + kb * 16]);
+        if constexpr (kSplitPV) {
+          vl[kb] = LoadFrag(&kv_lo[((dim_tile * 16) + sub) * kVtStride + kb * 16]);
+        }
+      }
+#pragma unroll
+      for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+        v8f o_lo = {};
+#pragma unroll
+        for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
+          const v16h ph = LoadFrag(&p_hi[(rb * 16) + sub][kb * 16]);
+          if constexpr (kSplitPV) {
+            const v16h pl = LoadFrag(&p_lo[(rb * 16) + sub][kb * 16]);
+            o_lo = Wmma(ph, vl[kb], o_lo);
+            o_lo = Wmma(pl, vh[kb], o_lo);
+          }
+          o_acc[rb][t] = Wmma(ph, vh[kb], o_acc[rb][t]);
+        }
+        if constexpr (kSplitPV) {
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i) o_acc[rb][t][i] += o_lo[i];
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // --- epilogue
+#pragma unroll
+  for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+    const std::uint32_t query_head = row_block_head(rb);
+    const std::uint32_t row_offset = row_block_offset(rb);
+#pragma unroll
+    for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
+      const std::uint32_t dim_tile = wave + (t * kWaves);
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t row = (2 * i) + half_id;
+        const std::uint32_t local_query = query_start + row_offset + row;
+        if (local_query >= batch_size) {
+          continue;
+        }
+        const float denominator = row_sum[(rb * 16) + row];
+        const std::size_t offset =
+            (static_cast<std::size_t>(local_query) * kAttnWidth) +
+            (static_cast<std::uint32_t>(query_head) * kHeadDim) +
+            (dim_tile * 16) + sub;
+        out[offset] =
+            (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
+      }
+    }
+  }
 }
 
-float* dupload(const std::vector<float>& h) {
-  float* p = nullptr;
-  CHECK(hipMalloc(&p, h.size() * sizeof(float)));
-  CHECK(hipMemcpy(p, h.data(), h.size() * sizeof(float),
-                  hipMemcpyHostToDevice));
-  return p;
-}
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
 
-struct Res {
-  double ms;
-  double ts;
-};
-
-template <typename F>
-Res timeit(F&& fn, int reps) {
-  hipEvent_t a, b;
-  CHECK(hipEventCreate(&a));
-  CHECK(hipEventCreate(&b));
-  fn();  // warm
-  CHECK(hipDeviceSynchronize());
-  CHECK(hipEventRecord(a));
-  for (int i = 0; i < reps; ++i) fn();
-  CHECK(hipEventRecord(b));
-  CHECK(hipEventSynchronize(b));
+template<typename Fn>
+float TimeMs(int iters, Fn&& fn) {
+  fn();
+  HIP_OK(hipGetLastError());
+  HIP_OK(hipDeviceSynchronize());
+  hipEvent_t a = nullptr;
+  hipEvent_t b = nullptr;
+  HIP_OK(hipEventCreate(&a));
+  HIP_OK(hipEventCreate(&b));
+  HIP_OK(hipEventRecord(a));
+  for (int i = 0; i < iters; ++i) {
+    fn();
+  }
+  HIP_OK(hipEventRecord(b));
+  HIP_OK(hipEventSynchronize(b));
   float ms = 0.0F;
-  CHECK(hipEventElapsedTime(&ms, a, b));
-  CHECK(hipEventDestroy(a));
-  CHECK(hipEventDestroy(b));
-  return {ms / reps, 0.0};
+  HIP_OK(hipEventElapsedTime(&ms, a, b));
+  HIP_OK(hipEventDestroy(a));
+  HIP_OK(hipEventDestroy(b));
+  return ms / static_cast<float>(iters);
 }
 
-}  // namespace
+// CPU FP64 reference, multithreaded over (token chunk, head): the candidate
+// gate is the production rocm_attention_test contract (relative <= 2e-5 vs
+// FP64 over the whole output tensor).
+void ReferenceAttention(const std::vector<float>& q,
+                        const std::vector<float>& kv, std::uint32_t start_pos,
+                        std::uint32_t batch, std::vector<double>& out) {
+  std::vector<std::thread> threads;
+  constexpr std::uint32_t kChunks = 8;
+  const std::uint32_t chunk = (batch + kChunks - 1) / kChunks;
+  for (std::uint32_t c = 0; c < kChunks; ++c) {
+    threads.emplace_back([&, c] {
+      const std::uint32_t t0 = c * chunk;
+      const std::uint32_t t1 = std::min(batch, t0 + chunk);
+      for (std::uint32_t t = t0; t < t1; ++t) {
+        const std::uint32_t absolute = start_pos + t;
+        for (std::uint32_t h = 0; h < kQueryHeads; ++h) {
+          const std::uint32_t g = h / kGqa;
+          const float* qrow =
+              q.data() + std::size_t(t) * kAttnWidth + h * kHeadDim;
+          std::vector<double> scores;
+          scores.reserve(absolute + 1);
+          for (std::uint32_t kp = 0; kp <= absolute; ++kp) {
+            double dot = 0.0;
+            const float* krow =
+                kv.data() + std::size_t(kp) * kKvRow + g * kHeadDim;
+            for (std::uint32_t d = 0; d < kHeadDim; ++d) {
+              dot += static_cast<double>(qrow[d]) *
+                     static_cast<double>(krow[d]);
+            }
+            scores.push_back(dot * static_cast<double>(kScale));
+          }
+          double m = -INFINITY;
+          for (double s : scores) {
+            m = std::fmax(m, s);
+          }
+          std::vector<double> w(scores.size());
+          double denom = 0.0;
+          for (std::size_t i = 0; i < scores.size(); ++i) {
+            w[i] = std::exp(scores[i] - m);
+            denom += w[i];
+          }
+          for (std::uint32_t d = 0; d < kHeadDim; ++d) {
+            double acc = 0.0;
+            for (std::size_t i = 0; i < w.size(); ++i) {
+              const float* vrow = kv.data() + std::size_t(i) * kKvRow +
+                                  kKvdim + g * kHeadDim;
+              acc += w[i] * static_cast<double>(vrow[d]);
+            }
+            out[std::size_t(t) * kAttnWidth + h * kHeadDim + d] =
+                (denom > 0.0) ? acc / denom : 0.0;
+          }
+        }
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+}
 
 int main(int argc, char** argv) {
-  int check_len = 131;
-  std::vector<int> lens;
-  for (int i = 1; i < argc; ++i) lens.push_back(std::atoi(argv[i]));
-  if (lens.empty()) lens = {2048, 8192, 16384};
+  std::uint32_t batch = 2048;
+  std::uint32_t start_pos = 0;
+  int iters = 3;
+  bool check = false;
+  std::string only;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-b" && i + 1 < argc) {
+      batch = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (arg == "-s" && i + 1 < argc) {
+      start_pos =
+          static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (arg == "-i" && i + 1 < argc) {
+      iters = std::atoi(argv[++i]);
+    } else if (arg == "-v" && i + 1 < argc) {
+      only = argv[++i];
+    } else if (arg == "-c") {
+      check = true;
+    }
+  }
 
-  // Correctness check vs f64 reference at check_len for all SKT/TR shapes.
-  {
-    std::vector<float> q(static_cast<size_t>(check_len) * kHeads * kHd), kv(
-        static_cast<size_t>(check_len) * 2 * kKvdim);
-    uint32_t st = 12345;
-    auto rnd = [&st]() {
-      st = st * 1664525U + 1013904223U;
-      return static_cast<float>(static_cast<int>(st >> 8) % 20000 - 10000) /
-             10000.0F;
-    };
-    for (auto& x : q) x = rnd();
-    for (auto& x : kv) x = rnd();
-    auto ref = cpu_attn(q, kv, check_len);
-    float* dq = dupload(q);
-    float* dkv = dupload(kv);
-    std::vector<float> cand(static_cast<size_t>(check_len) * kHeads * kHdv);
-    float* dcand = nullptr;
-    CHECK(hipMalloc(&dcand, cand.size() * sizeof(float)));
-    struct V {
-      const char* name;
-      void (*run)(const float*, const float*, int, float*, hipStream_t);
-    };
-    const V variants[] = {
-      {"G  tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
-      {"T22 tr24 r2j2     ", launch<24, 16, 1, 2, 2>},
-      {"T41 tr24 r4j1     ", launch<24, 16, 1, 4, 1>},
-      {"T12 tr24 r1j2     ", launch<24, 16, 1, 1, 2>},
-      {"E22 tr32 r2j2     ", launch<32, 16, 1, 2, 2>},
-      {"G2 tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
-    };
-    double worst = 0.0;
-    for (auto& v : variants) {
-      CHECK(hipMemset(dcand, 0, cand.size() * sizeof(float)));
-      v.run(dq, dkv, check_len, dcand, nullptr);
-      CHECK(hipDeviceSynchronize());
-      CHECK(hipMemcpy(cand.data(), dcand, cand.size() * sizeof(float),
-                      hipMemcpyDeviceToHost));
-      double num = 0.0, den = 0.0;
-      size_t nan_ref = 0, nan_cand = 0;
-      for (size_t i = 0; i < cand.size(); ++i) {
-        if (std::isnan(ref[i])) ++nan_ref;
-        if (std::isnan(cand[i])) ++nan_cand;
-        if (std::isnan(cand[i]) || std::isnan(ref[i])) {
-          std::printf("NaN at %zu: cand=%f ref=%f\n", i, cand[i], ref[i]);
+  const std::uint32_t context_end = start_pos + batch;
+  std::vector<float> h_q(static_cast<std::size_t>(batch) * kAttnWidth);
+  std::vector<float> h_kv(static_cast<std::size_t>(context_end) * kKvRow);
+  for (std::size_t i = 0; i < h_q.size(); ++i) {
+    h_q[i] = 0.9F * std::sin(0.0131F * static_cast<float>(i % 811)) +
+             0.2F * std::cos(0.0027F * static_cast<float>(i % 53));
+  }
+  for (std::size_t i = 0; i < h_kv.size(); ++i) {
+    const float kvv = 0.8F * std::sin(0.0173F * static_cast<float>(i % 907)) +
+                      0.3F * std::cos(0.0091F * static_cast<float>(i % 173));
+    const float vvv = 0.7F * std::cos(0.0119F * static_cast<float>(i % 643)) +
+                      0.25F * std::sin(0.0071F * static_cast<float>(i % 211));
+    const std::size_t slot = i % kKvRow;
+    h_kv[i] = slot < kKvdim ? kvv : vvv;
+  }
+
+  float* d_q = nullptr;
+  float* d_kv = nullptr;
+  float* d_out = nullptr;
+  HIP_OK(hipMalloc(&d_q, h_q.size() * sizeof(float)));
+  HIP_OK(hipMalloc(&d_kv, h_kv.size() * sizeof(float)));
+  HIP_OK(hipMalloc(&d_out, h_q.size() * sizeof(float)));
+  HIP_OK(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float),
+                   hipMemcpyHostToDevice));
+  HIP_OK(hipMemcpy(d_kv, h_kv.data(), h_kv.size() * sizeof(float),
+                   hipMemcpyHostToDevice));
+  HIP_OK(hipMemset(d_out, 0, h_q.size() * sizeof(float)));
+
+  const dim3 base_grid((batch + 23) / 24, kQueryHeads);
+  const dim3 wmma_grid((batch + 31) / 32, kQueryHeads / kWmmaHeads);
+  const auto run_base = [&] {
+    AttnKernel<24, 16><<<base_grid, kDim>>>(d_q, d_kv,
+                                            static_cast<int>(start_pos),
+                                            static_cast<int>(batch), d_out,
+                                            kQueryHeads, kHeadDim, kHeadDim,
+                                            kKvHeads, kKvdim, kScale);
+  };
+  const auto run_plain = [&] {
+    WmmaCausalAttention<32, 16, 8, false, false><<<wmma_grid, 256>>>(
+        d_q, d_kv, d_out, start_pos, batch);
+  };
+  const auto run_split = [&] {
+    WmmaCausalAttention<32, 16, 8, true, true><<<wmma_grid, 256>>>(
+        d_q, d_kv, d_out, start_pos, batch);
+  };
+  const auto run_qkonly = [&] {
+    WmmaCausalAttention<32, 16, 8, true, false><<<wmma_grid, 256>>>(
+        d_q, d_kv, d_out, start_pos, batch);
+  };
+  const auto run_pvonly = [&] {
+    WmmaCausalAttention<32, 16, 8, false, true><<<wmma_grid, 256>>>(
+        d_q, d_kv, d_out, start_pos, batch);
+  };
+
+  struct Variant {
+    const char* name;
+    const char* role;
+    bool run_check_ok;  // expected to meet 2e-5 vs FP64?
+    const std::function<void()>* run;
+  };
+  const std::function<void()> f_base = run_base;
+  const std::function<void()> f_plain = run_plain;
+  const std::function<void()> f_split = run_split;
+  const std::function<void()> f_qk = run_qkonly;
+  const std::function<void()> f_pv = run_pvonly;
+  const Variant variants[] = {
+      {"base", "production AttnKernel<24,16>", true, &f_base},
+      {"plain", "WMMA single F16 product (ceiling, fails contract)", false,
+       &f_plain},
+      {"split", "WMMA fp16x3 hi/lo split (contract candidate)", true, &f_split},
+      {"qkonly", "ablation: split S only, plain PV", false, &f_qk},
+      {"pvonly", "ablation: plain S, split PV", false, &f_pv},
+  };
+
+  std::vector<float> got(static_cast<std::size_t>(batch) * kAttnWidth);
+
+  std::fprintf(stderr, "shape: batch=%u start_pos=%u context_end=%u\n", batch,
+               start_pos, context_end);
+
+  if (check) {
+    std::vector<double> ref(static_cast<std::size_t>(batch) * kAttnWidth, 0.0);
+    ReferenceAttention(h_q, h_kv, start_pos, batch, ref);
+    double ref_norm = 0.0;
+    for (double r : ref) {
+      ref_norm = std::max(ref_norm, std::abs(r));
+    }
+    for (const auto& v : variants) {
+      if (!only.empty() && only != v.name) {
+        continue;
+      }
+      HIP_OK(hipMemset(d_out, 0, h_q.size() * sizeof(float)));
+      (*v.run)();
+      HIP_OK(hipGetLastError());
+      HIP_OK(hipDeviceSynchronize());
+      HIP_OK(hipMemcpy(got.data(), d_out, got.size() * sizeof(float),
+                       hipMemcpyDeviceToHost));
+      double max_abs = 0.0;
+      double num = 0.0;
+      double den = 0.0;
+      std::size_t worst = 0;
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        const double d = std::abs(static_cast<double>(got[i]) - ref[i]);
+        if (!std::isfinite(got[i]) || std::isnan(ref[i])) {
+          std::fprintf(stderr, "[%s] non-finite at %zu\n", v.name, i);
           return 1;
         }
-        const double d = static_cast<double>(cand[i]) - ref[i];
-        num += d * d;
-        den += ref[i] * ref[i];
+        if (d > max_abs) {
+          max_abs = d;
+          worst = i;
+        }
+        num += d;
+        den += std::abs(ref[i]);
       }
-      const double max_rel = std::sqrt(num / den);
-      if (max_rel > worst) worst = max_rel;
-      std::printf(
-          "  %s max_rel=%.3e nan_ref=%zu nan_cand=%zu "
-          "ref0=%.6f cand0=%.6f %s\n",
-          v.name, max_rel, nan_ref, nan_cand, ref[0], cand[0],
-          max_rel < 2e-4 ? "OK" : "FAIL");
-    }
-    if (worst >= 2e-4) {
-      std::printf("correctness FAILED\n");
-      return 1;
-    }
-    // check_len also exercises the ragged tail (131 = 8 tiles + 19 rows).
-  }
-
-  float* dq;
-  float* dkv;
-  float* dout;
-  int maxlen = 0;
-  for (int L : lens) maxlen = L > maxlen ? L : maxlen;
-  CHECK(hipMalloc(&dq, static_cast<size_t>(maxlen) * kHeads * kHd * 4));
-  CHECK(hipMalloc(&dkv, static_cast<size_t>(maxlen) * 2 * kKvdim * 4));
-  CHECK(hipMalloc(&dout, static_cast<size_t>(maxlen) * kHeads * kHdv * 4));
-  CHECK(hipMemset(dq, 0x3d, static_cast<size_t>(maxlen) * kHeads * kHd * 4));
-  CHECK(hipMemset(dkv, 0x3d, static_cast<size_t>(maxlen) * 2 * kKvdim * 4));
-
-  std::printf("\n%-16s", "variant");
-  for (int L : lens) std::printf("%10s", "t/s");
-  std::printf("\n");
-
-  struct V {
-    const char* name;
-    void (*run)(const float*, const float*, int, float*, hipStream_t);
-  };
-  const V variants[] = {
-    {"G  tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
-    {"T22 tr24 r2j2     ", launch<24, 16, 1, 2, 2>},
-    {"NV tr24 no-V      ", launch<24, 16, 1, 2, 2, 2>},
-    {"RF tr24 roofline  ", launch<24, 16, 1, 2, 2, 1>},
-    {"G2 tr24 p x r1j1  ", launch<24, 16, 1, 1, 1>},
-  };
-  std::vector<std::vector<double>> best(sizeof(variants) / sizeof(V),
-                                        std::vector<double>());
-  const int kRounds = 3;
-  for (int round = 0; round < kRounds; ++round) {
-    for (size_t vi = 0; vi < sizeof(variants) / sizeof(V); ++vi) {
-      auto& v = variants[vi];
-      std::printf("%-16s r%d", v.name, round);
-      for (int L : lens) {
-        int reps = L >= 16384 ? 2 : L >= 8192 ? 3 : 6;
-        auto r = timeit([&] { v.run(dq, dkv, L, dout, nullptr); }, reps);
-        const double ts = L / (r.ms * 1e-3);
-        best[vi].push_back(ts);
-        std::printf("%10.1f", ts);
+      {
+        const std::uint32_t t = static_cast<std::uint32_t>(worst / kAttnWidth);
+        const std::uint32_t h =
+            static_cast<std::uint32_t>((worst / kHeadDim) % kQueryHeads);
+        std::fprintf(stderr,
+                     "[%s] worst t=%u h=%u d=%lu got=%.9g ref=%.9g\n", v.name,
+                     t, h, static_cast<unsigned long>(worst % kHeadDim),
+                     static_cast<double>(got[worst]), ref[worst]);
       }
-      std::printf("\n");
-    }
-  }
-  // best[vi] holds one entry per (round,length) interleaved; take the median
-  // over rounds for each length to cancel thermal/ordering drift.
-  std::printf("\n%-16s", "MEDIAN");
-  for (int L : lens) std::printf("%10s", "t/s");
-  std::printf("\n");
-  std::vector<double> med(lens.size());
-  for (size_t vi = 0; vi < best.size(); ++vi) {
-    std::printf("%-16s    ", variants[vi].name);
-    for (size_t li = 0; li < lens.size(); ++li) {
-      std::vector<double> col;
-      for (int r = 0; r < kRounds; ++r) col.push_back(best[vi][r * lens.size() + li]);
-      std::sort(col.begin(), col.end());
-      med[li] = col[col.size() / 2];
-      std::printf("%10.1f", med[li]);
-    }
-    std::printf("\n");
-    if (std::string(variants[vi].name).find("roofline") != std::string::npos) {
-      std::printf("%-16s    ", "RF GB/s load");
-      for (size_t li = 0; li < lens.size(); ++li) {
-        const double gbs = stage_bytes(lens[li]) * med[li] /
-                           (static_cast<double>(lens[li]) * 1e9);
-        std::printf("%10.1f", gbs);
-      }
-      std::printf("\n");
+      const double rel = num / den;
+      const char* verdict = (rel <= 2e-5)
+                                ? "PASS"
+                                : (v.run_check_ok ? "FAIL" : "REF");
+      std::fprintf(stderr,
+                   "[%s] max_elem_rel=%.3e overall_rel=%.3e %s (gate 2e-5)\n",
+                   v.name, ref_norm > 0 ? max_abs / ref_norm : max_abs, rel,
+                   verdict);
     }
   }
 
-  CHECK(hipFree(dq));
-  CHECK(hipFree(dkv));
-  CHECK(hipFree(dout));
+  if (!check || only.empty()) {
+    const std::uint64_t pairs = static_cast<std::uint64_t>(batch) *
+                                    static_cast<uint64_t>(start_pos) +
+                                static_cast<uint64_t>(batch) * (batch + 1) / 2;
+    const double flops = 4.0 * static_cast<double>(pairs) * kQueryHeads *
+                         kHeadDim;
+    for (const auto& v : variants) {
+      if (!only.empty() && only != v.name) {
+        continue;
+      }
+      if (only.empty() && (std::string(v.name) == "qkonly" ||
+                           std::string(v.name) == "pvonly")) {
+        continue;  // ablations are correctness-only unless selected
+      }
+      const float ms = TimeMs(iters, *v.run);
+      std::fprintf(stderr, "[%s] %.3f ms  %.2f TFLOP/s  %s\n", v.name, ms,
+                   flops / (static_cast<double>(ms) * 1e-3) / 1e12, v.role);
+    }
+  }
   return 0;
 }

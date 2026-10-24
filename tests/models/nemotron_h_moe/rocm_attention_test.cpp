@@ -165,6 +165,20 @@ int main() {
   ok = RunShape(Cfg{8, 64, 64, 2, 1.0 / 8.0}, 200) && ok;
   ok = RunShape(Cfg{4, 32, 32, 1, 1.0 / std::sqrt(32.0)}, 200) && ok;
   ok = RunShape(Cfg{6, 64, 32, 3, 0.125}, 200) && ok;  // hd != hdv
+  // Production Nemotron shape: chunks of >= 32 tokens take the WMMA hi/lo
+  // split prefill path, shorter chunks and decode keep AttnKernel.
+  {
+    const Cfg p{32, 128, 128, 2, 1.0 / std::sqrt(128.0)};
+    std::uint32_t seed = 0xBEEF01U;
+    std::vector<float> cache(static_cast<std::size_t>(1200) * 2 * p.kvdim(),
+                             0.0F);
+    ok = RunChunk(p, seed, cache, 0, 40, "attn h32 kv2 wmma T40") && ok;
+    ok = RunChunk(p, seed, cache, 40, 97, "attn h32 kv2 wmma T97 unaligned") &&
+         ok;
+    ok = RunChunk(p, seed, cache, 853, 113, "attn h32 kv2 wmma deep ~1K") && ok;
+    ok = RunChunk(p, seed, cache, 966, 1, "attn h32 kv2 decode") && ok;
+    ok = RunChunk(p, seed, cache, 967, 24, "attn h32 kv2 T24 fallback") && ok;
+  }
   std::printf("rocm_attention: %s\n", ok ? "ALL PASS" : "FAILURES");
   return ok ? 0 : 1;
 }

@@ -32,6 +32,57 @@ by default in Gufo; text recipe temp 1.0 / top-p 0.95 is a serve default, not
 | pp65536 | — | — | — |
 | pp102400 | — | — | — |
 
+## UD-Q4_K_XL prefill vs llama.cpp (46.77 GiB artifact)
+
+Same model weights (`UD-Q4_K_XL`, 46.77 GiB, shard 1 loaded with the rest of
+the split), measured 2026-10-24 in consecutive exclusive windows: `gufo` at
+`a8bb20dd` (`gufo bench --n-prompt D --n-gen 1`, one run/depth) vs llama.cpp
+`ff5a23376` `llama-bench -fa on -ngl 99 -r 2` (HIP build
+`build_b11721_rocm`, Vulkan build `build_nemotron_vulkan`). The reference
+runtimes use all GPU layers and flat attention, matching Gufo settings.
+
+| depth | gufo | llama ROCm | llama Vulkan | gufo vs ROCm |
+| --- | --- | --- | --- | --- |
+| pp2048 | 611.52 ± 0.00 | 521.15 ± 7.37 | 538.95 ± 1.15 | +17.3 % |
+| pp4096 | 610.85 ± 0.00 | 507.95 ± 0.50 | 518.68 ± 1.92 | +20.3 % |
+| pp8192 | 560.56 ± 0.00 | 503.51 ± 0.21 | 510.78 ± 0.50 | +11.3 % |
+| pp16384 | 471.08 ± 0.00 | 492.43 ± 0.52 | 494.46 ± 3.39 | −4.3 % |
+| pp32768 | 313.39 ± 0.00 | 466.49 ± 3.18 | 449.88 ± 0.27 | −32.8 % |
+| pp65536 | 177.42 ± 0.00 | 436.76 ± 0.67 | 412.55 ± 0.39 | −59.4 % |
+
+Gufo wins ≤8K depth and loses from 16K on: throughput degrades super-linearly
+with depth (llama.cpp stays >430 t/s at 64K) and one pp65536 pass costs ~795 s
+wall vs ~150 s for the reference. This depth collapse — the open prefill lever
+at this revision — was fixed the same day by the WMMA attention kernel in the
+next section. Reference decode (tg) cells for this artifact are not measured
+yet.
+
+## UD-Q4_K_XL prefill vs llama.cpp — WMMA attention (same artifact)
+
+Profile of the table above put `AttnKernel<24,16>` at 52.3 % of the pp32768
+GPU trace. Replaced by a WMMA fp16x3 hi/lo-split prefill kernel (see
+[EXPERIMENTS.md](EXPERIMENTS.md) for the split-accumulator story and gates);
+decode and partial tiles keep the F32 kernel. `gufo` built on `a8bb20dd` with
+the WMMA kernel, 2026-10-24 exclusive windows, same bench command; llama
+columns carried from the section above (unchanged references).
+
+| depth | gufo | llama ROCm | llama Vulkan | gufo vs ROCm |
+| --- | --- | --- | --- | --- |
+| pp2048 | 616.76 ± 0.00 | 521.15 ± 7.37 | 538.95 ± 1.15 | +18.3 % |
+| pp4096 | 636.04 ± 0.00 | 507.95 ± 0.50 | 518.68 ± 1.92 | +25.2 % |
+| pp8192 | 637.86 ± 0.00 | 503.51 ± 0.21 | 510.78 ± 0.50 | +26.7 % |
+| pp16384 | 613.48 ± 0.00 | 492.43 ± 0.52 | 494.46 ± 3.39 | +24.6 % |
+| pp32768 | 551.44 ± 0.00 | 466.49 ± 3.18 | 449.88 ± 0.27 | +18.2 % |
+| pp65536 | 449.28 ± 0.00 | 436.76 ± 0.67 | 412.55 ± 0.39 | +2.9 % |
+| pp102400 | 379.66 ± 0.00 | — | — | — |
+
+The super-linear depth collapse is gone: 16K→64K now costs 613→449 t/s
+(−26.8 %) instead of 471→177 (−62.4 %), and Gufo leads llama ROCm at every
+measured depth. The remaining ≥65K falloff is KV read traffic
+(F32 cache streamed per tile), the Q8_0-cache lever, not the score phase.
+Quality gates on the WMMA build: extended `rocm_attention` (≤2e-5 rel),
+`rocm_ops`, and shipped-artifact `reference` + `device_step` all PASS.
+
 ## Decode (t/s, batch 1)
 
 | context | gufo | reference | date/rev |
