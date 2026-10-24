@@ -477,6 +477,11 @@ struct NblIq4Xs {
 static_assert(sizeof(NblQ4_K) == 144, "q4_K block must be 144 bytes");
 static_assert(sizeof(NblQ5_K) == 176, "q5_K block must be 176 bytes");
 static_assert(sizeof(NblQ6_K) == 210, "q6_K block must be 210 bytes");
+static_assert(offsetof(NblQ4_K, qs) % 8 == 0, "q4_K lane windows need qs % 8");
+static_assert(offsetof(NblQ5_K, qs) % 8 == 0 && offsetof(NblQ5_K, qh) % 8 == 0,
+              "q5_K lane windows need qs/qh % 8");
+static_assert(offsetof(NblIq4Xs, qs) % 8 == 0,
+              "iq4_xS lane windows need qs % 8");
 static_assert(sizeof(NblIq4Xs) == 136, "iq4_xs block must be 136 bytes");
 
 // Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS (ggml values_iq4_nl).
@@ -631,8 +636,21 @@ __device__ __forceinline__ float GemvChunkDotIq4Xs(const uint8_t* w,
 // is warp-uniform because the per-lane offset is a multiple of 8.
 
 // Fetch bytes w8[0..7] from a possibly dword-misaligned global pointer.
+// kAligned compiles the window to one 64-bit load; the caller selects it
+// at launch time (see LaunchGemvF32Type) because keeping the 8-alignment
+// check inside the device loop costs over half of the benefit (probe
+// tools/bench/nem_decode_kq_bench.hip, bitwise on every variant: v2
+// compile-time aligned 1.33x/1.26x on Q4_K/Q5_K decode rows vs v5 runtime
+// check 1.23x/1.07x over the dword funnel). The funnel path below keeps
+// Q6_K (210 B block stride, residue varies with the block) correct.
+template<bool kAligned>
 __device__ __forceinline__ uint2 LoadBytes8(const uint8_t* w8) {
   const uintptr_t a = reinterpret_cast<uintptr_t>(w8);
+  if constexpr (kAligned) {
+    uint64_t v;
+    __builtin_memcpy(&v, w8, sizeof(v));
+    return make_uint2(static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32));
+  }
   const uint32_t* const wd =
       reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
   const uint32_t sh = static_cast<uint32_t>(a & 3U) * 8U;
@@ -645,6 +663,7 @@ __device__ __forceinline__ uint2 LoadBytes8(const uint8_t* w8) {
   return make_uint2(__funnelshift_r(d0, d1, sh), __funnelshift_r(d1, d2, sh));
 }
 
+template<bool kAligned>
 __device__ __forceinline__ float GemvWarpDotQ4_K(const uint8_t* w,
                                                  const float* x, int block,
                                                  int lane) {
@@ -655,7 +674,7 @@ __device__ __forceinline__ float GemvWarpDotQ4_K(const uint8_t* w,
   float s = 0.0F;
   float m = 0.0F;
   QScaleMin(g, b->scales, d, dmin, s, m);
-  const uint2 q8 = LoadBytes8(b->qs + (g >> 1) * 32 + (lane & 3) * 8);
+  const uint2 q8 = LoadBytes8<kAligned>(b->qs + (g >> 1) * 32 + (lane & 3) * 8);
   const int sh = (g & 1) * 4;
   const float* xv = x + static_cast<int64_t>(block) * kKqElems + lane * 8;
   const float4 xa = *reinterpret_cast<const float4*>(xv);
@@ -671,6 +690,7 @@ __device__ __forceinline__ float GemvWarpDotQ4_K(const uint8_t* w,
   return acc;
 }
 
+template<bool kAligned>
 __device__ __forceinline__ float GemvWarpDotQ5_K(const uint8_t* w,
                                                  const float* x, int block,
                                                  int lane) {
@@ -684,8 +704,8 @@ __device__ __forceinline__ float GemvWarpDotQ5_K(const uint8_t* w,
   float s = 0.0F;
   float m = 0.0F;
   QScaleMin(2 * gg + half, b->scales, d, dmin, s, m);
-  const uint2 q8 = LoadBytes8(b->qs + gg * 32 + l0);
-  const uint2 h8 = LoadBytes8(b->qh + l0);
+  const uint2 q8 = LoadBytes8<kAligned>(b->qs + gg * 32 + l0);
+  const uint2 h8 = LoadBytes8<kAligned>(b->qh + l0);
   const int sh = 2 * gg + half;
   const uint32_t qw[2] = {q8.x, q8.y};
   const uint32_t hw[2] = {h8.x, h8.y};
@@ -718,8 +738,10 @@ __device__ __forceinline__ float GemvWarpDotQ6_K(const uint8_t* w,
   const int k = (lane >> 2) & 3;
   const int hi16 = (lane >> 1) & 1;
   const int j0 = (lane & 3) * 8;
-  const uint2 h8 = LoadBytes8(b->qh + c * 32 + j0);
-  const uint2 q8 = LoadBytes8(b->ql + c * 64 + (k & 1) * 32 + j0);
+  // Q6_K block stride (210 B) makes the window residue change with the
+  // block index, so this tier always takes the runtime funnel.
+  const uint2 h8 = LoadBytes8<false>(b->qh + c * 32 + j0);
+  const uint2 q8 = LoadBytes8<false>(b->ql + c * 64 + (k & 1) * 32 + j0);
   const float ds =
       Fp16ToF32(b->d) * static_cast<float>(b->scales[c * 8 + 2 * k + hi16]);
   const int sh_h = 2 * k;
@@ -742,6 +764,7 @@ __device__ __forceinline__ float GemvWarpDotQ6_K(const uint8_t* w,
   return acc;
 }
 
+template<bool kAligned>
 __device__ __forceinline__ float GemvWarpDotIq4Xs(const uint8_t* w,
                                                   const float* x, int block,
                                                   int lane) {
@@ -756,7 +779,7 @@ __device__ __forceinline__ float GemvWarpDotIq4Xs(const uint8_t* w,
       static_cast<int>((b->scales_l[ib / 2] >> (4U * (ib % 2))) & 0x0FU) |
       static_cast<int>(((b->scales_h >> (2U * ib)) & 0x03U) << 4U);
   const float s = d * static_cast<float>(ls - 32);
-  const uint2 q8 = LoadBytes8(b->qs + ib * 16 + (lane & 1) * 8);
+  const uint2 q8 = LoadBytes8<kAligned>(b->qs + ib * 16 + (lane & 1) * 8);
   const int sh = ((lane >> 1) & 1) * 4U;
   const float* xv = x + static_cast<int64_t>(block) * kKqElems + lane * 8;
   const float4 xa = *reinterpret_cast<const float4*>(xv);
@@ -772,20 +795,20 @@ __device__ __forceinline__ float GemvWarpDotIq4Xs(const uint8_t* w,
   return acc;
 }
 
-template<int TYPE>
+template<int TYPE, bool kAligned>
 __device__ __forceinline__ float GemvWarpDot(const uint8_t* __restrict__ w,
                                              const float* __restrict__ x,
                                              int block, int lane) {
   if (TYPE == kNblGemvQ4_K) {
-    return GemvWarpDotQ4_K(w, x, block, lane);
+    return GemvWarpDotQ4_K<kAligned>(w, x, block, lane);
   }
   if (TYPE == kNblGemvQ5_K) {
-    return GemvWarpDotQ5_K(w, x, block, lane);
+    return GemvWarpDotQ5_K<kAligned>(w, x, block, lane);
   }
   if (TYPE == kNblGemvQ6_K) {
     return GemvWarpDotQ6_K(w, x, block, lane);
   }
-  return GemvWarpDotIq4Xs(w, x, block, lane);
+  return GemvWarpDotIq4Xs<kAligned>(w, x, block, lane);
 }
 
 // Signed int8x4 dot via the native unsigned byte dot; the compiler inserts
@@ -1088,7 +1111,7 @@ __global__ void GemvF32PackedKernel(const float* __restrict__ x,
 // activation scalar-wise); warp i of a row walks super-blocks
 // i, i + warps_per_row, ... and a lane covers eight values per block. The
 // x pointer must keep 16-byte alignment (enforced by the launcher).
-template<int TYPE>
+template<int TYPE, bool kAligned>
 __global__ void GemvKqPackedKernel(const float* __restrict__ x,
                                    const uint8_t* __restrict__ w,
                                    float* __restrict__ out, int n_out, int k,
@@ -1131,7 +1154,7 @@ __global__ void GemvKqPackedKernel(const float* __restrict__ x,
     const uint8_t* wr = w + w_row * static_cast<int64_t>(expert_stride);
     const int n_super = k / kKqElems;
     for (int s = warp_in_row; s < n_super; s += warps_per_row) {
-      acc += GemvWarpDot<TYPE>(wr, xr, s, lane);
+      acc += GemvWarpDot<TYPE, kAligned>(wr, xr, s, lane);
     }
   }
   for (int off = warpSize / 2; off > 0; off >>= 1) {
@@ -1546,9 +1569,24 @@ void LaunchGemvF32Type(bool packed, const dim3& grid, const dim3& block,
     const bool vec = kq_tier && (reinterpret_cast<uintptr_t>(x) & 15U) == 0 &&
                      x_stride % 4 == 0;
     if (vec) {
-      GemvKqPackedKernel<TYPE><<<grid, block, 0, stream>>>(
-          x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens,
-          warps_per_row, blocks_per_slot);
+      // 8-aligned windows for the whole tensor: Q4_K/Q5_K/IQ4_XS lane
+      // offsets are multiples of 8 (static_asserts above), so the tensor
+      // base and the row stride decide. Weights land in page-aligned
+      // hipMalloc buffers, but the check stays so external buffers keep
+      // the runtime funnel. Deciding here instead of per window inside
+      // the loop keeps the aligned variant's codegen (see LoadBytes8).
+      const bool al8 = (TYPE != kNblGemvQ6_K) &&
+                       (reinterpret_cast<uintptr_t>(wb) & 7U) == 0U &&
+                       stride % 8 == 0;
+      if (al8) {
+        GemvKqPackedKernel<TYPE, true><<<grid, block, 0, stream>>>(
+            x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens,
+            warps_per_row, blocks_per_slot);
+      } else {
+        GemvKqPackedKernel<TYPE, false><<<grid, block, 0, stream>>>(
+            x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens,
+            warps_per_row, blocks_per_slot);
+      }
     } else {
       GemvF32PackedKernel<TYPE><<<grid, block, 0, stream>>>(
           x, wb, out, n_out, k, stride, ids, slots, x_stride, tokens,
