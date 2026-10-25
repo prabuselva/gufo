@@ -719,6 +719,80 @@ float RunShape(const Shape& sh) {
   printf("  %-26s v0 %8.3f ms %7.1f GB/s\n", sh.name, base_ms,
          wbytes / (base_ms * 1e6F));
 
+  // DRAM regime: rotate across weight parks totalling >512 MB so every
+  // iteration reads cold bytes (the plain loop above re-reads an L3-resident
+  // buffer and reports cache bandwidth, not the 117-150 GB/s production
+  // decode numbers). Same launch geometry, per-park timing. A second pass
+  // scatters the parks every ~32 MB across a 20 GB sparse reservation to
+  // reproduce production weight-page/TLB locality (59 read regions/token
+  // spread over the full 20 GB file).
+  uint8_t* wp = nullptr;
+  size_t npark = std::max<size_t>(2, (size_t)544 << 20) / wbytes;
+  if (npark > 128) npark = 128;
+  CHECK(hipMalloc(&wp, npark * wbytes));
+  for (size_t p = 0; p < npark; ++p) {
+    CHECK(hipMemcpy(wp + p * wbytes, hw.data(), wbytes, hipMemcpyHostToDevice));
+  }
+  auto timed_rot = [&](auto launch) {
+    for (int i = 0; i < 2; ++i) launch(i % npark);
+    CHECK(hipDeviceSynchronize());
+    float tot = 0.0F;
+    for (int i = 0; i < reps; ++i) {
+      CHECK(hipEventRecord(ev0));
+      launch(i % npark);
+      CHECK(hipEventRecord(ev1));
+      CHECK(hipEventSynchronize(ev1));
+      float ms = 0.0F;
+      CHECK(hipEventElapsedTime(&ms, ev0, ev1));
+      tot += ms;
+    }
+    return tot / reps;
+  };
+  float v0d = timed_rot([&](size_t p) {
+    LaunchOne<TYPE, 0>(x, wp + p * wbytes, out0, sh.n_out, sh.k, stride,
+                       sh.slots, 0);
+  });
+  printf("  %-26s v0DRAM %8.3f ms %7.1f GB/s\n", sh.name, v0d,
+         wbytes / (v0d * 1e6F));
+  uint8_t* ws = nullptr;
+  const size_t span = (size_t)20 << 30;
+  if (hipMalloc(&ws, span) == hipSuccess) {
+    CHECK(hipMemset(ws, 0, span));  // fault all pages (real 20 GB)
+    auto off = [](size_t p, size_t seed) {
+      size_t h = (p + 1) * (seed * 2654435761UL);
+      return (h % (((size_t)18 << 30) / ((size_t)32 << 20))) * ((size_t)32 << 20);
+    };
+    float v0s = timed_rot([&](size_t p) {
+      LaunchOne<TYPE, 0>(x, ws + off(p, 7), out0, sh.n_out, sh.k, stride,
+                         sh.slots, 0);
+    });
+    float v1s = timed_rot([&](size_t p) {
+      LaunchOne<TYPE, 1>(x, ws + off(p, 13), outv, sh.n_out, sh.k, stride,
+                         sh.slots, 0);
+    });
+    printf(
+        "  %-26s v0SPREAD %8.3f ms %7.1f GB/s   v1SPREAD %8.3f ms %7.1f GB/s\n",
+        sh.name, v0s, wbytes / (v0s * 1e6F), v1s, wbytes / (v1s * 1e6F));
+    hipFree(ws);
+  } else {
+    ws = nullptr;
+  }
+  auto runv_d = [&](int v, const char* tag) {
+    float ms = timed_rot([&](size_t p) {
+      if (v == 99) {
+        LaunchOne<TYPE, 99>(x, wp + p * wbytes, outv, sh.n_out, sh.k, stride,
+                            sh.slots, 0);
+      } else {
+        LaunchOne<TYPE, 1>(x, wp + p * wbytes, outv, sh.n_out, sh.k, stride,
+                           sh.slots, 0);
+      }
+    });
+    printf("  %-26s %s %8.3f ms %7.1f GB/s (%.3fx v0DRAM)\n", sh.name, tag, ms,
+           wbytes / (ms * 1e6F), v0d / ms);
+  };
+  runv_d(99, "roDRAM");
+  runv_d(1, "v1DRAM");
+
   auto check_v = [&](auto launch, const char* tag) {
     CHECK(hipMemsetAsync(outv, 0,
                          static_cast<size_t>(slots) * sh.n_out * sizeof(float)));
