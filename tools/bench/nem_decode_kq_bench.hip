@@ -527,7 +527,7 @@ __global__ void KqGemvKernel(const float* __restrict__ x,
                              const uint8_t* __restrict__ w,
                              float* __restrict__ out, int n_out, int k,
                              int stride, int warps_per_row,
-                             int blocks_per_slot) {
+                             int blocks_per_slot, int slots) {
   const int warp = static_cast<int>(threadIdx.x) / warpSize;
   const int lane = static_cast<int>(threadIdx.x) % warpSize;
   const int row_local = warp / warps_per_row;
@@ -537,14 +537,16 @@ __global__ void KqGemvKernel(const float* __restrict__ x,
     fold[threadIdx.x] = 0.0F;
   }
   __syncthreads();
-  const int row =
-      static_cast<int>(blockIdx.x) * (kBlock / warpSize / warps_per_row) +
-      row_local;
+  const int gid = static_cast<int>(blockIdx.x);
+  const int slot = gid / blocks_per_slot;
+  const int row = (gid % blocks_per_slot) * (kBlock / warpSize / warps_per_row) +
+                  row_local;
   const bool active = row < n_out;
   float acc = 0.0F;
   if (active) {
-    const uint8_t* wr = w + static_cast<int64_t>(row) * stride;
-    const float* xr = x;
+    const uint8_t* wr =
+        w + (static_cast<int64_t>(slot) * n_out + row) * stride;
+    const float* xr = x + static_cast<int64_t>(slot) * k;
     const int n_super = k / kKqElems;
     if constexpr (VAR == 0 || VAR == 2 || VAR == 3 || VAR == 5) {
       for (int s = warp_in_row; s < n_super; s += warps_per_row) {
@@ -577,6 +579,17 @@ __global__ void KqGemvKernel(const float* __restrict__ x,
         acc += (VAR == 1) ? WarpDotV0<TYPE>(wr, xr, s, lane)
                           : WarpDotV3<TYPE>(wr, xr, s, lane);
       }
+    } else if constexpr (VAR == 6) {
+      int s = warp_in_row;
+      for (; s + warps_per_row < n_super; s += 2 * warps_per_row) {
+        const float a0 = WarpDotV2<TYPE>(wr, xr, s, lane);
+        const float a1 = WarpDotV2<TYPE>(wr, xr, s + warps_per_row, lane);
+        acc += a0;
+        acc += a1;
+      }
+      for (; s < n_super; s += warps_per_row) {
+        acc += WarpDotV2<TYPE>(wr, xr, s, lane);
+      }
     } else {
       uint64_t r = 0;
       for (int bs = warp_in_row; bs < n_super; bs += warps_per_row) {
@@ -597,7 +610,7 @@ __global__ void KqGemvKernel(const float* __restrict__ x,
     for (int j = 0; j < kBlock / warpSize; ++j) {
       sum += fold[row_local * 8 + j];
     }
-    out[row] = sum;
+    out[static_cast<int64_t>(slot) * n_out + row] = sum;
   }
 }
 
@@ -612,40 +625,52 @@ struct Shape {
   int type;   // Tier
   int n_out;
   int k;
+  int slots;  // MoE experts gathered in one launch (production = 9).
 };
 
 constexpr Shape kShapes[] = {
-    {"ssm_in  18560x10240 Q6", kQ6, 18560, 10240},
-    {"ssm_out 10240x8192  Q6", kQ6, 10240, 8192},
-    {"ud_exp_up   1024x2048 Q6", kQ6, 1024, 2048},
-    {"ud_exp_down 2048x1024 Q6", kQ6, 2048, 1024},
-    {"up_shexp 5376x10240 Q5", kQ5, 5376, 10240},
-    {"qkv     5376x10240  Q4", kQ4, 5376, 10240},
+    {"ssm_in  18560x10240 Q6", kQ6, 18560, 10240, 1},
+    {"ssm_out 10240x8192  Q6", kQ6, 10240, 8192, 1},
+    // Production MoE gemv shapes: 9 expert slots per launch, n_out per expert
+    // row set, measured 100-183 GB/s in decode (60% of gemv busy time).
+    {"moe q6  1024x1536  s9", kQ6, 1024, 1536, 9},
+    {"moe q6  1024x2048  s9", kQ6, 1024, 2048, 9},
+    {"moe q6  1024x2304  s9", kQ6, 1024, 2304, 9},
+    {"moe q6  1024x2560  s9", kQ6, 1024, 2560, 9},
+    {"moe q5  1024x2048  s9", kQ5, 1024, 2048, 9},
+    {"moe q5  1024x2304  s9", kQ5, 1024, 2304, 9},
+    {"moe q5  1024x2560  s9", kQ5, 1024, 2560, 9},
+    {"moe q4  1024x2304  s9", kQ4, 1024, 2304, 9},
+    {"moe q4  1024x2560  s9", kQ4, 1024, 2560, 9},
+    {"up_shexp 5376x10240 Q5", kQ5, 5376, 10240, 1},
+    {"qkv     5376x10240  Q4", kQ4, 5376, 10240, 1},
 };
 
 template<int TYPE, int VAR>
 void LaunchOne(const float* x, const uint8_t* w, float* out, int n_out, int k,
-               int stride, hipStream_t stream) {
+               int stride, int slots, hipStream_t stream) {
   const int n_chunk = k / kKqElems;
   const int warps_per_row = (n_chunk + kWarp - 1) / kWarp;
   const int rows_per_block = kBlock / (kWarp * warps_per_row);
   const int blocks_per_slot = (n_out + rows_per_block - 1) / rows_per_block;
-  KqGemvKernel<TYPE, VAR><<<blocks_per_slot, kBlock, 0, stream>>>(
-      x, w, out, n_out, k, stride, warps_per_row, blocks_per_slot);
+  KqGemvKernel<TYPE, VAR><<<blocks_per_slot * slots, kBlock, 0, stream>>>(
+      x, w, out, n_out, k, stride, warps_per_row, blocks_per_slot, slots);
 }
 
 template<int TYPE>
 float RunShape(const Shape& sh) {
   const int stride = (TYPE == kQ6) ? 210 : (TYPE == kQ5) ? 176 : 144;
-  const size_t wbytes = static_cast<size_t>(sh.n_out) * stride * (sh.k / 256);
+  const int slots = sh.slots;
+  const size_t wbytes =
+      static_cast<size_t>(slots) * sh.n_out * stride * (sh.k / 256);
   uint8_t* w = nullptr;
   float* x = nullptr;
   float* out0 = nullptr;
   float* outv = nullptr;
   CHECK(hipMalloc(&w, wbytes));
-  CHECK(hipMalloc(&x, static_cast<size_t>(sh.k) * sizeof(float)));
-  CHECK(hipMalloc(&out0, static_cast<size_t>(sh.n_out) * sizeof(float)));
-  CHECK(hipMalloc(&outv, static_cast<size_t>(sh.n_out) * sizeof(float)));
+  CHECK(hipMalloc(&x, static_cast<size_t>(slots) * sh.k * sizeof(float)));
+  CHECK(hipMalloc(&out0, static_cast<size_t>(slots) * sh.n_out * sizeof(float)));
+  CHECK(hipMalloc(&outv, static_cast<size_t>(slots) * sh.n_out * sizeof(float)));
   std::vector<uint8_t> hw(wbytes);
   for (size_t i = 0; i < wbytes; ++i) {
     hw[i] = static_cast<uint8_t>(rand() & 0xFF);
@@ -663,7 +688,7 @@ float RunShape(const Shape& sh) {
       hw[blk + 3] = 0x3D;
     }
   }
-  std::vector<float> hx(sh.k);
+  std::vector<float> hx(static_cast<size_t>(slots) * sh.k);
   for (auto& v : hx) v = RandUnit();
   CHECK(hipMemcpy(w, hw.data(), wbytes, hipMemcpyHostToDevice));
   CHECK(hipMemcpy(x, hx.data(), hx.size() * sizeof(float), hipMemcpyHostToDevice));
@@ -690,20 +715,21 @@ float RunShape(const Shape& sh) {
     }
     return tot / reps;
   };
-  base_ms = timed([&] { LaunchOne<TYPE, 0>(x, w, out0, sh.n_out, sh.k, stride, 0); });
+  base_ms = timed([&] { LaunchOne<TYPE, 0>(x, w, out0, sh.n_out, sh.k, stride, sh.slots, 0); });
   printf("  %-26s v0 %8.3f ms %7.1f GB/s\n", sh.name, base_ms,
          wbytes / (base_ms * 1e6F));
 
   auto check_v = [&](auto launch, const char* tag) {
-    CHECK(hipMemsetAsync(outv, 0, static_cast<size_t>(sh.n_out) * sizeof(float)));
+    CHECK(hipMemsetAsync(outv, 0,
+                         static_cast<size_t>(slots) * sh.n_out * sizeof(float)));
     launch();
     CHECK(hipDeviceSynchronize());
-    std::vector<float> a(sh.n_out);
-    std::vector<float> b(sh.n_out);
+    std::vector<float> a(static_cast<size_t>(slots) * sh.n_out);
+    std::vector<float> b(static_cast<size_t>(slots) * sh.n_out);
     CHECK(hipMemcpy(a.data(), out0, a.size() * sizeof(float), hipMemcpyDeviceToHost));
     CHECK(hipMemcpy(b.data(), outv, b.size() * sizeof(float), hipMemcpyDeviceToHost));
     double worst = 0.0;
-    for (int i = 0; i < sh.n_out; ++i) {
+    for (size_t i = 0; i < a.size(); ++i) {
       const double denom = std::fabs(a[i]) + 1e-2;
       worst = std::max(worst, std::fabs(a[i] - b[i]) / denom);
     }
@@ -716,12 +742,12 @@ float RunShape(const Shape& sh) {
     float ms = 0.0F;                                                      \
     if constexpr ((V) == 99) {                                            \
       ms = timed([&] { LaunchOne<TYPE, 99>(x, w, outv, sh.n_out, sh.k,  \
-                                           stride, 0); });              \
+                                           stride, sh.slots, 0); });    \
       printf("  %-26s %s %8.3f ms %7.1f GB/s (roof)\n", sh.name, tag,   \
              ms, (wbytes) / (ms * 1e6F));                                 \
     } else {                                                              \
       ms = timed([&] { LaunchOne<TYPE, (V)>(x, w, outv, sh.n_out,       \
-                                            sh.k, stride, 0); });       \
+                                            sh.k, stride, sh.slots, 0); });       \
       printf("  %-26s %s %8.3f ms %7.1f GB/s (%.3fx)\n", sh.name, tag,  \
              ms, (wbytes) / (ms * 1e6F), base_ms / ms);                 \
     }                                                                     \
@@ -731,15 +757,17 @@ float RunShape(const Shape& sh) {
   RUNVAR(2, "v2 ");
   RUNVAR(3, "v3 ");
   RUNVAR(4, "v4 ");
+  RUNVAR(6, "v6 ");  // aligned-single loads, two-chain ILP (production cand.)
   if constexpr (TYPE != kQ6) {
     RUNVAR(5, "v5 ");  // shipped production LoadBytes8 (runtime align check)
   }
-  check_v([&] { LaunchOne<TYPE, 1>(x, w, outv, sh.n_out, sh.k, stride, 0); }, "v1");
-  check_v([&] { LaunchOne<TYPE, 2>(x, w, outv, sh.n_out, sh.k, stride, 0); }, "v2");
-  check_v([&] { LaunchOne<TYPE, 3>(x, w, outv, sh.n_out, sh.k, stride, 0); }, "v3");
-  check_v([&] { LaunchOne<TYPE, 4>(x, w, outv, sh.n_out, sh.k, stride, 0); }, "v4");
+  check_v([&] { LaunchOne<TYPE, 1>(x, w, outv, sh.n_out, sh.k, stride, sh.slots, 0); }, "v1");
+  check_v([&] { LaunchOne<TYPE, 2>(x, w, outv, sh.n_out, sh.k, stride, sh.slots, 0); }, "v2");
+  check_v([&] { LaunchOne<TYPE, 3>(x, w, outv, sh.n_out, sh.k, stride, sh.slots, 0); }, "v3");
+  check_v([&] { LaunchOne<TYPE, 4>(x, w, outv, sh.n_out, sh.k, stride, sh.slots, 0); }, "v4");
+  check_v([&] { LaunchOne<TYPE, 6>(x, w, outv, sh.n_out, sh.k, stride, sh.slots, 0); }, "v6");
   if constexpr (TYPE != kQ6) {
-    check_v([&] { LaunchOne<TYPE, 5>(x, w, outv, sh.n_out, sh.k, stride, 0); }, "v5");
+    check_v([&] { LaunchOne<TYPE, 5>(x, w, outv, sh.n_out, sh.k, stride, sh.slots, 0); }, "v5");
   }
   CHECK(hipEventDestroy(ev0));
   CHECK(hipEventDestroy(ev1));
@@ -752,6 +780,14 @@ float RunShape(const Shape& sh) {
 
 }  // namespace
 
+void RunByType(const Shape& sh) {
+  switch (sh.type) {
+    case kQ4: RunShape<kQ4>(sh); break;
+    case kQ5: RunShape<kQ5>(sh); break;
+    case kQ6: RunShape<kQ6>(sh); break;
+  }
+}
+
 int main() {
   srand(1234);
   int dev = 0;
@@ -759,11 +795,6 @@ int main() {
   hipDeviceProp_t prop;
   CHECK(hipGetDeviceProperties(&prop, dev));
   printf("device: %s\n", prop.name);
-  RunShape<kQ6>(kShapes[0]);
-  RunShape<kQ6>(kShapes[1]);
-  RunShape<kQ6>(kShapes[2]);
-  RunShape<kQ6>(kShapes[3]);
-  RunShape<kQ5>(kShapes[4]);
-  RunShape<kQ4>(kShapes[5]);
+  for (const Shape& sh : kShapes) RunByType(sh);
   return 0;
 }

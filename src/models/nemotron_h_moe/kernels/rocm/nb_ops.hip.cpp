@@ -1153,29 +1153,23 @@ __global__ void GemvKqPackedKernel(const float* __restrict__ x,
                                        : static_cast<int64_t>(k));
     const uint8_t* wr = w + w_row * static_cast<int64_t>(expert_stride);
     const int n_super = k / kKqElems;
-    if constexpr (TYPE == kNblGemvQ6_K) {
-      // Q6_K expert GEMVs are latency-bound on the single-chain funnel
-      // (~40 GB/s at the UD-Q4_K_XL 2.1 M-param expert rows; the v1
-      // two-chain probe in tools/bench/nem_decode_kq_bench.hip is 4.0x
-      // there and bitwise-exact, wide Q6 rows stay neutral 0.91-1.07x).
-      // Kept off the aligned tiers, whose shipped u64 loads already beat
-      // the dual chain (1.30x/1.68x vs 1.21x/1.59x). The cross-super-block
-      // accumulation order change is ULP-scale.
-      int s = warp_in_row;
-      for (; s + warps_per_row < n_super; s += 2 * warps_per_row) {
-        const float a0 = GemvWarpDot<TYPE, kAligned>(wr, xr, s, lane);
-        const float a1 =
-            GemvWarpDot<TYPE, kAligned>(wr, xr, s + warps_per_row, lane);
-        acc += a0;
-        acc += a1;
-      }
-      for (; s < n_super; s += warps_per_row) {
-        acc += GemvWarpDot<TYPE, kAligned>(wr, xr, s, lane);
-      }
-    } else {
-      for (int s = warp_in_row; s < n_super; s += warps_per_row) {
-        acc += GemvWarpDot<TYPE, kAligned>(wr, xr, s, lane);
-      }
+    // Two independent super-block chains per iteration. Every expert GEMV
+    // (slots=9, n_out<=2560, k<=2560) is latency-bound in the single-chain
+    // loop: the slots=9 probe in tools/bench/nem_decode_kq_bench.hip gives
+    // the dual chain 1.64-2.10x on Q4_K/Q5_K/Q6_K expert shapes, bitwise
+    // exact vs the shipped loader (Q6_K alone shipped +4.4% UD tg128). Wide
+    // dense rows stay neutral (0.94-1.09x). The cross-super-block
+    // accumulation order change is ULP-scale.
+    int s = warp_in_row;
+    for (; s + warps_per_row < n_super; s += 2 * warps_per_row) {
+      const float a0 = GemvWarpDot<TYPE, kAligned>(wr, xr, s, lane);
+      const float a1 =
+          GemvWarpDot<TYPE, kAligned>(wr, xr, s + warps_per_row, lane);
+      acc += a0;
+      acc += a1;
+    }
+    for (; s < n_super; s += warps_per_row) {
+      acc += GemvWarpDot<TYPE, kAligned>(wr, xr, s, lane);
     }
   }
   for (int off = warpSize / 2; off > 0; off >>= 1) {
