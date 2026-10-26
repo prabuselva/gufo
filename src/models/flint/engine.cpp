@@ -110,6 +110,17 @@ std::string Model::ModelName() const {
                          .value_or("Flint Preview 40B-A2B"));
 }
 
+std::size_t Model::ResidentBytes() const noexcept {
+  return executor_ == nullptr ? 0 : executor_->device_bytes();
+}
+
+std::size_t Model::SessionBytes(std::uint32_t context) const noexcept {
+  // K+V fp16 per layer and position, matching the executor's KV planes.
+  const Config& c = weights_->config;
+  return static_cast<std::size_t>(c.num_layers) * 2u *
+         static_cast<std::size_t>(context) * c.AttentionKvDim() * 2u;
+}
+
 const Config& Model::config() const noexcept {
   return weights_->config;
 }

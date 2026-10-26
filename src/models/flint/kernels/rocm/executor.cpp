@@ -72,9 +72,12 @@ struct FlintExecutor::State {
   __half* v_plane{nullptr};
   std::size_t layer_stride{0};
   std::uint32_t kv_capacity{0};
+  std::size_t bytes{0};  // Device bytes accumulated during Create.
 };
 
 namespace {
+
+State* g_alloc_sink{nullptr};  // Non-null only inside FlintExecutor::Create.
 
 [[nodiscard]] bool Alloc(void** p, std::size_t bytes, std::string* error) {
   if (bytes == 0) {
@@ -82,7 +85,13 @@ namespace {
     return true;
   }
   const hipError_t err = hipMalloc(p, bytes);
-  return HipOk(err, error, "hipMalloc");
+  if (!HipOk(err, error, "hipMalloc")) {
+    return false;
+  }
+  if (g_alloc_sink != nullptr) {
+    g_alloc_sink->bytes += bytes;
+  }
+  return true;
 }
 
 }  // namespace
@@ -244,8 +253,10 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
   State* st = new State();
   ex->state_ = st;
   st->host = weights;
+  g_alloc_sink = st;
 
   if (!UploadWeights(reader, weights, &st->dev, &st->weight_buffers, error)) {
+    g_alloc_sink = nullptr;
     return nullptr;  // ~FlintExecutor frees state_
   }
 
@@ -287,6 +298,7 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
                    c.num_layers * kv_capacity * KVD * 2, error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->v_plane),
                    c.num_layers * kv_capacity * KVD * 2, error);
+  g_alloc_sink = nullptr;
   st->layer_stride = static_cast<std::size_t>(kv_capacity) * KVD;
   st->kv_capacity = kv_capacity;
   if (!ok) {
@@ -297,6 +309,10 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
   }
   ex->position_ = 0;
   return ex;
+}
+
+std::size_t FlintExecutor::device_bytes() const noexcept {
+  return state_ == nullptr ? 0 : state_->bytes;
 }
 
 namespace {

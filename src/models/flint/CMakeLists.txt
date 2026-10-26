@@ -4,6 +4,7 @@
 # The metadata loader, gpt2-BPE tokenizer and weight binder are built here;
 # the runtime lands with the engine.
 add_library(gufo_flint STATIC
+  chat_template.cpp
   config.cpp
   tokenizer.cpp
   weights.cpp)

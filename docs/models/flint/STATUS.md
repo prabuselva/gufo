@@ -128,6 +128,11 @@ pair in one tool call (AGENTS protocol).
   linked into `gufo_llm_cli` and dispatched from `src/cli/bench/bench.cpp`.
   Smoke on the real artifact (GPU exclusive): load 12.4 s, pp2048 255.0 t/s,
   tg128 37.3 t/s — prefill far behind llama.cpp, tune in C7.
+- [x] Chat template: `chat_template.{hpp,cpp}` replicates the GGUF jinja
+  byte-exactly (turn framing, sanitized user/system content with the seven
+  registered specials HTML-escaped, think-tag/thought rendering, tool
+  preamble + `tool_call`/tool_response XML). The `flint.chat_template`
+  test pins seven cases against renderings checked with a jinja oracle.
 - [ ] C5 serve: `serve_runner.{hpp,cpp}` + `inference_backend` dispatch.
 - [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /

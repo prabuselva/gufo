@@ -53,6 +53,12 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] std::string ModelName() const;
+  /// Device bytes held by the loaded executor (weights, activations, KV).
+  [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// KV-cache bytes one session consumes at `context`.
+  [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
+  /// Flint allocates every device buffer at Load; nothing is deferred.
+  [[nodiscard]] std::size_t DeferredScratchBytes() const noexcept { return 0; }
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const FlintTokenizer& tokenizer() const noexcept {
     return *tokenizer_;

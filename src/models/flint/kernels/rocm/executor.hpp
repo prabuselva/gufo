@@ -40,6 +40,10 @@ public:
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   void Reset() noexcept { position_ = 0; }
 
+  /// Device bytes held by this executor (weights, activations, KV caches),
+  /// accumulated while `Create` allocates.
+  [[nodiscard]] std::size_t device_bytes() const noexcept;
+
   /// Debug aid: record the MoE intermediates of one chosen layer during the
   /// next Forward (router input, sigmoid scores, chosen ids/weights, routed
   /// outputs and the shared-expert stream) for host-side comparison.
