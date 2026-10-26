@@ -139,7 +139,12 @@ pair in one tool call (AGENTS protocol).
   load 18.3 s, `Flint Preview` listed, three chat completions (thinking
   output, continuation with prefix reuse, tools-ignored path) at 44-50
   t/s decode.
-- [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
+- [x] C6 logits parity vs llama.cpp b11879: `flint_logits_probe` (GPU engine)
+  vs a libllama C-API probe, same 22-token raw chat prompt, 8 greedy steps,
+  exclusive GPU. Chosen-id chains identical; top-32 overlap 30-32/32 with all
+  max margin deltas (-0.4..-2.5 logit) on tokens far below argmax; rank-0-
+  margin differences 0.0 at every step. Scalar-oracle parity covered by the
+  passing `flint.reference` and `flint.rocm.forward` tests.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 

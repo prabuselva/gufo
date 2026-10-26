@@ -61,3 +61,10 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(flint.rocm.forward PROPERTIES
     LABELS "flint;gpu;external-model;slow" SKIP_RETURN_CODE 77)
 endif()
+
+# Manual C6 parity probe (no ctest entry): prints the per-position top-32
+# logit margins and the greedy chain for a raw prompt.
+if (ENGINE_ENABLE_HIP)
+  add_executable(flint_logits_probe EXCLUDE_FROM_ALL logits_probe.cpp)
+  target_link_libraries(flint_logits_probe PRIVATE gufo_flint_engine)
+endif()
