@@ -124,7 +124,11 @@ pair in one tool call (AGENTS protocol).
   tokenize/decode roundtrip, session exclusivity, deterministic full-replay
   and append-prefix logits. Passes on the real artifact (first=450,
   second=6963).
-- [ ] C5 CLI (`bench`/`prompt`/`serve`) dispatch + runners.
+- [x] C5 bench CLI: `cli_runner.{hpp,cpp}` (`IsFlint`, `RunFlintBenchmark`)
+  linked into `gufo_llm_cli` and dispatched from `src/cli/bench/bench.cpp`.
+  Smoke on the real artifact (GPU exclusive): load 12.4 s, pp2048 255.0 t/s,
+  tg128 37.3 t/s — prefill far behind llama.cpp, tune in C7.
+- [ ] C5 serve: `serve_runner.{hpp,cpp}` + `inference_backend` dispatch.
 - [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
