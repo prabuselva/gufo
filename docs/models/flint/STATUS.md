@@ -118,8 +118,13 @@ pair in one tool call (AGENTS protocol).
   (`tests/models/flint/tokenizer_test.cpp`: byte coverage, piece
   boundaries, CJK split trap, specials/stops, BOS/EOS, roundtrips, GGUF
   validation); passes.
-- [ ] C5 CLI (`bench`/`prompt`/`serve`) dispatch + runners; engine
-  (`engine.{hpp,cpp}`) first.
+- [x] Engine: `engine.{hpp,cpp}` (Model/Session over FlintExecutor; chunked
+  prefill, prefix-reuse Sync with divergence replay, one live session) +
+  test `flint.engine` (GPU, `GUFO_FLINT_GGUF`, skip 77): vocab agreement,
+  tokenize/decode roundtrip, session exclusivity, deterministic full-replay
+  and append-prefix logits. Passes on the real artifact (first=450,
+  second=6963).
+- [ ] C5 CLI (`bench`/`prompt`/`serve`) dispatch + runners.
 - [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.

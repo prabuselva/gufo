@@ -50,4 +50,11 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_flint_executor PUBLIC ${PROJECT_SOURCE_DIR})
   target_link_libraries(gufo_flint_executor PUBLIC
     gufo_flint_kernels gufo_flint hip::host)
+
+  # Model/Session runtime consumed by the CLI runners.
+  add_library(gufo_flint_engine STATIC EXCLUDE_FROM_ALL engine.cpp)
+  set_target_properties(gufo_flint_engine PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_flint_engine PUBLIC ${PROJECT_SOURCE_DIR})
+  target_link_libraries(gufo_flint_engine PUBLIC gufo_flint_executor)
 endif()

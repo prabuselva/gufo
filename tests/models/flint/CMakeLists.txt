@@ -32,6 +32,16 @@ add_test(NAME flint.reference COMMAND flint_reference_test)
 set_tests_properties(flint.reference PROPERTIES
   LABELS "flint;cpu;external-model;slow" SKIP_RETURN_CODE 77)
 
+# Engine Model/Session checks run against the real artifact on the GPU
+# (exclusive access; a few forwards) and skip (77) without GUFO_FLINT_GGUF.
+if (ENGINE_ENABLE_HIP)
+  add_executable(flint_engine_test EXCLUDE_FROM_ALL engine_test.cpp)
+  target_link_libraries(flint_engine_test PRIVATE gufo_flint_engine)
+  add_test(NAME flint.engine COMMAND flint_engine_test)
+  set_tests_properties(flint.engine PROPERTIES
+    LABELS "flint;gpu;external-model;slow" SKIP_RETURN_CODE 77)
+endif()
+
 # ROCm trunk parity against the scalar oracle over the real artifact; needs
 # exclusive GPU access and skips (77) without GUFO_FLINT_GGUF.
 if (ENGINE_ENABLE_HIP)
