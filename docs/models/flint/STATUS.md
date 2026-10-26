@@ -92,9 +92,23 @@ pair in one tool call (AGENTS protocol).
   `[pos+1-513, pos]`; MoE: sigmoid(router), top-6 desc (lower index on tie =
   ggml argsort), `weights /= clamp(sum, 6.103515625e-5, ∞)`, scale 1.0 no-op,
   single `_shexp` added once, then residual (`llama-graph.cpp:2194-2360`).
-- [ ] C4 ROCm kernels + executor (Q8 mmq routed path, dense f16 GEMM,
-  windowed attention with sinks + QK norm, per-layer rope bypass,
-  sigmoid top-6 gate + L2 norm + 2 shared experts).
+- [x] C4 ROCm kernels + executor (Q8 mmq routed expert path, SIMT GEMV tier
+  for dense/attention projections incl. batched prefill, f16 KV planes,
+  windowed attention with sinks + per-head QK norm + NEOX rope gated per
+  layer, sigmoid top-6 gate + clamped L2 norm + single shared expert).
+  `src/models/flint/kernels/rocm/{kernels,linear}.{hpp,cpp}`,
+  `executor.{hpp,cpp}`; test `flint.rocm.forward`
+  (`tests/models/flint/rocm_forward_test.cpp`, EXCLUDE_FROM_ALL target,
+  `GUFO_FLINT_GGUF`, skip 77). Passes: decode steps 0-3 max|logit diff|
+  0.21-0.91 vs oracle budgets ≤1.13 with argmax match, batched prefill
+  identical to sequential decode (0.637). Debug aids kept (off by default):
+  `GUFO_FLINT_DEBUG` stats, layer-hidden capture both sides,
+  `EnableMoeTrace` host replay. Bugs found here: Q8_0 header scale is
+  `ggml_half` not float (kernels `Q8Scale()`), MoE down-GEMM pair-indexed
+  convention, missing `__syncthreads()` between rope pair-rewrite and the
+  output readers in `QkEpilogueKernel` (half the dims could leak unrotated
+  values at pos>0), and mmq dense prefill exceeding the oracle envelope
+  (→ fp32 `GemvBatch` tier until the speed phase).
 - [ ] C5 CLI (`bench`/`prompt`/`serve`) dispatch + runners.
 - [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /

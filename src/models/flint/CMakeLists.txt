@@ -19,3 +19,33 @@ target_link_libraries(gufo_flint_reference PUBLIC gufo_flint)
 # even as an oracle, so it keeps -O2 in every configuration.
 set_source_files_properties(cpu_ops.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
+
+if (ENGINE_ENABLE_HIP)
+  # Flint-private fused operators and linear tiers. Built only by explicit
+  # GPU validation targets until the engine consumes them.
+  add_library(gufo_flint_kernels STATIC EXCLUDE_FROM_ALL
+    kernels/rocm/kernels.hip.cpp
+    kernels/rocm/linear.hip.cpp)
+  set_source_files_properties(kernels/rocm/kernels.hip.cpp
+    kernels/rocm/linear.hip.cpp PROPERTIES LANGUAGE HIP)
+  set_target_properties(gufo_flint_kernels PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_flint_kernels PUBLIC ${PROJECT_SOURCE_DIR})
+  target_compile_options(gufo_flint_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+  # The batched Q8_0 tiers reuse the Qwen3.8-Flash-Next mmq path; the target
+  # exports its header directory transitively, weights stay native.
+  target_link_libraries(gufo_flint_kernels PUBLIC
+    gufo_qwen38_flash_next_mmq gufo_flint hip::host)
+
+  # Host-side driver: streams the artifact to the GPU and runs one forward.
+  add_library(gufo_flint_executor STATIC EXCLUDE_FROM_ALL
+    kernels/rocm/executor.cpp)
+  set_target_properties(gufo_flint_executor PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_flint_executor PUBLIC ${PROJECT_SOURCE_DIR})
+  target_link_libraries(gufo_flint_executor PUBLIC
+    gufo_flint_kernels gufo_flint hip::host)
+endif()

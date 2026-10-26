@@ -216,6 +216,9 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     return false;
   }
 
+  if (capture_) {
+    hidden_.clear();
+  }
   std::vector<float> x(c_.hidden_size);
   cpu::DequantizeRow(w_.token_embd, 0, static_cast<std::uint64_t>(token),
                      x.data());
@@ -238,6 +241,9 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     Ffn(l, normed, ffn);
     for (std::uint32_t j = 0; j < c_.hidden_size; ++j) {
       x[j] += ffn[j];
+    }
+    if (capture_) {
+      hidden_.push_back(x);
     }
   }
 

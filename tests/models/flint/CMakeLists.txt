@@ -25,3 +25,17 @@ set_source_files_properties(reference_test.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 add_test(NAME flint.reference COMMAND flint_reference_test)
 set_tests_properties(flint.reference PROPERTIES
   LABELS "flint;cpu;external-model;slow" SKIP_RETURN_CODE 77)
+
+# ROCm trunk parity against the scalar oracle over the real artifact; needs
+# exclusive GPU access and skips (77) without GUFO_FLINT_GGUF.
+if (ENGINE_ENABLE_HIP)
+  add_executable(flint_rocm_forward_test EXCLUDE_FROM_ALL
+    rocm_forward_test.cpp)
+  target_link_libraries(flint_rocm_forward_test PRIVATE
+    gufo_flint_executor gufo_flint_reference)
+  set_source_files_properties(rocm_forward_test.cpp
+    PROPERTIES COMPILE_OPTIONS "-O2")
+  add_test(NAME flint.rocm.forward COMMAND flint_rocm_forward_test)
+  set_tests_properties(flint.rocm.forward PROPERTIES
+    LABELS "flint;gpu;external-model;slow" SKIP_RETURN_CODE 77)
+endif()

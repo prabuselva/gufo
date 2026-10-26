@@ -32,6 +32,15 @@ public:
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   void Reset();
 
+  /// Debug aid: record the hidden row after every layer's residuals during
+  /// Step so a GPU run can be diffed layer by layer. Cleared by the next
+  /// Step, not by Reset.
+  void EnableLayerCapture(bool enable) noexcept { capture_ = enable; }
+  [[nodiscard]] const std::vector<std::vector<float>>& CapturedHidden()
+      const noexcept {
+    return hidden_;
+  }
+
 private:
   struct AttentionState {
     std::vector<float> k;  ///< [pos][kv_heads][head_dim], post-rope
@@ -49,6 +58,8 @@ private:
   std::uint32_t max_context_;
   std::uint32_t position_{0};
   std::vector<AttentionState> layers_;
+  bool capture_{false};
+  std::vector<std::vector<float>> hidden_;
 };
 
 }  // namespace gufo::models::flint
