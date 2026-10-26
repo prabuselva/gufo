@@ -79,7 +79,19 @@ pair in one tool call (AGENTS protocol).
   (`tests/models/flint/weights_test.cpp`, `GUFO_FLINT_GGUF`, skip 77):
   expected-name table == all 779 file tensors exactly, per-layer kind/shape
   checks. Passes on the real artifact.
-- [ ] C3 scalar reference oracle + numerical test.
+- [x] C3 scalar reference oracle: `src/models/flint/{cpu_ops.hpp,cpu_ops.cpp,
+  reference.hpp,reference.cpp}` (built only via `gufo_flint_reference`,
+  EXCLUDE_FROM_ALL, -O2) + `flint.reference` test (build target explicitly).
+  Passes on the artifact: 3 tokens finite/non-degenerate logits, repeat-stable,
+  vocab-range rejection, Reset rewinds.
+  Semantics nailed from llama.cpp source (b11879, oracle contract):
+  per-head `attn_q_norm`/`attn_k_norm` = LLM_NORM_RMS with plain `w` (no +1)
+  over one head_dim, before the gated NEOX full-head rope (`n_rot=128`);
+  sinks = full softmax over causal keys + sink as extra per-head logit, incl.
+  max (`ops.cpp:5988-5999`, FA kernels identical); window reads keys
+  `[pos+1-513, pos]`; MoE: sigmoid(router), top-6 desc (lower index on tie =
+  ggml argsort), `weights /= clamp(sum, 6.103515625e-5, ∞)`, scale 1.0 no-op,
+  single `_shexp` added once, then residual (`llama-graph.cpp:2194-2360`).
 - [ ] C4 ROCm kernels + executor (Q8 mmq routed path, dense f16 GEMM,
   windowed attention with sinks + QK norm, per-layer rope bypass,
   sigmoid top-6 gate + L2 norm + 2 shared experts).
