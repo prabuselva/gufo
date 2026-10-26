@@ -70,9 +70,15 @@ pair in one tool call (AGENTS protocol).
   root `CMakeLists.txt`; `flint.config` CPU test
   (`tests/models/flint/config_test.cpp`) — geometry profile gate, bool-array
   pattern parsing, vocab-from-tokenizer, rejection cases.
-- [ ] C2 weights: tensor table (`ffn_gate_inp` BF16 router, 3D `_exps`
-  experts, 2× `_shexp`, `attn_q_norm`/`attn_k_norm`, `attn_sinks`) +
-  `flint.weights` test against the real artifact (`GUFO_FLINT_GGUF`, skip 77).
+- [x] C2 weights: `src/models/flint/weights.{hpp,cpp}` — `TensorRef`
+  (native encodings, no dequant; shard/offset + bounds check; `Expert()`
+  stride), `LayerWeights` (per-layer q/k/v/o + `attn_q_norm`/`attn_k_norm`/
+  `attn_sinks`; dense ffn on layers 0-1 vs BF16-router + 3D `_exps` +
+  single `_shexp` on 2-48), `ModelWeights::Bind` with exact-shape/format
+  gate and tied-embedding fallback. `flint.weights` test
+  (`tests/models/flint/weights_test.cpp`, `GUFO_FLINT_GGUF`, skip 77):
+  expected-name table == all 779 file tensors exactly, per-layer kind/shape
+  checks. Passes on the real artifact.
 - [ ] C3 scalar reference oracle + numerical test.
 - [ ] C4 ROCm kernels + executor (Q8 mmq routed path, dense f16 GEMM,
   windowed attention with sinks + QK norm, per-layer rope bypass,
