@@ -109,7 +109,17 @@ pair in one tool call (AGENTS protocol).
   output readers in `QkEpilogueKernel` (half the dims could leak unrotated
   values at pos>0), and mmq dense prefill exceeding the oracle envelope
   (→ fp32 `GemvBatch` tier until the speed phase).
-- [ ] C5 CLI (`bench`/`prompt`/`serve`) dispatch + runners.
+- [x] gpt2 BPE tokenizer with the `flint` pre-tokenizer
+  (`src/models/flint/tokenizer.{hpp,cpp}`): specials from `token_type`
+  CONTROL metadata (spelling-free), eog ∪ eos stop set, collapsed-letters
+  pre-split reproducing llama.cpp's generic splitter (digit ≤3, CJK split
+  before letters, whitespace/punct prefixes, clitics, whitespace run
+  rules), request-local piece memo. Test `flint.tokenizer`
+  (`tests/models/flint/tokenizer_test.cpp`: byte coverage, piece
+  boundaries, CJK split trap, specials/stops, BOS/EOS, roundtrips, GGUF
+  validation); passes.
+- [ ] C5 CLI (`bench`/`prompt`/`serve`) dispatch + runners; engine
+  (`engine.{hpp,cpp}`) first.
 - [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.

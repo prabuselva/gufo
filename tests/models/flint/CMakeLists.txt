@@ -8,6 +8,12 @@ add_test(NAME flint.config COMMAND flint_config_test)
 set_tests_properties(flint.config PROPERTIES LABELS "flint;cpu")
 add_dependencies(flint_tests flint_config_test)
 
+add_executable(flint_tokenizer_test tokenizer_test.cpp)
+target_link_libraries(flint_tokenizer_test PRIVATE gufo_flint)
+add_test(NAME flint.tokenizer COMMAND flint_tokenizer_test)
+set_tests_properties(flint.tokenizer PROPERTIES LABELS "flint;cpu")
+add_dependencies(flint_tests flint_tokenizer_test)
+
 # Weight-table binding runs against the real artifact when GUFO_FLINT_GGUF
 # names it and skips (77) otherwise.
 add_executable(flint_weights_test weights_test.cpp)

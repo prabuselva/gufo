@@ -1,9 +1,11 @@
 # Flint Preview 40B-A2B (flint) model package: 49-layer trunk with 2 leading
 # dense FFN layers, 256-expert sigmoid top-6 MoE plus 2 shared experts, and
 # gated per-layer rotary/window attention with QK norms and attention sinks.
-# Only the metadata loader and weight binder are built until the runtime lands.
+# The metadata loader, gpt2-BPE tokenizer and weight binder are built here;
+# the runtime lands with the engine.
 add_library(gufo_flint STATIC
   config.cpp
+  tokenizer.cpp
   weights.cpp)
 
 target_include_directories(gufo_flint PUBLIC ${PROJECT_SOURCE_DIR})
