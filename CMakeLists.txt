@@ -100,6 +100,10 @@ add_subdirectory(src/models/ling3_0)
 # MoE engine. Model-private kernels only; no other model tree is modified.
 add_subdirectory(src/models/nemotron_h_moe)
 
+# Flint Preview 40B-A2B (flint) — dense-lead MoE with gated rotary/window
+# attention, QK norms and attention sinks. Metadata loader first.
+add_subdirectory(src/models/flint)
+
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -542,6 +546,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/gemma4)
   add_subdirectory(tests/models/ling3_0)
   add_subdirectory(tests/models/nemotron_h_moe)
+  add_subdirectory(tests/models/flint)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
