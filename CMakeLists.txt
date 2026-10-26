@@ -313,6 +313,7 @@ add_executable(gufo
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
+  src/models/flint/serve_runner.cpp
   src/models/gemma4/serve_runner.cpp
   src/models/ling3_0/serve_runner.cpp
   src/models/nemotron_h_moe/serve_runner.cpp

@@ -77,7 +77,7 @@ struct FlintExecutor::State {
 
 namespace {
 
-State* g_alloc_sink{nullptr};  // Non-null only inside FlintExecutor::Create.
+std::size_t* g_alloc_sink{nullptr};  // Only set in FlintExecutor::Create.
 
 [[nodiscard]] bool Alloc(void** p, std::size_t bytes, std::string* error) {
   if (bytes == 0) {
@@ -89,7 +89,7 @@ State* g_alloc_sink{nullptr};  // Non-null only inside FlintExecutor::Create.
     return false;
   }
   if (g_alloc_sink != nullptr) {
-    g_alloc_sink->bytes += bytes;
+    *g_alloc_sink += bytes;
   }
   return true;
 }
@@ -253,7 +253,7 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
   State* st = new State();
   ex->state_ = st;
   st->host = weights;
-  g_alloc_sink = st;
+  g_alloc_sink = &st->bytes;
 
   if (!UploadWeights(reader, weights, &st->dev, &st->weight_buffers, error)) {
     g_alloc_sink = nullptr;

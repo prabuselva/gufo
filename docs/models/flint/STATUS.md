@@ -133,7 +133,12 @@ pair in one tool call (AGENTS protocol).
   registered specials HTML-escaped, think-tag/thought rendering, tool
   preamble + `tool_call`/tool_response XML). The `flint.chat_template`
   test pins seven cases against renderings checked with a jinja oracle.
-- [ ] C5 serve: `serve_runner.{hpp,cpp}` + `inference_backend` dispatch.
+- [x] C5 serve: `serve_runner.{hpp,cpp}` (serial runner, one session, state
+  ABI `flint-rocm-session-v1`) wired into the `gufo` target and dispatched
+  from `inference_backend` on architecture `flint`. GPU-exclusive smoke:
+  load 18.3 s, `Flint Preview` listed, three chat completions (thinking
+  output, continuation with prefix reuse, tools-ignored path) at 44-50
+  t/s decode.
 - [ ] C6 logits parity vs scalar oracle and llama.cpp b11879.
 - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
