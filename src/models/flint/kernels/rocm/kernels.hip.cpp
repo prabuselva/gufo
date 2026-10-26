@@ -131,73 +131,156 @@ __global__ void QkEpilogueKernel(
   }
 }
 
+// Tiled attention: TR query rows per block, KV staged into LDS with K
+// transposed (skT[d][j + 1]; the +1 pad avoids the bank conflict of
+// k-row-major reads in the score loop). Each LDS K word feeds two FFMAs
+// through the 2x2 register tile; score chains are d-ascending per output.
+// Ported from the nemotron_h_moe LDS-tile kernel (measured 3.2x at pp16384
+// shapes with TR=24, kTile=16 on gfx1151), adapted to Flint's separate
+// fp16 K/V cache rows, sliding-window masking and attention sinks.
+constexpr int kHeadDim = 128;  // Flint rotary/noPE head dimension.
+
+template <int TR, int kTile>
 __global__ void AttentionKernel(const float* __restrict__ q,
                                 const __half* __restrict__ k_cache,
                                 const __half* __restrict__ v_cache,
                                 const float* __restrict__ sinks, float scale,
-                                std::uint32_t pos0, std::uint32_t window,
-                                std::uint32_t n_head, std::uint32_t n_kv,
-                                std::uint32_t head_dim, std::uint32_t kv_row,
-                                float* __restrict__ out) {
-  const std::uint32_t t = blockIdx.y;
-  const std::uint32_t h = blockIdx.x;
-  const std::uint32_t pos = pos0 + t;
-  const std::uint32_t start =
-      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
-  const std::uint32_t d = threadIdx.x;
-  __shared__ float sm_q[128];
-  __shared__ float sm_sc[4];
-  sm_q[d] = q[(static_cast<std::size_t>(t) * n_head + h) * head_dim + d];
-  __syncthreads();
+                                std::uint32_t pos0, std::uint32_t batch,
+                                std::uint32_t window, std::uint32_t n_head,
+                                std::uint32_t n_kv, std::uint32_t head_dim,
+                                std::uint32_t kv_row, float* __restrict__ out) {
+  constexpr float kNegInf = -3.4e38F;
+  const std::uint32_t h = blockIdx.y;
+  const std::uint32_t row0 = blockIdx.x * TR;
+  const std::uint32_t tokens = batch;
+  const std::uint32_t rows =
+      tokens - row0 < TR ? tokens - row0 : static_cast<std::uint32_t>(TR);
   const std::uint32_t kvh = h * n_kv / n_head;
-  // One warp per key slot of a 4-key chunk; head_dim 128 -> 4 dims per lane.
-  const int slot = d / 32;
-  const int lane = d % 32;
-  float m = -INFINITY;
-  float lacc = 0.0F;
-  float o = 0.0F;
-  for (std::uint32_t p = start; p <= pos; p += 4) {
-    const std::uint32_t left = pos - p + 1;
-    const int cnt = static_cast<int>(left < 4U ? left : 4U);
-    if (slot < cnt) {
-      const __half* __restrict__ kp =
-          k_cache + static_cast<std::size_t>(p + slot) * kv_row +
-          kvh * head_dim + lane * 4;
-      float dot = 0.0F;
-      for (int j = 0; j < 4; ++j) {
-        dot += sm_q[lane * 4 + j] * __half2float(kp[j]);
-      }
-      for (int off = 16; off > 0; off >>= 1) {
-        dot += __shfl_down_sync(__activemask(), dot, off);
-      }
-      if (lane == 0) {
-        sm_sc[slot] = dot * scale;
-      }
+  const int tid = static_cast<int>(threadIdx.x);
+
+  __shared__ float sq[TR][kHeadDim];
+  __shared__ float skT[kHeadDim][kTile + 1];
+  __shared__ float sv[kTile][kHeadDim];
+  __shared__ float se[TR][kTile];
+  __shared__ float sm[TR];
+  __shared__ float sl[TR];
+  __shared__ float sa[TR];
+
+  for (int i = tid; i < TR * kHeadDim; i += kHeadDim) {
+    const int r = i / kHeadDim;
+    const int d = i % kHeadDim;
+    sq[r][d] = r < static_cast<int>(rows)
+                   ? q[(static_cast<std::size_t>(row0 + r) * n_head + h) *
+                           head_dim +
+                       d]
+                   : 0.0F;
+  }
+  if (tid < TR) {
+    sm[tid] = kNegInf;
+    sl[tid] = 0.0F;
+  }
+  __syncthreads();
+
+  const __half* __restrict__ kv_k = k_cache + kvh * head_dim;
+  const __half* __restrict__ kv_v = v_cache + kvh * head_dim;
+  const std::uint32_t nmax = pos0 + row0 + rows;  // exclusive causal bound
+  const uint32_t pmin = window != 0 && pos0 + row0 + 1 > window
+                            ? pos0 + row0 + 1 - window
+                            : 0u;
+  const std::uint32_t p0_start = pmin / kTile * kTile;
+
+  float o[TR] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+  for (std::uint32_t p0 = p0_start; p0 < nmax; p0 += kTile) {
+    const int nj = static_cast<int>(
+        nmax - p0 < static_cast<std::uint32_t>(kTile) ? nmax - p0 : kTile);
+    for (int i = tid; i < nj * kHeadDim; i += kHeadDim) {
+      const int j = i / kHeadDim;
+      const int d = i % kHeadDim;
+      skT[d][j + 1] =
+          __half2float(kv_k[(static_cast<std::size_t>(p0 + j)) * kv_row + d]);
+    }
+    for (int i = tid; i < nj * kHeadDim; i += kHeadDim) {
+      const int j = i / kHeadDim;
+      const int d = i % kHeadDim;
+      sv[j][d] =
+          __half2float(kv_v[(static_cast<std::size_t>(p0 + j)) * kv_row + d]);
     }
     __syncthreads();
-    float cm = -INFINITY;
-    for (int c = 0; c < cnt; ++c) {
-      cm = fmaxf(cm, sm_sc[c]);
+
+    for (int i = tid; i < (TR / 2) * (kTile / 2); i += kHeadDim) {
+      const int r0 = (i / (kTile / 2)) * 2;
+      const int j0 = (i % (kTile / 2)) * 2;
+      float a00 = 0.0F;
+      float a01 = 0.0F;
+      float a10 = 0.0F;
+      float a11 = 0.0F;
+      for (int d = 0; d < kHeadDim; ++d) {
+        const float k0 = skT[d][j0 + 1];
+        const float k1 = skT[d][j0 + 2];
+        const float q0 = sq[r0][d];
+        a00 += q0 * k0;
+        a01 += q0 * k1;
+        const float q1 = sq[r0 + 1][d];
+        a10 += q1 * k0;
+        a11 += q1 * k1;
+      }
+      const std::uint32_t rp = pos0 + row0;
+      const std::uint32_t p00 = p0 + j0;
+      const std::uint32_t p01 = p0 + j0 + 1;
+      const bool ok00 = r0 < rows && p00 <= rp + r0 && p00 >= pmin;
+      const bool ok01 = r0 < rows && p01 <= rp + r0 && p01 >= pmin;
+      const bool ok10 = r0 + 1 < rows && p00 <= rp + r0 + 1 && p00 >= pmin;
+      const bool ok11 = r0 + 1 < rows && p01 <= rp + r0 + 1 && p01 >= pmin;
+      se[r0][j0] = ok00 ? a00 * scale : kNegInf;
+      se[r0][j0 + 1] = ok01 ? a01 * scale : kNegInf;
+      se[r0 + 1][j0] = ok10 ? a10 * scale : kNegInf;
+      se[r0 + 1][j0 + 1] = ok11 ? a11 * scale : kNegInf;
     }
-    const float m_new = fmaxf(m, cm);
-    const float alpha = expf(m - m_new);
-    float lnew = lacc * alpha;
-    float add = 0.0F;
-    for (int c = 0; c < cnt; ++c) {
-      const float e = expf(sm_sc[c] - m_new);
-      lnew += e;
-      const __half* __restrict__ vp = v_cache +
-                                      static_cast<std::size_t>(p + c) * kv_row +
-                                      kvh * head_dim + d;
-      add += e * __half2float(*vp);
+    __syncthreads();
+
+    if (tid < TR) {
+      float mnew = sm[tid];
+      for (int j = 0; j < kTile; ++j) {
+        mnew = se[tid][j] > mnew ? se[tid][j] : mnew;
+      }
+      sa[tid] = expf(sm[tid] - mnew);
+      sm[tid] = mnew;
     }
-    o = o * alpha + add;
-    m = m_new;
-    lacc = lnew;
+    __syncthreads();
+
+    for (int i = tid; i < TR * kTile; i += kHeadDim) {
+      const int r = i / kTile;
+      const int j = i % kTile;
+      se[r][j] = expf(se[r][j] - sm[r]);
+    }
+    __syncthreads();
+
+    if (tid < TR) {
+      float ssum = 0.0F;
+      for (int j = 0; j < kTile; ++j) {
+        ssum += se[tid][j];
+      }
+      sl[tid] = sl[tid] * sa[tid] + ssum;
+    }
+    for (int r = 0; r < TR; ++r) {
+      o[r] *= sa[r];
+    }
+    for (int j = 0; j < nj; ++j) {
+      for (int r = 0; r < TR; ++r) {
+        o[r] += se[r][j] * sv[j][tid];
+      }
+    }
     __syncthreads();
   }
-  lacc += expf(sinks[h] - m);
-  out[(static_cast<std::size_t>(t) * n_head + h) * head_dim + d] = o / lacc;
+
+  if (tid < TR) {
+    sl[tid] += expf(sinks[h] - sm[tid]);
+  }
+  __syncthreads();
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    out[(static_cast<std::size_t>(row0 + r) * n_head + h) * head_dim + tid] =
+        o[r] / sl[r];
+  }
 }
 
 constexpr float kWeightSumFloor = 6.103515625e-5F;
@@ -312,10 +395,10 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t batch, std::uint32_t window, std::uint32_t n_head,
                std::uint32_t n_kv, std::uint32_t head_dim,
                std::uint32_t kv_row_elements, float* out, hipStream_t stream) {
-  const dim3 grid(n_head, batch);
-  AttentionKernel<<<grid, head_dim, 0, stream>>>(
-      q, k_cache, v_cache, sinks, scale, pos0, window, n_head, n_kv, head_dim,
-      kv_row_elements, out);
+  const dim3 grid((batch + 23) / 24, n_head);
+  AttentionKernel<24, 16><<<grid, kHeadDim, 0, stream>>>(
+      q, k_cache, v_cache, sinks, scale, pos0, batch, window, n_head, n_kv,
+      head_dim, kv_row_elements, out);
 }
 
 void RouterTopK(const float* probs_logits, std::int32_t* ids, float* weights,
