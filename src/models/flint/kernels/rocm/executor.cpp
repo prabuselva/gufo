@@ -3,6 +3,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include "src/models/flint/kernels/rocm/linear.hpp"
 #include "src/models/flint/kernels/rocm/moe/moe_prefill.hpp"
 #include "src/models/flint/kernels/rocm/moe/routed_compact.hpp"
+#include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::models::flint {
 namespace {
@@ -54,6 +56,14 @@ struct FlintExecutor::State {
   float* o{nullptr};
   float* ffn_a{nullptr};
   float* ffn_b{nullptr};
+  // Tiled Q8_1 activation scratch for the shared W8A8 WMMA prefill route
+  // (gufo::hip::LaunchBatchedQuantGEMMPreQuantized). qa8 holds the
+  // attention- and ffn-normed rows (hidden width) while their projections
+  // consume them; ao8 holds the attention output (QD rows) for attn_out;
+  // qd8 holds the SiLU outputs for down projections.
+  void* qa8{nullptr};
+  void* ao8{nullptr};
+  void* qd8{nullptr};
   float* probs{nullptr};
   std::int32_t* ids{nullptr};
   float* wts{nullptr};
@@ -126,6 +136,9 @@ FlintExecutor::~FlintExecutor() {
   hipFree(state_->v);
   hipFree(state_->attn);
   hipFree(state_->o);
+  hipFree(state_->qa8);
+  hipFree(state_->ao8);
+  hipFree(state_->qd8);
   hipFree(state_->ffn_a);
   hipFree(state_->ffn_b);
   hipFree(state_->probs);
@@ -298,6 +311,12 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
   ok = ok && Alloc(reinterpret_cast<void**>(&st->k), B * KVD * 4, error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->v), B * KVD * 4, error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->attn), B * QD * 4, error);
+  ok = ok && Alloc(&st->qa8, gufo::hip::QuantizedActivationBytes(B, H), error);
+  ok = ok && Alloc(&st->ao8, gufo::hip::QuantizedActivationBytes(B, QD), error);
+  ok = ok && Alloc(&st->qd8,
+                   gufo::hip::QuantizedActivationBytes(
+                       B, std::max(c.shared_expert_ff, c.ffn_length)),
+                   error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->o), B * H * 4, error);
   ok = ok &&
        Alloc(reinterpret_cast<void**>(&st->ffn_a), B * c.ffn_length * 4, error);
@@ -374,10 +393,28 @@ std::size_t FlintExecutor::device_bytes() const noexcept {
 
 namespace {
 
+/// Shape gate for the shared W8A8 int8-WMMA prefill route (gufo_core's
+/// LaunchBatchedQuantGEMMPreQuantized). It consumes the GGML Q8_0 weights
+/// directly (no per-call requantize) and beats the mmq tier on every
+/// qualifying Flint projection; the tiled activation must be prepared with
+/// LaunchQuantizeActivationQ8_1FromFp32 into a QuantizedActivationBytes
+/// buffer first (see State::qa8/ao8/qd8).
+[[nodiscard]] bool W8A8Eligible(const TensorRef& w, std::uint32_t batch) {
+  return w.type == core::GgmlType::kQ8_0 && batch >= 96U && w.rows >= 1024U &&
+         w.cols >= 1024U && (w.cols % 256U) == 0U;
+}
+
+void W8A8QuantizeRows(const float* x, void* x8, std::size_t batch,
+                      std::size_t k, hipStream_t stream) {
+  gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(x, x8, batch, k, stream);
+}
+
 /// out = base @ x for rows (batch <= capacity), dispatching decode through
-/// the plain GEMV and wider batches through the GEMM tier.
+/// the plain GEMV and wider batches through the GEMM tier. When `x8` holds
+/// the tiled Q8_1 copy of `x` (W8A8Eligible inputs), the shared W8A8 WMMA
+/// tier replaces the mmq route.
 void Project(const TensorRef& w, const float* x, float* out,
-             std::uint32_t batch, hipStream_t stream) {
+             std::uint32_t batch, hipStream_t stream, void* x8 = nullptr) {
   if (batch == 1) {
     rocm::Gemv(w.data, w.type, static_cast<std::uint32_t>(w.rows),
                static_cast<std::uint32_t>(w.cols), w.RowBytes(), x, out,
@@ -385,6 +422,11 @@ void Project(const TensorRef& w, const float* x, float* out,
     return;
   }
   if (w.type == core::GgmlType::kQ8_0) {
+    if (x8 != nullptr) {
+      gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
+          w.type, w.data, x8, out, batch, w.rows, w.cols, stream);
+      return;
+    }
     // Q8 prefill goes through the tensor-core mmq tier (f16-rounded
     // activations, fp32 accumulate); the oracle contract adjudicates.
     rocm::Gemm(w.data, w.type, static_cast<std::uint32_t>(w.rows),
@@ -457,7 +499,12 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     const bool dbg = L == 0 && std::getenv("GUFO_FLINT_DEBUG") != nullptr;
     rocm::RmsNorm(st->x, static_cast<const float*>(l.attn_norm.data), c.rms_eps,
                   st->normed, B, static_cast<std::uint32_t>(H), stream);
-    Project(l.attn_q, st->normed, st->q, B, stream);
+    // One tiled Q8_1 copy of the normed rows feeds the W8A8 q projection.
+    const bool q8_ok = W8A8Eligible(l.attn_q, B);
+    if (q8_ok) {
+      W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+    }
+    Project(l.attn_q, st->normed, st->q, B, stream, q8_ok ? st->qa8 : nullptr);
     Project(l.attn_k, st->normed, st->k, B, stream);
     Project(l.attn_v, st->normed, st->v, B, stream);
     rocm::QkEpilogue(
@@ -481,7 +528,11 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     if (dbg) {
       DebugStats("L0 attn", st->attn, B * QD);
     }
-    Project(l.attn_out, st->attn, st->o, B, stream);
+    const bool o8_ok = W8A8Eligible(l.attn_out, B);
+    if (o8_ok) {
+      W8A8QuantizeRows(st->attn, st->ao8, B, QD, stream);
+    }
+    Project(l.attn_out, st->attn, st->o, B, stream, o8_ok ? st->ao8 : nullptr);
     rocm::AddResidual(st->x, st->o, B, static_cast<std::uint32_t>(H), stream);
     if (dbg) {
       DebugStats("L0 o", st->o, B * H);
@@ -491,11 +542,23 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     rocm::RmsNorm(st->x, static_cast<const float*>(l.ffn_norm.data), c.rms_eps,
                   st->normed, B, static_cast<std::uint32_t>(H), stream);
     if (!l.moe) {
-      Project(l.ffn_gate, st->normed, st->ffn_a, B, stream);
-      Project(l.ffn_up, st->normed, st->ffn_b, B, stream);
+      const bool f8_ok =
+          W8A8Eligible(l.ffn_gate, B) && W8A8Eligible(l.ffn_up, B);
+      if (f8_ok) {
+        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+      }
+      Project(l.ffn_gate, st->normed, st->ffn_a, B, stream,
+              f8_ok ? st->qa8 : nullptr);
+      Project(l.ffn_up, st->normed, st->ffn_b, B, stream,
+              f8_ok ? st->qa8 : nullptr);
       rocm::SiluMul(st->ffn_a, st->ffn_b, st->ffn_a,
                     static_cast<std::size_t>(B) * c.ffn_length, stream);
-      Project(l.ffn_down, st->ffn_a, st->o, B, stream);
+      const bool d8_ok = W8A8Eligible(l.ffn_down, B);
+      if (d8_ok) {
+        W8A8QuantizeRows(st->ffn_a, st->qd8, B, c.ffn_length, stream);
+      }
+      Project(l.ffn_down, st->ffn_a, st->o, B, stream,
+              d8_ok ? st->qd8 : nullptr);
       rocm::AddResidual(st->x, st->o, B, static_cast<std::uint32_t>(H), stream);
       if (st->layer_capture) {
         CaptureRow(st->x, H, L, true, &st->hidden);
@@ -615,11 +678,23 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
                     st->ed, B * c.num_experts_used, c.num_experts, 1U, stream,
                     h_counts);
     }
-    Project(l.shexp_gate, st->normed, st->sg, B, stream);
-    Project(l.shexp_up, st->normed, st->su, B, stream);
+    const bool s8_ok =
+        W8A8Eligible(l.shexp_gate, B) && W8A8Eligible(l.shexp_up, B);
+    if (s8_ok) {
+      W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+    }
+    Project(l.shexp_gate, st->normed, st->sg, B, stream,
+            s8_ok ? st->qa8 : nullptr);
+    Project(l.shexp_up, st->normed, st->su, B, stream,
+            s8_ok ? st->qa8 : nullptr);
     rocm::SiluMul(st->sg, st->su, st->sg,
                   static_cast<std::size_t>(B) * c.shared_expert_ff, stream);
-    Project(l.shexp_down, st->sg, st->sd, B, stream);
+    const bool sd8_ok = W8A8Eligible(l.shexp_down, B);
+    if (sd8_ok) {
+      W8A8QuantizeRows(st->sg, st->qd8, B, c.shared_expert_ff, stream);
+    }
+    Project(l.shexp_down, st->sg, st->sd, B, stream,
+            sd8_ok ? st->qd8 : nullptr);
     if (dbg) {
       DebugStats("L0 ed", st->ed, B * c.num_experts_used * H);
       DebugStats("L0 sd", st->sd, B * H);

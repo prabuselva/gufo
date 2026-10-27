@@ -295,8 +295,28 @@ pair in one tool call (AGENTS protocol).
       >256-expert models keep the mmq route. Gates 3/3, pp2048 1936.42 →
       2328.41 (+20 %), pp8192 1706.82 → 1929.89 (+13 %), pp16384 1342.98 →
       1469.49 (+9 %); tg128 40.49 (no matched prior run, no regression vs
-      the C-era 37.3 record).
-   - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+       the C-era 37.3 record).
+     - [x] C7m W8A8 int8-WMMA dense prefill route (shared qwen tier).
+       `Project()` adds a pre-quantized x8 route calling the gufo_core
+       launchers `LaunchQuantizeActivationQ8_1FromFp32` +
+       `LaunchBatchedQuantGEMMPreQuantized` (wave64 128x128 tile with
+       wave32 fallback, `prefill_quant_gemm.hip`) — no mmq for eligible
+       shapes. `W8A8Eligible` = Q8_0 && batch>=96 && rows>=1024 &&
+       cols>=1024 && cols%256; quantize once per distinct activation
+       (shared qa8/ao8/qd8 scratch): attn q + dense/shexp gate+up from the
+       post-norm rows, attn_out (k=q_dim) and ffn/shexp down (k=ffn) from
+       their f32 intermediates. k/v (m=512), router and batch-1 decode keep
+       the existing tiers. Standalone A/B
+       (`tools/bench/flint_w8a8_bench.hip`) GEMM-only w8a8 vs mmq
+       at batch 2048: attn_q 1.34 vs 1.65 ms, attn_out 1.25 vs 1.77,
+       shexp gate/up 0.34/0.35 vs 0.39/0.45, down 0.34 vs 0.40-0.44;
+       requantize-per-call (w8full) ≈ mmq, so the shared quantize is the
+       whole game. Gates 3/3 exclusive (flintgate — oracle accepts the
+       numerics). Release bench (exclusive, w8a8perf): pp2048 2328.41 →
+       2424.91 (+4.1 %), pp8192 1929.89 → 1975.27 (+2.4 %), pp16384
+       1469.49 → 1514.75 (+3.1 %); tg128 39.60 within the prior 40.49
+       noise floor (decode path untouched).
+    - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
    QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
