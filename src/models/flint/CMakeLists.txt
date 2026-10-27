@@ -24,12 +24,41 @@ set_source_files_properties(cpu_ops.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  # Flint fork of the vendored mmq tree (see mmq/VENDOR.md): identical at
+  # import to the Flash-Next path aside from the flint_ rename, evolved
+  # here for the Q8_0 pipeline without touching shared production kernels.
+  set(FLINT_MMQ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm/mmq")
+  set(FLINT_MMQ_SOURCES
+    ${FLINT_MMQ_DIR}/flint_ggml_stubs.hip.cpp
+    ${FLINT_MMQ_DIR}/flint_mmq.hip.cpp
+    ${FLINT_MMQ_DIR}/mmid.hip.cpp
+    ${FLINT_MMQ_DIR}/mmvq.hip.cpp
+    ${FLINT_MMQ_DIR}/moe_wave64.hip.cpp
+    ${FLINT_MMQ_DIR}/quantize.hip.cpp)
+
+  add_library(gufo_flint_mmq STATIC EXCLUDE_FROM_ALL ${FLINT_MMQ_SOURCES})
+  set_source_files_properties(${FLINT_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${FLINT_MMQ_DIR}/moe_wave64.hip.cpp
+    PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
+  set_target_properties(gufo_flint_mmq PROPERTIES
+    HIP_STANDARD 17
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_compile_definitions(gufo_flint_mmq PRIVATE
+    GGML_HIP_NO_VMM ENGINE_ENABLE_HIP=1)
+  target_compile_options(gufo_flint_mmq PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+  target_include_directories(gufo_flint_mmq SYSTEM PUBLIC ${FLINT_MMQ_DIR})
+  target_link_libraries(gufo_flint_mmq PUBLIC hip::host roc::hipblas)
+
   # Flint-private fused operators and linear tiers. Built only by explicit
   # GPU validation targets until the engine consumes them.
   add_library(gufo_flint_kernels STATIC EXCLUDE_FROM_ALL
+    kernels/rocm/attention_wmma.hip.cpp
     kernels/rocm/kernels.hip.cpp
     kernels/rocm/linear.hip.cpp)
-  set_source_files_properties(kernels/rocm/kernels.hip.cpp
+  set_source_files_properties(kernels/rocm/attention_wmma.hip.cpp
+    kernels/rocm/kernels.hip.cpp
     kernels/rocm/linear.hip.cpp PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_flint_kernels PROPERTIES
     HIP_STANDARD 20
@@ -38,10 +67,27 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_flint_kernels PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_flint_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
-  # The batched Q8_0 tiers reuse the Qwen3.8-Flash-Next mmq path; the target
-  # exports its header directory transitively, weights stay native.
+  # The batched Q8_0 tiers use the Flint-owned mmq fork; the target exports
+  # its header directory transitively, weights stay native.
   target_link_libraries(gufo_flint_kernels PUBLIC
-    gufo_qwen38_flash_next_mmq gufo_flint hip::host)
+    gufo_flint_mmq gufo_flint hip::host)
+
+  # Flint fork of the Gemma-4 grouped MoE prefill route (see
+  # kernels/rocm/moe/VENDOR.md): Q8_0 128-row bucketed WMMA GEMMs with
+  # device-side RoutedCompact, evaluated against the mmq route.
+  add_library(gufo_flint_moe STATIC EXCLUDE_FROM_ALL
+    kernels/rocm/moe/moe_prefill.hip.cpp
+    kernels/rocm/moe/routed_compact.hip.cpp)
+  set_source_files_properties(kernels/rocm/moe/moe_prefill.hip.cpp
+    kernels/rocm/moe/routed_compact.hip.cpp PROPERTIES LANGUAGE HIP)
+  set_target_properties(gufo_flint_moe PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(gufo_flint_moe PUBLIC ${PROJECT_SOURCE_DIR})
+  target_compile_options(gufo_flint_moe PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+  target_link_libraries(gufo_flint_moe PUBLIC hip::host)
 
   # Host-side driver: streams the artifact to the GPU and runs one forward.
   add_library(gufo_flint_executor STATIC EXCLUDE_FROM_ALL
@@ -50,7 +96,7 @@ if (ENGINE_ENABLE_HIP)
     POSITION_INDEPENDENT_CODE ON)
   target_include_directories(gufo_flint_executor PUBLIC ${PROJECT_SOURCE_DIR})
   target_link_libraries(gufo_flint_executor PUBLIC
-    gufo_flint_kernels gufo_flint hip::host)
+    gufo_flint_kernels gufo_flint_moe gufo_flint hip::host)
 
   # Model/Session runtime and the bench runner consumed by the CLI.
   add_library(gufo_flint_engine STATIC EXCLUDE_FROM_ALL

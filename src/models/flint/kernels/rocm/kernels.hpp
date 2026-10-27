@@ -49,12 +49,30 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t n_kv, std::uint32_t head_dim,
                std::uint32_t kv_row_elements, float* out, hipStream_t stream);
 
+/// WMMA matrix-core prefill attention (head dimension 128) over the same
+/// layouts and semantics as Attention. Returns false when the shape is not
+/// supported, having launched nothing.
+bool LaunchWmmaAttention(const float* q, const __half* k_cache,
+                         const __half* v_cache, const float* sinks, float scale,
+                         std::uint32_t pos0, std::uint32_t batch,
+                         std::uint32_t window, std::uint32_t n_head,
+                         std::uint32_t n_kv, std::uint32_t kv_row_elements,
+                         float* out, hipStream_t stream);
+
 /// probs = sigmoid(router[t]) then top-`used` by probability (ties keep the
 /// lower index), weights clamped-sum renormalized. ids int32, weights f32,
 /// both [batch][used]. `n_experts` must be 256.
 void RouterTopK(const float* probs_logits, std::int32_t* ids, float* weights,
                 std::uint32_t batch, std::uint32_t used, bool normalize,
                 float weight_scale, hipStream_t stream);
+
+/// counts[e] = number of entries in ids[0..n_ids) equal to e. `counts`
+/// must hold n_experts entries; zeroed on the stream before the atomic
+/// pass. Used host-side to bound the routed mmq launch (flint_mmq
+/// routed_max_expert_rows / routed_tile_cols).
+void ExpertCounts(const std::int32_t* ids, std::uint32_t n_ids,
+                  std::uint32_t n_experts, unsigned int* counts,
+                  hipStream_t stream);
 
 /// x[t] += sum_s weights[t][s] * routed[t*used + s] (+ shexp[t] when set).
 void SumExperts(float* x, const float* routed, const float* weights,

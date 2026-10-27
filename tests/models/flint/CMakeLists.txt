@@ -62,6 +62,19 @@ if (ENGINE_ENABLE_HIP)
     LABELS "flint;gpu;external-model;slow" SKIP_RETURN_CODE 77)
 endif()
 
+# Operator-level attention checks (no artifact): fp64 oracle parity for the
+# WMMA and dispatched kernels plus bitwise batch invariance of the WMMA one.
+if (ENGINE_ENABLE_HIP)
+  add_executable(flint_attention_op_test EXCLUDE_FROM_ALL
+    attention_op_test.cpp)
+  target_link_libraries(flint_attention_op_test PRIVATE gufo_flint_kernels)
+  set_source_files_properties(attention_op_test.cpp
+    PROPERTIES COMPILE_OPTIONS "-O2")
+  add_test(NAME flint.attention.op COMMAND flint_attention_op_test)
+  set_tests_properties(flint.attention.op PROPERTIES
+    LABELS "flint;gpu" SKIP_RETURN_CODE 77)
+endif()
+
 # Manual C6 parity probe (no ctest entry): prints the per-position top-32
 # logit margins and the greedy chain for a raw prompt.
 if (ENGINE_ENABLE_HIP)

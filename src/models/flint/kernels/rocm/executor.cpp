@@ -12,11 +12,13 @@
 #include <string>
 #include <vector>
 
-#include "qfn_mmq.h"
+#include "flint_mmq.h"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/flint/kernels/rocm/kernels.hpp"
 #include "src/models/flint/kernels/rocm/linear.hpp"
+#include "src/models/flint/kernels/rocm/moe/moe_prefill.hpp"
+#include "src/models/flint/kernels/rocm/moe/routed_compact.hpp"
 
 namespace gufo::models::flint {
 namespace {
@@ -55,6 +57,20 @@ struct FlintExecutor::State {
   float* probs{nullptr};
   std::int32_t* ids{nullptr};
   float* wts{nullptr};
+  unsigned int* expert_counts{nullptr};    // device [num_experts]
+  unsigned int* h_expert_counts{nullptr};  // pinned mirror for the host
+  // Grouped Q8_0 prefill route (RoutedCompact bucket layout, 128-row
+  // tiles). Active when the routed weights are Q8_0 and the tile maps are
+  // allocated; otherwise the mmq routed path handles the layer.
+  bool moe_grouped{false};
+  __half* moe_xh{nullptr};             // [B] x H narrowed router-input rows
+  __half* moe_ah{nullptr};             // [B * E] x expert_ff narrowed slot rows
+  std::int32_t* moe_tiles{nullptr};    // RoutedTileCapacity entries
+  std::int32_t* moe_pad{nullptr};      // [num_experts + 1] pad bounds
+  std::int32_t* moe_cursors{nullptr};  // [num_experts] scatter scratch
+  std::int32_t* moe_rows_token{nullptr};  // compact row -> token
+  std::int32_t* moe_rows_slot{nullptr};   // compact row -> token * E + j
+  std::uint32_t moe_tile_capacity{0};
   float* eg{nullptr};
   float* eu{nullptr};
   float* ed{nullptr};
@@ -115,6 +131,15 @@ FlintExecutor::~FlintExecutor() {
   hipFree(state_->probs);
   hipFree(state_->ids);
   hipFree(state_->wts);
+  hipFree(state_->expert_counts);
+  (void)hipHostFree(state_->h_expert_counts);
+  hipFree(state_->moe_xh);
+  hipFree(state_->moe_ah);
+  hipFree(state_->moe_tiles);
+  hipFree(state_->moe_pad);
+  hipFree(state_->moe_cursors);
+  hipFree(state_->moe_rows_token);
+  hipFree(state_->moe_rows_slot);
   hipFree(state_->eg);
   hipFree(state_->eu);
   hipFree(state_->ed);
@@ -247,7 +272,7 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
     std::uint32_t batch_capacity, std::uint32_t kv_capacity,
     std::string* error) {
   static std::once_flag mmq_once;
-  std::call_once(mmq_once, [] { (void)qfn_mmq_init(0); });
+  std::call_once(mmq_once, [] { (void)flint_mmq_init(0); });
 
   std::unique_ptr<FlintExecutor> ex(new FlintExecutor());
   State* st = new State();
@@ -282,6 +307,38 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
                    error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->ids), B * E * 4, error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->wts), B * E * 4, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->expert_counts),
+                   static_cast<std::size_t>(c.num_experts) * 4, error);
+  if (ok) {
+    const hipError_t herr = hipHostMalloc(
+        reinterpret_cast<void**>(&st->h_expert_counts),
+        static_cast<std::size_t>(c.num_experts) * 4, hipHostMallocDefault);
+    if (!HipOk(herr, error, "hipHostMalloc")) {
+      ok = false;
+    }
+  }
+  const std::size_t compact_rows =
+      rocm::RoutedCompactRows(B * E, c.num_experts);
+  st->moe_tile_capacity =
+      rocm::RoutedTileCapacity(static_cast<std::uint32_t>(B * E),
+                               static_cast<std::uint32_t>(c.num_experts),
+                               /*rows=*/128U);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_xh), B * H * 2, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_ah),
+                   B * E * c.expert_ff * 2, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_tiles),
+                   static_cast<std::size_t>(st->moe_tile_capacity) * 4, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_pad),
+                   (static_cast<std::size_t>(c.num_experts) + 1) * 4, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_cursors),
+                   static_cast<std::size_t>(c.num_experts) * 4, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_rows_token),
+                   compact_rows * 4, error);
+  ok = ok && Alloc(reinterpret_cast<void**>(&st->moe_rows_slot),
+                   compact_rows * 4, error);
+  // The grouped kernels cover at most 256 experts (tile ids pack expert |
+  // tile << 16 into 31 bits with a byte-wide expert).
+  st->moe_grouped = ok && c.num_experts <= 256U;
   ok = ok &&
        Alloc(reinterpret_cast<void**>(&st->eg), B * E * c.expert_ff * 4, error);
   ok = ok &&
@@ -327,9 +384,16 @@ void Project(const TensorRef& w, const float* x, float* out,
                stream);
     return;
   }
-  // The fp32-accumulating SIMT tier keeps batched prefill inside the
-  // oracle's numeric envelope; the tensor-core mmq dense path rounds its
-  // activations to f16 and is reserved for the speed phase.
+  if (w.type == core::GgmlType::kQ8_0) {
+    // Q8 prefill goes through the tensor-core mmq tier (f16-rounded
+    // activations, fp32 accumulate); the oracle contract adjudicates.
+    rocm::Gemm(w.data, w.type, static_cast<std::uint32_t>(w.rows),
+               static_cast<std::uint32_t>(w.cols), w.RowBytes(), x, out, batch,
+               stream);
+    return;
+  }
+  // The fp32-accumulating SIMT tier keeps batched Bf16/F32 prefill inside
+  // the oracle's numeric envelope.
   rocm::GemvBatch(w.data, w.type, static_cast<std::uint32_t>(w.rows),
                   static_cast<std::uint32_t>(w.cols), w.RowBytes(), x, out,
                   batch, stream);
@@ -445,6 +509,28 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     rocm::RouterTopK(st->probs, st->ids, st->wts, B,
                      static_cast<std::uint32_t>(c.num_experts_used),
                      c.expert_weights_norm, c.expert_weights_scale, stream);
+    rocm::ExpertCounts(st->ids, B * c.num_experts_used, c.num_experts,
+                       st->expert_counts, stream);
+    // Grouped Q8_0 route: one bucket layout per layer, then per-projection
+    // GEMMs whose tiles skip whole 128-row buckets and never read back to
+    // the host. Non-Q8_0 experts fall through to the mmq routed entry.
+    const bool grouped = st->moe_grouped &&
+                         l.ffn_gate_exps.type == core::GgmlType::kQ8_0 &&
+                         l.ffn_up_exps.type == core::GgmlType::kQ8_0 &&
+                         l.ffn_down_exps.type == core::GgmlType::kQ8_0;
+    // Routed launch bound (mmq route): the per-expert token counts size the
+    // mmq id grids (grid-only; results are unchanged). The one host sync
+    // per MoE layer pays for itself at chunk-sized batches but not at
+    // decode sizes, so small batches keep the plain launch.
+    const unsigned int* h_counts = nullptr;
+    if (!grouped && B >= 32U) {
+      if (hipMemcpyAsync(st->h_expert_counts, st->expert_counts,
+                         static_cast<std::size_t>(c.num_experts) * 4,
+                         hipMemcpyDeviceToHost, stream) == hipSuccess &&
+          hipStreamSynchronize(stream) == hipSuccess) {
+        h_counts = st->h_expert_counts;
+      }
+    }
     const bool trace =
         L == static_cast<std::size_t>(st->moe_trace_layer) && B == 1;
     if (trace) {
@@ -462,20 +548,73 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
       pull(tr.ids.data(), st->ids, c.num_experts_used * 4);
       pull(tr.wts.data(), st->wts, c.num_experts_used * 4);
     }
-    rocm::GemmMoe(l.ffn_gate_exps.data, static_cast<std::uint32_t>(c.expert_ff),
-                  static_cast<std::uint32_t>(H), st->normed, st->ids, st->eg, B,
-                  c.num_experts, c.num_experts_used, stream);
-    rocm::GemmMoe(l.ffn_up_exps.data, static_cast<std::uint32_t>(c.expert_ff),
-                  static_cast<std::uint32_t>(H), st->normed, st->ids, st->eu, B,
-                  c.num_experts, c.num_experts_used, stream);
-    rocm::SiluMul(
-        st->eg, st->eu, st->eg,
-        static_cast<std::size_t>(B) * c.num_experts_used * c.expert_ff, stream);
-    // down consumes the slot-indexed SiLU output, so each routed pair acts
-    // as its own token with a single expert slot (ids stay pair-indexed).
-    rocm::GemmMoe(l.ffn_down_exps.data, static_cast<std::uint32_t>(H),
-                  static_cast<std::uint32_t>(c.expert_ff), st->eg, st->ids,
-                  st->ed, B * c.num_experts_used, c.num_experts, 1U, stream);
+    if (grouped) {
+      rocm::BuildRoutedTiles(
+          st->expert_counts, c.num_experts,
+          /*rows_a=*/128U, st->moe_tile_capacity, st->moe_tiles,
+          /*rows_b=*/128U, st->moe_tile_capacity, st->moe_tiles, stream);
+      rocm::RoutedCompact(st->ids, st->expert_counts, st->moe_pad,
+                          st->moe_cursors, st->moe_rows_token,
+                          st->moe_rows_slot, B, c.num_experts_used,
+                          c.num_experts, stream);
+      rocm::NarrowActivations(st->normed, st->moe_xh,
+                              static_cast<std::size_t>(B) * H, stream);
+      // gate/up read the token rows and scatter into slot rows (the same
+      // [token * E + j] layout the mmq route and SumExperts expect).
+      const bool gate_ok = rocm::LaunchRoutedHalfGemm(
+          rocm::ExpertFormat::kQ8_0, l.ffn_gate_exps.data, st->moe_xh,
+          st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
+          st->moe_rows_token, st->moe_rows_slot, st->eg, nullptr, c.expert_ff,
+          static_cast<std::uint32_t>(H), stream);
+      const bool up_ok = rocm::LaunchRoutedHalfGemm(
+          rocm::ExpertFormat::kQ8_0, l.ffn_up_exps.data, st->moe_xh,
+          st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
+          st->moe_rows_token, st->moe_rows_slot, st->eu, nullptr, c.expert_ff,
+          static_cast<std::uint32_t>(H), stream);
+      if (!gate_ok || !up_ok) {
+        if (error != nullptr) {
+          *error = "flint: grouped gate/up launch rejected";
+        }
+        return false;
+      }
+      rocm::SiluMul(
+          st->eg, st->eu, st->eg,
+          static_cast<std::size_t>(B) * c.num_experts_used * c.expert_ff,
+          stream);
+      rocm::NarrowActivations(
+          st->eg, st->moe_ah,
+          static_cast<std::size_t>(B) * c.num_experts_used * c.expert_ff,
+          stream);
+      if (!rocm::LaunchRoutedHalfGemm(
+              rocm::ExpertFormat::kQ8_0, l.ffn_down_exps.data, st->moe_ah,
+              st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
+              st->moe_rows_slot, st->moe_rows_slot, st->ed, nullptr,
+              static_cast<std::uint32_t>(H), c.expert_ff, stream)) {
+        if (error != nullptr) {
+          *error = "flint: grouped down launch rejected";
+        }
+        return false;
+      }
+    } else {
+      rocm::GemmMoe(l.ffn_gate_exps.data,
+                    static_cast<std::uint32_t>(c.expert_ff),
+                    static_cast<std::uint32_t>(H), st->normed, st->ids, st->eg,
+                    B, c.num_experts, c.num_experts_used, stream, h_counts);
+      rocm::GemmMoe(l.ffn_up_exps.data, static_cast<std::uint32_t>(c.expert_ff),
+                    static_cast<std::uint32_t>(H), st->normed, st->ids, st->eu,
+                    B, c.num_experts, c.num_experts_used, stream, h_counts);
+      rocm::SiluMul(
+          st->eg, st->eu, st->eg,
+          static_cast<std::size_t>(B) * c.num_experts_used * c.expert_ff,
+          stream);
+      // down consumes the slot-indexed SiLU output, so each routed pair
+      // acts as its own token with a single expert slot (ids stay
+      // pair-indexed).
+      rocm::GemmMoe(l.ffn_down_exps.data, static_cast<std::uint32_t>(H),
+                    static_cast<std::uint32_t>(c.expert_ff), st->eg, st->ids,
+                    st->ed, B * c.num_experts_used, c.num_experts, 1U, stream,
+                    h_counts);
+    }
     Project(l.shexp_gate, st->normed, st->sg, B, stream);
     Project(l.shexp_up, st->normed, st->su, B, stream);
     rocm::SiluMul(st->sg, st->su, st->sg,

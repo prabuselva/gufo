@@ -37,11 +37,15 @@ void Gemm(const void* base, core::GgmlType type, std::uint32_t rows,
 
 /// Grouped routed projection: with e = ids[t*n_used + s],
 /// out[(t*n_used + s)][r] = sum_k W[e][r][k] * x[t][k]. Q8_0 only; `base` is
-/// the stacked [n_experts x rows x cols] matrix.
+/// the stacked [n_experts x rows x cols] matrix. When `h_counts` (host,
+/// n_experts entries, as produced by ExpertCounts) is set it bounds the
+/// routed mmq launch (max expert rows + count-selected column tile); the
+/// values do not change results, only the grid.
 void GemmMoe(const void* base, std::uint32_t rows, std::uint32_t cols,
              const float* x, const std::int32_t* ids, float* out,
              std::uint32_t n_tokens, std::uint32_t n_experts,
-             std::uint32_t n_expert_used, hipStream_t stream);
+             std::uint32_t n_expert_used, hipStream_t stream,
+             const unsigned int* h_counts = nullptr);
 
 /// Zero-copy dequantization of one Q8_0/F32 row into a float buffer; the
 /// executor embeds token rows with it.

@@ -140,7 +140,7 @@ __global__ void QkEpilogueKernel(
 // fp16 K/V cache rows, sliding-window masking and attention sinks.
 constexpr int kHeadDim = 128;  // Flint rotary/noPE head dimension.
 
-template <int TR, int kTile>
+template<int TR, int kTile>
 __global__ void AttentionKernel(const float* __restrict__ q,
                                 const __half* __restrict__ k_cache,
                                 const __half* __restrict__ v_cache,
@@ -169,11 +169,11 @@ __global__ void AttentionKernel(const float* __restrict__ q,
   for (int i = tid; i < TR * kHeadDim; i += kHeadDim) {
     const int r = i / kHeadDim;
     const int d = i % kHeadDim;
-    sq[r][d] = r < static_cast<int>(rows)
-                   ? q[(static_cast<std::size_t>(row0 + r) * n_head + h) *
-                           head_dim +
-                       d]
-                   : 0.0F;
+    sq[r][d] =
+        r < static_cast<int>(rows)
+            ? q[(static_cast<std::size_t>(row0 + r) * n_head + h) * head_dim +
+                d]
+            : 0.0F;
   }
   if (tid < TR) {
     sm[tid] = kNegInf;
@@ -184,9 +184,8 @@ __global__ void AttentionKernel(const float* __restrict__ q,
   const __half* __restrict__ kv_k = k_cache + kvh * head_dim;
   const __half* __restrict__ kv_v = v_cache + kvh * head_dim;
   const std::uint32_t nmax = pos0 + row0 + rows;  // exclusive causal bound
-  const uint32_t pmin = window != 0 && pos0 + row0 + 1 > window
-                            ? pos0 + row0 + 1 - window
-                            : 0u;
+  const uint32_t pmin =
+      window != 0 && pos0 + row0 + 1 > window ? pos0 + row0 + 1 - window : 0u;
   const std::uint32_t p0_start = pmin / kTile * kTile;
 
   float o[TR] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
@@ -395,6 +394,11 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t batch, std::uint32_t window, std::uint32_t n_head,
                std::uint32_t n_kv, std::uint32_t head_dim,
                std::uint32_t kv_row_elements, float* out, hipStream_t stream) {
+  if (head_dim == kHeadDim &&
+      LaunchWmmaAttention(q, k_cache, v_cache, sinks, scale, pos0, batch,
+                          window, n_head, n_kv, kv_row_elements, out, stream)) {
+    return;
+  }
   const dim3 grid((batch + 23) / 24, n_head);
   AttentionKernel<24, 16><<<grid, kHeadDim, 0, stream>>>(
       q, k_cache, v_cache, sinks, scale, pos0, batch, window, n_head, n_kv,
@@ -406,6 +410,27 @@ void RouterTopK(const float* probs_logits, std::int32_t* ids, float* weights,
                 float weight_scale, hipStream_t stream) {
   RouterTopKKernel<<<batch, 256, 0, stream>>>(probs_logits, ids, weights, used,
                                               normalize ? 1 : 0, weight_scale);
+}
+
+namespace {
+__global__ void ExpertCountsKernel(const std::int32_t* __restrict__ ids,
+                                   std::uint32_t n_ids,
+                                   unsigned int* __restrict__ counts) {
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids;
+       i += gridDim.x * blockDim.x) {
+    atomicAdd(&counts[ids[i]], 1U);
+  }
+}
+}  // namespace
+
+void ExpertCounts(const std::int32_t* ids, std::uint32_t n_ids,
+                  std::uint32_t n_experts, unsigned int* counts,
+                  hipStream_t stream) {
+  (void)hipMemsetAsync(counts, 0, static_cast<std::size_t>(n_experts) * 4,
+                       stream);
+  const std::uint32_t threads = 256;
+  const std::uint32_t blocks = (n_ids + threads - 1) / threads;
+  ExpertCountsKernel<<<blocks, threads, 0, stream>>>(ids, n_ids, counts);
 }
 
 void SumExperts(float* x, const float* routed, const float* weights,

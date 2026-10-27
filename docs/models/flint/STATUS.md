@@ -145,8 +145,159 @@ pair in one tool call (AGENTS protocol).
   max margin deltas (-0.4..-2.5 logit) on tokens far below argmax; rank-0-
   margin differences 0.0 at every step. Scalar-oracle parity covered by the
   passing `flint.reference` and `flint.rocm.forward` tests.
-- [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
-  QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
+- [x] C7a WMMA attention: `kernels/rocm/attention_wmma.hip.cpp` (dispatched
+  from `Attention()` at head_dim 128), 16x16x16 fused f16 tiles with hi/lo Q
+  and hi/lo probability correction chains. gfx1151 finding: the f32 WMMA
+  accumulator is not zero-neutral — a masked exact +0 probability still moves
+  the row by 1-2 ulp through values sharing its B (V) tile, and the
+  zero-filled cache tail makes tile contents launch-specific, so naive WMMA
+  broke batch-invariance (engine bitwise replay red). The kernel keeps WMMA
+  only for interior tiles — every wave row attends every column — with the
+  interior bounds keyed on the wave's own rows only (never `a.rows`, so a
+  row's arithmetic path is identical across prefix lengths) and exact
+  per-element accumulation on boundary tiles. New `flint.attention.op` test
+  (`tests/models/flint/attention_op_test.cpp`): fp64-oracle parity for WMMA
+  and dispatched kernels (worst 6.8e-7, scalar same) + 10 bitwise
+  prefix/batch-invariance pairs — all pass. Matched `flint.rocm.forward`
+  evidence (argmax matched everywhere): decode0 0.378 (wmma) vs 0.491
+  (scalar), prefill 0.221 vs 0.266, per-layer tracking equal or better; the
+  chaotic decode1 draw (1.034 vs 0.936 on budget 1.031 spread 51.5, scalar
+  already at 91 % of budget from MoE expert flips) led to raising the parity
+  budget 2 % -> 3 % of the vocab logit spread (maintainer-approved).
+  Gates GPU-exclusive on Q8_0: flint.attention.op 9.0 s, flint.rocm.forward
+  13.9 s, flint.engine 12.3 s — all pass. Release bench (exclusive):
+  pp2048 394.0 t/s (was 255.0 at C5 smoke), pp8192 363.0 t/s, tg1 ~39 — prefill
+  now bounded by the fp32 GEMV trunk tiers, not attention; the ≥3000 target
+   needs a sustained bf16 GEMM path next.
+- [x] C7b token-tiled dense Q8 prefill: `GemvBatchQ8TileKernel` in
+   `kernels/rocm/linear.hip.cpp` — one warp per row now computes 32
+   consecutive tokens, loading each 34-byte Q8 block and its exact float(qs)
+   conversions once (per weight byte, not per token) into 32 accumulator
+   chains. Per-token b-stride order, float4 x loads, j-order, d*x products
+   and WarpSum tree match `GemvBatchQ8Kernel`, so outputs are BITWISE
+   identical (`tools/bench/flint_gemv_btile_bench.hip`: bitwise n=0 vs the
+   production kernel on all four Flint projection shapes, hoist-T32 1.84-
+   2.04x, floor-normalized ~5.1 TFMA/s); `GemvBatch` dispatches full tiles
+   through it and routes ragged tails through the old kernel. Microbench
+   note: earlier "vanished stores" runs were a bench bug (`ot` base missing
+   `+ row` — every warp raced one cell), not a ROCm anomaly. Gates GPU-
+   exclusive on Q8_0: flint.rocm.forward (prefill max|diff| 0.221 on budget
+   1.539) and flint.engine pass. Release bench (exclusive): pp2048 497.2
+   t/s (was 394.0, +26 %), pp8192 494.0 t/s (was 363.0, +36 %) — the ≥3000
+   target still needs the tensor-core dense tier (measured kernel floor is
+   ~5x below this FMA ceiling).
+ - [x] C7c mmq tensor-core dense prefill: `Project()` dispatches Q8 batch>1
+   through `qfn_mmq_q8_0_dense` (q8_1 X-quantized `ggml_mul_mat_vec_q`),
+   keeping the batch-1 decode tier on the bitwise SIMT `Gemv`. Release bench
+   (exclusive): pp2048 946 t/s (was 497.2, +90 %), tg1 unchanged. Tier mixing
+   breaks two bitwise contracts, both calibrated with evidence:
+   `flint.rocm.forward` — the 4-token probe prompt flips the executor top-1
+   (margin ~0.36) while llama.cpp b11879 flips its own top-1 (332 vs 269,
+   same margin) between sequential decode and batched prefill (probe
+   `flint_batch_argmax_probe.cpp`), so `Compare()` moved to a tie-margin
+   argmax rule (exact top-1 when the oracle margin exceeds the budget; inside
+   a tie the chosen candidate must sit within budget of the oracle top-1) —
+   maintainer-approved 2026-10-27.
+   `flint.engine` — mmq tiles couple a row's accumulation order to the batch
+   size, so a replayed prefill no longer bitwise-matches a batch-1 decode
+   step (measured max|diff| 2.08 = 3.8 % of the 54.9 spread, argmax identical
+   in both replays); `ExpectReplay()` replaced `std::equal` with a
+   5 %-of-spread bound (floor 0.25) plus the same tie-margin rule,
+   maintainer-approved 2026-10-27. Same-sequence determinism stays bitwise.
+   Gates GPU-exclusive on Q8_0: flint.attention.op 9.2 s, flint.rocm.forward
+    12.8 s, flint.engine 11.6 s — all pass (fw6).
+  - [x] C7d prefill chunk 256→2048: profiling pp2048 showed the MoE routed
+    id-GEMM (`qfn_mmq::mul_mat_q<80>`, one launch per expert-id column) at
+    53 % of kernel time because `kPrefillChunk = 256` made every chunk
+    re-read the 256-expert weight planes — 8 launches per gemm per layer.
+    `tools/bench/flint_moe_mmq_bench.hip` (uniform routing, worst case for
+    weight traffic): one 2048-token id launch beats eight 256-token launches
+    ~7x on gate/up and ~8x on down; the count-selected tile-cols and
+    `max_expert_rows` knobs beat defaults at every batch but are additive,
+    not adopted yet. Release bench (exclusive): pp2048 1408.93 t/s (was
+    946, +49 %; llama.cpp b11879 reference 1478, within 5 %), pp8192
+    1237.55 t/s. Gates re-verified GPU-exclusive on Q8_0 with
+    the new chunk: flint.engine 11.6 s, flint.rocm.forward 12.2 s,
+    flint.attention.op 9.3 s — all pass (fw7b).
+  - [x] C7e token-tiled bf16 router GEMV: at chunk 2048 the router's
+    warp-per-token `GemvBatchBf16Kernel` re-read the 4 KB expert row per
+    token (~550 GB/s effective, 0.59 TF/s). `GemvBatchBf16TileKernel`
+    mirrors the C7b design — one warp per row, 32 consecutive tokens, each
+    bf16 weight converted once, 32 accumulator chains keeping the exact
+    k-stride fmaf chain and WarpSum tree. `flint_gemv_bf16_tile_bench.hip`:
+    bitwise 0 mismatches at B=256/1024/2048 on 256x2048, 3.84-4.29x;
+    dispatch tiles full groups and routes the ragged tail through the old
+    kernel (decode batch 1 unchanged). Release bench (exclusive): pp2048
+    1628.08 t/s (was 1408.93, +15.6 %; now above the llama.cpp b11879
+    reference 1478), pp8192 1401.68 t/s (was 1237.55). Gates pass again
+    unchanged (engine bitwise replay proves router logits identical;
+    rtr1).
+  - [x] C7f routed mmq launch bounds from per-expert counts: the id-GEMM
+    default grid covers all column tiles for all 256 experts — whole-chunk
+    padding once counts are known. `rocm::ExpertCounts` (atomic pass over
+    ids, gemma4 pattern) + pinned D2H after RouterTopK; `GemmMoe` sets
+    `qfn_mmq_set_routed_max_expert_rows` (trims empty column tiles) and
+    `qfn_mmq_routed_tile_cols_for_counts` and resets to 0 after. Grid-only:
+    results unchanged; decode (batch < 32) skips the host sync and keeps
+    the plain launch. Release bench (exclusive): pp2048 1818.61 t/s (was
+    1628.08, +11.7 %; llama.cpp b11879 reference 1478, +23 %), pp8192
+    1559.67 t/s (was 1401.68, +11.3 %). Gates unchanged and pass (rtr2).
+  - [x] C7g WMMA attention config sweep: `tools/bench/flint_attn_wmma_bench`
+    compared the valid launches (K/V staging fixes kRowBlocks = 8) on the
+    measured windowed-513 and full-causal pp2048 shapes; `<8, 1>` (whole
+    GQA group per staged K/V tile) is bitwise-identical to `<2, 4>` on both
+    and 31 %/10 % faster → new default with `<2, 4>` fallback. Release
+    bench (exclusive): pp2048 1920.02 t/s (+5.6 %), pp8192 1657.07 t/s
+    (+6.2 %). Gates unchanged and pass (attn81).
+  - [x] C7h prefill chunk 2048 → 4096: fewer launches per prompt past one
+    chunk (per-chunk MoE/attention prefix overlap halves). Exclusive
+    bench: pp8192 1706.82 (vs 1657.07, +3.0 %), pp16384 1342.98 (vs
+    1324.80 control, +1.4 %); pp2048 = single chunk, unchanged at 1920.02.
+     Gates pass with the new chunking incl. the 24 K-activity engine replay
+     (ck4k).
+  - [x] C7i qfn_mmq fork for Flint: copied the whole vendored mmq tree to
+     `src/models/flint/kernels/rocm/mmq` (mechanical `flint_`/`FLINT_`
+     rename, new `gufo_flint_mmq` target, `kernels/rocm/mmq/VENDOR.md`
+     records provenance) so the Q8_0 pipeline restructure (double-buffered
+     LDS staging) evolves without touching Flash-Next production kernels
+     (mmq/VENDOR.md:11-14). Code-identical at import: exclusive bench
+     pp2048 1950.02 t/s (1920 ± noise) and all three gates pass — engine
+      bitwise replay proves the rename preserved outputs (fork1).
+   - [x] C7j flint_mmq standalone bench + Q8_0 pipeline experiment
+     (negative). `tools/bench/flint_mmq_bench.hip` times the shipped dense
+     and routed entry points (compile/link line in its header; `--save`/
+     `--ref` bitwise compare): baseline dense_2048x4096x2048 20.48 TFLOP/s,
+     moe gate/up 9.89, down 7.49 (mmqb). A fused-iteration staging variant
+     in the fork (knob `FLINT_MMQ_PIPE_Q8_0`, 4 y-stage + 2 x-tile LDS
+     regions, one barrier per K iteration) measured 13.44/2.60/1.51: the
+     same-shape control (knob off, host gate still sized for the pipeline)
+     was bitwise-identical yet -47 % on dense, so 97.6 KB blocks (1 wave
+     group/CU vs 33.9 KB ≈ 3) dominate; the barrier win (+22 %) cannot pay
+     for the residency loss. Shipped default keeps the knob off; the pipe
+     branch itself also mismatches (unfixed, inert while off) and needs a
+     race diagnosis before anyone re-enables. Host smem gate now mirrors
+     the device pipe gate (was the control-build slowdown). Gates pass,
+     pp2048 1936.42 ≈ 1950 within session noise (land1).
+    - [x] C7k fix `ds4_serving_test` link since f61bf542: the flint serve
+      dispatch in `inference_backend.cpp` was never linked for the
+      cross-model serving tests; add `flint/serve_runner.cpp` +
+      `gufo_flint_engine` to the ds4, qwen27b and qwen38 test targets.
+    - [x] C7l grouped Q8_0 MoE prefill route (Gemma-4 `moe_prefill` fork).
+      Vendored gemma4 `moe_prefill` + the `RoutedCompact` builders into
+      `kernels/rocm/moe/` (VENDOR.md, format-excluded like the mmq fork).
+      Standalone A/B (`tools/bench/flint_moe_route_bench.hip`, same weights
+      /routing both routes): grouped vs mmq 16.63 vs 9.39 TF at gateup
+      (+77 %) and 15.32 vs 6.96 TF at down (+120 %); grouped self-check
+      bitwise-stable, vs mmq rms ≈5e-4 of ref (f16 activations). Executor:
+      Q8_0 routed layers take bucket tiles (128) + `rows_slot` scatter,
+      gate/up from f16 token rows, down from f16 slot rows; the per-layer
+      counts→host sync only remains on the mmq fallback. Non-Q8_0 or
+      >256-expert models keep the mmq route. Gates 3/3, pp2048 1936.42 →
+      2328.41 (+20 %), pp8192 1706.82 → 1929.89 (+13 %), pp16384 1342.98 →
+      1469.49 (+9 %); tg128 40.49 (no matched prior run, no regression vs
+      the C-era 37.3 record).
+   - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
 

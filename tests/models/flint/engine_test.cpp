@@ -1,6 +1,7 @@
 #include "src/models/flint/engine.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <span>
@@ -26,6 +27,63 @@ std::size_t ArgMax(std::span<const float> row) {
     }
   }
   return best;
+}
+
+// Continuation parity between a replayed prefill and the incremental decode
+// step that produced the same history.
+//
+// Same-sequence determinism stays bit-for-bit in every tier, but a replay
+// through the mmq tensor-core prefill tier is no longer bit-identical to the
+// batch-1 SIMT decode step: mmq tiles couple a row's accumulation order to
+// the batch size, removing exactly the per-token row independence that made
+// the two paths bitwise equal. The residual is bounded chaotic drift (the
+// MoE trunk amplifies ordering noise into expert-selection flips): measured
+// at max|diff|=2.08 with an identical argmax, 3.8 % of the 54.9-spread
+// vocab logits of this artifact and prompt. Maintainer decision 2026-10-27
+// replaced the bitwise equality with a 5 %-of-spread bound (floor 0.25)
+// plus the tie-margin argmax rule of rocm_forward_test.cpp: the replay must
+// pick the step's top-1 unless its top1-top2 margin lies inside the budget,
+// in which case the replay's chosen candidate must itself sit within the
+// budget of the step's top-1.
+void ExpectReplay(std::span<const float> got, std::span<const float> ref,
+                  const std::string& tag) {
+  Require(got.size() == ref.size(), tag + ": logit width");
+  bool finite = true;
+  double max_abs = 0.0;
+  double ref_hi = -1e30;
+  double ref_lo = 1e30;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    if (!std::isfinite(got[i])) {
+      finite = false;
+    }
+    max_abs = std::max(max_abs, std::abs(static_cast<double>(got[i]) -
+                                         static_cast<double>(ref[i])));
+    ref_hi = std::max(ref_hi, static_cast<double>(ref[i]));
+    ref_lo = std::min(ref_lo, static_cast<double>(ref[i]));
+  }
+  Require(finite, tag + ": replay logits are finite");
+  const double spread = ref_hi - ref_lo;
+  const double budget = std::max(0.25, 0.05 * spread);
+  const std::size_t ref_best = ArgMax(ref);
+  double ref_second = -1e30;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    if (i != ref_best) {
+      ref_second = std::max(ref_second, static_cast<double>(ref[i]));
+    }
+  }
+  const double margin = ref_hi - ref_second;
+  const std::size_t got_best = ArgMax(got);
+  std::cout << tag << ": max|diff|=" << max_abs << " spread=" << spread
+            << " budget=" << budget << " top1-top2 margin=" << margin << "\n";
+  Require(max_abs <= budget, tag + ": replay logits within the budget");
+  if (margin > budget) {
+    Require(got_best == ref_best, tag + ": replay argmax matches the step");
+  } else {
+    Require(static_cast<double>(got[ref_best]) -
+                    static_cast<double>(got[got_best]) <=
+                budget,
+            tag + ": tie argmax within budget of the step top-1");
+  }
 }
 
 }  // namespace
@@ -67,18 +125,14 @@ int main() {
     const std::vector<float> after_step(session->Logits().begin(),
                                         session->Logits().end());
 
-    // Replaying the same history from a fresh state must reproduce the
-    // logits bit-for-bit (deterministic kernels, divergence restart).
+    // Replaying the same history from a fresh state must reproduce the step
+    // logits under the continuation-parity contract (bounded drift +
+    // tie-margin argmax; see ExpectReplay).
     session->Reset();
     std::vector<std::int32_t> history = ids;
     history.push_back(first);
     Require(session->Sync(history, &error), "sync history: " + error);
-    Require(std::span(session->Logits()).data() != nullptr &&
-                session->Logits().size() == after_step.size(),
-            "history logit width");
-    Require(std::equal(after_step.begin(), after_step.end(),
-                       session->Logits().begin()),
-            "replayed history must reproduce the last logits");
+    ExpectReplay(session->Logits(), after_step, "replay history 1");
 
     // Extending the prompt through the already-forwarded prefix keeps the
     // append path and the same result as the step.
@@ -89,8 +143,7 @@ int main() {
     session->Reset();
     history.push_back(second);
     Require(session->Sync(history, &error), "sync history 2: " + error);
-    Require(std::equal(step2.begin(), step2.end(), session->Logits().begin()),
-            "full replay must reproduce step 2 logits");
+    ExpectReplay(session->Logits(), step2, "replay history 2");
 
     session->Reset();
     Require(session->Position() == 0, "reset position");

@@ -16,8 +16,16 @@ void AssignError(std::string* error_msg, std::string_view message) {
   }
 }
 
-/// Prefill chunk fed to FlintExecutor::Forward in one launch.
-constexpr std::uint32_t kPrefillChunk = 256;
+/// Prefill chunk fed to FlintExecutor::Forward in one launch. The chunk is
+/// also the MoE expert id-GEMM batch: at 256 the 256-expert weight planes
+/// are re-read once per chunk, which dominated the routed tier
+/// (tools/bench/flint_moe_mmq_bench.hip: one 2048-token id launch beats
+/// eight 256-token launches ~7x on gate/up and ~8x on down). 4096 further
+/// halves the per-chunk fixed cost for prompts past one chunk: exclusive
+/// bench vs 2048 gives pp8192 1706.82 vs 1657.07 (+3.0 %) and pp16384
+/// 1342.98 vs 1324.80 (+1.4 %), gates green; single-chunk prompts are
+/// unaffected.
+constexpr std::uint32_t kPrefillChunk = 4096;
 
 }  // namespace
 
