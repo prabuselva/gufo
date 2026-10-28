@@ -344,7 +344,23 @@ pair in one tool call (AGENTS protocol).
         2491.14/2514.80, pp8192 2003.13 -> 2035.58 (+1.6 %), pp16384
         1519.80 -> 1556.65 (+2.4 %), tg128 41.20 unchanged; the win grows
         with context as the slot-traffic share does.
-     - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+      - [x] C7p fused grouped gate/up launch with a SiLU epilogue.
+        One `RoutedHalfDownKernel` geglu launch over the two stacked
+        tensors (kernel/launcher gain a trailing `w_up` pointer: gate
+        rows from `w`, up rows from `w_up`, both at `expert_ffn` rows
+        per expert) replaces the two FP32-output launches plus `SiluMul`
+        + `NarrowActivations`; up waves hand their raw FP32 accumulators
+        to the gate waves through LDS in two token-tile chunks, so the
+        epilogue computes `silu(gate) * up` (not `GeGluValue`) on
+        exactly the values of the chain it replaces and narrows once
+        (unit check `flint_moe_route_bench check-geglu`: two-pointer
+        bit-identical to the fused single-tensor geglu, old-pipeline
+        parity at host-mirror ULP only). Gates 3/3 exclusive (geglu3).
+        Release bench (exclusive, gegperf): pp2048 2491.14/2514.80 ->
+        2577.54/2617.01 (+3.5-5.0 %), pp8192 2035.58 -> 2099.64
+        (+3.1 %), pp16384 1556.65 -> 1581.59 (+1.6 %), tg128 41.20 ->
+        41.75, tg1 43-44 -> 45-46.
+      - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
     QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes

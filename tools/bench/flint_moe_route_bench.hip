@@ -113,6 +113,168 @@ float Median(std::vector<float> v) {
   return v[v.size() / 2];
 }
 
+float HalfSat(float v) {  // SaturatedHalf mirror (value, not bits)
+  if (v > 65504.0F) v = 65504.0F;
+  if (v < -65504.0F) v = -65504.0F;
+  return v;
+}
+
+// Gate mirror for the fused grouped launch (Flint gates experts with
+// SiLU, as in SiluMulKernel).
+float GeGluRef(float x, float u) { return x / (1.0F + expf(-x)) * u; }
+
+// Unit check for the fused GeGLU grouped launch: the same fused [gate | up]
+// Q8_0 tensor must give bit-identical results for the single-pointer and
+// the two-pointer (w_up) modes, and both must match the f32 reference
+// (ungated m-row launch + host GeGLU with the kernel's binary16 rounding).
+int CheckGeGlu() {
+  const Shape &s = kShapes[0];
+  if (s.down) {
+    std::fprintf(stderr, "expected a gate/up shape first\n");
+    return 1;
+  }
+  Xorshift rng;
+  std::vector<std::int32_t> ids;
+  FillIds(ids, s.n_tokens, s.expert_used, s.n_experts, rng);
+  std::vector<std::uint32_t> counts(s.n_experts, 0);
+  for (const std::int32_t e : ids) ++counts[e];
+
+  std::vector<std::uint8_t> wf;
+  FillWeights(wf, s.n_experts * s.M, s.K, rng);
+  const std::size_t rb = Q8_0Bytes(1, s.K);
+  const std::size_t half_exp = static_cast<std::size_t>(s.M / 2) * rb;
+  std::vector<std::uint8_t> wg(static_cast<std::size_t>(s.n_experts) *
+                               half_exp);
+  std::vector<std::uint8_t> wu(wg.size());
+  for (int e = 0; e < s.n_experts; ++e) {
+    const std::uint8_t *src = wf.data() + static_cast<std::size_t>(e) *
+                                               static_cast<std::size_t>(s.M) *
+                                               rb;
+    std::memcpy(wg.data() + static_cast<std::size_t>(e) * half_exp, src,
+                half_exp);
+    std::memcpy(wu.data() + static_cast<std::size_t>(e) * half_exp,
+                src + half_exp, half_exp);
+  }
+  const std::size_t slots =
+      static_cast<std::size_t>(s.n_tokens) * s.expert_used;
+  std::vector<float> x(static_cast<std::size_t>(s.n_tokens) * s.K);
+  for (auto &v : x) v = rng.Uniform() * 0.25f;
+
+  void *d_wf = nullptr, *d_wg = nullptr, *d_wu = nullptr;
+  float *d_x = nullptr, *d_ref = nullptr;
+  __half *d_xh = nullptr, *d_o1 = nullptr, *d_o2 = nullptr;
+  std::int32_t *d_ids = nullptr, *d_pad = nullptr, *d_cur = nullptr;
+  std::int32_t *d_rows_tok = nullptr, *d_rows_slot = nullptr;
+  std::int32_t *d_tiles = nullptr;
+  std::uint32_t *d_counts = nullptr;
+  const std::size_t compact_rows =
+      flint::RoutedCompactRows(slots, s.n_experts);
+  const std::uint32_t rows_tile = 128U;
+  const std::uint32_t n_tiles = static_cast<std::uint32_t>(
+      flint::RoutedTileCapacity(static_cast<std::uint32_t>(slots),
+                                static_cast<std::uint32_t>(s.n_experts),
+                                rows_tile));
+  CHECK(hipMalloc(&d_wf, wf.size()));
+  CHECK(hipMemcpy(d_wf, wf.data(), wf.size(), hipMemcpyHostToDevice));
+  CHECK(hipMalloc(&d_wg, wg.size()));
+  CHECK(hipMemcpy(d_wg, wg.data(), wg.size(), hipMemcpyHostToDevice));
+  CHECK(hipMalloc(&d_wu, wu.size()));
+  CHECK(hipMemcpy(d_wu, wu.data(), wu.size(), hipMemcpyHostToDevice));
+  CHECK(hipMalloc(&d_x, x.size() * sizeof(float)));
+  CHECK(hipMemcpy(d_x, x.data(), x.size() * sizeof(float),
+                  hipMemcpyHostToDevice));
+  CHECK(hipMalloc(&d_xh, x.size() * sizeof(__half)));
+  CHECK(hipMalloc(&d_ref, slots * s.M * sizeof(float)));
+  CHECK(hipMalloc(&d_o1, slots * (s.M / 2) * sizeof(__half)));
+  CHECK(hipMalloc(&d_o2, slots * (s.M / 2) * sizeof(__half)));
+  CHECK(hipMalloc(&d_ids, ids.size() * sizeof(std::int32_t)));
+  CHECK(hipMemcpy(d_ids, ids.data(), ids.size() * sizeof(std::int32_t),
+                  hipMemcpyHostToDevice));
+  CHECK(hipMalloc(&d_counts, counts.size() * sizeof(std::uint32_t)));
+  CHECK(hipMemcpy(d_counts, counts.data(), counts.size() * sizeof(std::uint32_t),
+                  hipMemcpyHostToDevice));
+  CHECK(hipMalloc(&d_pad, (s.n_experts + 1) * sizeof(std::int32_t)));
+  CHECK(hipMalloc(&d_cur, s.n_experts * sizeof(std::int32_t)));
+  CHECK(hipMalloc(&d_rows_tok, compact_rows * sizeof(std::int32_t)));
+  CHECK(hipMalloc(&d_rows_slot, compact_rows * sizeof(std::int32_t)));
+  CHECK(hipMalloc(&d_tiles, n_tiles * sizeof(std::int32_t)));
+  flint::BuildRoutedTiles(d_counts, s.n_experts, rows_tile, n_tiles, d_tiles,
+                          rows_tile, n_tiles, d_tiles, 0);
+  flint::RoutedCompact(d_ids, d_counts, d_pad, d_cur, d_rows_tok, d_rows_slot,
+                       s.n_tokens, s.expert_used, s.n_experts, 0);
+  flint::NarrowActivations(d_x, d_xh, x.size(), 0);
+
+  const auto half_m = static_cast<std::uint32_t>(s.M / 2);
+  const auto m = static_cast<std::uint32_t>(s.M);
+  const auto k = static_cast<std::uint32_t>(s.K);
+  const bool ok_ref = flint::LaunchRoutedHalfGemm(
+      flint::ExpertFormat::kQ8_0, d_wf, d_xh, d_tiles, n_tiles, rows_tile,
+      d_pad, d_rows_tok, d_rows_slot, d_ref, nullptr, m, k, 0, /*geglu=*/false);
+  const bool ok1 = flint::LaunchRoutedHalfGemm(
+      flint::ExpertFormat::kQ8_0, d_wf, d_xh, d_tiles, n_tiles, rows_tile,
+      d_pad, d_rows_tok, d_rows_slot, nullptr, d_o1, m, k, 0, /*geglu=*/true);
+  const bool ok2 = flint::LaunchRoutedHalfGemm(
+      flint::ExpertFormat::kQ8_0, d_wg, d_xh, d_tiles, n_tiles, rows_tile,
+      d_pad, d_rows_tok, d_rows_slot, nullptr, d_o2, m, k, 0, /*geglu=*/true,
+      d_wu);
+  if (!ok_ref || !ok1 || !ok2) {
+    std::fprintf(stderr, "launch rejected ref=%d fused=%d twoptr=%d\n", ok_ref,
+                 ok1, ok2);
+    return 1;
+  }
+  CHECK(hipDeviceSynchronize());
+
+  std::vector<float> href(slots * s.M);
+  std::vector<__half> h1(slots * half_m), h2(slots * half_m);
+  CHECK(hipMemcpy(href.data(), d_ref, href.size() * sizeof(float),
+                  hipMemcpyDeviceToHost));
+  CHECK(hipMemcpy(h1.data(), d_o1, h1.size() * sizeof(__half),
+                  hipMemcpyDeviceToHost));
+  CHECK(hipMemcpy(h2.data(), d_o2, h2.size() * sizeof(__half),
+                  hipMemcpyDeviceToHost));
+  std::size_t twoptr_bits_mismatch = 0, ref_mismatch = 0, old_mismatch = 0;
+  double twoptr_max = 0.0, ref_max = 0.0, ref_ref_abs = 0.0, old_max = 0.0;
+  int shown = 0;
+  for (std::size_t slot = 0; slot < slots; ++slot) {
+    for (std::uint32_t r = 0; r < half_m; ++r) {
+      const std::size_t o = slot * half_m + r;
+      const float gate = __half2float(
+          __float2half_rn(HalfSat(href[slot * s.M + r])));
+      const float up = __half2float(
+          __float2half_rn(HalfSat(href[slot * s.M + s.M / 2 + r])));
+      const float expect = HalfSat(GeGluRef(gate, up));
+      const float expect_old = HalfSat(
+          GeGluRef(href[slot * s.M + r], href[slot * s.M + s.M / 2 + r]));
+      const float v1 = __half2float(h1[o]);
+      const float v2 = __half2float(h2[o]);
+      if (h1[o] != h2[o]) ++twoptr_bits_mismatch;
+      const bool ref_bad = __float2half_rn(expect) != h1[o];
+      if (ref_bad && ++ref_mismatch && shown < 5) {
+        std::printf("slot %zu r %u: gate %g up %g expect %.6f fused %.6f\n",
+                    slot, r, gate, up, expect, v1);
+        ++shown;
+      }
+      if (__float2half_rn(expect_old) != h1[o]) ++old_mismatch;
+      if (const double d = std::fabs(v1 - expect_old); d > old_max)
+        old_max = d;
+      if (const double d = std::fabs(v1 - v2); d > twoptr_max)
+        twoptr_max = d;
+      if (const double d = std::fabs(v1 - expect); d > ref_max) ref_max = d;
+      if (const double d = std::fabs(expect); d > ref_ref_abs)
+        ref_ref_abs = d;
+    }
+  }
+  std::printf("twoptr vs fused: %zu/%zu bit mismatches, max|diff|=%.6g\n",
+              twoptr_bits_mismatch, h1.size(), twoptr_max);
+  std::printf("fused  vs ref:   %zu/%zu bit mismatches, max|diff|=%.6g "
+              "(max|ref|=%.6g)\n",
+              ref_mismatch, h1.size(), ref_max, ref_ref_abs);
+  std::printf("fused  vs old pipeline: %zu/%zu bit mismatches, "
+              "max|diff|=%.6g\n",
+              old_mismatch, h1.size(), old_max);
+  return twoptr_bits_mismatch == 0 && ref_mismatch < h1.size() / 2 ? 0 : 2;
+}
+
 float TimeLaunch(const std::function<void()> &launch, int reps) {
   launch();  // warmup (module load, scratch alloc)
   launch();
@@ -138,6 +300,10 @@ float TimeLaunch(const std::function<void()> &launch, int reps) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  if (argc > 1 && std::strcmp(argv[1], "check-geglu") == 0) {
+    RK(flint_mmq_init(0));
+    return CheckGeGlu();
+  }
   int reps = 20;
   if (argc > 1) reps = std::atoi(argv[1]);
 

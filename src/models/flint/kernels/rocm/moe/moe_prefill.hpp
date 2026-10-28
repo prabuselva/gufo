@@ -30,14 +30,18 @@ enum class ExpertFormat : std::uint32_t {
 // RoutedF16Gemm route lacks or runs slower (Q4_K, Q5_K, Q6_K, and Q4_0 /
 // Q5_0 / Q5_1 / Q8_0 / binary16 with FP32 outputs; 96-row tiles); returns
 // false for others. With `geglu` (a K-quant, Q4_0, Q8_0 or binary16 fused
-// [gate | up] W, binary16 output) row r of `out_half` holds the m / 2 GeGLU
-// values of the binary16 pair.
+// [gate | up] W, binary16 output) row r of `out_half` holds the m / 2
+// gated values of the binary16 pair (GeGLU for a K-quant, silu(gate) * up
+// for the block-wise formats). `w_up` (Q8_0 only): gate and up are separate
+// stacked tensors; `w` holds the gate rows and `w_up` the up rows, each with
+// m / 2 rows per expert.
 [[nodiscard]] bool LaunchRoutedHalfGemm(
     ExpertFormat format, const void* w, const void* x,
     const std::int32_t* tiles, std::uint32_t n_tiles, std::uint32_t tile_rows,
     const std::int32_t* pad_bounds, const std::int32_t* rows_in,
     const std::int32_t* rows_out, float* out, void* out_half, std::uint32_t m,
-    std::uint32_t k, hipStream_t stream, bool geglu = false);
+    std::uint32_t k, hipStream_t stream, bool geglu = false,
+    const void* w_up = nullptr);
 
 // Dense prefill projection over binary16 activation rows `x` ([rows][k])
 // for Q4_K, Q5_K, Q6_K (the routed GEMM's arithmetic over an identity

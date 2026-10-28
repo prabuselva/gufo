@@ -628,32 +628,22 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
                           c.num_experts, stream);
       rocm::NarrowActivations(st->normed, st->moe_xh,
                               static_cast<std::size_t>(B) * H, stream);
-      // gate/up read the token rows and scatter into slot rows (the same
-      // [token * E + j] layout the mmq route and SumExperts expect).
-      const bool gate_ok = rocm::LaunchRoutedHalfGemm(
+      // gate/up read the token rows and write the GeGLU of the binary16
+      // pair as slot rows (the same [token * E + j] layout the mmq route
+      // and SumExperts expect): [gate | up] stay two stacked tensors, the
+      // kernel pairs them per block.
+      const bool gateup_ok = rocm::LaunchRoutedHalfGemm(
           rocm::ExpertFormat::kQ8_0, l.ffn_gate_exps.data, st->moe_xh,
           st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
-          st->moe_rows_token, st->moe_rows_slot, st->eg, nullptr, c.expert_ff,
-          static_cast<std::uint32_t>(H), stream);
-      const bool up_ok = rocm::LaunchRoutedHalfGemm(
-          rocm::ExpertFormat::kQ8_0, l.ffn_up_exps.data, st->moe_xh,
-          st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
-          st->moe_rows_token, st->moe_rows_slot, st->eu, nullptr, c.expert_ff,
-          static_cast<std::uint32_t>(H), stream);
-      if (!gate_ok || !up_ok) {
+          st->moe_rows_token, st->moe_rows_slot, nullptr, st->moe_ah,
+          2U * c.expert_ff, static_cast<std::uint32_t>(H), stream,
+          /*geglu=*/true, l.ffn_up_exps.data);
+      if (!gateup_ok) {
         if (error != nullptr) {
-          *error = "flint: grouped gate/up launch rejected";
+          *error = "flint: grouped fused gate/up launch rejected";
         }
         return false;
       }
-      rocm::SiluMul(
-          st->eg, st->eu, st->eg,
-          static_cast<std::size_t>(B) * c.num_experts_used * c.expert_ff,
-          stream);
-      rocm::NarrowActivations(
-          st->eg, st->moe_ah,
-          static_cast<std::size_t>(B) * c.num_experts_used * c.expert_ff,
-          stream);
       if (!rocm::LaunchRoutedHalfGemm(
               rocm::ExpertFormat::kQ8_0, l.ffn_down_exps.data, st->moe_ah,
               st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
