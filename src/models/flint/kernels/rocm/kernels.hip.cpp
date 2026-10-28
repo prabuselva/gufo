@@ -377,21 +377,36 @@ __global__ void RouterTopKKernel(const float* __restrict__ logits,
   }
 }
 
+__device__ inline float4 LoadRouted4(const float* p) {
+  return *reinterpret_cast<const float4*>(p);
+}
+
+__device__ inline float4 LoadRouted4(const __half* p) {
+  union {
+    uint2 u;
+    __half2 h[2];
+  } v;
+  v.u = *reinterpret_cast<const uint2*>(p);
+  return make_float4(__half2float(v.h[0].x), __half2float(v.h[0].y),
+                     __half2float(v.h[1].x), __half2float(v.h[1].y));
+}
+
+template<typename RoutedT>
 __global__ void SumExpertsKernel(float* __restrict__ x,
-                                 const float* __restrict__ routed,
+                                 const RoutedT* __restrict__ routed,
                                  const float* __restrict__ weights,
                                  const float* __restrict__ shared,
                                  std::uint32_t cols, std::uint32_t used) {
   const std::uint32_t t = blockIdx.y;
   float* __restrict__ xr = x + static_cast<std::size_t>(t) * cols;
-  const float* __restrict__ rbase =
+  const RoutedT* __restrict__ rbase =
       routed + static_cast<std::size_t>(t) * used * cols;
   const float* __restrict__ wrow = weights + static_cast<std::size_t>(t) * used;
   if ((cols & 3U) == 0U) {
     // Vector path; each output channel keeps the same per-s add order.
     const std::uint32_t cols4 = cols / 4U;
     float4* __restrict__ xv = reinterpret_cast<float4*>(xr);
-    const float4* __restrict__ rv = reinterpret_cast<const float4*>(rbase);
+    const RoutedT* __restrict__ rv = rbase;
     const float4* __restrict__ sv =
         shared != nullptr ? reinterpret_cast<const float4*>(shared) : nullptr;
     const std::size_t row4 = static_cast<std::size_t>(t) * cols4;
@@ -399,7 +414,8 @@ __global__ void SumExpertsKernel(float* __restrict__ x,
       float4 acc = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
       for (std::uint32_t s = 0; s < used; ++s) {
         const float w = wrow[s];
-        const float4 r = rv[static_cast<std::size_t>(s) * cols4 + i];
+        const float4 r =
+            LoadRouted4(rv + (static_cast<std::size_t>(s) * cols4 + i) * 4U);
         acc.x += w * r.x;
         acc.y += w * r.y;
         acc.z += w * r.z;
@@ -424,7 +440,8 @@ __global__ void SumExpertsKernel(float* __restrict__ x,
   for (std::uint32_t j = threadIdx.x; j < cols; j += kNormThreads) {
     float acc = 0.0F;
     for (std::uint32_t s = 0; s < used; ++s) {
-      acc += wrow[s] * rbase[static_cast<std::size_t>(s) * cols + j];
+      acc += wrow[s] *
+             static_cast<float>(rbase[static_cast<std::size_t>(s) * cols + j]);
     }
     if (shared != nullptr) {
       acc += shared[static_cast<std::size_t>(t) * cols + j];
@@ -516,8 +533,16 @@ void SumExperts(float* x, const float* routed, const float* weights,
                 const float* shared, std::uint32_t rows, std::uint32_t cols,
                 std::uint32_t used, hipStream_t stream) {
   const dim3 grid(1, rows);
-  SumExpertsKernel<<<grid, kNormThreads, 0, stream>>>(x, routed, weights,
-                                                      shared, cols, used);
+  SumExpertsKernel<float><<<grid, kNormThreads, 0, stream>>>(
+      x, routed, weights, shared, cols, used);
+}
+
+void SumExperts(float* x, const __half* routed, const float* weights,
+                const float* shared, std::uint32_t rows, std::uint32_t cols,
+                std::uint32_t used, hipStream_t stream) {
+  const dim3 grid(1, rows);
+  SumExpertsKernel<__half><<<grid, kNormThreads, 0, stream>>>(
+      x, routed, weights, shared, cols, used);
 }
 
 }  // namespace gufo::models::flint::rocm

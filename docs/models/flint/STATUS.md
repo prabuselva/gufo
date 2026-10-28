@@ -332,6 +332,18 @@ pair in one tool call (AGENTS protocol).
         (+2.6 %), pp8192 1949.06 → 2003.13 (+2.8 %), pp16384 1519.80 flat
         within the 1514.75–1529.94 band, tg128 41.02 unchanged (batch-1
         decode path untouched).
+     - [x] C7o binary16 routed down-projection slot rows.
+        `RoutedHalfDownKernel` gains a `kHalfOut` epilogue (Q8_0 grouped
+        down only): the transposed token store writes 8 `__half` instead
+        of two `float4`, halving the [slots x 2048] traffic at both the
+        write and the `SumExperts` read (~200 MB per pass removed at
+        pp2048). `SumExpertsKernel` is templated on the routed element
+        type with an 8-byte half4 load; the mmq route keeps binary32
+        (`ed` and `ed_h` are allocated per route). Gates 3/3 exclusive
+        (edh2/edh3). Release bench (exclusive, edhperf): pp2048
+        2491.14/2514.80, pp8192 2003.13 -> 2035.58 (+1.6 %), pp16384
+        1519.80 -> 1556.65 (+2.4 %), tg128 41.20 unchanged; the win grows
+        with context as the slot-traffic share does.
      - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
     QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 

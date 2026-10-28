@@ -84,6 +84,7 @@ struct FlintExecutor::State {
   float* eg{nullptr};
   float* eu{nullptr};
   float* ed{nullptr};
+  __half* ed_h{nullptr};  // grouped route: binary16 down slot rows [B * E] x H
   float* sg{nullptr};
   float* su{nullptr};
   float* sd{nullptr};
@@ -156,6 +157,7 @@ FlintExecutor::~FlintExecutor() {
   hipFree(state_->eg);
   hipFree(state_->eu);
   hipFree(state_->ed);
+  hipFree(state_->ed_h);
   hipFree(state_->sg);
   hipFree(state_->su);
   hipFree(state_->sd);
@@ -362,7 +364,11 @@ std::unique_ptr<FlintExecutor> FlintExecutor::Create(
        Alloc(reinterpret_cast<void**>(&st->eg), B * E * c.expert_ff * 4, error);
   ok = ok &&
        Alloc(reinterpret_cast<void**>(&st->eu), B * E * c.expert_ff * 4, error);
-  ok = ok && Alloc(reinterpret_cast<void**>(&st->ed), B * E * H * 4, error);
+  if (st->moe_grouped) {
+    ok = ok && Alloc(reinterpret_cast<void**>(&st->ed_h), B * E * H * 2, error);
+  } else {
+    ok = ok && Alloc(reinterpret_cast<void**>(&st->ed), B * E * H * 4, error);
+  }
   ok = ok && Alloc(reinterpret_cast<void**>(&st->sg),
                    B * c.shared_expert_ff * 4, error);
   ok = ok && Alloc(reinterpret_cast<void**>(&st->su),
@@ -651,7 +657,7 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
       if (!rocm::LaunchRoutedHalfGemm(
               rocm::ExpertFormat::kQ8_0, l.ffn_down_exps.data, st->moe_ah,
               st->moe_tiles, st->moe_tile_capacity, 128U, st->moe_pad,
-              st->moe_rows_slot, st->moe_rows_slot, st->ed, nullptr,
+              st->moe_rows_slot, st->moe_rows_slot, nullptr, st->ed_h,
               static_cast<std::uint32_t>(H), c.expert_ff, stream)) {
         if (error != nullptr) {
           *error = "flint: grouped down launch rejected";
@@ -696,20 +702,37 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     Project(l.shexp_down, st->sg, st->sd, B, stream,
             sd8_ok ? st->qd8 : nullptr);
     if (dbg) {
-      DebugStats("L0 ed", st->ed, B * c.num_experts_used * H);
+      if (!st->moe_grouped) {
+        DebugStats("L0 ed", st->ed, B * c.num_experts_used * H);
+      }
       DebugStats("L0 sd", st->sd, B * H);
     }
     if (trace) {
       auto& tr = st->moe_trace;
       tr.routed.resize(static_cast<std::size_t>(c.num_experts_used) * H);
       tr.shared.resize(H);
-      hipMemcpy(tr.routed.data(), st->ed, tr.routed.size() * 4,
-                hipMemcpyDeviceToHost);
+      if (st->moe_grouped) {
+        std::vector<__half> routed_h(tr.routed.size());
+        hipMemcpy(routed_h.data(), st->ed_h, routed_h.size() * 2,
+                  hipMemcpyDeviceToHost);
+        for (std::size_t i = 0; i < routed_h.size(); ++i) {
+          tr.routed[i] = __half2float(routed_h[i]);
+        }
+      } else {
+        hipMemcpy(tr.routed.data(), st->ed, tr.routed.size() * 4,
+                  hipMemcpyDeviceToHost);
+      }
       hipMemcpy(tr.shared.data(), st->sd, H * 4, hipMemcpyDeviceToHost);
     }
-    rocm::SumExperts(st->x, st->ed, st->wts, st->sd, B,
-                     static_cast<std::uint32_t>(H),
-                     static_cast<std::uint32_t>(c.num_experts_used), stream);
+    if (st->moe_grouped) {
+      rocm::SumExperts(st->x, st->ed_h, st->wts, st->sd, B,
+                       static_cast<std::uint32_t>(H),
+                       static_cast<std::uint32_t>(c.num_experts_used), stream);
+    } else {
+      rocm::SumExperts(st->x, st->ed, st->wts, st->sd, B,
+                       static_cast<std::uint32_t>(H),
+                       static_cast<std::uint32_t>(c.num_experts_used), stream);
+    }
     if (dbg) {
       DebugStats("L0 x2", st->x, B * H);
     }

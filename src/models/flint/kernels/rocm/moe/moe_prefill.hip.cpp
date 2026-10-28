@@ -752,7 +752,7 @@ __device__ __forceinline__ void DecodeQ50(const std::uint32_t (&w)[kQ50Words],
 /// the gate/up projection with RoutedHalfKQuantKernel's row split and GeGLU
 /// epilogue into `out_half`.
 template<ExpertFormat F, int kTileTokens, bool kGeGlu = false,
-         bool kDense = false>
+         bool kDense = false, bool kHalfOut = false>
 __global__ void __launch_bounds__(kThreads)
     RoutedHalfDownKernel(const std::uint8_t* __restrict__ w,
                          const __half* __restrict__ x,
@@ -1107,16 +1107,42 @@ __global__ void __launch_bounds__(kThreads)
     if (dst >= 0) {
       const int r = (tid % 16) * 8;
       const float* src = s_out + tt * kOutStride + r;
-      float* o = out + std::size_t{static_cast<std::uint32_t>(dst)} * m + row0 +
-                 static_cast<std::uint32_t>(r);
-      if (row0 + static_cast<std::uint32_t>(r) + 8 <= m) {
-        reinterpret_cast<float4*>(o)[0] = *reinterpret_cast<const float4*>(src);
-        reinterpret_cast<float4*>(o)[1] =
-            *reinterpret_cast<const float4*>(src + 4);
+      if constexpr (kHalfOut) {
+        // binary16 slot rows: the same 128-value token store, half wide.
+        __half* o =
+            out_half + std::size_t{static_cast<std::uint32_t>(dst)} * m + row0 +
+            static_cast<std::uint32_t>(r);
+        if (row0 + static_cast<std::uint32_t>(r) + 8 <= m) {
+          union {
+            uint4 u;
+            __half h[8];
+          } v;
+#pragma unroll
+          for (int q = 0; q < 8; ++q) {
+            v.h[q] = SaturatedHalf(src[q]);
+          }
+          *reinterpret_cast<uint4*>(o) = v.u;
+        } else {
+          for (int q = 0; q < 8; ++q) {
+            if (row0 + static_cast<std::uint32_t>(r + q) < m) {
+              o[q] = SaturatedHalf(src[q]);
+            }
+          }
+        }
       } else {
-        for (int q = 0; q < 8; ++q) {
-          if (row0 + static_cast<std::uint32_t>(r + q) < m) {
-            o[q] = src[q];
+        float* o =
+            out + std::size_t{static_cast<std::uint32_t>(dst)} * m + row0 +
+            static_cast<std::uint32_t>(r);
+        if (row0 + static_cast<std::uint32_t>(r) + 8 <= m) {
+          reinterpret_cast<float4*>(o)[0] =
+              *reinterpret_cast<const float4*>(src);
+          reinterpret_cast<float4*>(o)[1] =
+              *reinterpret_cast<const float4*>(src + 4);
+        } else {
+          for (int q = 0; q < 8; ++q) {
+            if (row0 + static_cast<std::uint32_t>(r + q) < m) {
+              o[q] = src[q];
+            }
           }
         }
       }
@@ -1268,8 +1294,13 @@ bool LaunchRoutedHalfGemm(ExpertFormat format, const void* w, const void* x,
           <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
                                           rows_out, out, nullptr, m, k);
       return true;
-    case ExpertFormat::kQ8_0:
-      if (k % kDownStageK != 0 || (out == nullptr) != geglu) {
+    case ExpertFormat::kQ8_0: {
+      // Non-GeGLU writes either binary32 `out` or binary16 `out_half` slot
+      // rows (the routed down projection reads them back in SumExperts).
+      const bool half_out = !geglu && out == nullptr && oh != nullptr;
+      if (k % kDownStageK != 0 ||
+          (geglu ? (out != nullptr || oh == nullptr)
+                 : (out == nullptr) == (oh == nullptr))) {
         return false;
       }
       if (tile_rows == 128) {
@@ -1278,6 +1309,11 @@ bool LaunchRoutedHalfGemm(ExpertFormat format, const void* w, const void* x,
               <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
                                                     rows_in, rows_out, nullptr,
                                                     oh, m, k);
+        } else if (half_out) {
+          RoutedHalfDownKernel<ExpertFormat::kQ8_0, 128, false, false, true>
+              <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
+                                              rows_in, rows_out, nullptr, oh,
+                                              m, k);
         } else {
           RoutedHalfDownKernel<ExpertFormat::kQ8_0, 128>
               <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
@@ -1289,12 +1325,17 @@ bool LaunchRoutedHalfGemm(ExpertFormat format, const void* w, const void* x,
             <<<geglu_grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds,
                                                   rows_in, rows_out, nullptr,
                                                   oh, m, k);
+      } else if (half_out) {
+        RoutedHalfDownKernel<ExpertFormat::kQ8_0, 96, false, false, true>
+            <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
+                                            rows_out, nullptr, oh, m, k);
       } else {
         RoutedHalfDownKernel<ExpertFormat::kQ8_0, 96>
             <<<grid, kThreads, 0, stream>>>(wb, xh, tiles, pad_bounds, rows_in,
                                             rows_out, out, nullptr, m, k);
       }
       return true;
+    }
     case ExpertFormat::kQ4_0:
       if (k % kDownStageK != 0 || (out == nullptr) != geglu) {
         return false;

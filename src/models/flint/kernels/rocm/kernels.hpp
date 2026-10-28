@@ -79,6 +79,11 @@ void SumExperts(float* x, const float* routed, const float* weights,
                 const float* shared, std::uint32_t rows, std::uint32_t cols,
                 std::uint32_t used, hipStream_t stream);
 
+/// Same accumulation with binary16 routed slot rows (grouped down out).
+void SumExperts(float* x, const __half* routed, const float* weights,
+                const float* shared, std::uint32_t rows, std::uint32_t cols,
+                std::uint32_t used, hipStream_t stream);
+
 }  // namespace gufo::models::flint::rocm
 
 #endif  // GUFO_MODELS_FLINT_KERNELS_ROCM_KERNELS_HPP_
