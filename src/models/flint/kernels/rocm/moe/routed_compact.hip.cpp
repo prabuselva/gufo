@@ -73,9 +73,27 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 
 __global__ void NarrowHalfKernel(const float* x, __half* out,
                                  std::size_t count) {
-  const std::size_t i =
-      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (i < count) {
+  const std::size_t n4 =
+      count / 4U;  // vector body; base pointers are 16-byte aligned
+  const float4* __restrict__ x4 = reinterpret_cast<const float4*>(x);
+  uint2* __restrict__ o4 = reinterpret_cast<uint2*>(out);
+  for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+       i < n4; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const float4 v = x4[i];
+    const __half h0 = __float2half(v.x);
+    const __half h1 = __float2half(v.y);
+    const __half h2 = __float2half(v.z);
+    const __half h3 = __float2half(v.w);
+    uint2 packed;
+    packed.x = static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(&h0)) |
+               (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(&h1)) << 16);
+    packed.y = static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(&h2)) |
+               (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(&h3)) << 16);
+    o4[i] = packed;
+  }
+  const std::size_t tail = n4 * 4U;
+  if (blockIdx.x == 0 && threadIdx.x < count - tail) {
+    const std::size_t i = tail + threadIdx.x;
     out[i] = __float2half(x[i]);
   }
 }
@@ -132,7 +150,8 @@ __global__ void __launch_bounds__(256)
 
 void NarrowActivations(const float* x, __half* out, std::size_t count,
                        hipStream_t stream) {
-  NarrowHalfKernel<<<Blocks(count), kThreads, 0, stream>>>(x, out, count);
+  const std::size_t vec_work = count / 4U + (count % 4U != 0U ? 1U : 0U);
+  NarrowHalfKernel<<<Blocks(vec_work), kThreads, 0, stream>>>(x, out, count);
 }
 
 std::size_t RoutedCompactRows(std::size_t slots, std::size_t n_experts) {

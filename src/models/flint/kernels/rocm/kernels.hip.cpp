@@ -58,6 +58,25 @@ __global__ void AddResidualKernel(float* __restrict__ x,
   float* __restrict__ xr = x + static_cast<std::size_t>(blockIdx.x) * cols;
   const float* __restrict__ yr =
       y + static_cast<std::size_t>(blockIdx.x) * cols;
+  // Vector path: cols % 4 == 0 keeps every row 16-byte aligned and every
+  // output element's arithmetic identical to the scalar loop.
+  if ((cols & 3U) == 0U) {
+    const std::uint32_t cols4 = cols / 4U;
+    float4* __restrict__ xv =
+        reinterpret_cast<float4*>(xr);  // IWYU pragma: ignore
+    const float4* __restrict__ yv =
+        reinterpret_cast<const float4*>(yr);  // IWYU pragma: ignore
+    for (std::uint32_t i = threadIdx.x; i < cols4; i += kNormThreads) {
+      float4 a = xv[i];
+      const float4 b = yv[i];
+      a.x += b.x;
+      a.y += b.y;
+      a.z += b.z;
+      a.w += b.w;
+      xv[i] = a;
+    }
+    return;
+  }
   for (std::uint32_t i = threadIdx.x; i < cols; i += kNormThreads) {
     xr[i] += yr[i];
   }
@@ -67,9 +86,35 @@ __global__ void SiluMulKernel(const float* __restrict__ a,
                               const float* __restrict__ b,
                               float* __restrict__ out, std::size_t count) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const std::size_t n4 = count / 4U;  // pointers are 16-byte aligned bases
+  const float4* __restrict__ a4 =
+      reinterpret_cast<const float4*>(a);  // IWYU pragma: ignore
+  const float4* __restrict__ b4 =
+      reinterpret_cast<const float4*>(b);  // IWYU pragma: ignore
+  float4* __restrict__ out4 =
+      reinterpret_cast<float4*>(out);  // IWYU pragma: ignore
   for (std::size_t i =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < count; i += stride) {
+       i < n4; i += stride) {
+    float4 o;
+    const float4 av = a4[i];
+    const float4 bv = b4[i];
+    const float xs[4] = {av.x, av.y, av.z, av.w};
+    const float ys[4] = {bv.x, bv.y, bv.z, bv.w};
+    float os[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      os[c] = xs[c] / (1.0F + expf(-xs[c])) * ys[c];
+    }
+    o.x = os[0];
+    o.y = os[1];
+    o.z = os[2];
+    o.w = os[3];
+    out4[i] = o;
+  }
+  const std::size_t tail = n4 * 4U;
+  if (blockIdx.x == 0 && threadIdx.x < count - tail) {
+    const std::size_t i = tail + threadIdx.x;
     const float av = a[i];
     out[i] = av / (1.0F + expf(-av)) * b[i];
   }
@@ -342,6 +387,40 @@ __global__ void SumExpertsKernel(float* __restrict__ x,
   const float* __restrict__ rbase =
       routed + static_cast<std::size_t>(t) * used * cols;
   const float* __restrict__ wrow = weights + static_cast<std::size_t>(t) * used;
+  if ((cols & 3U) == 0U) {
+    // Vector path; each output channel keeps the same per-s add order.
+    const std::uint32_t cols4 = cols / 4U;
+    float4* __restrict__ xv = reinterpret_cast<float4*>(xr);
+    const float4* __restrict__ rv = reinterpret_cast<const float4*>(rbase);
+    const float4* __restrict__ sv =
+        shared != nullptr ? reinterpret_cast<const float4*>(shared) : nullptr;
+    const std::size_t row4 = static_cast<std::size_t>(t) * cols4;
+    for (std::uint32_t i = threadIdx.x; i < cols4; i += kNormThreads) {
+      float4 acc = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      for (std::uint32_t s = 0; s < used; ++s) {
+        const float w = wrow[s];
+        const float4 r = rv[static_cast<std::size_t>(s) * cols4 + i];
+        acc.x += w * r.x;
+        acc.y += w * r.y;
+        acc.z += w * r.z;
+        acc.w += w * r.w;
+      }
+      if (sv != nullptr) {
+        const float4 sh = sv[row4 + i];
+        acc.x += sh.x;
+        acc.y += sh.y;
+        acc.z += sh.z;
+        acc.w += sh.w;
+      }
+      float4 a = xv[i];
+      a.x += acc.x;
+      a.y += acc.y;
+      a.z += acc.z;
+      a.w += acc.w;
+      xv[i] = a;
+    }
+    return;
+  }
   for (std::uint32_t j = threadIdx.x; j < cols; j += kNormThreads) {
     float acc = 0.0F;
     for (std::uint32_t s = 0; s < used; ++s) {

@@ -1,6 +1,12 @@
 // A/B for a token-tiled GemvBatchBf16Kernel (flint router shape): the tiled
 // kernel must be BITWISE identical to the warp-per-token kernel and faster.
+// Pipe mirrors GemvBatchBf16TileKernel in src/models/flint/kernels/rocm/
+// linear.hip.cpp (pair-pipelined k steps). Variants tried and rejected on
+// this shape: LDS-staged x tiles with per-chunk barriers (-18..-25%),
+// 64-token tiles (register spill, -300%), plain __ldg on the strided
+// activation loads (-4%).
 //
+//   export PATH=/opt/rocm/lib/llvm/bin:$PATH   # provides ld.lld
 //   clang++ --offload-arch=gfx1151 --driver-mode=g++ -L/opt/rocm/lib \
 //     --hip-link -O3 -std=c++20 -x hip \
 //     tools/bench/flint_gemv_bf16_tile_bench.hip -o /tmp/flint_gemv_bf16
@@ -70,7 +76,7 @@ __global__ void Old(const std::uint16_t* __restrict__ w, std::uint32_t rows,
   }
 }
 
-__global__ void Tile(const std::uint16_t* __restrict__ w, std::uint32_t rows,
+__global__ void Pipe(const std::uint16_t* __restrict__ w, std::uint32_t rows,
                      std::uint32_t cols, const float* __restrict__ x,
                      float* __restrict__ out) {
   const std::uint32_t row =
@@ -90,7 +96,24 @@ __global__ void Tile(const std::uint16_t* __restrict__ w, std::uint32_t rows,
   for (int t = 0; t < kTileTokens; ++t) {
     acc[t] = 0.0F;
   }
-  for (std::uint32_t k = lane; k < cols; k += kWarp) {
+  std::uint32_t k = lane;
+  for (; k + kWarp < cols; k += 2 * kWarp) {
+    float xv0[kTileTokens];
+    float xv1[kTileTokens];
+#pragma unroll
+    for (int t = 0; t < kTileTokens; ++t) {
+      xv0[t] = xt[static_cast<std::size_t>(t) * cols + k];
+      xv1[t] = xt[static_cast<std::size_t>(t) * cols + k + kWarp];
+    }
+    const float w0 = Bf16(wr[k]);
+    const float w1 = Bf16(wr[k + kWarp]);
+#pragma unroll
+    for (int t = 0; t < kTileTokens; ++t) {
+      acc[t] = fmaf(w0, xv0[t], acc[t]);
+      acc[t] = fmaf(w1, xv1[t], acc[t]);
+    }
+  }
+  if (k < cols) {
     const float wf = Bf16(wr[k]);
 #pragma unroll
     for (int t = 0; t < kTileTokens; ++t) {
@@ -128,7 +151,10 @@ int main() {
     std::uint32_t rows;
     std::uint32_t cols;
     std::uint32_t batch;
-  } shapes[] = {{256, 2048, 2048}, {256, 2048, 1024}, {256, 2048, 256}};
+  } shapes[] = {{256, 2048, 2048},
+                {256, 2048, 8192},
+                {256, 2048, 1024},
+                {256, 2048, 256}};
 
   std::vector<std::uint16_t> hw;
   std::vector<float> hx;
@@ -154,7 +180,7 @@ int main() {
     CHECK(hipMemcpy(x, hx.data(), hx.size() * 4, hipMemcpyHostToDevice));
 
     Old<<<dim3(s.rows / 8, s.batch), kThreads>>>(w, s.rows, s.cols, x, o1);
-    Tile<<<dim3(s.rows / 8, s.batch / kTileTokens), kThreads>>>(
+    Pipe<<<dim3(s.rows / 8, s.batch / kTileTokens), kThreads>>>(
         w, s.rows, s.cols, x, o2);
     CHECK(hipDeviceSynchronize());
     std::vector<float> h1(static_cast<std::size_t>(s.batch) * s.rows),
@@ -169,12 +195,12 @@ int main() {
     }
     const double o =
         TimeK(Old, static_cast<int>(s.batch), w, s.rows, s.cols, x, o1, 20);
-    const double t = TimeK(Tile, static_cast<int>(s.batch / kTileTokens), w,
+    const double p = TimeK(Pipe, static_cast<int>(s.batch / kTileTokens), w,
                            s.rows, s.cols, x, o2, 20);
     std::printf(
         "rows=%u cols=%u B=%u bitwise_mismatches=%d old=%8.3f ms "
-        "tile=%8.3f ms speedup=%.2fx\n",
-        s.rows, s.cols, s.batch, mism, o, t, o / t);
+        "pipe=%8.3f ms speedup=%.2fx\n",
+        s.rows, s.cols, s.batch, mism, o, p, o / p);
     (void)hipFree(w);
     (void)hipFree(x);
     (void)hipFree(o1);

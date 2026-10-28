@@ -279,7 +279,30 @@ __global__ void GemvBatchBf16TileKernel(const std::uint16_t* __restrict__ w,
   for (int t = 0; t < kTileTokens; ++t) {
     acc[t] = 0.0F;
   }
-  for (std::uint32_t k = lane; k < cols; k += kWarp) {
+  // Pair-pipelined k steps: loads for k and k+warp are issued together
+  // before the fmaf chains consume them, which raises memory-level
+  // parallelism across the strided activation tile (~10% on the
+  // router shape; tools/bench/flint_gemv_bf16_tile_bench.hip TilePF2).
+  // Chain order per token stays k-ascending, so results remain bitwise
+  // identical to the per-token kernel.
+  std::uint32_t k = lane;
+  for (; k + kWarp < cols; k += 2 * kWarp) {
+    float xv0[kTileTokens];
+    float xv1[kTileTokens];
+#pragma unroll
+    for (int t = 0; t < kTileTokens; ++t) {
+      xv0[t] = xt[static_cast<std::size_t>(t) * cols + k];
+      xv1[t] = xt[static_cast<std::size_t>(t) * cols + k + kWarp];
+    }
+    const float w0 = Bf16ToF16(wr[k]);
+    const float w1 = Bf16ToF16(wr[k + kWarp]);
+#pragma unroll
+    for (int t = 0; t < kTileTokens; ++t) {
+      acc[t] = fmaf(w0, xv0[t], acc[t]);
+      acc[t] = fmaf(w1, xv1[t], acc[t]);
+    }
+  }
+  if (k < cols) {
     const float wf = Bf16ToF16(wr[k]);
 #pragma unroll
     for (int t = 0; t < kTileTokens; ++t) {

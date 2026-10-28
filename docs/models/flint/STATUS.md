@@ -316,8 +316,24 @@ pair in one tool call (AGENTS protocol).
        2424.91 (+4.1 %), pp8192 1929.89 → 1975.27 (+2.4 %), pp16384
        1469.49 → 1514.75 (+3.1 %); tg128 39.60 within the prior 40.49
        noise floor (decode path untouched).
-    - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
-   QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
+      - [x] C7n vectorized elementwise kernels + pipelined router tile GEMV.
+        `float4` paths in SumExperts/AddResidual/SiluMul (`kernels.hip.cpp`)
+        and the `NarrowHalf` gather+scatter (`moe/routed_compact.hip.cpp`):
+        per-pass profile 55→37/12→10/12→10/12→9 ms, bitwise identical,
+        wall-neutral (vec128 gates, tg128 41.38). `GemvBatchBf16TileKernel`
+        now issues the activation loads for k and k+32 before the fmaf
+        chains consume them (pair-pipelined k steps, ascending order kept):
+        `tools/bench/flint_gemv_bf16_tile_bench.hip` 0 bitwise mismatches,
+        8–13 % faster than the plain tile at B>=2048 (router GEMV was ~2 TF
+        from strided-load latency); LDS-staged x tiles, 64-token tiles
+        (register spill) and plain `__ldg` all measured slower and are
+        documented in the bench header. Gates 3/3 exclusive (rodfix).
+        Release bench (exclusive, rodperf): pp2048 2419.22 → 2480.83/2482.24
+        (+2.6 %), pp8192 1949.06 → 2003.13 (+2.8 %), pp16384 1519.80 flat
+        within the 1514.75–1529.94 band, tg128 41.02 unchanged (batch-1
+        decode path untouched).
+     - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+    QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
 
