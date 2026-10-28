@@ -402,6 +402,25 @@ pair in one tool call (AGENTS protocol).
           bench keeps the variants reproducible (`--offload-arch=gfx1151`,
           grid `((rows+15)/16, heads/8)` required for full-head
           coverage).
+        - [x] C7s gate/up prefetch ring — investigated, no adoptable lever.
+          The routed grouped gate/up geglu GEMM is the prefill hotspot
+          (~37 % at pp8192) and only reaches ~130 GB/s of the measured
+          239 GB/s DRAM ceiling. A bit-identical probe copy
+          (`tools/bench/flint_moe_down_probe.hip`, `ProbeGateup`) showed a
+          depth-3 stage-prefetch ring running **-25 %** at identical
+          bits (5.25 vs 6.99 ms @2048 rows); depth 4 tied it, so the ring
+          was ported to `RoutedHalfDownKernel` (Q8 geglu instantiations
+          only). Gates 3/3 exclusive with the ring depth-3 default, but a
+          14-run interleaved A/B (base/ring, exclusive) measured **zero
+          prefill gain** (pp2048 -0.4 %, pp8192 -0.2 %, pp16384 -0.6 %)
+          and tg128 42.92 -> 40.49 (-5.7 %). The probe overstates: with
+          real routing the shipped kernel already beats every probe
+          variant, and its 28 KB LDS holds two blocks per CU while every
+          ring depth >= 2 needs >= 45 KB (one block per CU), so the
+          latency win the isolated probe saw cannot coexist with the
+          occupancy the engine relies on. Routed gate/up stands as
+          shipped; the ring code lives only in the probe
+          (`PROBE_VARIANT=v min1 pf3`).
         - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
      QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
