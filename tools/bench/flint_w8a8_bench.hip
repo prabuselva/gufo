@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
       {"attn_q    ", 4096, 2048}, {"attn_out  ", 2048, 4096},
       {"shexp_gate", 1024, 2048}, {"shexp_up  ", 1024, 2048},
       {"shexp_down", 2048, 1024}, {"attn_k    ", 512, 2048},
+      {"dense_gate", 6144, 2048},
   };
   std::printf("batch=%zu reps=%d\n", batch, reps);
   for (const Shape& s : shapes) {
@@ -189,6 +190,74 @@ int main(int argc, char** argv) {
         TimeIt([&] { LaunchCfg<16, 64, 2, 1, 4>(dw, q8, y2, batch, s.m, s.k,
                                                 nullptr); },
                reps);
+    // Wave layouts used by the sibling qwen38 Q8_0 wave64 route (4x1) and
+    // its (4,2) variant; Flint's shared launcher pins Q8_0 to the (2,2)
+    // schedule inherited from Qwen27B's qualified tuning.
+    const double cfg_e =
+        TimeIt([&] { LaunchCfg<128, 128, 2, 4, 1>(dw, q8, y2, batch, s.m,
+                                                  s.k, nullptr); },
+               reps);
+    // Bit-parity of the (4,1) schedule against the shipped (2,2) schedule.
+    float* y3 = nullptr;
+    std::size_t word_diff = 0;
+    double word_max = 0.0;
+    if (hipMalloc(&y3, batch * s.m * sizeof(float)) == hipSuccess) {
+      hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k, nullptr);
+      LaunchCfg<128, 128, 2, 2, 2>(dw, q8, y3, batch, s.m, s.k, nullptr);
+      CHECK(hipDeviceSynchronize());
+      LaunchCfg<128, 128, 2, 4, 1>(dw, q8, y2, batch, s.m, s.k, nullptr);
+      CHECK(hipDeviceSynchronize());
+      std::vector<float> oa(batch * s.m), ob(batch * s.m);
+      CHECK(hipMemcpy(oa.data(), y3, oa.size() * 4, hipMemcpyDeviceToHost));
+      CHECK(hipMemcpy(ob.data(), y2, ob.size() * 4, hipMemcpyDeviceToHost));
+      for (std::size_t i = 0; i < oa.size(); ++i) {
+        if (std::memcmp(&oa[i], &ob[i], 4) != 0) {
+          ++word_diff;
+          word_max = std::max(word_max, std::fabs(double(oa[i]) - ob[i]));
+        }
+      }
+      CHECK(hipFree(y3));
+    }
+    // Fused gate/up + SwiGLU + Q8_1 epilogue (shared-expert / dense-FFN
+    // pair) against the shipped chain (two GEMMs + SiLU + requantize; the
+    // SiLU kernel itself is omitted, ~0.2 ms per pass at pp2048).
+    double ms_fused = -1.0, ms_pair = -1.0;
+    const std::size_t fused_cap = hipk::QuantizedActivationBytes(batch, s.m);
+    if (hipk::IsFusedSwiGluGemmEpilogueSupported(core::GgmlType::kQ8_0, batch,
+                                                 s.m, fused_cap)) {
+      void* dw2 = nullptr;
+      void* q8o = nullptr;
+      float* yg = nullptr;
+      CHECK(hipMalloc(&dw2, w.size() * sizeof(Q8Block)));
+      CHECK(hipMemcpy(dw2, w.data(), w.size() * sizeof(Q8Block),
+                      hipMemcpyHostToDevice));
+      CHECK(hipMalloc(&q8o, fused_cap));
+      CHECK(hipMalloc(&yg, batch * s.m * sizeof(float)));
+      ms_fused = TimeIt(
+          [&] {
+            hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k,
+                                                       nullptr);
+            hipk::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+                core::GgmlType::kQ8_0, dw, dw2, q8, yg, q8o, batch, s.m, s.k,
+                nullptr);
+          },
+          reps);
+      ms_pair = TimeIt(
+          [&] {
+            hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k,
+                                                       nullptr);
+            LaunchCfg<128, 128, 2, 2, 2>(dw, q8, y1, batch, s.m, s.k,
+                                         nullptr);
+            LaunchCfg<128, 128, 2, 2, 2>(dw2, q8, y2, batch, s.m, s.k,
+                                         nullptr);
+            hipk::LaunchQuantizeActivationQ8_1FromFp32(y2, q8o, batch, s.m,
+                                                       nullptr);
+          },
+          reps);
+      CHECK(hipFree(dw2));
+      CHECK(hipFree(q8o));
+      CHECK(hipFree(yg));
+    }
 
     // Numerical comparison against mmq as reference (both are int8-act).
     // Re-run the shipped schedule once so y2 holds a schedule whose output
@@ -241,10 +310,13 @@ int main(int argc, char** argv) {
     }
     std::printf(
         "%s m=%5zu k=%5zu mmq %7.3f(%5.1fTF) q=%.3f w8full %7.3f(%5.1fTF) "
-        "cfg128x128 %7.3f cfg64x128 %7.3f cfg32x128 %7.3f cfg16x64 %7.3f  "
+        "cfg128x128 %7.3f cfg64x128 %7.3f cfg32x128 %7.3f cfg16x64 %7.3f "
+        "cfg41 %7.3f par41=%zu/%.4f "
+        "fusedSwiGLU %7.3f pair %7.3f  "
         "rms=%.5f nnan=%zu/%zu\n",
         s.name, s.m, s.k, ms_mmq, flops / (ms_mmq * 1e9), ms_q, ms_w8,
-        flops / (ms_w8 * 1e9), cfg_a, cfg_b, cfg_c, cfg_d,
+        flops / (ms_w8 * 1e9), cfg_a, cfg_b, cfg_c, cfg_d, cfg_e,
+        word_diff, word_max, ms_fused, ms_pair,
         std::sqrt(se / std::max(ref, 1.0)), nan2, o1.size());
     CHECK(hipFree(dw));
     CHECK(hipFree(dx));

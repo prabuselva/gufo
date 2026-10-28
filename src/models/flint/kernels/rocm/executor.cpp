@@ -550,21 +550,37 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     if (!l.moe) {
       const bool f8_ok =
           W8A8Eligible(l.ffn_gate, B) && W8A8Eligible(l.ffn_up, B);
-      if (f8_ok) {
+      // opt-c192 port: the fused gate GEMM + up/SwiGLU/Q8_1 epilogue
+      // replaces the GEMM pair, the separate SiLU pass and the activation
+      // requantize (qd8 must not alias the qa8 input; it never does).
+      const bool ff_ok =
+          f8_ok && W8A8Eligible(l.ffn_down, B) &&
+          gufo::hip::IsFusedSwiGluGemmEpilogueSupported(
+              core::GgmlType::kQ8_0, B, c.ffn_length,
+              gufo::hip::QuantizedActivationBytes(
+                  B, std::max(c.shared_expert_ff, c.ffn_length)));
+      if (ff_ok) {
+        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        gufo::hip::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+            core::GgmlType::kQ8_0, l.ffn_gate.data, l.ffn_up.data, st->qa8,
+            st->ffn_a, st->qd8, B, c.ffn_length, H, stream);
+      } else if (f8_ok) {
         W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
       }
-      Project(l.ffn_gate, st->normed, st->ffn_a, B, stream,
-              f8_ok ? st->qa8 : nullptr);
-      Project(l.ffn_up, st->normed, st->ffn_b, B, stream,
-              f8_ok ? st->qa8 : nullptr);
-      rocm::SiluMul(st->ffn_a, st->ffn_b, st->ffn_a,
-                    static_cast<std::size_t>(B) * c.ffn_length, stream);
+      if (!ff_ok) {
+        Project(l.ffn_gate, st->normed, st->ffn_a, B, stream,
+                f8_ok ? st->qa8 : nullptr);
+        Project(l.ffn_up, st->normed, st->ffn_b, B, stream,
+                f8_ok ? st->qa8 : nullptr);
+        rocm::SiluMul(st->ffn_a, st->ffn_b, st->ffn_a,
+                      static_cast<std::size_t>(B) * c.ffn_length, stream);
+      }
       const bool d8_ok = W8A8Eligible(l.ffn_down, B);
-      if (d8_ok) {
+      if (!ff_ok && d8_ok) {
         W8A8QuantizeRows(st->ffn_a, st->qd8, B, c.ffn_length, stream);
       }
       Project(l.ffn_down, st->ffn_a, st->o, B, stream,
-              d8_ok ? st->qd8 : nullptr);
+              (ff_ok || d8_ok) ? st->qd8 : nullptr);
       rocm::AddResidual(st->x, st->o, B, static_cast<std::uint32_t>(H), stream);
       if (st->layer_capture) {
         CaptureRow(st->x, H, L, true, &st->hidden);
@@ -676,21 +692,33 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
     }
     const bool s8_ok =
         W8A8Eligible(l.shexp_gate, B) && W8A8Eligible(l.shexp_up, B);
-    if (s8_ok) {
+    const bool sf_ok = s8_ok && W8A8Eligible(l.shexp_down, B) &&
+                       gufo::hip::IsFusedSwiGluGemmEpilogueSupported(
+                           core::GgmlType::kQ8_0, B, c.shared_expert_ff,
+                           gufo::hip::QuantizedActivationBytes(
+                               B, std::max(c.shared_expert_ff, c.ffn_length)));
+    if (sf_ok) {
       W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+      gufo::hip::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+          core::GgmlType::kQ8_0, l.shexp_gate.data, l.shexp_up.data, st->qa8,
+          st->sg, st->qd8, B, c.shared_expert_ff, H, stream);
+    } else {
+      if (s8_ok) {
+        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+      }
+      Project(l.shexp_gate, st->normed, st->sg, B, stream,
+              s8_ok ? st->qa8 : nullptr);
+      Project(l.shexp_up, st->normed, st->su, B, stream,
+              s8_ok ? st->qa8 : nullptr);
+      rocm::SiluMul(st->sg, st->su, st->sg,
+                    static_cast<std::size_t>(B) * c.shared_expert_ff, stream);
     }
-    Project(l.shexp_gate, st->normed, st->sg, B, stream,
-            s8_ok ? st->qa8 : nullptr);
-    Project(l.shexp_up, st->normed, st->su, B, stream,
-            s8_ok ? st->qa8 : nullptr);
-    rocm::SiluMul(st->sg, st->su, st->sg,
-                  static_cast<std::size_t>(B) * c.shared_expert_ff, stream);
     const bool sd8_ok = W8A8Eligible(l.shexp_down, B);
-    if (sd8_ok) {
+    if (!sf_ok && sd8_ok) {
       W8A8QuantizeRows(st->sg, st->qd8, B, c.shared_expert_ff, stream);
     }
     Project(l.shexp_down, st->sg, st->sd, B, stream,
-            sd8_ok ? st->qd8 : nullptr);
+            (sf_ok || sd8_ok) ? st->qd8 : nullptr);
     if (dbg) {
       if (!st->moe_grouped) {
         DebugStats("L0 ed", st->ed, B * c.num_experts_used * H);

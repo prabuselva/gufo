@@ -360,8 +360,28 @@ pair in one tool call (AGENTS protocol).
         2577.54/2617.01 (+3.5-5.0 %), pp8192 2035.58 -> 2099.64
         (+3.1 %), pp16384 1556.65 -> 1581.59 (+1.6 %), tg128 41.20 ->
         41.75, tg1 43-44 -> 45-46.
-      - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
-    QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
+       - [x] C7q fused SwiGLU gate/up epilogue for the dense FFNs.
+         When the Q8_0 wave64 route and the shared
+         `IsFusedSwiGluGemmEpilogueSupported` predicate hold (batch >= 96,
+         m % 128 == 0, tiled+sum sidecar within the qd8 capacity), the
+         dense FFN and the shared expert replace the gate/up GEMM pair,
+         `SiluMul` and the activation requantize with one
+         `LaunchQuantize` + `LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1`
+         (gate GEMM, then up GEMM + SwiGLU + Q8_1 tiling fused in the
+         epilogue); the down projection consumes the tiled sidecar
+         directly. The old three-op chain remains for decode and any
+         shape the predicate rejects. Bench sweep
+         (`tools/bench/flint_w8a8_bench.hip`). A wider-tile retune of the
+         shared wave64 config (128x128, cluster 4x1) measured 0-2 %
+         *slower* on every Flint shape while bit-identical (parity
+         check in the bench), so the shipped 2x2 config stands. Gates
+         3/3 exclusive (fused1). Release bench (exclusive, fused2):
+         pp2048 2577.54/2617.01 -> 2617.81/2646.01 (+1.1-1.6 %),
+         pp8192 2099.64 -> 2123.40 (+1.1 %), pp16384 1581.59 -> 1597.46
+         (+1.0 %), tg128 41.75 unchanged (batch-1 decode path
+         untouched), tg1 44.5-45.0.
+       - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+     QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
 
