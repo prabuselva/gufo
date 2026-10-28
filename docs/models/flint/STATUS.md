@@ -378,9 +378,31 @@ pair in one tool call (AGENTS protocol).
          3/3 exclusive (fused1). Release bench (exclusive, fused2):
          pp2048 2577.54/2617.01 -> 2617.81/2646.01 (+1.1-1.6 %),
          pp8192 2099.64 -> 2123.40 (+1.1 %), pp16384 1581.59 -> 1597.46
-         (+1.0 %), tg128 41.75 unchanged (batch-1 decode path
-         untouched), tg1 44.5-45.0.
-       - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+          (+1.0 %), tg128 41.75 unchanged (batch-1 decode path
+          untouched), tg1 44.5-45.0.
+        - [x] C7r attention correction-chain rework — investigated, no
+          adoptable lever. The WMMA attention score stage carries the
+          Q-hi/Q-lo correction chain, so a ten-variant probe bench
+          (`tools/bench/flint_attn_probe.hip`, full shape 8.5 ms baseline)
+          bisected the cost: dropping the lo correction runs -44 %
+          (4.6 ms) — the single fast configuration — but the hi/lo split
+          exists to hold ~22-bit Q fidelity for MoE router argmax parity,
+          so it is quality-forbidden. Every bitwise-preserving rework of
+          the same math stayed within +/- 2 % of shipped: per-tile hi+lo
+          fragment rebuild freeing the prologue liveness
+          (bit-identical, mismatches=0, +1.7 %), per-tile hi-only rebuild
+          (+0.7-1.3 %), dead-lo construction sunk away (+0-1 %),
+          `__launch_bounds__(256, 2)` occupancy copies (-1.2-1.8 %),
+          persistent-hi + rebuilt-lo (+6 %), and split hi/lo accumulator
+          chains (+1.0 %, also reassociates, so not bitwise). WMMA rate
+          probe: 26.44 TF/s wave32 peak vs 6.2 TF/s effective here; the
+          gap is not barriers (earlier double-buffer bench also
+          rejected), register pressure at the launch bounds tried, or
+          accumulator latency. Attention stands as shipped; the probe
+          bench keeps the variants reproducible (`--offload-arch=gfx1151`,
+          grid `((rows+15)/16, heads/8)` required for full-head
+          coverage).
+        - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
      QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
