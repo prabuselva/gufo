@@ -2982,6 +2982,303 @@ __global__ void __launch_bounds__(32 * kHeads * kQueryBlocks)
   }
 }
 
+// --- C7t candidate: two-barrier schedule with double-buffered K/V staging.
+// Arithmetic and tile values are byte-identical to the shipped kernel; only
+// the loop placement changes. The shipped loop runs three __syncthreads per
+// 16-key tile: after the scores, after softmax+next-keys, after the values
+// prefetch+before the next tile. Double-buffering K and V^T lets each
+// "readers are done" barrier gate a store into the *other* buffer, so the
+// third barrier drops:
+//   fetch(next) -> scores(k[slot]) -> SYNC_A -> store_keys(other); softmax
+//   -> SYNC_B -> store_values(other) -> rescale + PV(vt[slot]).
+// The register prefetch stays at the top of the iteration, exactly as in
+// the shipped kernel: each iteration's fetch feeds that same iteration's
+// stores. SYNC_A proves every wave finished reading k[slot], so the next keys may
+// stage into the other buffer, and SYNC_B proves the previous tile's PV
+// retired before it in each wave's program order (PV precedes the next
+// iteration's SYNC_A/SYNC_B), so vt[other] is safe to write. p/pl/row_scale
+// stay single-buffered: they are overwritten only after the next SYNC_B,
+// once every wave has consumed them in softmax and PV.
+template<std::uint32_t kHeads, std::uint32_t kQueryBlocks>
+__global__ void __launch_bounds__(32 * kHeads * kQueryBlocks)
+    ProbeKernelTwoSyncs(const WmmaArgs a) {
+  constexpr std::uint32_t kD = 128;
+  constexpr std::uint32_t kRowBlocks = kHeads * kQueryBlocks;
+  constexpr std::uint32_t kKStride = kD + 8;
+  constexpr std::uint32_t kVtStride = kKeys + 8;
+  constexpr std::uint32_t kQueries = kQueryBlocks * 16;
+  constexpr std::uint32_t kSegLanes = 2;
+  constexpr std::uint32_t kSegKeys = kKeys / kSegLanes;
+
+  __shared__ __align__(16) __half k_lds[2][kKeys * kKStride];
+  __shared__ __align__(16) __half vt_lds[2][kD * kVtStride];
+  __shared__ float s_lds[kRowBlocks][16][17];
+  __shared__ __align__(16) __half p_lds[kRowBlocks][16][kKeys + 8];
+  __shared__ __align__(16) __half pl_lds[kRowBlocks][16][kKeys + 8];
+  __shared__ float row_scale[kRowBlocks][16];
+  __shared__ float row_sum[kRowBlocks][16];
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t rb = __builtin_amdgcn_readfirstlane(tid >> 5U);
+  const std::uint32_t sub = lane & 15U;
+  const std::uint32_t half_id = lane >> 4U;
+
+  const std::uint32_t query_start = blockIdx.x * kQueries;
+  const std::uint32_t head_base = blockIdx.y * kHeads;
+  const std::uint32_t gqa = a.heads / a.kv_heads;
+  const std::uint32_t kv_head = head_base / gqa;
+  const std::uint32_t head = head_base + rb % kHeads;
+  const std::uint32_t row0 = query_start + (rb / kHeads) * 16;
+
+  const std::uint32_t last_row = min(query_start + kQueries, a.rows) - 1;
+  const std::uint32_t position_of_last =
+      a.first_position + min(last_row, a.rows - 1);
+  const std::uint32_t block_lo =
+      KeyBounds(a, a.first_position + min(query_start, a.rows - 1)).lo &
+      ~(kKeys - 1);
+  const std::uint32_t block_hi = KeyBounds(a, position_of_last).hi;
+
+  v16h qh[kSliceSteps];
+  v16h ql[kSliceSteps];
+  {
+    const std::uint32_t row = row0 + sub;
+    const bool live = row < a.rows;
+    const float* q =
+        a.q + (static_cast<std::size_t>(row) * a.heads + head) * kD;
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kSliceSteps; ++ks) {
+#pragma unroll
+      for (std::uint32_t v = 0; v < 16; v += 4) {
+        const float4 f = live
+                             ? *reinterpret_cast<const float4*>(q + ks * 16 + v)
+                             : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        const float x[4] = {f.x, f.y, f.z, f.w};
+#pragma unroll
+        for (std::uint32_t i = 0; i < 4; ++i) {
+          const __half h = __float2half_rn(x[i]);
+          qh[ks][v + i] = static_cast<_Float16>(h);
+          ql[ks][v + i] =
+              static_cast<_Float16>(__float2half_rn(x[i] - __half2float(h)));
+        }
+      }
+    }
+  }
+  v8f o_acc[kSliceSteps] = {};
+
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+  const std::uint32_t sm_row = lane / kSegLanes;
+  const std::uint32_t sm_seg = lane % kSegLanes;
+  const std::uint32_t sm_query = row0 + sm_row;
+  const std::uint32_t sm_clamped = min(sm_query, a.rows - 1);
+  const Bounds sm_keys = KeyBounds(a, a.first_position + sm_clamped);
+
+  const auto* k_cache = a.k_cache;
+  const auto* v_cache = a.v_cache;
+  const std::size_t kv_stride = a.kv_stride;
+
+  const std::uint32_t chunk_key = tid & (kKeys - 1);
+  const std::uint32_t chunk_d8 = (tid >> 4) * 8;
+  const __half* const key_base = k_cache + kv_head * kD + chunk_d8;
+  uint4 k_next;
+  uint4 v_next;
+  const auto fetch = [&](std::uint32_t key0) {
+    const std::uint32_t position = key0 + chunk_key;
+    k_next = make_uint4(0U, 0U, 0U, 0U);
+    v_next = make_uint4(0U, 0U, 0U, 0U);
+    if (position < block_hi) {
+      k_next = *reinterpret_cast<const uint4*>(
+          key_base + static_cast<std::size_t>(position) * kv_stride);
+      v_next = *reinterpret_cast<const uint4*>(
+          v_cache + static_cast<std::size_t>(position) * kv_stride +
+          static_cast<std::size_t>(kv_head) * kD + chunk_d8);
+    }
+  };
+  const auto store_keys = [&](int slot) {
+    *reinterpret_cast<uint4*>(&k_lds[slot][chunk_key * kKStride + chunk_d8]) =
+        k_next;
+  };
+  const auto store_values = [&](int slot) {
+    const bool even = (tid & 1U) == 0;
+    const uint4 v = v_next;
+    const std::uint32_t send0 = even ? v.z : v.x;
+    const std::uint32_t send1 = even ? v.w : v.y;
+    const std::uint32_t recv0 =
+        static_cast<std::uint32_t>(__builtin_amdgcn_mov_dpp(
+            static_cast<int>(send0), 0xB1, 0xF, 0xF, true));
+    const std::uint32_t recv1 =
+        static_cast<std::uint32_t>(__builtin_amdgcn_mov_dpp(
+            static_cast<int>(send1), 0xB1, 0xF, 0xF, true));
+    const std::uint32_t own[2] = {even ? v.x : v.z, even ? v.y : v.w};
+    const std::uint32_t other[2] = {recv0, recv1};
+    auto* rows = reinterpret_cast<std::uint32_t*>(vt_lds[slot]);
+    const std::uint32_t dim = chunk_d8 + (even ? 0U : 4U);
+#pragma unroll
+    for (std::uint32_t i = 0; i < 4; ++i) {
+      const std::uint32_t mine = (own[i / 2] >> (16 * (i % 2))) & 0xFFFFU;
+      const std::uint32_t theirs = (other[i / 2] >> (16 * (i % 2))) & 0xFFFFU;
+      const std::uint32_t pair =
+          even ? (mine | (theirs << 16)) : (theirs | (mine << 16));
+      rows[(dim + i) * (kVtStride / 2) + chunk_key / 2] = pair;
+    }
+  };
+  if (block_lo < block_hi) {
+    fetch(block_lo);
+    store_keys(0);
+    store_values(0);
+  }
+  __syncthreads();
+
+  const std::uint32_t full_hi = a.first_position + row0 + 1U;
+  const std::int64_t full_lo =
+      a.window == 0U ? 0
+                     : static_cast<std::int64_t>(a.first_position) + row0 + 16 -
+                           static_cast<std::int64_t>(a.window);
+  int slot = 0;
+  for (std::uint32_t key0 = block_lo; key0 < block_hi;
+       key0 += kKeys, slot ^= 1) {
+    const bool more = key0 + kKeys < block_hi;
+    const int nslot = slot ^ 1;
+    if (more) {
+      fetch(key0 + kKeys);
+    }
+
+    {
+      v8f s_acc = {};
+      v8f s_corr = {};
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kSliceSteps; ++ks) {
+        const v16h k_frag = LoadFrag(&k_lds[slot][sub * kKStride + ks * 16]);
+        s_acc = Wmma(qh[ks], k_frag, s_acc);
+        s_corr = Wmma(ql[ks], k_frag, s_corr);
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        s_lds[rb][2 * i + half_id][sub] = s_acc[i] + s_corr[i];
+      }
+    }
+    __syncthreads();
+    if (more) {
+      store_keys(nslot);
+    }
+
+    {
+      const std::uint32_t position_row = sm_query;
+      float vals[kSegKeys];
+      float tile_max = -INFINITY;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kSegKeys; ++m) {
+        const std::uint32_t col = sm_seg * kSegKeys + m;
+        const std::uint32_t key = key0 + col;
+        float s = 0.0F;
+        s += s_lds[rb][sm_row][col];
+        const bool valid =
+            position_row < a.rows && key >= sm_keys.lo && key < sm_keys.hi;
+        vals[m] = valid ? s * a.scale : -INFINITY;
+        tile_max = fmaxf(tile_max, vals[m]);
+      }
+      tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 1, 32));
+      const float next_max = fmaxf(running_max, tile_max);
+      const float scale =
+          next_max == -INFINITY ? 1.0F : expf(running_max - next_max);
+      float tile_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kSegKeys; ++m) {
+        const float w = vals[m] == -INFINITY ? 0.0F : expf(vals[m] - next_max);
+        tile_sum += w;
+        const __half ph = __float2half_rn(w);
+        p_lds[rb][sm_row][sm_seg * kSegKeys + m] = static_cast<_Float16>(ph);
+        pl_lds[rb][sm_row][sm_seg * kSegKeys + m] =
+            static_cast<_Float16>(__float2half_rn(w - __half2float(ph)));
+      }
+      tile_sum += __shfl_xor(tile_sum, 1, 32);
+      running_max = next_max;
+      running_sum = running_sum * scale + tile_sum;
+      if (sm_seg == 0) {
+        row_scale[rb][sm_row] = scale;
+      }
+    }
+    __syncthreads();
+    if (more) {
+      store_values(nslot);
+    }
+
+    float sc2[8];
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      sc2[i] = row_scale[rb][2 * i + half_id];
+    }
+    const bool full_tile =
+        key0 + kKeys <= full_hi &&
+        static_cast<std::int64_t>(key0) >= (full_lo > 0 ? full_lo : 0);
+    bool unchanged = true;
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      unchanged = unchanged && sc2[i] == 1.0F;
+    }
+    if (!__all(unchanged)) {
+#pragma unroll
+      for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          o_acc[t][i] *= sc2[i];
+        }
+      }
+    }
+    if (full_tile) {
+      const v16h p_frag = LoadFrag(&p_lds[rb][sub][0]);
+      const v16h pl_frag = LoadFrag(&pl_lds[rb][sub][0]);
+#pragma unroll
+      for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+        const v16h v_frag =
+            LoadFrag(&vt_lds[slot][(t * 16 + sub) * kVtStride]);
+        o_acc[t] = Wmma(p_frag, v_frag, o_acc[t]);
+        o_acc[t] = Wmma(pl_frag, v_frag, o_acc[t]);
+      }
+    } else {
+#pragma unroll
+      for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+        const __half* const v_row =
+            &vt_lds[slot][(t * 16U + sub) * kVtStride];
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          const std::uint32_t r = 2U * i + half_id;
+          float s = o_acc[t][i];
+#pragma unroll
+          for (std::uint32_t m = 0; m < kKeys; ++m) {
+            const float v = static_cast<float>(v_row[m]);
+            s += static_cast<float>(p_lds[rb][r][m]) * v;
+            s += static_cast<float>(pl_lds[rb][r][m]) * v;
+          }
+          o_acc[t][i] = s;
+        }
+      }
+    }
+  }
+
+  if (sm_seg == 0) {
+    row_sum[rb][sm_row] = running_sum + expf(a.sinks[head] - running_max);
+  }
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t i = 0; i < 8; ++i) {
+    const std::uint32_t r = 2 * i + half_id;
+    const std::uint32_t row = row0 + r;
+    if (row >= a.rows) {
+      continue;
+    }
+    const float l = row_sum[rb][r];
+    const float inv = l > 0.0F ? 1.0F / l : 0.0F;
+    const std::size_t at =
+        (static_cast<std::size_t>(row) * a.heads + head) * kD + sub;
+#pragma unroll
+    for (std::uint32_t t = 0; t < kSliceSteps; ++t) {
+      a.out[at + t * 16] = o_acc[t][i] * inv;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace gufo::models::flint::rocm
 
@@ -2996,7 +3293,7 @@ using gufo::models::flint::rocm::ProbeKernelRebuildHiOnly;
 using gufo::models::flint::rocm::ProbeKernelSplitChain;
 using gufo::models::flint::rocm::ProbeKernelHiPersistLoRebuild;
 using gufo::models::flint::rocm::ProbeKernelRebuildQ2b;
-using gufo::models::flint::rocm::ProbeKernelNoQl;
+using gufo::models::flint::rocm::ProbeKernelTwoSyncs;
 constexpr std::uint32_t kRows = 2048;
 constexpr std::uint32_t kHeadsN = 32;
 constexpr std::uint32_t kKvHeads = 4;
@@ -3083,7 +3380,194 @@ double TimeIt(int cfg, const WmmaArgs& a, int iters) {
 }
 
 
-int main() {
+// C7t long-context configuration sweep. C7g picked <8, 1> at pp2048 shapes
+// where one launch's KV fits the MALL, so KV re-reads across the 16-row
+// blocks are nearly free. At pp32768 a full dispatch serves ~18K average
+// keys: each extra row-block column re-reads the whole KV span, so wider
+// kQueries configs (<4, 2>, <1, 8>) cut KV traffic 2x/8x and may win where
+// they lost at short context. Bitwise-equal per row block by the same
+// per-row invariants as the C7g sweep; mismatches are printed to prove it.
+namespace {
+
+WmmaArgs MakeCfgArgs(const float* q, const __half* k, const __half* v,
+                     const float* sink, float* out, std::uint32_t rows,
+                     std::uint32_t pos0, std::uint32_t window) {
+  WmmaArgs a{};
+  a.q = q;
+  a.k_cache = k;
+  a.v_cache = v;
+  a.sinks = sink;
+  a.out = out;
+  a.scale = 1.0F / std::sqrt(static_cast<float>(kDim));
+  a.rows = rows;
+  a.first_position = pos0;
+  a.key_limit = pos0 + rows;
+  a.window = window;
+  a.heads = kHeadsN;
+  a.kv_heads = kKvHeads;
+  a.kv_stride = kKvHeads * kDim;
+  return a;
+}
+
+template <typename LaunchFn>
+double TimeLaunch(LaunchFn launch, int iters) {
+  for (int i = 0; i < 2; ++i) {
+    launch();
+  }
+  CHECK(hipDeviceSynchronize());
+  hipEvent_t beg, end;
+  CHECK(hipEventCreate(&beg));
+  CHECK(hipEventCreate(&end));
+  CHECK(hipEventRecord(beg));
+  for (int i = 0; i < iters; ++i) {
+    launch();
+  }
+  CHECK(hipEventRecord(end));
+  CHECK(hipEventSynchronize(end));
+  float ms = 0.0F;
+  CHECK(hipEventElapsedTime(&ms, beg, end));
+  CHECK(hipEventDestroy(beg));
+  CHECK(hipEventDestroy(end));
+  return ms / iters;
+}
+
+template <std::uint32_t KH, std::uint32_t QB>
+double TimeCfg(const float* q, const __half* k, const __half* v,
+               const float* sink, float* out, std::uint32_t rows,
+               std::uint32_t pos0, std::uint32_t window, int iters) {
+  WmmaArgs a = MakeCfgArgs(q, k, v, sink, out, rows, pos0, window);
+  constexpr std::uint32_t kQueries = 16 * QB;
+  return TimeLaunch(
+      [&] {
+        fr::WmmaAttentionKernel<KH, QB>
+            <<<dim3((rows + kQueries - 1) / kQueries, kHeadsN / KH),
+               32 * KH * QB>>>(a);
+      },
+      iters);
+}
+
+// C7t: two-barrier double-buffered variant at the shipped <8, 1> shape.
+double TimeTwoSyncs(const float* q, const __half* k, const __half* v,
+                    const float* sink, float* out, std::uint32_t rows,
+                    std::uint32_t pos0, std::uint32_t window, int iters) {
+  WmmaArgs a = MakeCfgArgs(q, k, v, sink, out, rows, pos0, window);
+  return TimeLaunch(
+      [&] {
+        ProbeKernelTwoSyncs<8, 1>
+            <<<dim3((rows + 15) / 16, kHeadsN / 8), 256>>>(a);
+      },
+      iters);
+}
+
+struct CfgShape {
+  const char* label;
+  std::uint32_t rows;
+  std::uint32_t pos0;
+  int iters;
+};
+
+std::size_t Mismatches(const float* ref, const float* got, std::size_t n) {
+  std::vector<float> r(n), g(n);
+  CHECK(hipMemcpy(r.data(), ref, n * sizeof(float), hipMemcpyDeviceToHost));
+  CHECK(hipMemcpy(g.data(), got, n * sizeof(float), hipMemcpyDeviceToHost));
+  std::size_t mism = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (std::memcmp(&r[i], &g[i], sizeof(float)) != 0) {
+      ++mism;
+    }
+  }
+  return mism;
+}
+
+int RunConfigs() {
+  const CfgShape shapes[] = {
+      {"long32k", 4096, 28672, 8},
+      {"mid16k", 4096, 12288, 12},
+      {"ship2k", 2048, 512, 20},
+  };
+  std::uint32_t state = 987654321U;
+  auto rnd = [&] {
+    state = state * 1664525U + 1013904223U;
+    return (static_cast<float>(state >> 8) / 8388608.0F) - 1.0F;
+  };
+  for (const CfgShape& s : shapes) {
+    const std::size_t qn = std::size_t(s.rows) * kHeadsN * kDim;
+    const std::size_t kcn = std::size_t(s.pos0 + s.rows) * kKvHeads * kDim;
+    std::vector<float> h_q(qn), h_sink(kHeadsN, 0.75F);
+    std::vector<__half> h_k(kcn), h_v(kcn);
+    for (auto& x : h_q) {
+      x = rnd();
+    }
+    for (std::size_t i = 0; i < kcn; ++i) {
+      h_k[i] = __float2half_rn(2.0F * rnd());
+      h_v[i] = __float2half_rn(2.0F * rnd());
+    }
+    float* q = nullptr;
+    float* sink = nullptr;
+    __half *k = nullptr, *v = nullptr;
+    float* oa = nullptr;
+    float* ob = nullptr;
+    float* oc = nullptr;
+    CHECK(hipMalloc(&q, qn * sizeof(float)));
+    CHECK(hipMalloc(&sink, kHeadsN * sizeof(float)));
+    CHECK(hipMalloc(&k, kcn * sizeof(__half)));
+    CHECK(hipMalloc(&v, kcn * sizeof(__half)));
+    CHECK(hipMalloc(&oa, qn * sizeof(float)));
+    CHECK(hipMalloc(&ob, qn * sizeof(float)));
+    CHECK(hipMalloc(&oc, qn * sizeof(float)));
+    CHECK(hipMemcpy(q, h_q.data(), qn * sizeof(float), hipMemcpyHostToDevice));
+    CHECK(hipMemcpy(sink, h_sink.data(), kHeadsN * sizeof(float),
+                    hipMemcpyHostToDevice));
+    CHECK(hipMemcpy(k, h_k.data(), kcn * sizeof(__half),
+                    hipMemcpyHostToDevice));
+    CHECK(hipMemcpy(v, h_v.data(), kcn * sizeof(__half),
+                    hipMemcpyHostToDevice));
+    for (const std::uint32_t w : {513U, 0U}) {
+      const char* wl = w == 0U ? "full" : "win513";
+      const double t81 = TimeCfg<8, 1>(q, k, v, sink, oa, s.rows, s.pos0, w, 1);
+      (void)t81;
+      const double a81 = TimeCfg<8, 1>(q, k, v, sink, oa, s.rows, s.pos0, w,
+                                       s.iters);
+      const double a24 = TimeCfg<2, 4>(q, k, v, sink, ob, s.rows, s.pos0, w,
+                                       s.iters);
+      const std::size_t m24 = Mismatches(oa, ob, qn);
+      const double a42 = TimeCfg<4, 2>(q, k, v, sink, ob, s.rows, s.pos0, w,
+                                       s.iters);
+      const std::size_t m42 = Mismatches(oa, ob, qn);
+      const double a18 = TimeCfg<1, 8>(q, k, v, sink, ob, s.rows, s.pos0, w,
+                                       s.iters);
+      const std::size_t m18 = Mismatches(oa, ob, qn);
+      const double a2s = TimeTwoSyncs(q, k, v, sink, ob, s.rows, s.pos0, w,
+                                      s.iters);
+      const std::size_t m2s = Mismatches(oa, ob, qn);
+      const double a2s2 = TimeTwoSyncs(q, k, v, sink, oc, s.rows, s.pos0, w,
+                                       s.iters);
+      const std::size_t m2s2 = Mismatches(ob, oc, qn);
+      std::printf(
+          "%-8s %-7s h8q1 %8.3f ms | h2q4 %8.3f ms (%+6.1f%% m=%zu) | "
+          "h4q2 %8.3f ms (%+6.1f%% m=%zu) | h1q8 %8.3f ms (%+6.1f%% m=%zu)\n",
+          s.label, wl, a81, a24, 100.0 * (a24 / a81 - 1.0), m24, a42,
+          100.0 * (a42 / a81 - 1.0), m42, a18, 100.0 * (a18 / a81 - 1.0), m18);
+      std::printf("%-8s %-7s 2sync %8.3f ms (%+6.1f%% m=%zu self=%zu)\n",
+                  s.label, wl, a2s, 100.0 * (a2s / a81 - 1.0), m2s, m2s2);
+    }
+    hipFree(q);
+    hipFree(sink);
+    hipFree(k);
+    hipFree(v);
+    hipFree(oa);
+    hipFree(ob);
+    hipFree(oc);
+  }
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc > 1 && std::strcmp(argv[1], "configs") == 0) {
+    return RunConfigs();
+  }
   std::vector<float> h_q(kQn);
   std::vector<float> h_sink(kHeadsN, 0.75F);
   const std::size_t kcn =

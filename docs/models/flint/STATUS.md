@@ -420,8 +420,32 @@ pair in one tool call (AGENTS protocol).
           latency win the isolated probe saw cannot coexist with the
           occupancy the engine relies on. Routed gate/up stands as
           shipped; the ring code lives only in the probe
-          (`PROBE_VARIANT=v min1 pf3`).
-        - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+           (`PROBE_VARIANT=v min1 pf3`).
+         - [x] C7t attention long-context scheduling — investigated, no
+           adoptable lever. The WMMA attention kernel is 43 % of pp8192
+           and quadratic, so two zero-risk scheduling levers were probed
+           at production depths (`tools/bench/flint_attn_probe.hip`
+           `configs` mode; shapes rows=4096 at pos0 28672/12288/512,
+           win513 + full). First, the wave-partition sweep rerun at long
+           context: `<2, 4>` / `<4, 2>` / `<1, 8>` are all *slower* than
+           shipped `<8, 1>` everywhere (full: +1.6-7.4 % at 32K/16K, up
+           to +32.5 % at 2K; win513: +18-115 %), and every one is
+           bit-identical (mismatches=0), so the shipped partition stands
+           even where KV-traffic reuse should pay. Second, a
+           double-buffered two-barrier variant (`ProbeKernelTwoSyncs`,
+           K/V^T staged per-slot so `PV` of tile T-1 and the
+           `store_values` of tile T use different buffers): bit-identical
+           (mismatches=0, self-consistent) but +2.9-4.6 % on full and
+           +0.6-3.3 % on win513 — the third barrier already hides under
+           the WMMA tensor latency, and the doubled staging LDS plus slot
+           addressing costs more than the barrier saved. (An intermediate
+           copy that sank the register prefetch below the stores ran one
+           tile stale and mismatched everywhere; the prefetch must stay
+           at the top feeding the same iteration's stores.) Attention
+           scheduling stands as shipped; both probes reproduce via
+           `/tmp/flint_attn_probe configs`-style rebuild
+           (`--offload-arch=gfx1151`).
+         - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
      QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
