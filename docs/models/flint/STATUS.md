@@ -503,6 +503,22 @@ pair in one tool call (AGENTS protocol).
              inside the pair band in every round - the win is real at
              kernel level but below the end-to-end noise floor of a
              19 s single-shot bench.
+           - [x] C7w chunk 4096 -> 8192 trial (negative, reverted). The
+             C7h reasoning ("expert weight planes are re-read once per
+             chunk") predates the C7l grouped route, so 8192 was untested
+             there. Scratch sizes follow `batch_capacity`
+             (executor.cpp:299), so flipping `kPrefillChunk` was the whole
+             change; exclusive gate 3/3 at the larger buffers (c7wgate).
+             Interleaved exclusive A/B vs the C7v binary, 4 rounds
+             (c7wab): pp8192 - exactly one 8192 launch instead of two
+             half-chunk MoE weight sweeps - is flat, 2128.6 vs 2134.8
+             median (-0.3 %), and pp16384 is consistently worse at
+             -0.8 % (1579.3 vs 1592.2, all four new rounds below all four
+             old); pp2048 and tg1 inside the pair bands. The grouped
+             route is therefore not per-chunk weight-read floor-bound and
+             halving the chunk count buys nothing; 4096 stays, and any
+             further MoE-tier lever must come from inside the grouped
+             kernels, not from scheduling amortization.
            - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
      QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
