@@ -1017,6 +1017,11 @@ void LaunchZeroQ8ActTail(void* q8_1_out, std::size_t batch, std::size_t k,
 
 }  // namespace
 
+void LaunchZeroQ8ActTailFor(void* q8_1_out, std::size_t batch, std::size_t k,
+                            hipStream_t stream) {
+  LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
+}
+
 void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                   std::size_t batch, std::size_t k,
                                   hipStream_t stream) {

@@ -240,6 +240,13 @@ void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
                                           std::size_t batch, std::size_t k,
                                           hipStream_t stream = nullptr);
 
+/// Zeroes the uninitialized tail of the last 16-token tile of a Q8_1
+/// activation buffer. No-op when batch % 16 == 0. Lets a fused producer
+/// write the tiled layout directly and still match
+/// LaunchQuantizeActivationQ8_1FromFp32 bit-for-bit.
+void LaunchZeroQ8ActTailFor(void* q8_1_out, std::size_t batch, std::size_t k,
+                            hipStream_t stream = nullptr);
+
 /// Byte size of the tiled Q8_1 activation buffer a [batch, k] activation needs
 /// before LaunchBatchedQuantGEMMPreQuantized can consume it.
 [[nodiscard]] std::size_t QuantizedActivationBytes(std::size_t batch,

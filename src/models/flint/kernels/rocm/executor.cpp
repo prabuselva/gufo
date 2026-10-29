@@ -410,6 +410,17 @@ namespace {
          w.cols >= 1024U && (w.cols % 256U) == 0U;
 }
 
+/// opt-c7v: gate for the fused RMSNorm + tiled Q8_1 quantize launch
+/// (rocm::RmsNormQuantizeQ8_1). The warp-per-block quantize mapping needs
+/// cols % 256 == 0. tools/bench/flint_norm_probe.hip measured +5 % to +21 %
+/// for rows >= 3072 versus the AddResidual/RmsNorm/quantize chain and a 3 %
+/// to 15 % regression in the 1024-3072 mid band, so short rows and the mid
+/// band keep the chain.
+[[nodiscard]] bool FusedNormQuantEligible(std::uint32_t batch,
+                                          std::size_t cols) {
+  return batch >= 3072U && (cols % 256U) == 0U;
+}
+
 void W8A8QuantizeRows(const float* x, void* x8, std::size_t batch,
                       std::size_t k, hipStream_t stream) {
   gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(x, x8, batch, k, stream);
@@ -503,12 +514,20 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
   for (std::uint32_t L = 0; L < c.num_layers; ++L) {
     const LayerWeights& l = st->dev.layers[L];
     const bool dbg = L == 0 && std::getenv("GUFO_FLINT_DEBUG") != nullptr;
-    rocm::RmsNorm(st->x, static_cast<const float*>(l.attn_norm.data), c.rms_eps,
-                  st->normed, B, static_cast<std::uint32_t>(H), stream);
     // One tiled Q8_1 copy of the normed rows feeds the W8A8 q projection.
     const bool q8_ok = W8A8Eligible(l.attn_q, B);
-    if (q8_ok) {
-      W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+    if (q8_ok && FusedNormQuantEligible(B, H)) {
+      rocm::RmsNormQuantizeQ8_1(st->x, nullptr,
+                                static_cast<const float*>(l.attn_norm.data),
+                                c.rms_eps, st->normed, st->qa8, B,
+                                static_cast<std::uint32_t>(H), stream);
+    } else {
+      rocm::RmsNorm(st->x, static_cast<const float*>(l.attn_norm.data),
+                    c.rms_eps, st->normed, B, static_cast<std::uint32_t>(H),
+                    stream);
+      if (q8_ok) {
+        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+      }
     }
     Project(l.attn_q, st->normed, st->q, B, stream, q8_ok ? st->qa8 : nullptr);
     Project(l.attn_k, st->normed, st->k, B, stream);
@@ -539,14 +558,28 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
       W8A8QuantizeRows(st->attn, st->ao8, B, QD, stream);
     }
     Project(l.attn_out, st->attn, st->o, B, stream, o8_ok ? st->ao8 : nullptr);
-    rocm::AddResidual(st->x, st->o, B, static_cast<std::uint32_t>(H), stream);
+    // Whichever path the layer takes, its first projection quantizes the
+    // normed rows exactly once this layer iff normed_8. Fused, that add, the
+    // norm and the Q8_1 copy are one launch (opt-c7v); the four chain
+    // quantizes below then stand down.
+    const bool normed_8 =
+        FusedNormQuantEligible(B, H) &&
+        (l.moe ? W8A8Eligible(l.shexp_gate, B) && W8A8Eligible(l.shexp_up, B)
+               : W8A8Eligible(l.ffn_gate, B) && W8A8Eligible(l.ffn_up, B));
+    if (normed_8) {
+      rocm::RmsNormQuantizeQ8_1(
+          st->x, st->o, static_cast<const float*>(l.ffn_norm.data), c.rms_eps,
+          st->normed, st->qa8, B, static_cast<std::uint32_t>(H), stream);
+    } else {
+      rocm::AddResidual(st->x, st->o, B, static_cast<std::uint32_t>(H), stream);
+      rocm::RmsNorm(st->x, static_cast<const float*>(l.ffn_norm.data),
+                    c.rms_eps, st->normed, B, static_cast<std::uint32_t>(H),
+                    stream);
+    }
     if (dbg) {
       DebugStats("L0 o", st->o, B * H);
       DebugStats("L0 x", st->x, B * H);
     }
-
-    rocm::RmsNorm(st->x, static_cast<const float*>(l.ffn_norm.data), c.rms_eps,
-                  st->normed, B, static_cast<std::uint32_t>(H), stream);
     if (!l.moe) {
       const bool f8_ok =
           W8A8Eligible(l.ffn_gate, B) && W8A8Eligible(l.ffn_up, B);
@@ -560,12 +593,16 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
               gufo::hip::QuantizedActivationBytes(
                   B, std::max(c.shared_expert_ff, c.ffn_length)));
       if (ff_ok) {
-        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        if (!normed_8) {
+          W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        }
         gufo::hip::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
             core::GgmlType::kQ8_0, l.ffn_gate.data, l.ffn_up.data, st->qa8,
             st->ffn_a, st->qd8, B, c.ffn_length, H, stream);
       } else if (f8_ok) {
-        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        if (!normed_8) {
+          W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        }
       }
       if (!ff_ok) {
         Project(l.ffn_gate, st->normed, st->ffn_a, B, stream,
@@ -698,13 +735,17 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
                            gufo::hip::QuantizedActivationBytes(
                                B, std::max(c.shared_expert_ff, c.ffn_length)));
     if (sf_ok) {
-      W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+      if (!normed_8) {
+        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+      }
       gufo::hip::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
           core::GgmlType::kQ8_0, l.shexp_gate.data, l.shexp_up.data, st->qa8,
           st->sg, st->qd8, B, c.shared_expert_ff, H, stream);
     } else {
       if (s8_ok) {
-        W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        if (!normed_8) {
+          W8A8QuantizeRows(st->normed, st->qa8, B, H, stream);
+        }
       }
       Project(l.shexp_gate, st->normed, st->sg, B, stream,
               s8_ok ? st->qa8 : nullptr);

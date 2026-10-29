@@ -19,6 +19,18 @@ namespace gufo::models::flint::rocm {
 void RmsNorm(const float* x, const float* gamma, float eps, float* out,
              std::uint32_t rows, std::uint32_t cols, hipStream_t stream);
 
+/// opt-c7v: RmsNorm (with an optional in-place residual add when `residual`
+/// is non-null) and the tiled Q8_1 activation copy in one launch. The normed
+/// value quantizes from the register the norm stored, so the normed row, the
+/// updated residual stream, and every q byte, scale and activation-sum sidecar
+/// are bit-identical to [AddResidual][RmsNorm][LaunchQuantizeActivationQ8_1Fr
+/// omFp32]. Requires cols % 256 == 0 so each output-loop warp iteration owns
+/// one whole 32-element block; callers also gate the batch size.
+void RmsNormQuantizeQ8_1(float* x, const float* residual, const float* gamma,
+                         float eps, float* out, void* q8_1_out,
+                         std::uint32_t rows, std::uint32_t cols,
+                         hipStream_t stream);
+
 /// x[t][i] += y[t][i].
 void AddResidual(float* x, const float* y, std::uint32_t rows,
                  std::uint32_t cols, hipStream_t stream);

@@ -471,7 +471,39 @@ pair in one tool call (AGENTS protocol).
             (+0.7 %, candidate ahead in every pair), pp16384 1604.5 ->
             1608.7 (+0.3 %); tg128 untouched (decode is below the W8A8
             batch floor and never reaches the quantizer).
-          - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+           - [x] C7v fused RMSNorm + Q8_1 quantize (adopted). The prefill
+             quantize chain re-read its own output twice a site: site A
+             `RmsNorm` -> `QuantizeActivation4ToQ8_1Kernel` and site B
+             `AddResidual` -> `RmsNorm` -> quantize (four sites per layer
+             sharing the normed rows). Because the norm output loop
+             strides `kNormThreads`, with `cols % 256 == 0` each warp
+             iteration owns exactly one 32-element Q8_1 block, so the
+             shipped per-wave quantizer math runs on the register value
+             the norm just stored: `RmsNormQuantizeQ8_1Kernel<AddResidual>`
+             emits the normed row, the in-place residual (site B) and the
+             tiled q bytes/scales/activation-sum sidecars in one launch,
+             bit-identical by construction (verbatim `BlockReduceSum`,
+             tree, `d`/`id`/`roundf`, `StoreQ8ActLane`; the tail guard is
+             `LaunchZeroQ8ActTailFor`, the shipped tail-zero). Probe
+             `tools/bench/flint_norm_probe.hip`: mismatches=0 on 9
+             batches incl. `batch % 16 != 0`, zero-block and ±1e30
+             lanes; fused vs chain +12 %..+21 % at rows 3072-8192 and
+             -3 %..-8 % in the 1024-2048 band, so callers gate
+             `FusedNormQuantEligible = rows >= 3072 && cols % 256 == 0`
+             (`kPrefillChunk` is 4096, decode stays on the chain; at
+             site B all four quantize sites of the layer share the one
+             `qa8`, so the chain quantizes are skipped only when every
+             path through the layer consumes it). Gates 3/3 exclusive
+             (c7vgate). Matched exclusive profiles (pp8192, both run
+             orders): the replaced kernels 410.6/410.5 ms -> fused +
+             remaining ao8 quantize 329.0/331.4 ms, -80 ms per run
+             (site A 531 -> 437 us/launch, site B 848 -> 808 us), while
+             unrelated kernels drift +-3 % between runs; interleaved
+             release bench (c7vab2) keeps pp2048/pp8192/pp16384/tg1
+             inside the pair band in every round - the win is real at
+             kernel level but below the end-to-end noise floor of a
+             19 s single-shot bench.
+           - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
      QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes

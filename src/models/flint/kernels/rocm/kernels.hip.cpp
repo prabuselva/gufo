@@ -7,6 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
+#include "src/models/qwen/hip/ops/gemm.hpp"
+
 namespace gufo::models::flint::rocm {
 namespace {
 
@@ -49,6 +52,65 @@ __global__ void RmsNormKernel(const float* __restrict__ x,
   const float scale = 1.0F / sqrtf(ss / static_cast<float>(cols) + eps);
   for (std::uint32_t i = threadIdx.x; i < cols; i += kNormThreads) {
     orow[i] = xr[i] * scale * gamma[i];
+  }
+}
+
+// opt-c7v-norm-quant: RMSNorm (optionally after an in-place residual add) and
+// the tiled Q8_1 activation copy in one launch.
+//
+// The output loop strides kNormThreads, so with cols % 256 == 0 each iteration
+// leaves warp w holding exactly the 32 elements of quantization block
+// `iteration * (kNormThreads / 32) + w`: the shipped per-wave quantizer's
+// shape matches the norm loop with no staging. The tree, d/id/roundf
+// expressions and StoreQ8ActLane are copied from the shipped quantizer and run
+// on the register value the norm stored, so the q bytes, scales and
+// activation-sum sidecars are bit-identical to quantizing a second read of the
+// normed row (probe tools/bench/flint_norm_probe.hip: zero mismatches on
+// 9 batches, +5 % to +21 % for rows >= 3072). Measured callers gate the batch;
+// shorter rows keep the chain.
+template<bool AddResidual>
+__global__ void RmsNormQuantizeQ8_1Kernel(
+    float* __restrict__ x, const float* __restrict__ y,
+    const float* __restrict__ gamma, float eps, float* __restrict__ out,
+    void* __restrict__ q8, std::size_t batch, std::uint32_t cols) {
+  __shared__ float sm[kNormThreads / 32];
+  float* __restrict__ xr = x + static_cast<std::size_t>(blockIdx.x) * cols;
+  const float* __restrict__ yr =
+      AddResidual ? y + static_cast<std::size_t>(blockIdx.x) * cols : nullptr;
+  float* __restrict__ orow = out + static_cast<std::size_t>(blockIdx.x) * cols;
+  float ss = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < cols; i += kNormThreads) {
+    float v = xr[i];
+    if constexpr (AddResidual) {
+      v += yr[i];
+      xr[i] = v;
+    }
+    ss += v * v;
+  }
+  ss = BlockReduceSum(ss, sm);
+  const float scale = 1.0F / sqrtf(ss / static_cast<float>(cols) + eps);
+  const std::size_t lane = threadIdx.x & 31u;
+  const std::size_t warp = threadIdx.x >> 5u;
+  const std::size_t num_blocks = cols / 32u;
+  const std::size_t tok = blockIdx.x;
+  for (std::uint32_t i = threadIdx.x; i < cols; i += kNormThreads) {
+    const float val = xr[i] * scale * gamma[i];
+    orow[i] = val;
+    const std::size_t blk =
+        (static_cast<std::size_t>(i) / kNormThreads) * (kNormThreads / 32u) +
+        warp;
+    if (blk >= num_blocks) {
+      continue;
+    }
+    float max_abs = fabsf(val);
+    for (int off = 16; off > 0; off >>= 1) {
+      max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
+    }
+    const float d = max_abs / 127.0F;
+    const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+    const std::int8_t q = static_cast<std::int8_t>(roundf(val * id));
+    gufo::hip::StoreQ8ActLane<true>(q8, batch, num_blocks, tok, blk, lane, d,
+                                    q);
   }
 }
 
@@ -455,6 +517,20 @@ __global__ void SumExpertsKernel(float* __restrict__ x,
 void RmsNorm(const float* x, const float* gamma, float eps, float* out,
              std::uint32_t rows, std::uint32_t cols, hipStream_t stream) {
   RmsNormKernel<<<rows, kNormThreads, 0, stream>>>(x, gamma, eps, out, cols);
+}
+
+void RmsNormQuantizeQ8_1(float* x, const float* residual, const float* gamma,
+                         float eps, float* out, void* q8_1_out,
+                         std::uint32_t rows, std::uint32_t cols,
+                         hipStream_t stream) {
+  if (residual != nullptr) {
+    RmsNormQuantizeQ8_1Kernel<true><<<rows, kNormThreads, 0, stream>>>(
+        x, residual, gamma, eps, out, q8_1_out, rows, cols);
+  } else {
+    RmsNormQuantizeQ8_1Kernel<false><<<rows, kNormThreads, 0, stream>>>(
+        x, nullptr, gamma, eps, out, q8_1_out, rows, cols);
+  }
+  gufo::hip::LaunchZeroQ8ActTailFor(q8_1_out, rows, cols, stream);
 }
 
 void AddResidual(float* x, const float* y, std::uint32_t rows,
