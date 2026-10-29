@@ -37,7 +37,10 @@ env GUFO_FLINT_GGUF=<flint-Q8_0.gguf> ctest --test-dir build/gpu-test \
 - Speed rows 2026-10-29, rev `062c616d`, binary `build/release/gufo`
   (SHA-256 prefix `841c712c403e6ad7`), exclusive GPU through the
   `gpu_exclusive` harness; llama.cpp worktree @ b11879 baseline retained
-  in STATUS (ROCm build, `-ngl 99 -fa 1 -r 3`, KV f16).
+  in STATUS (ROCm build, `-ngl 99 -fa 1 -r 3`, KV f16). The matched
+  2048–131072 comparison table (both engines, one session) is
+  `artifacts/flint-full-sweep.log`, rev `57d22867` on the same binary; it
+  supersedes the earlier 6-point llama baseline numbers.
 - Artifact `flint-Q8_0.gguf` (41.7 GiB, 779 tensors, imatrix Q8_0);
   weights are not part of the runtime package.
 - Power profile node is absent on this host

@@ -1,25 +1,28 @@
 # Flint Preview 40B-A2B — Benchmarks
 
 Strix Halo gfx1151, exclusive GPU, Q8_0 GGUF. Dates and provenance:
-[QUALITY.md](QUALITY.md). Raw rows:
-[`artifacts/flint-c7-native-sweep.log`](artifacts/flint-c7-native-sweep.log).
+[QUALITY.md](QUALITY.md). Raw rows: full depth sweep
+[`artifacts/flint-full-sweep.log`](artifacts/flint-full-sweep.log), earlier
+native sweeps [`artifacts/flint-c7-native-sweep.log`](artifacts/flint-c7-native-sweep.log).
 
 ## Single user, autoregressive
 
 Native CLI scope on both sides (no HTTP): Gufo `gufo bench`, llama.cpp
 `llama-bench` @ b11879 (`-ngl 99 -fa 1 -r 3`, KV f16). Each row matches
 llama-bench's depth semantics: prefill a 512-token block at frontier
-`depth = ctx − 640`, generate 128 tokens at that frontier. Gufo is one
-warmed sample, mean `± sd` degenerate by design.
+`depth = ctx − 640`, generate 128 tokens at that frontier. Both engines were
+measured in one exclusive session (full sweep log in `artifacts/`). Gufo is
+one warmed sample, mean `± sd` degenerate by design.
 
 | ctx      | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
 |----------|----------------:|---------------------:|-----:|----------------:|---------------------:|-----:|
-| 2048     | 2043.02 | 1478.22 | +38.2 % | 41.81 | 47.72 | −12.4 % |
-| 8192     | 2056.97 | 1375.79 | +49.5 % | 42.40 | 45.74 | −7.3 % |
-| 16384    | 2013.30 | 1265.11 | +59.1 % | 41.74 | 43.72 | −4.5 % |
-| 32768    | 2004.04 | 1080.82 | +85.4 % | 42.80 | 39.93 | +7.2 % |
-| 65536    | 1960.51 |  860.59 | +127.8 % | 42.52 | 34.21 | +24.3 % |
-| 131072   | 1966.43 |  611.30 | +221.7 % | 41.26 | 26.71 | +54.5 % |
+| 2048     | 2065.42 | 1425.93 | +44.8 % | 42.69 | 48.05 | −11.2 % |
+| 4096     | 2065.62 | 1381.61 | +49.5 % | 41.65 | 47.44 | −12.2 % |
+| 8192     | 2064.02 | 1269.81 | +62.5 % | 41.94 | 46.26 |  −9.3 % |
+| 16384    | 2023.39 | 1093.01 | +85.1 % | 42.65 | 44.19 |  −3.5 % |
+| 32768    | 2019.60 |  881.95 | +129.0 % | 42.89 | 40.49 |  +5.9 % |
+| 65536    | 2011.00 |  619.08 | +224.8 % | 42.25 | 34.53 | +22.4 % |
+| 131072   | 1962.88 |  385.39 | +409.3 % | 41.19 | 27.05 | +52.3 % |
 
 Gufo's incremental pp512 and decode stay flat to the deepest frontier
 (4 KV heads → the global layers read only 3.8 GB of KV per 512-token block

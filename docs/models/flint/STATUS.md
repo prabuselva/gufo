@@ -64,6 +64,11 @@ pair in one tool call (AGENTS protocol).
   | 65536|  860.59 | 34.21 |
   | 131072| 611.30 | 26.71 |
 
+  Superseded by the densified same-session re-measure below
+  (`artifacts/flint-full-sweep.log`: 1426/…/385 pp, 48.1/…/27.1 tg); the
+  131072 pp row re-measured far lower there (385 vs 611), so BENCHMARKS.md
+  now quotes gains only from that matched single-session run.
+
 ## Checkpoints
 
 - [x] C0+C1 module skeleton + metadata loader:
@@ -530,9 +535,16 @@ pair in one tool call (AGENTS protocol).
              prefix (4 KV heads). tg 41-43 vs 47.7-26.7: reference leads
              at ctx <= 16384 (prefill-only campaign; recorded as the decode
              lever in EXPERIMENTS.md). Created BENCHMARKS.md,
-             QUALITY.md, EXPERIMENTS.md, flint README.md +
-             docs/models/README.md row; full-prompt rate table kept as a
-             second, clearly scoped table (no native llama counterpart).
+              QUALITY.md, EXPERIMENTS.md, flint README.md +
+              docs/models/README.md row; full-prompt rate table kept as a
+              second, clearly scoped table (no native llama counterpart).
+            - [x] C7 follow-up full sweep (2048/4096/8192/16384/32768/
+              65536/131072, both engines in one exclusive session, rev
+              57d22867, same binary; artifact `flint-full-sweep.log`):
+              Gufo pp512@depth 2065/2066/2064/2023/2020/2011/1963 vs llama
+              1426/1382/1270/1093/882/619/385 → +45 % .. +409 %; tg 41.2-
+              42.9 flat vs 48.1-27.1, crossover at 32768. BENCHMARKS.md
+              table replaced with these rows.
 
 ## Design notes
 

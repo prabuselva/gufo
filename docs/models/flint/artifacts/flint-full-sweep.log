@@ -1,0 +1,62 @@
+# Full depth sweep 2048..131072 (redacted), host: gfx1151 Strix Halo, exclusive GPU
+# rev 57d22867, binary build/release/gufo (SHA-256 prefix 841c712c403e6ad7), 2026-10-29
+# Scope: Gufo gufo-bench pp512 at frontier depth=ctx-640 + tg128; llama.cpp
+# llama-bench build 11879 (commit c49edf096), -ngl 99 -fa 1 -r 3, KV f16.
+# Both engines measured in one gpu_exclusive session (server stopped).
+# Gufo: one warmed sample per point (pp512 row of pp {ctx-640,512} -n 128).
+rev 57d22867
+=== GUFO ctx2048 depth1408 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp1408 |       2589.18 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2065.42 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.69 ± 0.00 |
+=== END GUFO ctx2048 ===
+=== GUFO ctx4096 depth3456 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp3456 |       2586.85 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2065.62 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.65 ± 0.00 |
+=== END GUFO ctx4096 ===
+=== GUFO ctx8192 depth7552 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp7552 |       2197.77 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2064.02 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.94 ± 0.00 |
+=== END GUFO ctx8192 ===
+=== GUFO ctx16384 depth15744 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp15744 |       1669.29 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2023.39 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.65 ± 0.00 |
+=== END GUFO ctx16384 ===
+=== GUFO ctx32768 depth32128 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp32128 |       1087.74 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2019.60 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.89 ± 0.00 |
+=== END GUFO ctx32768 ===
+=== GUFO ctx65536 depth64896 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp64896 |        640.64 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2011.00 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.25 ± 0.00 |
+=== END GUFO ctx65536 ===
+=== GUFO ctx131072 depth130432 ===
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |           pp130432 |        333.60 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       1962.88 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.19 ± 0.00 |
+=== END GUFO ctx131072 ===
+=== LLAMA llama-bench version ===
+version: 0.7.0-dev (build 11879, commit c49edf096)
+built with Clang 23.0.0 for Linux
+=== LLAMA sweep (-p 512 -n 128 -d 1408,3456,7552,15744,32128,64896,130432) ===
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |   pp512 @ d1408 |      1425.93 ± 16.53 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |   tg128 @ d1408 |         48.05 ± 0.03 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |   pp512 @ d3456 |      1381.61 ± 10.78 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |   tg128 @ d3456 |         47.44 ± 0.12 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |   pp512 @ d7552 |       1269.81 ± 4.84 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |   tg128 @ d7552 |         46.26 ± 0.10 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |  pp512 @ d15744 |      1093.01 ± 20.81 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |  tg128 @ d15744 |         44.19 ± 0.09 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |  pp512 @ d32128 |        881.95 ± 9.48 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |  tg128 @ d32128 |         40.49 ± 0.02 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |  pp512 @ d64896 |        619.08 ± 5.84 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 |  tg128 @ d64896 |         34.53 ± 0.01 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 | pp512 @ d130432 |        385.39 ± 3.58 |
+| flint ?B Q8_0                  |  39.39 GiB |    39.79 B | ROCm       |  99 |   1 | tg128 @ d130432 |         27.05 ± 0.01 |
+build: c49edf096 (11879)
+=== FULL SWEEP DONE rc=0 ===
