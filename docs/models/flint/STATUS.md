@@ -545,6 +545,15 @@ pair in one tool call (AGENTS protocol).
               1426/1382/1270/1093/882/619/385 → +45 % .. +409 %; tg 41.2-
               42.9 flat vs 48.1-27.1, crossover at 32768. BENCHMARKS.md
               table replaced with these rows.
+            - [x] C8a multi-row Bf16 router tile `GemvBatchBf16TileRKernel
+              <8,8>` (`linear.hip.cpp`, gate `rows % 64 == 0`, ragged tail
+              through the per-token kernel): 8 rows × 8 tokens per warp,
+              x k-steps feed 8 accumulator chains; bitwise identical to
+              the per-token GEMV on all benched shapes
+              (`tools/bench/flint_gemv_tile2_bench.hip`). Router 0.96 →
+              0.41 ms at the pp2048 shape; one exclusive session: gate
+              tests (engine/rocm.forward/attention.op) all pass, pp2048
+              2778.63 / 2760.90, pp8192 2246.51.
 
 ## Design notes
 

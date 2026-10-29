@@ -30,6 +30,15 @@ commands and matched numbers live in the numbered entries of
   `rows >= 3072 && cols % 256 == 0`: −80 ms per pp8192 at kernel level,
   bit-identical by construction; e2e win below the bench noise floor,
   zero regressions.
+- C8a multi-row Bf16 router tile (`GemvBatchBf16TileRKernel<8,8>`,
+  dispatch gate `rows % 64 == 0`): one warp owns 8 rows × 8 tokens so a
+  loaded x k-step feeds 8 accumulator chains; per-token k-ascending
+  chains keep it bitwise identical to the per-token GEMV
+  (`tools/bench/flint_gemv_tile2_bench.hip`, mismatches=0 on
+  256×2048×{256,1024,2048,8192}). Router kernel 0.96 → 0.41 ms at the
+  pp2048 shape (2.4×); pp2048 2677.90 → 2778.63/2760.90 (+3.7 %/+3.1 %),
+  pp8192 2159.85 → 2246.51 (+4.0 %), tg unchanged, all three flint gate
+  tests bitwise clean in the same session.
 
 ## Rejected / investigated, no adoptable lever
 

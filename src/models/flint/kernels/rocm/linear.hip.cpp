@@ -16,6 +16,10 @@ constexpr int kThreads = 256;
 constexpr std::uint32_t kQ8Block = 32;
 constexpr std::size_t kQ8BlockBytes = 34;
 constexpr int kTileTokens = 32;
+// Multi-row Bf16 prefill tile (GemvBatchBf16TileRKernel): 8 rows x 8 tokens
+// per warp, fastest bitwise-equal shape on gfx1151.
+constexpr int kTileRows = 8;
+constexpr int kTileTokR = 8;
 
 [[nodiscard]] __device__ __forceinline__ float Bf16ToF16(std::uint16_t v) {
   union {
@@ -318,6 +322,84 @@ __global__ void GemvBatchBf16TileKernel(const std::uint16_t* __restrict__ w,
   }
 }
 
+// Multi-row activation-tile variant: one warp owns kRows consecutive rows x
+// kTok consecutive tokens, so each loaded x k-step feeds kRows accumulator
+// chains and the block reads the token tile once per 8 rows instead of once
+// per 8 warps. Per (row, token) the pair-pipelined loop keeps the
+// k-ascending fmaf chain and WarpSum tree of GemvBatchBf16Kernel, so
+// results stay bitwise identical (tools/bench/
+// flint_gemv_tile2_bench.hip: 0 mismatches on the 256x2048 router shape
+// for B in {256,1024,2048,8192}; t8x8 is ~2.4x over the 1-row 32-token
+// warp at B=2048). Callers need rows % (8 * kRows) == 0 and route the
+// ragged token tail through GemvBatchBf16Kernel.
+template<int kRows, int kTok>
+__global__ void GemvBatchBf16TileRKernel(const std::uint16_t* __restrict__ w,
+                                         std::uint32_t rows, std::uint32_t cols,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ out) {
+  const int warp = threadIdx.x / kWarp;
+  const int lane = threadIdx.x % kWarp;
+  const std::uint32_t r0 = blockIdx.x * ((kThreads / kWarp) * kRows) +
+                           warp * static_cast<std::uint32_t>(kRows);
+  const std::uint32_t t0 = blockIdx.y * kTok;
+  const std::uint16_t* __restrict__ wr =
+      w + static_cast<std::size_t>(r0) * cols;
+  const float* __restrict__ xt = x + static_cast<std::size_t>(t0) * cols;
+  float* __restrict__ ot =
+      out + static_cast<std::size_t>(r0) + static_cast<std::size_t>(t0) * rows;
+  float acc[kRows][kTok];
+#pragma unroll
+  for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+    for (int t = 0; t < kTok; ++t) {
+      acc[r][t] = 0.0F;
+    }
+  }
+  std::uint32_t k = lane;
+  for (; k + kWarp < cols; k += 2 * kWarp) {
+    float xv0[kTok];
+    float xv1[kTok];
+#pragma unroll
+    for (int t = 0; t < kTok; ++t) {
+      xv0[t] = xt[static_cast<std::size_t>(t) * cols + k];
+      xv1[t] = xt[static_cast<std::size_t>(t) * cols + k + kWarp];
+    }
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      const float w0 = Bf16ToF16(wr[static_cast<std::size_t>(r) * cols + k]);
+      const float w1 =
+          Bf16ToF16(wr[static_cast<std::size_t>(r) * cols + k + kWarp]);
+#pragma unroll
+      for (int t = 0; t < kTok; ++t) {
+        acc[r][t] = fmaf(w0, xv0[t], acc[r][t]);
+        acc[r][t] = fmaf(w1, xv1[t], acc[r][t]);
+      }
+    }
+  }
+  if (k < cols) {
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      const float wf = Bf16ToF16(wr[static_cast<std::size_t>(r) * cols + k]);
+#pragma unroll
+      for (int t = 0; t < kTok; ++t) {
+        acc[r][t] =
+            fmaf(wf, xt[static_cast<std::size_t>(t) * cols + k], acc[r][t]);
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+    for (int t = 0; t < kTok; ++t) {
+      const float a = WarpSum(acc[r][t]);
+      if (lane == 0) {
+        ot[static_cast<std::size_t>(r) + static_cast<std::size_t>(t) * rows] =
+            a;
+      }
+    }
+  }
+}
+
 __global__ void GemvBatchF32Kernel(const float* __restrict__ w,
                                    std::uint32_t rows, std::uint32_t cols,
                                    const float* __restrict__ x,
@@ -429,6 +511,26 @@ void GemvBatch(const void* base, core::GgmlType type, std::uint32_t rows,
       break;
     default: {
       const auto* const wb = static_cast<const std::uint16_t*>(base);
+      // 8-row x 8-token tiles first (router shape): bitwise-identical and
+      // ~2.4x over the 1-row warp at B=2048 (flint_gemv_tile2_bench).
+      if (rows % (8U * kTileRows) == 0U) {
+        const std::uint32_t tiles =
+            batch / static_cast<std::uint32_t>(kTileTokR);
+        if (tiles > 0) {
+          GemvBatchBf16TileRKernel<kTileRows, kTileTokR>
+              <<<dim3(rows / (kThreads / kWarp * kTileRows), tiles), kThreads,
+                 0, stream>>>(wb, rows, cols, x, out);
+          const std::uint32_t done =
+              tiles * static_cast<std::uint32_t>(kTileTokR);
+          if (done < batch) {
+            GemvBatchBf16Kernel<<<dim3(grid.x, batch - done), kThreads, 0,
+                                  stream>>>(
+                wb, rows, cols, x + static_cast<std::size_t>(done) * cols,
+                out + static_cast<std::size_t>(done) * rows);
+          }
+          break;
+        }
+      }
       const std::uint32_t tiles =
           batch / static_cast<std::uint32_t>(kTileTokens);
       if (tiles > 0) {
