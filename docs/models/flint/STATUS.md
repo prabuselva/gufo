@@ -1,8 +1,9 @@
 # Flint Preview 40B-A2B — Implementation Status
 
 Working memory lane for bringing `flint` up in Gufo on gfx1151. Update every
-phase transition; keep evidence pointers, not prose. Companion files to be
-created with the runtime: EXPERIMENTS.md, BENCHMARKS.md.
+phase transition; keep evidence pointers, not prose. Companion cards:
+[BENCHMARKS.md](BENCHMARKS.md), [QUALITY.md](QUALITY.md),
+[EXPERIMENTS.md](EXPERIMENTS.md).
 
 Branch: `feat/support_flint_moe`. Artifact:
 `~/projects/llm/models/gguf/Flint-40B-A2B-GGUF/flint-Q8_0.gguf`
@@ -519,8 +520,19 @@ pair in one tool call (AGENTS protocol).
              halving the chunk count buys nothing; 4096 stays, and any
              further MoE-tier lever must come from inside the grouped
              kernels, not from scheduling amortization.
-           - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
-     QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
+           - [x] C7 GPU benchmark sweep vs baseline table above (adopted
+             llama-bench depth semantics: pp512 filled to `depth = ctx −
+             640`, tg128 at that frontier; `gufo bench -p <depth>,512 -n
+             128`, exclusive, artifact `flint-c7-native-sweep.log`).
+             pp512@depth 2043/2057/2013/2004/1961/1966 t/s vs the
+             llama-bench 1478/1376/1265/1081/861/611 row: +38 % .. +222 %,
+             flat to 131 K because only the 14 global layers read the
+             prefix (4 KV heads). tg 41-43 vs 47.7-26.7: reference leads
+             at ctx <= 16384 (prefill-only campaign; recorded as the decode
+             lever in EXPERIMENTS.md). Created BENCHMARKS.md,
+             QUALITY.md, EXPERIMENTS.md, flint README.md +
+             docs/models/README.md row; full-prompt rate table kept as a
+             second, clearly scoped table (no native llama counterpart).
 
 ## Design notes
 
