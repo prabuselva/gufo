@@ -80,6 +80,17 @@ for t in "${targets[@]}"; do
     native_sources+=(tools/bench/flint_w8a8_wave64.hip)
     native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
     native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
+    # C9: the mmq k/v fallback baseline (flint_mmq_q8_0_dense).
+    extra+=(-Xlinker build/release/src/models/flint/libgufo_flint_mmq.a)
+  fi
+  if [[ "$src" -ef tools/bench/flint_moe_down_probe.hip ]]; then
+    # The probe includes the production routed GEMM unit directly and links
+    # the routing helpers (RoutedCompact, BuildRoutedTiles, NarrowActivations)
+    # and the mmq oracle from the release build. The archives go through
+    # -Xlinker so the driver does not try to compile them as HIP sources.
+    extra+=(-I src/models/flint/kernels/rocm/mmq
+      -Xlinker build/release/src/models/flint/libgufo_flint_moe.a
+      -Xlinker build/release/src/models/flint/libgufo_flint_mmq.a)
   fi
   if ((${#native_sources[@]})); then
     # HIP helpers and their callers must share the native wave size.

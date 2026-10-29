@@ -15,6 +15,12 @@
 // Synthetic Q8_0 weights/activations are only a payload: route numerics are
 // adjudicated by the flint engine/forward gates at adoption time, and the
 // per-candidate `mismatch` column must read 0 for any timing to matter.
+// C9: `attn_kv` (m=512, k=2048 - the W8A8-ineligible k/v projections) adds
+// an `mmq dense` baseline line: `flint_mmq_q8_0_dense` timing plus its
+// relative deviation from the shipped W8A8 output (both are quantized
+// approximations, so bitwise comparison does not apply here; the W8A8-vs-
+// true-quality contract is the flint forward gate, the same one C7m passed
+// for the q projection).
 #define ENGINE_ENABLE_HIP 1
 #include <algorithm>
 #include <cmath>
@@ -27,6 +33,13 @@
 #include <vector>
 
 #include <hip/hip_runtime.h>
+
+extern "C" {
+int flint_mmq_init(int device);
+int flint_mmq_q8_0_dense(const void* W_q8_0, const float* X_f32,
+                         float* out_f32, int M, int N, int K,
+                         hipStream_t stream);
+}
 
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hip"
 
@@ -100,10 +113,15 @@ __global__ void CompareBits(const float* reference, const float* candidate,
     atomicAdd(mismatches, 1U);
 }
 
+// ggml block_q8_0 layout: {__half d; int8_t qs[32];}, 34 bytes
+// (src/models/qwen/hip/quant_ops.hpp). A 36-byte float-scale block makes
+// every weight read misaligned inside the WMMA kernels.
 struct Q8Block {
-  float d;
+  __half d;
   std::int8_t qs[32];
 };
+
+static_assert(sizeof(Q8Block) == 34, "block_q8_0 must be packed 34 bytes");
 
 std::vector<Q8Block> MakeQ8Weights(std::size_t rows, std::size_t cols,
                                    std::mt19937& rng) {
@@ -117,10 +135,10 @@ std::vector<Q8Block> MakeQ8Weights(std::size_t rows, std::size_t cols,
       amax = std::max(amax, std::fabs(e));
     }
     const float d = amax / 127.f;
-    out[blk].d = d == 0.f ? 1.f : d;
+    const float scale = d == 0.f ? 1.f : d;
+    out[blk].d = __float2half(scale);
     for (int i = 0; i < 32; ++i) {
-      out[blk].qs[i] =
-          static_cast<std::int8_t>(std::lround(v[i] / out[blk].d));
+      out[blk].qs[i] = static_cast<std::int8_t>(std::lround(v[i] / scale));
     }
   }
   return out;
@@ -251,6 +269,64 @@ void RunShape(const char* label, std::size_t m, std::size_t k,
     LaunchKQuantW32<128, 128, 2, 2, 4>(dw, q8, y, batch, m, k);
   });
 
+  // C9: production fallback for this shape is the mmq tier; report its
+  // timing and how far it deviates from the shipped W8A8 result.
+  if (m <= 1024U) {
+    CHECK(hipMemset(y_cand, 0, batch * m * sizeof(float)));
+    const int rc = flint_mmq_q8_0_dense(dw, dx, y_cand, static_cast<int>(m),
+                                        static_cast<int>(batch),
+                                        static_cast<int>(k), nullptr);
+    if (rc != 0) {
+      std::fprintf(stderr, "flint_mmq_q8_0_dense rc=%d\n", rc);
+      std::exit(2);
+    }
+    CHECK(hipDeviceSynchronize());
+    const std::size_t count = batch * m;
+    std::vector<float> h_ref(count);
+    std::vector<float> h_mmq(count);
+    CHECK(hipMemcpy(h_ref.data(), y_ref, count * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    CHECK(hipMemcpy(h_mmq.data(), y_cand, count * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    double max_abs = 0.0;
+    double scale = 1e-30;
+    double sq = 0.0;
+    std::size_t nan_ref = 0;
+    std::size_t nan_mmq = 0;
+    std::size_t first_nan = static_cast<std::size_t>(-1);
+    std::size_t min_nan_row = static_cast<std::size_t>(-1);
+    std::size_t max_nan_row = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (std::isnan(h_ref[i])) {
+        ++nan_ref;
+        if (first_nan == static_cast<std::size_t>(-1)) first_nan = i;
+        const std::size_t row = i % m;
+        min_nan_row = std::min(min_nan_row, row);
+        max_nan_row = std::max(max_nan_row, row);
+      }
+      if (std::isnan(h_mmq[i])) ++nan_mmq;
+      const double d = std::fabs(h_ref[i] - h_mmq[i]);
+      max_abs = std::max(max_abs, d);
+      scale = std::max(scale, std::fabs(static_cast<double>(h_ref[i])));
+      sq += d * d;
+    }
+    const double ms = TimeIt(
+        [&] {
+          (void)flint_mmq_q8_0_dense(dw, dx, y_cand, static_cast<int>(m),
+                                     static_cast<int>(batch),
+                                     static_cast<int>(k), nullptr);
+        },
+        reps);
+    std::printf(
+        "  %-24s %8.3f ms %7.1f TF/s  %+7.1f%%  "
+        "maxrel=%.3e relL2=%.3e nan_ref=%zu nan_mmq=%zu "
+        "first=%zu(tok %zu row %zu) rows[%zu..%zu]\n",
+        "mmq dense", ms, flops / ms / 1e9, (ms_ship / ms - 1.0) * 100.0,
+        max_abs / scale, std::sqrt(sq / static_cast<double>(count)) / scale,
+        nan_ref, nan_mmq, first_nan, first_nan / m, first_nan % m, min_nan_row,
+        max_nan_row);
+  }
+
   CHECK(hipFree(dw));
   CHECK(hipFree(dx));
   CHECK(hipFree(y_ref));
@@ -271,12 +347,17 @@ int main(int argc, char** argv) {
     batches = {512, 2048, 4096};
   }
   std::mt19937 rng(1234);
+  if (flint_mmq_init(0) != 0) {
+    std::fprintf(stderr, "flint_mmq_init failed\n");
+    return 2;
+  }
   const char* shapes = std::getenv("FLINT_W8A8_SHAPES");
   const auto want = [&](const char* label) {
     return shapes == nullptr || std::strstr(shapes, label) != nullptr;
   };
   for (std::size_t batch : batches) {
     if (want("attn_q")) RunShape("attn_q  ", 4096, 2048, batch, reps, rng);
+    if (want("attn_kv")) RunShape("attn_kv ", 512, 2048, batch, reps, rng);
     if (want("attn_out")) RunShape("attn_out", 2048, 4096, batch, reps, rng);
     if (want("shexp_gu")) RunShape("shexp_gu", 1024, 2048, batch, reps, rng);
     if (want("shexp_dn")) RunShape("shexp_dn", 2048, 1024, batch, reps, rng);
