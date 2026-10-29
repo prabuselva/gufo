@@ -1,0 +1,15 @@
+// Tile configurations for the WKQuantA8 wave64 route on the Flint dense
+// projections. Expand with X(id, BM, BN, BK, WM, WN); id 0 replicates the
+// shipped wave64 Q8_0 schedule (128x128, BK 2, 2x2 waves) tuned for the
+// square Qwen shapes. All variants keep the per-element int32 K-ascending
+// accumulation order, so they must be bitwise identical to each other.
+X(0, 128, 128, 2, 2, 2)
+X(1, 128, 128, 2, 4, 1)
+X(2, 128, 128, 2, 1, 4)
+X(3, 128, 128, 1, 2, 2)
+X(4, 128, 128, 4, 2, 2)
+X(5, 64, 128, 2, 2, 2)
+X(6, 128, 64, 2, 2, 2)
+X(7, 64, 64, 2, 2, 2)
+X(8, 64, 128, 1, 2, 2)
+X(9, 192, 128, 2, 4, 1)

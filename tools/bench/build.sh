@@ -55,6 +55,11 @@ for t in "${targets[@]}"; do
   echo "==> $src -> $out"
   compile=(hipcc -O3 --offload-arch=gfx1151 -std=c++20
     -I. "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
+  if [[ "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
+    # The bench includes the production prefill GEMM unit, which gufo_core
+    # compiles with SLP disabled (qwen CMakeLists).
+    compile+=(-fno-slp-vectorize)
+  fi
   if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ]]; then
     # Exact projection comparisons use the production compiler optimization level.
     compile[1]=-O2
@@ -67,6 +72,14 @@ for t in "${targets[@]}"; do
   fi
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
+  fi
+  if [[ "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
+    # Wave64 WKQuantA8 tile configs (this unit also defines the shipped
+    # TryLaunchQuantPrefillWave64 used as the bench baseline), plus the
+    # small-batch wave64 helpers referenced by the included GEMM unit.
+    native_sources+=(tools/bench/flint_w8a8_wave64.hip)
+    native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
+    native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
   fi
   if ((${#native_sources[@]})); then
     # HIP helpers and their callers must share the native wave size.
@@ -81,12 +94,17 @@ for t in "${targets[@]}"; do
         if [[ "$unit" == src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip ]]; then
           native_extra+=(-Xarch_device -mllvm=-amdgpu-sched-strategy=iterative-ilp)
         fi
+        if [[ "$unit" == tools/bench/flint_w8a8_wave64.hip ]]; then
+          # Match the production flags of the shared prefill GEMM units.
+          native_extra+=(-fno-slp-vectorize)
+        fi
         "${compile[@]}" -DENGINE_ENABLE_HIP=1 -mwavefrontsize64 \
           "${native_extra[@]}" \
           -c "$unit" -o "$object" || exit 1
         native_objects+=("$object")
       done
-      if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
+      if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ||
+            "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
         "${compile[@]}" -c src/core/quant/ggml_dequant.cpp \
           -o "$objects/quant.o" || exit 1
         native_objects+=("$objects/quant.o")

@@ -1,0 +1,649 @@
+# C8b W8A8/WKQuantA8 tile config matrix at flint dense projection shapes (redacted)
+# host: gfx1151 Strix Halo, exclusive GPU, 2026-10-29. tools/bench/flint_w8a8_bench.hip
+# (production prefill_quant_gemm.hip included directly; native wave-64 launcher TU
+# flint_w8a8_wave64.hip), bench binary /tmp/flint_w8a8_bench SHA-256 prefix da9f6079dad6b49d,
+# built at rev 59aa54b1 + bench tooling (this commit). Shipped route = wave-64 gate
+# default; every candidate is checked bitwise against it (mismatch=0 everywhere below).
+START 2026-10-29T20:28:08+08:00 name=w8a8fin inner_timeout=1500s pid=42065 pgid=42065
+CMD: env LD_LIBRARY_PATH=/opt/rocm/lib /tmp/flint_w8a8_bench 20 512 2048 4096
+
+=== [gpu_exclusive] captured serve command for respawn -> /tmp/gufo_serve_cmdline ===
+
+=== [gpu_exclusive] stopping gufo serve (pid 41364) ===
+
+=== [gpu_exclusive] server stopped; VRAM released ===
+
+=== [gpu_exclusive] running benchmark: env LD_LIBRARY_PATH=/opt/rocm/lib /tmp/flint_w8a8_bench 20 512 2048 4096 ===
+
+attn_q   m=4096 k=2048 batch=512  (8.6 GFLOP/call)
+  shipped                     0.301 ms    28.5 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.323 ms    26.6 TF/s     -6.7%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.347 ms    24.7 TF/s    -13.3%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.381 ms    22.5 TF/s    -21.0%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.339 ms    25.3 TF/s    -11.3%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.369 ms    23.3 TF/s    -18.3%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.333 ms    25.8 TF/s     -9.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.354 ms    24.3 TF/s    -15.0%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.357 ms    24.1 TF/s    -15.6%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.341 ms    25.2 TF/s    -11.6%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.363 ms    23.7 TF/s    -17.0%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.343 ms    25.0 TF/s    -12.2%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.344 ms    25.0 TF/s    -12.4%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.340 ms    25.3 TF/s    -11.5%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.346 ms    24.8 TF/s    -12.9%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.351 ms    24.5 TF/s    -14.3%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.332 ms    25.9 TF/s     -9.2%  mismatch=0
+
+attn_out m=2048 k=4096 batch=512  (8.6 GFLOP/call)
+  shipped                     0.302 ms    28.4 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.325 ms    26.4 TF/s     -7.1%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.338 ms    25.4 TF/s    -10.6%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.418 ms    20.5 TF/s    -27.7%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.322 ms    26.6 TF/s     -6.3%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.407 ms    21.1 TF/s    -25.7%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.350 ms    24.6 TF/s    -13.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.374 ms    23.0 TF/s    -19.2%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.338 ms    25.4 TF/s    -10.6%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.380 ms    22.6 TF/s    -20.5%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.369 ms    23.3 TF/s    -18.0%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.331 ms    26.0 TF/s     -8.7%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.353 ms    24.3 TF/s    -14.5%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.372 ms    23.1 TF/s    -18.7%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.356 ms    24.1 TF/s    -15.1%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.334 ms    25.8 TF/s     -9.4%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.374 ms    23.0 TF/s    -19.2%  mismatch=0
+
+shexp_gu m=1024 k=2048 batch=512  (2.1 GFLOP/call)
+  shipped                     0.093 ms    23.0 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.094 ms    22.8 TF/s     -0.9%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.100 ms    21.5 TF/s     -6.7%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.107 ms    20.0 TF/s    -12.9%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.102 ms    21.0 TF/s     -8.6%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.109 ms    19.7 TF/s    -14.6%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.094 ms    22.8 TF/s     -0.8%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.097 ms    22.0 TF/s     -4.3%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.089 ms    24.0 TF/s     +4.3%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.096 ms    22.3 TF/s     -2.9%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.147 ms    14.7 TF/s    -36.3%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.097 ms    22.2 TF/s     -3.3%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.096 ms    22.3 TF/s     -3.2%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.103 ms    20.8 TF/s     -9.6%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.098 ms    21.8 TF/s     -5.1%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.101 ms    21.2 TF/s     -7.9%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.102 ms    21.0 TF/s     -8.6%  mismatch=0
+
+shexp_dn m=2048 k=1024 batch=512  (2.1 GFLOP/call)
+  shipped                     0.083 ms    25.7 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.085 ms    25.2 TF/s     -2.0%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.089 ms    24.2 TF/s     -6.0%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.114 ms    18.8 TF/s    -26.9%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.089 ms    24.1 TF/s     -6.4%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.108 ms    19.8 TF/s    -22.9%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.094 ms    22.8 TF/s    -11.3%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.100 ms    21.5 TF/s    -16.6%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.091 ms    23.6 TF/s     -8.4%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.101 ms    21.3 TF/s    -17.2%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.105 ms    20.4 TF/s    -20.8%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.094 ms    22.9 TF/s    -11.1%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.102 ms    21.0 TF/s    -18.4%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.105 ms    20.5 TF/s    -20.4%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.101 ms    21.2 TF/s    -17.6%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.093 ms    23.1 TF/s    -10.3%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.103 ms    20.8 TF/s    -19.2%  mismatch=0
+
+ffn_gu   m=6144 k=2048 batch=512  (12.9 GFLOP/call)
+  shipped                     0.422 ms    30.6 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.482 ms    26.8 TF/s    -12.4%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.485 ms    26.6 TF/s    -13.0%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.573 ms    22.5 TF/s    -26.4%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.511 ms    25.2 TF/s    -17.4%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.538 ms    24.0 TF/s    -21.6%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.486 ms    26.5 TF/s    -13.2%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.528 ms    24.4 TF/s    -20.1%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.552 ms    23.3 TF/s    -23.6%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.501 ms    25.7 TF/s    -15.7%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.553 ms    23.3 TF/s    -23.7%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.502 ms    25.7 TF/s    -16.0%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.506 ms    25.5 TF/s    -16.7%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.499 ms    25.8 TF/s    -15.5%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.510 ms    25.3 TF/s    -17.3%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.500 ms    25.8 TF/s    -15.6%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.511 ms    25.2 TF/s    -17.5%  mismatch=0
+
+ffn_dn   m=2048 k=6144 batch=512  (12.9 GFLOP/call)
+  shipped                     0.467 ms    27.6 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.504 ms    25.6 TF/s     -7.2%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.511 ms    25.2 TF/s     -8.5%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.626 ms    20.6 TF/s    -25.3%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.515 ms    25.0 TF/s     -9.2%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.602 ms    21.4 TF/s    -22.3%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.546 ms    23.6 TF/s    -14.4%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.559 ms    23.0 TF/s    -16.4%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.516 ms    25.0 TF/s     -9.5%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.565 ms    22.8 TF/s    -17.3%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.561 ms    23.0 TF/s    -16.7%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.500 ms    25.8 TF/s     -6.5%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.536 ms    24.0 TF/s    -12.9%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.558 ms    23.1 TF/s    -16.2%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.530 ms    24.3 TF/s    -11.9%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.510 ms    25.2 TF/s     -8.4%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.563 ms    22.9 TF/s    -16.9%  mismatch=0
+
+attn_q   m=4096 k=2048 batch=2048  (34.4 GFLOP/call)
+  shipped                     1.302 ms    26.4 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         1.312 ms    26.2 TF/s     -0.8%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         1.358 ms    25.3 TF/s     -4.1%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         1.441 ms    23.8 TF/s     -9.7%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         1.369 ms    25.1 TF/s     -4.9%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         1.408 ms    24.4 TF/s     -7.6%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          1.490 ms    23.1 TF/s    -12.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          1.404 ms    24.5 TF/s     -7.3%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           1.655 ms    20.8 TF/s    -21.3%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          1.431 ms    24.0 TF/s     -9.0%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         1.319 ms    26.0 TF/s     -1.4%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             1.284 ms    26.8 TF/s     +1.4%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            1.368 ms    25.1 TF/s     -4.9%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             1.349 ms    25.5 TF/s     -3.6%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             1.499 ms    22.9 TF/s    -13.2%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              1.258 ms    27.3 TF/s     +3.5%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              1.304 ms    26.4 TF/s     -0.2%  mismatch=0
+
+attn_out m=2048 k=4096 batch=2048  (34.4 GFLOP/call)
+  shipped                     1.179 ms    29.1 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         1.204 ms    28.5 TF/s     -2.0%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         1.271 ms    27.0 TF/s     -7.2%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         1.371 ms    25.1 TF/s    -14.0%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         1.261 ms    27.3 TF/s     -6.5%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         1.310 ms    26.2 TF/s    -10.0%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          1.248 ms    27.5 TF/s     -5.5%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          1.285 ms    26.7 TF/s     -8.2%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           1.341 ms    25.6 TF/s    -12.0%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          1.233 ms    27.9 TF/s     -4.4%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         1.179 ms    29.2 TF/s     +0.1%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             1.253 ms    27.4 TF/s     -5.9%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            1.262 ms    27.2 TF/s     -6.5%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             1.247 ms    27.6 TF/s     -5.4%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             1.261 ms    27.2 TF/s     -6.5%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              1.234 ms    27.8 TF/s     -4.4%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              1.246 ms    27.6 TF/s     -5.3%  mismatch=0
+
+shexp_gu m=1024 k=2048 batch=2048  (8.6 GFLOP/call)
+  shipped                     0.307 ms    28.0 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.339 ms    25.4 TF/s     -9.4%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.348 ms    24.7 TF/s    -11.9%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.395 ms    21.8 TF/s    -22.3%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.352 ms    24.4 TF/s    -12.8%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.384 ms    22.4 TF/s    -20.2%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.341 ms    25.2 TF/s     -9.9%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.357 ms    24.1 TF/s    -14.0%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.353 ms    24.4 TF/s    -13.0%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.346 ms    24.9 TF/s    -11.3%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.393 ms    21.8 TF/s    -22.1%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.352 ms    24.4 TF/s    -12.8%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.350 ms    24.5 TF/s    -12.4%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.337 ms    25.5 TF/s     -9.0%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.359 ms    23.9 TF/s    -14.5%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.346 ms    24.8 TF/s    -11.3%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.342 ms    25.1 TF/s    -10.3%  mismatch=0
+
+shexp_dn m=2048 k=1024 batch=2048  (8.6 GFLOP/call)
+  shipped                     0.319 ms    26.9 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.356 ms    24.2 TF/s    -10.3%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.382 ms    22.5 TF/s    -16.6%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.389 ms    22.1 TF/s    -18.0%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.386 ms    22.3 TF/s    -17.4%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.371 ms    23.1 TF/s    -14.1%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.338 ms    25.4 TF/s     -5.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.379 ms    22.7 TF/s    -15.9%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.377 ms    22.8 TF/s    -15.5%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.354 ms    24.3 TF/s    -10.0%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.342 ms    25.1 TF/s     -6.8%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.371 ms    23.1 TF/s    -14.1%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.355 ms    24.2 TF/s    -10.2%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.360 ms    23.8 TF/s    -11.5%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.353 ms    24.3 TF/s     -9.8%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.358 ms    24.0 TF/s    -11.0%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.342 ms    25.1 TF/s     -6.8%  mismatch=0
+
+ffn_gu   m=6144 k=2048 batch=2048  (51.5 GFLOP/call)
+  shipped                     1.939 ms    26.6 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         1.932 ms    26.7 TF/s     +0.4%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         1.999 ms    25.8 TF/s     -3.0%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         2.144 ms    24.0 TF/s     -9.5%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         2.018 ms    25.5 TF/s     -3.9%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         2.093 ms    24.6 TF/s     -7.3%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          2.246 ms    22.9 TF/s    -13.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          2.097 ms    24.6 TF/s     -7.5%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           2.515 ms    20.5 TF/s    -22.9%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          2.173 ms    23.7 TF/s    -10.8%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         1.967 ms    26.2 TF/s     -1.4%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             1.864 ms    27.7 TF/s     +4.1%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            2.019 ms    25.5 TF/s     -3.9%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             1.967 ms    26.2 TF/s     -1.4%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             2.225 ms    23.2 TF/s    -12.9%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              1.838 ms    28.0 TF/s     +5.5%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              1.924 ms    26.8 TF/s     +0.8%  mismatch=0
+
+ffn_dn   m=2048 k=6144 batch=2048  (51.5 GFLOP/call)
+  shipped                     1.802 ms    28.6 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         1.818 ms    28.4 TF/s     -0.9%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         1.895 ms    27.2 TF/s     -4.9%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         2.058 ms    25.0 TF/s    -12.4%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         1.905 ms    27.1 TF/s     -5.4%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         1.961 ms    26.3 TF/s     -8.1%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          1.880 ms    27.4 TF/s     -4.2%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          1.927 ms    26.8 TF/s     -6.5%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           2.047 ms    25.2 TF/s    -12.0%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          1.864 ms    27.7 TF/s     -3.3%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         1.764 ms    29.2 TF/s     +2.2%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             1.821 ms    28.3 TF/s     -1.0%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            1.867 ms    27.6 TF/s     -3.5%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             1.881 ms    27.4 TF/s     -4.2%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             1.927 ms    26.7 TF/s     -6.5%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              1.813 ms    28.4 TF/s     -0.6%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              1.862 ms    27.7 TF/s     -3.2%  mismatch=0
+
+attn_q   m=4096 k=2048 batch=4096  (68.7 GFLOP/call)
+  shipped                     2.712 ms    25.3 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         2.741 ms    25.1 TF/s     -1.0%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         2.805 ms    24.5 TF/s     -3.3%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         2.970 ms    23.1 TF/s     -8.7%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         2.926 ms    23.5 TF/s     -7.3%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         2.840 ms    24.2 TF/s     -4.5%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          3.597 ms    19.1 TF/s    -24.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          2.837 ms    24.2 TF/s     -4.4%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           3.922 ms    17.5 TF/s    -30.9%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          3.537 ms    19.4 TF/s    -23.3%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         2.734 ms    25.1 TF/s     -0.8%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             2.593 ms    26.5 TF/s     +4.6%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            2.776 ms    24.8 TF/s     -2.3%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             2.755 ms    24.9 TF/s     -1.6%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             3.465 ms    19.8 TF/s    -21.7%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              2.597 ms    26.5 TF/s     +4.4%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              2.824 ms    24.3 TF/s     -4.0%  mismatch=0
+
+attn_out m=2048 k=4096 batch=4096  (68.7 GFLOP/call)
+  shipped                     2.542 ms    27.0 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         2.526 ms    27.2 TF/s     +0.6%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         2.633 ms    26.1 TF/s     -3.4%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         2.849 ms    24.1 TF/s    -10.8%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         2.605 ms    26.4 TF/s     -2.4%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         2.712 ms    25.3 TF/s     -6.3%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          2.833 ms    24.3 TF/s    -10.3%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          2.609 ms    26.3 TF/s     -2.6%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           3.129 ms    22.0 TF/s    -18.7%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          2.912 ms    23.6 TF/s    -12.7%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         2.470 ms    27.8 TF/s     +2.9%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             2.416 ms    28.4 TF/s     +5.2%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            2.499 ms    27.5 TF/s     +1.7%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             2.529 ms    27.2 TF/s     +0.5%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             2.806 ms    24.5 TF/s     -9.4%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              2.403 ms    28.6 TF/s     +5.8%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              2.582 ms    26.6 TF/s     -1.5%  mismatch=0
+
+shexp_gu m=1024 k=2048 batch=4096  (17.2 GFLOP/call)
+  shipped                     0.594 ms    28.9 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.608 ms    28.2 TF/s     -2.4%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.650 ms    26.4 TF/s     -8.7%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.714 ms    24.1 TF/s    -16.9%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.663 ms    25.9 TF/s    -10.4%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.679 ms    25.3 TF/s    -12.5%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          0.664 ms    25.9 TF/s    -10.5%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.664 ms    25.9 TF/s    -10.5%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           0.725 ms    23.7 TF/s    -18.1%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          0.681 ms    25.2 TF/s    -12.8%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.739 ms    23.3 TF/s    -19.6%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.646 ms    26.6 TF/s     -8.2%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.642 ms    26.8 TF/s     -7.5%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.652 ms    26.3 TF/s     -9.0%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             0.672 ms    25.6 TF/s    -11.6%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.624 ms    27.5 TF/s     -4.9%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.642 ms    26.8 TF/s     -7.5%  mismatch=0
+
+shexp_dn m=2048 k=1024 batch=4096  (17.2 GFLOP/call)
+  shipped                     0.783 ms    21.9 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         0.813 ms    21.1 TF/s     -3.7%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         0.833 ms    20.6 TF/s     -5.9%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         0.959 ms    17.9 TF/s    -18.3%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         0.858 ms    20.0 TF/s     -8.7%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         0.889 ms    19.3 TF/s    -11.9%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          1.101 ms    15.6 TF/s    -28.8%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          0.934 ms    18.4 TF/s    -16.2%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           1.260 ms    13.6 TF/s    -37.9%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          1.059 ms    16.2 TF/s    -26.0%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         0.812 ms    21.2 TF/s     -3.5%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             0.764 ms    22.5 TF/s     +2.5%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            0.932 ms    18.4 TF/s    -16.0%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             0.883 ms    19.5 TF/s    -11.3%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             1.073 ms    16.0 TF/s    -27.0%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              0.785 ms    21.9 TF/s     -0.3%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              0.869 ms    19.8 TF/s     -9.9%  mismatch=0
+
+ffn_gu   m=6144 k=2048 batch=4096  (103.1 GFLOP/call)
+  shipped                     3.963 ms    26.0 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         3.971 ms    26.0 TF/s     -0.2%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         4.046 ms    25.5 TF/s     -2.0%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         4.403 ms    23.4 TF/s    -10.0%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         4.399 ms    23.4 TF/s     -9.9%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         4.147 ms    24.9 TF/s     -4.4%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          5.457 ms    18.9 TF/s    -27.4%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          4.181 ms    24.7 TF/s     -5.2%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           5.761 ms    17.9 TF/s    -31.2%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          5.437 ms    19.0 TF/s    -27.1%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         3.909 ms    26.4 TF/s     +1.4%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             3.843 ms    26.8 TF/s     +3.1%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            4.097 ms    25.2 TF/s     -3.3%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             4.104 ms    25.1 TF/s     -3.4%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             5.153 ms    20.0 TF/s    -23.1%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              3.879 ms    26.6 TF/s     +2.2%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              4.221 ms    24.4 TF/s     -6.1%  mismatch=0
+
+ffn_dn   m=2048 k=6144 batch=4096  (103.1 GFLOP/call)
+  shipped                     3.476 ms    29.7 TF/s   (baseline)
+  .. running v64 128x128 bk2 2x2
+  v64 128x128 bk2 2x2         3.478 ms    29.6 TF/s     -0.1%  mismatch=0
+  .. running v64 128x128 bk2 4x1
+  v64 128x128 bk2 4x1         3.576 ms    28.8 TF/s     -2.8%  mismatch=0
+  .. running v64 128x128 bk2 1x4
+  v64 128x128 bk2 1x4         3.892 ms    26.5 TF/s    -10.7%  mismatch=0
+  .. running v64 128x128 bk1 2x2
+  v64 128x128 bk1 2x2         3.626 ms    28.4 TF/s     -4.1%  mismatch=0
+  .. running v64 128x128 bk4 2x2
+  v64 128x128 bk4 2x2         3.681 ms    28.0 TF/s     -5.6%  mismatch=0
+  .. running v64 64x128 bk2 2x2
+  v64 64x128 bk2 2x2          3.762 ms    27.4 TF/s     -7.6%  mismatch=0
+  .. running v64 128x64 bk2 2x2
+  v64 128x64 bk2 2x2          3.785 ms    27.2 TF/s     -8.2%  mismatch=0
+  .. running v64 64x64 bk2 2x2
+  v64 64x64 bk2 2x2           4.126 ms    25.0 TF/s    -15.8%  mismatch=0
+  .. running v64 64x128 bk1 2x2
+  v64 64x128 bk1 2x2          3.681 ms    28.0 TF/s     -5.6%  mismatch=0
+  .. running v64 192x128 bk2 4x1
+  v64 192x128 bk2 4x1         3.492 ms    29.5 TF/s     -0.5%  mismatch=0
+  .. running w32 blk 4x2 bk2
+  w32 blk 4x2 bk2             3.532 ms    29.2 TF/s     -1.6%  mismatch=0
+  .. running w32 blk bn64 bk2
+  w32 blk bn64 bk2            3.672 ms    28.1 TF/s     -5.3%  mismatch=0
+  .. running w32 blk 2x4 bk2
+  w32 blk 2x4 bk2             3.689 ms    27.9 TF/s     -5.8%  mismatch=0
+  .. running w32 blk 64m bk4
+  w32 blk 64m bk4             3.895 ms    26.5 TF/s    -10.8%  mismatch=0
+  .. running w32 kq 4x2 bk2
+  w32 kq 4x2 bk2              3.485 ms    29.6 TF/s     -0.2%  mismatch=0
+  .. running w32 kq 2x4 bk2
+  w32 kq 2x4 bk2              3.615 ms    28.5 TF/s     -3.8%  mismatch=0
+
+=== [gpu_exclusive] done (benchmark exit 0) ===
+END 2026-10-29T20:28:24+08:00 rc=0

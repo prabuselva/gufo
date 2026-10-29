@@ -39,6 +39,24 @@ commands and matched numbers live in the numbered entries of
   pp2048 shape (2.4×); pp2048 2677.90 → 2778.63/2760.90 (+3.7 %/+3.1 %),
   pp8192 2159.85 → 2246.51 (+4.0 %), tg unchanged, all three flint gate
   tests bitwise clean in the same session.
+- C8b wave-32 128×128 4×2 K-quant tile (`TryLaunchQuantPrefillWave32`) for
+  flint `Project()` shapes `batch >= 2048 && (rows >= 4096 || (batch >=
+  4096 && cols >= 4096 && rows >= 2048))`: a full tile-config matrix,
+  16 configs over the six dense projection shapes at batch
+  {512, 2048, 4096} (`tools/bench/flint_w8a8_bench.hip`, wave-64 configs
+  through a native `-mwavefrontsize64` launcher TU), every candidate
+  bitwise identical to the shipped output. The wave-32 tile wins
+  +3.5/+5.5 % (attn_q, dense ffn gate/up at batch 2048) and
+  +4.4/+5.8/+2.2 % (attn_q, attn_out, ffn gate/up at 4096); outside the
+  zone wave-64 wins by 3–19 %, so the gate keeps the shared launcher and
+  every decode/small batch on it. E2E 2776.90/2790.32 pp2048 and
+  2238.33/2248.36 pp8192 — an e2e effect below the matched-run spread
+  (the shape wins shrink once the projections interleave with the rest
+  of the forward), zero regressions; kept as default. The matrix run also
+  localized a bench-only allocation bug (the tiled Q8_1 buffer was sized
+  without the activation-sum sidecar; production uses
+  `QuantizedActivationBytes`, which includes it).
+  Artifacts `flint-c8b-w8a8-config-matrix.log`, `flint-c8b-adoption.log`.
 
 ## Rejected / investigated, no adoptable lever
 

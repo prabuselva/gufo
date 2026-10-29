@@ -426,6 +426,20 @@ void W8A8QuantizeRows(const float* x, void* x8, std::size_t batch,
   gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(x, x8, batch, k, stream);
 }
 
+/// C8b tile preference: at prefill batch the wave-32 128x128 4x2 K-quant
+/// tile out-reads the wave-64 default on tall projections (rows >= 4096:
+/// attn_q, dense ffn gate/up; +3.5/+5.5 % at batch 2048) and on
+/// rows 2048 x cols 4096 (attn_out) only from batch 4096 (tools/bench/
+/// flint_w8a8_bench.hip; every config bitwise identical to the shipped
+/// output). The rows-1024 shared-expert shapes, cols <= 1024 and the
+/// decode/small-batch range keep wave-64, where it wins 3-14 %
+/// (docs/models/flint/artifacts/flint-c8b-w8a8-config-matrix.log).
+[[nodiscard]] bool W8A8Wave32Preferred(std::uint32_t batch, std::size_t rows,
+                                       std::size_t cols) {
+  return batch >= 2048U &&
+         (rows >= 4096U || (batch >= 4096U && cols >= 4096U && rows >= 2048U));
+}
+
 /// out = base @ x for rows (batch <= capacity), dispatching decode through
 /// the plain GEMV and wider batches through the GEMM tier. When `x8` holds
 /// the tiled Q8_1 copy of `x` (W8A8Eligible inputs), the shared W8A8 WMMA
@@ -440,6 +454,12 @@ void Project(const TensorRef& w, const float* x, float* out,
   }
   if (w.type == core::GgmlType::kQ8_0) {
     if (x8 != nullptr) {
+      if (W8A8Wave32Preferred(batch, static_cast<std::size_t>(w.rows),
+                              static_cast<std::size_t>(w.cols)) &&
+          gufo::hip::TryLaunchQuantPrefillWave32(w.type, w.data, x8, out, batch,
+                                                 w.rows, w.cols, stream)) {
+        return;
+      }
       gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
           w.type, w.data, x8, out, batch, w.rows, w.cols, stream);
       return;

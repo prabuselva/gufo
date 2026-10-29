@@ -1,43 +1,34 @@
-// A/B harness for the Flint dense Q8_0 tier: the shipped mmq Gemm path
-// (quantize_mmq_q8_1 + mul_mat_q per call) against the shared qwen W8A8
-// int8-WMMA route (tiled Q8_1 activation quantize +
-// LaunchBatchedQuantGEMMPreQuantized, wave64 at batch >= 96).
-// Shapes and dtypes match the Flint artifacts: hidden 2048, shared-expert
-// ff 1024, attn q [4096x2048], attn_out [2048x4096], k/v [512x2048].
+// Tile-configuration matrix for the Flint dense W8A8 prefill tier at the
+// exact production shapes (attn_q 4096x2048, attn_out 2048x4096) over the
+// whole-prompt chunk sizes. Baseline `shipped` is the production route
+// LaunchBatchedQuantGEMMPreQuantized picks today: the wave64 WKQuantA8
+// 128x128 2x2 schedule qualified on square Qwen shapes, never re-tuned for
+// Flint's skewed m/k. Candidates are the wave64 schedules from
+// flint_w8a8_wave64_cfgs.def (native wave64 TU) and the wave32 W8A8Blocked
+// schedules the shared launcher would use without the wave64 gate. Every
+// schedule keeps the per-element int32 K-ascending accumulation order, so
+// all candidates must be bitwise identical to the baseline on every shape.
 //
-//   clang++ --offload-arch=gfx1151 --driver-mode=g++ -L/opt/rocm/lib \
-//     --hip-link -O3 -std=c++20 -DENGINE_ENABLE_HIP \
-//     -I . -I src/models/flint/kernels/rocm/mmq \
-//     -x hip tools/bench/flint_w8a8_bench.hip -x none \
-//     build/gpu-test/src/models/flint/libgufo_flint_kernels.a \
-//     build/gpu-test/src/models/flint/libgufo_flint_mmq.a \
-//     build/gpu-test/libgufo_core.a \
-//     -lhipblas -lrocblas -lhsa-runtime64 -o /tmp/flint_w8a8_bench
+//   tools/bench/build.sh flint_w8a8_bench
+//   /tmp/flint_w8a8_bench [reps] [batch ...]
 //
-// Usage: /tmp/flint_w8a8_bench [reps]
-// Timing harness only: the f32 sanity columns are meaningless (they feed
-// synthetic payloads through the mmq q8_1 padding contract, which expects
-// ggml's exact row/K-block layout); route numerics are adjudicated by the
-// flint engine/forward gates. Timings are valid (reproduced 3x).
-#include <hip/hip_runtime.h>
-
+// Synthetic Q8_0 weights/activations are only a payload: route numerics are
+// adjudicated by the flint engine/forward gates at adoption time, and the
+// per-candidate `mismatch` column must read 0 for any timing to matter.
+#define ENGINE_ENABLE_HIP 1
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdint>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <random>
 #include <vector>
 
-#include "src/models/flint/kernels/rocm/linear.hpp"
-#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
+#include <hip/hip_runtime.h>
 
-namespace flint = gufo::models::flint::rocm;
-namespace core = gufo::core;
-namespace hipk = gufo::hip;
+#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hip"
 
 #define CHECK(call)                                                     \
   do {                                                                  \
@@ -49,7 +40,65 @@ namespace hipk = gufo::hip;
     }                                                                   \
   } while (0)
 
+namespace hipk = gufo::hip;
+namespace core = gufo::core;
+
 namespace {
+
+using Wave64Fn = void (*)(const void*, const void*, float*, std::size_t,
+                          std::size_t, std::size_t, hipStream_t);
+
+#define X(id, BM, BN, BK, WM, WN)                                \
+  extern "C" void flint_w8a8_v64_##id(const void*, const void*,  \
+                                      float*, std::size_t,       \
+                                      std::size_t, std::size_t,  \
+                                      hipStream_t);
+#include "flint_w8a8_wave64_cfgs.def"
+#undef X
+
+#define X(id, BM, BN, BK, WM, WN)                                \
+  {                                                              \
+    flint_w8a8_v64_##id, "v64 " #BM "x" #BN " bk" #BK            \
+                         " " #WM "x" #WN                         \
+  },
+const struct {
+  Wave64Fn fn;
+  const char* name;
+} kWave64Cfgs[] = {
+#include "flint_w8a8_wave64_cfgs.def"
+#undef X
+}
+;
+
+// Wave32 candidates from the shared launcher's own kernels (this TU is
+// compiled wave32, so the w32 WMMA builtins are legal here).
+template <int BM, int BN, int BK, int WM, int WN>
+void LaunchW8A8W32(const void* w, const void* x_tiled, float* y,
+                   std::size_t batch, std::size_t m, std::size_t k) {
+  const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+  hipk::W8A8BlockedWmmaGEMMKernel<BM, BN, BK, WM, WN>
+      <<<grid, 256>>>(w, x_tiled, y, batch, m, k);
+}
+
+template <int BM, int BN, int BK, int WM, int WN>
+void LaunchKQuantW32(const void* w, const void* x_tiled, float* y,
+                     std::size_t batch, std::size_t m, std::size_t k) {
+  const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+  hipk::WKQuantA8BlockedWmmaGEMMKernel<BM, BN, BK, WM, WN, core::GgmlType::
+                                            kQ8_0,
+                                        32>
+      <<<grid, 256>>>(w, x_tiled, y, batch, m, k);
+}
+
+__global__ void CompareBits(const float* reference, const float* candidate,
+                            std::size_t count, unsigned* mismatches) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count &&
+      __float_as_uint(reference[i]) != __float_as_uint(candidate[i]))
+    atomicAdd(mismatches, 1U);
+}
 
 struct Q8Block {
   float d;
@@ -70,8 +119,8 @@ std::vector<Q8Block> MakeQ8Weights(std::size_t rows, std::size_t cols,
     const float d = amax / 127.f;
     out[blk].d = d == 0.f ? 1.f : d;
     for (int i = 0; i < 32; ++i) {
-      out[blk].qs[i] = static_cast<std::int8_t>(
-          std::lround(v[i] / out[blk].d));
+      out[blk].qs[i] =
+          static_cast<std::int8_t>(std::lround(v[i] / out[blk].d));
     }
   }
   return out;
@@ -96,233 +145,143 @@ float TimeIt(const std::function<void()>& fn, int reps) {
   return ms / reps;
 }
 
-struct Shape {
-  const char* name;
-  std::size_t m;
-  std::size_t k;
-};
+void RunShape(const char* label, std::size_t m, std::size_t k,
+              std::size_t batch, int reps, std::mt19937& rng) {
+  auto w = MakeQ8Weights(m, k, rng);
+  std::vector<float> x(batch * k);
+  std::uniform_real_distribution<float> xd(-3.f, 3.f);
+  for (float& e : x) e = xd(rng);
 
-// Tile schedules for the wave64 kernel (WaveSize=64 => WM*WN == 4, BM %
-// (16*WM)==0, BN % (16*WN)==0). The shipped route uses <128,128>; smaller
-// BM keeps every row tile and more blocks resident when m <= 1024.
-template <int BM, int BN, int BK, int WM, int WN>
-void LaunchCfg(const void* w, const void* x_tiled, float* out,
-               std::size_t batch, std::size_t m, std::size_t k,
-               hipStream_t stream) {
-  const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
-                  static_cast<unsigned>((m + BM - 1) / BM));
-  gufo::hip::WKQuantA8BlockedWmmaGEMMKernel<BM, BN, BK, WM, WN,
-                                            core::GgmlType::kQ8_0, 64>
-      <<<grid, WM * WN * 64, 0, stream>>>(w, x_tiled, out, batch, m, k);
+  void* dw;
+  float *dx, *y_ref, *y_cand;
+  unsigned* d_mismatch;
+  // Zeroed guard tail: any candidate that speculates a read past the last
+  // row reads zeros instead of faulting an unmapped page; the bitwise
+  // column still gates correctness.
+  constexpr std::size_t kGuard = 256u * 1024u;
+  const auto alloc_guarded = [&](void** ptr, std::size_t bytes) {
+    CHECK(hipMalloc(ptr, bytes + kGuard));
+    CHECK(hipMemset(*ptr, 0, bytes + kGuard));
+  };
+  alloc_guarded(&dw, w.size() * sizeof(Q8Block));
+  CHECK(hipMemcpy(dw, w.data(), w.size() * sizeof(Q8Block),
+                  hipMemcpyHostToDevice));
+  alloc_guarded(reinterpret_cast<void**>(&dx), x.size() * sizeof(float));
+  CHECK(hipMemcpy(dx, x.data(), x.size() * sizeof(float),
+                  hipMemcpyHostToDevice));
+  alloc_guarded(reinterpret_cast<void**>(&y_ref), batch * m * sizeof(float));
+  alloc_guarded(reinterpret_cast<void**>(&y_cand), batch * m * sizeof(float));
+  CHECK(hipMalloc(&d_mismatch, sizeof(unsigned)));
+  const std::size_t q8_bytes = hipk::QuantizedActivationBytes(batch, k);
+  void* q8;
+  alloc_guarded(&q8, q8_bytes);
+
+  // The shipped route (baseline) and every candidate share this tile.
+  CHECK(hipMemset(y_ref, 0, batch * m * sizeof(float)));
+  hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, k, nullptr);
+  CHECK(hipDeviceSynchronize());
+
+  const double flops = 2.0 * batch * m * k;
+  std::printf("\n%s m=%zu k=%zu batch=%zu  (%.1f GFLOP/call)\n", label, m, k,
+              batch, flops / 1e9);
+
+  const double ms_ship =
+      TimeIt(
+          [&] {
+            hipk::LaunchBatchedQuantGEMMPreQuantized(
+                core::GgmlType::kQ8_0, dw, q8, y_ref, batch, m, k, nullptr);
+          },
+          reps);
+  std::printf("  %-24s %8.3f ms %7.1f TF/s   (baseline)\n", "shipped",
+              ms_ship, flops / ms_ship / 1e9);
+
+  const char* keep = std::getenv("FLINT_W8A8_KEEP");
+  const auto run_candidate = [&](const char* name,
+                                 const std::function<void(float*)>& launch) {
+    if (keep != nullptr && std::strstr(name, keep) == nullptr) {
+      return;
+    }
+    std::printf("  .. running %s\n", name);
+    CHECK(hipMemset(y_cand, 0, batch * m * sizeof(float)));
+    launch(y_cand);
+    const hipError_t launch_err = hipGetLastError();
+    if (launch_err != hipSuccess) {
+      std::fprintf(stderr, "launch error on %s: %s\n", name,
+                   hipGetErrorString(launch_err));
+      std::exit(2);
+    }
+    CHECK(hipDeviceSynchronize());
+    unsigned mismatch = 0;
+    CHECK(hipMemset(d_mismatch, 0, sizeof(unsigned)));
+    const std::size_t count = batch * m;
+    CompareBits<<<static_cast<unsigned>((count + 255) / 256), 256>>>(
+        y_ref, y_cand, count, d_mismatch);
+    CHECK(hipMemcpy(&mismatch, d_mismatch, sizeof(unsigned),
+                    hipMemcpyDeviceToHost));
+    const double ms = TimeIt([&] { launch(y_cand); }, reps);
+    std::printf("  %-24s %8.3f ms %7.1f TF/s  %+7.1f%%  mismatch=%u\n", name,
+                ms, flops / ms / 1e9, (ms_ship / ms - 1.0) * 100.0,
+                mismatch);
+    // Unbuffered progress: the last printed line is exactly the candidate
+    // where a faulting config would abort the run.
+    std::fflush(stdout);
+  };
+
+  for (const auto& cfg : kWave64Cfgs) {
+    run_candidate(cfg.name, [&](float* y) {
+      cfg.fn(dw, q8, y, batch, m, k, nullptr);
+    });
+  }
+  run_candidate("w32 blk 4x2 bk2", [&, dw, q8, batch, m, k](float* y) {
+    LaunchW8A8W32<128, 128, 2, 4, 2>(dw, q8, y, batch, m, k);
+  });
+  run_candidate("w32 blk bn64 bk2", [&, dw, q8, batch, m, k](float* y) {
+    LaunchW8A8W32<128, 64, 2, 4, 2>(dw, q8, y, batch, m, k);
+  });
+  run_candidate("w32 blk 2x4 bk2", [&, dw, q8, batch, m, k](float* y) {
+    LaunchW8A8W32<128, 128, 2, 2, 4>(dw, q8, y, batch, m, k);
+  });
+  run_candidate("w32 blk 64m bk4", [&, dw, q8, batch, m, k](float* y) {
+    LaunchW8A8W32<64, 128, 4, 4, 2>(dw, q8, y, batch, m, k);
+  });
+  run_candidate("w32 kq 4x2 bk2", [&, dw, q8, batch, m, k](float* y) {
+    LaunchKQuantW32<128, 128, 2, 4, 2>(dw, q8, y, batch, m, k);
+  });
+  run_candidate("w32 kq 2x4 bk2", [&, dw, q8, batch, m, k](float* y) {
+    LaunchKQuantW32<128, 128, 2, 2, 4>(dw, q8, y, batch, m, k);
+  });
+
+  CHECK(hipFree(dw));
+  CHECK(hipFree(dx));
+  CHECK(hipFree(y_ref));
+  CHECK(hipFree(y_cand));
+  CHECK(hipFree(q8));
+  CHECK(hipFree(d_mismatch));
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IOLBF, 0);
   const int reps = argc > 1 ? std::atoi(argv[1]) : 20;
-  const std::size_t batch = argc > 2 ? std::atol(argv[2]) : 2048;
+  std::vector<std::size_t> batches;
+  if (argc > 2) {
+    for (int i = 2; i < argc; ++i) batches.push_back(std::atol(argv[i]));
+  } else {
+    batches = {512, 2048, 4096};
+  }
   std::mt19937 rng(1234);
-  const Shape shapes[] = {
-      {"attn_q    ", 4096, 2048}, {"attn_out  ", 2048, 4096},
-      {"shexp_gate", 1024, 2048}, {"shexp_up  ", 1024, 2048},
-      {"shexp_down", 2048, 1024}, {"attn_k    ", 512, 2048},
-      {"dense_gate", 6144, 2048},
+  const char* shapes = std::getenv("FLINT_W8A8_SHAPES");
+  const auto want = [&](const char* label) {
+    return shapes == nullptr || std::strstr(shapes, label) != nullptr;
   };
-  std::printf("batch=%zu reps=%d\n", batch, reps);
-  for (const Shape& s : shapes) {
-    auto w = MakeQ8Weights(s.m, s.k, rng);
-    std::vector<float> x(batch * s.k);
-    std::uniform_real_distribution<float> xd(-3.f, 3.f);
-    for (float& e : x) {
-      e = xd(rng);
-    }
-    void* dw;
-    float *dx, *y1, *y2;
-    CHECK(hipMalloc(&dw, w.size() * sizeof(Q8Block)));
-    CHECK(hipMemcpy(dw, w.data(), w.size() * sizeof(Q8Block),
-                    hipMemcpyHostToDevice));
-    CHECK(hipMalloc(&dx, x.size() * sizeof(float)));
-    CHECK(hipMemcpy(dx, x.data(), x.size() * sizeof(float),
-                    hipMemcpyHostToDevice));
-    CHECK(hipMalloc(&y1, batch * s.m * sizeof(float)));
-    CHECK(hipMalloc(&y2, batch * s.m * sizeof(float)));
-    const std::size_t q8_bytes = hipk::Q8ActTiledBytes(batch, s.k);
-    void* q8;
-    CHECK(hipMalloc(&q8, q8_bytes));
-
-    const std::size_t row_bytes = (s.k / 32) * sizeof(Q8Block);
-    const double flops = 2.0 * batch * s.m * s.k;
-    const double ms_mmq =
-        TimeIt([&] {
-          flint::Gemm(dw, core::GgmlType::kQ8_0,
-                      static_cast<std::uint32_t>(s.m),
-                      static_cast<std::uint32_t>(s.k), row_bytes, dx, y1,
-                      static_cast<std::uint32_t>(batch), nullptr);
-        }, reps);
-    // Quantize-activation cost alone (paid once per distinct input at
-    // integration; q/k/v and gate/up share it).
-    const double ms_q =
-        TimeIt([&] {
-          hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k,
-                                                     nullptr);
-        }, reps);
-    const double ms_w8 =
-        TimeIt([&] {
-          hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k,
-                                                     nullptr);
-          hipk::LaunchBatchedQuantGEMMPreQuantized(
-              core::GgmlType::kQ8_0, dw, q8, y2, batch, s.m, s.k, nullptr);
-        }, reps);
-    // GEMM-only schedules sharing the prepared activation tile.
-    const double cfg_a =
-        TimeIt([&] { LaunchCfg<128, 128, 2, 2, 2>(dw, q8, y2, batch, s.m,
-                                                  s.k, nullptr); },
-               reps);
-    const double cfg_b =
-        TimeIt([&] { LaunchCfg<64, 128, 2, 2, 2>(dw, q8, y2, batch, s.m,
-                                                 s.k, nullptr); },
-               reps);
-    const double cfg_c =
-        TimeIt([&] { LaunchCfg<32, 128, 2, 2, 2>(dw, q8, y2, batch, s.m,
-                                                 s.k, nullptr); },
-               reps);
-    const double cfg_d =
-        TimeIt([&] { LaunchCfg<16, 64, 2, 1, 4>(dw, q8, y2, batch, s.m, s.k,
-                                                nullptr); },
-               reps);
-    // Wave layouts used by the sibling qwen38 Q8_0 wave64 route (4x1) and
-    // its (4,2) variant; Flint's shared launcher pins Q8_0 to the (2,2)
-    // schedule inherited from Qwen27B's qualified tuning.
-    const double cfg_e =
-        TimeIt([&] { LaunchCfg<128, 128, 2, 4, 1>(dw, q8, y2, batch, s.m,
-                                                  s.k, nullptr); },
-               reps);
-    // Bit-parity of the (4,1) schedule against the shipped (2,2) schedule.
-    float* y3 = nullptr;
-    std::size_t word_diff = 0;
-    double word_max = 0.0;
-    if (hipMalloc(&y3, batch * s.m * sizeof(float)) == hipSuccess) {
-      hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k, nullptr);
-      LaunchCfg<128, 128, 2, 2, 2>(dw, q8, y3, batch, s.m, s.k, nullptr);
-      CHECK(hipDeviceSynchronize());
-      LaunchCfg<128, 128, 2, 4, 1>(dw, q8, y2, batch, s.m, s.k, nullptr);
-      CHECK(hipDeviceSynchronize());
-      std::vector<float> oa(batch * s.m), ob(batch * s.m);
-      CHECK(hipMemcpy(oa.data(), y3, oa.size() * 4, hipMemcpyDeviceToHost));
-      CHECK(hipMemcpy(ob.data(), y2, ob.size() * 4, hipMemcpyDeviceToHost));
-      for (std::size_t i = 0; i < oa.size(); ++i) {
-        if (std::memcmp(&oa[i], &ob[i], 4) != 0) {
-          ++word_diff;
-          word_max = std::max(word_max, std::fabs(double(oa[i]) - ob[i]));
-        }
-      }
-      CHECK(hipFree(y3));
-    }
-    // Fused gate/up + SwiGLU + Q8_1 epilogue (shared-expert / dense-FFN
-    // pair) against the shipped chain (two GEMMs + SiLU + requantize; the
-    // SiLU kernel itself is omitted, ~0.2 ms per pass at pp2048).
-    double ms_fused = -1.0, ms_pair = -1.0;
-    const std::size_t fused_cap = hipk::QuantizedActivationBytes(batch, s.m);
-    if (hipk::IsFusedSwiGluGemmEpilogueSupported(core::GgmlType::kQ8_0, batch,
-                                                 s.m, fused_cap)) {
-      void* dw2 = nullptr;
-      void* q8o = nullptr;
-      float* yg = nullptr;
-      CHECK(hipMalloc(&dw2, w.size() * sizeof(Q8Block)));
-      CHECK(hipMemcpy(dw2, w.data(), w.size() * sizeof(Q8Block),
-                      hipMemcpyHostToDevice));
-      CHECK(hipMalloc(&q8o, fused_cap));
-      CHECK(hipMalloc(&yg, batch * s.m * sizeof(float)));
-      ms_fused = TimeIt(
-          [&] {
-            hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k,
-                                                       nullptr);
-            hipk::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
-                core::GgmlType::kQ8_0, dw, dw2, q8, yg, q8o, batch, s.m, s.k,
-                nullptr);
-          },
-          reps);
-      ms_pair = TimeIt(
-          [&] {
-            hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k,
-                                                       nullptr);
-            LaunchCfg<128, 128, 2, 2, 2>(dw, q8, y1, batch, s.m, s.k,
-                                         nullptr);
-            LaunchCfg<128, 128, 2, 2, 2>(dw2, q8, y2, batch, s.m, s.k,
-                                         nullptr);
-            hipk::LaunchQuantizeActivationQ8_1FromFp32(y2, q8o, batch, s.m,
-                                                       nullptr);
-          },
-          reps);
-      CHECK(hipFree(dw2));
-      CHECK(hipFree(q8o));
-      CHECK(hipFree(yg));
-    }
-
-    // Numerical comparison against mmq as reference (both are int8-act).
-    // Re-run the shipped schedule once so y2 holds a schedule whose output
-    // layout is known-good, not the last config swept.
-    hipk::LaunchQuantizeActivationQ8_1FromFp32(dx, q8, batch, s.k, nullptr);
-    CHECK(hipDeviceSynchronize());
-    LaunchCfg<128, 128, 2, 2, 2>(dw, q8, y2, batch, s.m, s.k, nullptr);
-    CHECK(hipDeviceSynchronize());
-    std::vector<float> o1(batch * s.m), o2(batch * s.m);
-    CHECK(hipMemcpy(o1.data(), y1, o1.size() * 4, hipMemcpyDeviceToHost));
-    CHECK(hipMemcpy(o2.data(), y2, o2.size() * 4, hipMemcpyDeviceToHost));
-    // Host fp32 reference for the first three elements under both candidate
-    // out indexings: token-major y[idx] = x[idx / m] . w[idx % m] vs
-    // row-major y[idx] = x[idx % batch] . w[idx / batch].
-    auto Dot = [&](const float* xr, const std::uint8_t* wr) {
-      double sacc = 0.0;
-      for (std::size_t b = 0; b < s.k / 32; ++b) {
-        float dq;
-        std::memcpy(&dq, wr + b * 36, 4);
-        for (int q = 0; q < 32; ++q) {
-          sacc += static_cast<double>(dq) *
-                  static_cast<int>(
-                      static_cast<signed char>(wr[b * 36 + 4 + q]));
-        }
-      }
-      double acc = 0.0;
-      for (std::size_t j = 0; j < s.k; ++j) acc += static_cast<double>(xr[j]) * sacc;
-      return acc;
-    };
-    const auto* wbytes = reinterpret_cast<const std::uint8_t*>(w.data());
-    auto RefTok = [&](std::size_t p) {
-      return Dot(&x[(p / s.m) * s.k], wbytes + (p % s.m) * (s.k / 32) * 36);
-    };
-    auto RefRow = [&](std::size_t p) {
-      return Dot(&x[p % batch], wbytes + (p / batch) * (s.k / 32) * 36);
-    };
-    std::printf(
-        "  [diag] idx0 o1=%.2f o2=%.2f refTok=%.2f refRow=%.2f | "
-        "idx1 o1=%.2f o2=%.2f refTok=%.2f refRow=%.2f\n",
-        o1[0], o2[0], RefTok(0), RefRow(0), o1[1], o2[1], RefTok(1),
-        RefRow(1));
-    double se = 0.0, ref = 0.0;
-    std::size_t nan1 = 0, nan2 = 0;
-    for (std::size_t i = 0; i < o1.size(); ++i) {
-      if (!std::isfinite(o1[i])) ++nan1;
-      if (!std::isfinite(o2[i])) ++nan2;
-      const double d = o2[i] - o1[i];
-      se += d * d;
-      ref += static_cast<double>(o1[i]) * o1[i];
-    }
-    std::printf(
-        "%s m=%5zu k=%5zu mmq %7.3f(%5.1fTF) q=%.3f w8full %7.3f(%5.1fTF) "
-        "cfg128x128 %7.3f cfg64x128 %7.3f cfg32x128 %7.3f cfg16x64 %7.3f "
-        "cfg41 %7.3f par41=%zu/%.4f "
-        "fusedSwiGLU %7.3f pair %7.3f  "
-        "rms=%.5f nnan=%zu/%zu\n",
-        s.name, s.m, s.k, ms_mmq, flops / (ms_mmq * 1e9), ms_q, ms_w8,
-        flops / (ms_w8 * 1e9), cfg_a, cfg_b, cfg_c, cfg_d, cfg_e,
-        word_diff, word_max, ms_fused, ms_pair,
-        std::sqrt(se / std::max(ref, 1.0)), nan2, o1.size());
-    CHECK(hipFree(dw));
-    CHECK(hipFree(dx));
-    CHECK(hipFree(y1));
-    CHECK(hipFree(y2));
-    CHECK(hipFree(q8));
+  for (std::size_t batch : batches) {
+    if (want("attn_q")) RunShape("attn_q  ", 4096, 2048, batch, reps, rng);
+    if (want("attn_out")) RunShape("attn_out", 2048, 4096, batch, reps, rng);
+    if (want("shexp_gu")) RunShape("shexp_gu", 1024, 2048, batch, reps, rng);
+    if (want("shexp_dn")) RunShape("shexp_dn", 2048, 1024, batch, reps, rng);
+    if (want("ffn_gu")) RunShape("ffn_gu  ", 6144, 2048, batch, reps, rng);
+    if (want("ffn_dn")) RunShape("ffn_dn  ", 2048, 6144, batch, reps, rng);
   }
   return 0;
 }

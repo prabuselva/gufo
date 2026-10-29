@@ -554,6 +554,16 @@ pair in one tool call (AGENTS protocol).
               0.41 ms at the pp2048 shape; one exclusive session: gate
               tests (engine/rocm.forward/attention.op) all pass, pp2048
               2778.63 / 2760.90, pp8192 2246.51.
+            - [x] C8b W8A8 tile-config matrix (`tools/bench/
+              flint_w8a8_bench.hip`, 16 configs × six dense shapes ×
+              batch {512,2048,4096}, all bitwise identical to the shipped
+              wave-64 output): wave-32 128×128 4×2 wins tall shapes at
+              prefill batch (+3.5..+5.8 % kernel-level), adopted via
+              `TryLaunchQuantPrefillWave32` behind that shape gate; e2e
+              effect matched-run noise (pp2048 2776.90/2790.32, pp8192
+              2238.33/2248.36), no regression, gate tests pass
+              (artifacts `flint-c8b-w8a8-config-matrix.log`,
+              `flint-c8b-adoption.log`).
 
 ## Design notes
 
