@@ -442,10 +442,36 @@ pair in one tool call (AGENTS protocol).
            copy that sank the register prefetch below the stores ran one
            tile stale and mismatched everywhere; the prefetch must stay
            at the top feeding the same iteration's stores.) Attention
-           scheduling stands as shipped; both probes reproduce via
-           `/tmp/flint_attn_probe configs`-style rebuild
-           (`--offload-arch=gfx1151`).
-         - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
+            scheduling stands as shipped; both probes reproduce via
+            `/tmp/flint_attn_probe configs`-style rebuild
+            (`--offload-arch=gfx1151`).
+          - [x] C7u activation-quantize float4 (adopted). Fresh pp8192
+            profile (exclusive): `QuantizeActivationToQ8_1Kernel` 588
+            calls, 263.66 ms — 3.2 % of prefill GPU time — one FP32
+            element per thread (one wavefront per 32-element block),
+            running at only ~165-195 GB/s of the ~230 GB/s copy
+            ceiling in-process (`tools/bench/flint_quant_probe.hip`).
+            Adopted variant `QuantizeActivation4ToQ8_1Kernel`: one
+            wavefront owns four blocks through one `float4` per lane;
+            block `lane / 8` holds elements `4 * (lane % 8) + j`, so its
+            max is a three-step `fmaxf` butterfly and the q-sum a
+            three-step int butterfly. Max, int sums and the per-element
+            `d`/`id`/`roundf` math are order-independent and exact, so
+            every q byte, scale and sidecar is bit-identical to the old
+            kernel — the probe verifies byte equality over the tiled
+            payload, sidecar and tail guard on six shapes incl. a
+            zero-block (`d == 0`) and ±1e30 lanes (mismatches=0), at
+            -25 % to -55 %: 0.261 -> 0.195 ms @4096x2048, 0.540 ->
+            0.382 ms @4096x4096. Dispatched from
+            `LaunchQuantizeActivationQ8_1FromFp32` when `k % 128 == 0`
+            and the input is 16-byte aligned; the old kernel remains for
+            every other shape. Gates 3/3 exclusive (c7ugate). Release
+            bench (exclusive, interleaved c7uab): pp2048 median
+            2641.55 -> 2679.65 (+1.4 %), pp8192 median 2131.7 -> 2145.8
+            (+0.7 %, candidate ahead in every pair), pp16384 1604.5 ->
+            1608.7 (+0.3 %); tg128 untouched (decode is below the W8A8
+            batch floor and never reaches the quantizer).
+          - [ ] C7 GPU benchmark sweep vs baseline table above; BENCHMARKS.md /
      QUALITY.md / EXPERIMENTS.md + docs/models/README.md row.
 
 ## Design notes
