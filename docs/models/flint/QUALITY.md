@@ -49,5 +49,13 @@ env GUFO_FLINT_GGUF=<flint-Q8_0.gguf> ctest --test-dir build/gpu-test \
 - Fused-kernel quality gates (C7v): probe `flint_norm_probe` reports
   mismatches=0 across 9 batches; the Q8_1 MoE tiers are checked
   bitwise-stable by the route benches' `--save`/`--ref` compares.
+- C9 KV W8A8 dispatch (rev `0371a1fd` + dispatch, binary prefix
+  `d02818172e3b29df`): outputs are byte-identical to `0371a1fd` below
+  batch 1024 (850-token `flint_logits_probe` control), so the agreement
+  point above (batch 22) and every bitwise contract are untouched by
+  construction; at 2116 prompt tokens the greedy trajectory diverges at
+  a 0.23-margin near-tie top-1 with magnitude no larger than a
+  layer-0-only control — the int8 accumulation-order class shipped
+  since C7m (statistics in `artifacts/flint-c9-kv-w8a8-adoption.log`).
 - No hosted functional (HTTP) profile exists for Flint yet; serve parity
   beyond the single-session C5 runner is an open gap, not a pass.

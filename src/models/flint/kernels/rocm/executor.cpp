@@ -405,8 +405,13 @@ namespace {
 /// qualifying Flint projection; the tiled activation must be prepared with
 /// LaunchQuantizeActivationQ8_1FromFp32 into a QuantizedActivationBytes
 /// buffer first (see State::qa8/ao8/qd8).
+/// C9: rows 512 (the kv projections) join from batch 1024 - the
+/// flint_w8a8_bench matrix (tools/bench/flint_w8a8_bench.hip, attn_kv
+/// 512x2048) times mmq at -12..-29 % relative to W8A8 at batch >= 1024,
+/// while mmq still wins +53 % at batch 512, which keeps the mmq tier.
 [[nodiscard]] bool W8A8Eligible(const TensorRef& w, std::uint32_t batch) {
-  return w.type == core::GgmlType::kQ8_0 && batch >= 96U && w.rows >= 1024U &&
+  const bool rows_ok = w.rows >= 1024U || (w.rows >= 512U && batch >= 1024U);
+  return w.type == core::GgmlType::kQ8_0 && batch >= 96U && rows_ok &&
          w.cols >= 1024U && (w.cols % 256U) == 0U;
 }
 
@@ -550,8 +555,15 @@ bool FlintExecutor::Forward(const std::int32_t* tokens, std::uint32_t count,
       }
     }
     Project(l.attn_q, st->normed, st->q, B, stream, q8_ok ? st->qa8 : nullptr);
-    Project(l.attn_k, st->normed, st->k, B, stream);
-    Project(l.attn_v, st->normed, st->v, B, stream);
+    // C9: the same tiled Q8_1 copy feeds the kv projections once W8A8
+    // qualifies for their 512 rows (batch >= 1024), dropping the per-layer
+    // mmq GEMM and the two extra activation encodes it performed on these
+    // rows. q8_ok guards the buffer (attn_q's eligibility implies it for
+    // every kv shape that passes the gate).
+    const bool kv8_ok =
+        q8_ok && W8A8Eligible(l.attn_k, B) && W8A8Eligible(l.attn_v, B);
+    Project(l.attn_k, st->normed, st->k, B, stream, kv8_ok ? st->qa8 : nullptr);
+    Project(l.attn_v, st->normed, st->v, B, stream, kv8_ok ? st->qa8 : nullptr);
     rocm::QkEpilogue(
         st->q, st->k, st->v, static_cast<const float*>(l.attn_q_norm.data),
         static_cast<const float*>(l.attn_k_norm.data), c.rms_eps, c.rope_theta,

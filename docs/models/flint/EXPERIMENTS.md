@@ -57,6 +57,25 @@ commands and matched numbers live in the numbered entries of
   without the activation-sum sidecar; production uses
   `QuantizedActivationBytes`, which includes it).
   Artifacts `flint-c8b-w8a8-config-matrix.log`, `flint-c8b-adoption.log`.
+- C9 int8 W8A8 attention K/V prefill projections: `W8A8Eligible` extended
+  with `rows >= 512 && batch >= 1024`, and `kv8_ok` reuses attn_q's
+  pre-quantized `qa8` sidecar for attn_k/attn_v. At the 512×2048 kv shape
+  the shipped tier beats mmq by 52/30/54 % at batch {1024,2048,4096}
+  (0.222 → 0.155 ms at 2048), while mmq wins +53 % at batch
+  512, hence the batch gate; maxrel≈1.0e-04, relL2≈5e-6 against the bench's
+  exact same-quantization reference (`tools/bench/flint_w8a8_bench.hip`).
+  E2E pp2048 2842.47/2851.07 (+2.3/+2.6 %), pp8192 2282.92 (+1.6 %),
+  pp16384 1703.15 (+4.6 % — every 4096-token chunk dispatches it), tg
+  unchanged; three gate tests clean. Outputs are byte-identical below
+  batch 1024 (850-token probe control), so every bitwise contract keeps
+  its range. At 2116 tokens the greedy trajectory flips at a 0.23-margin
+  near-tie top-1 with the same magnitude as a *layer-0-only* variant —
+  whose chain matches full-C9 exactly — i.e. the int8 accumulation-order
+  class already shipped since C7m, nothing new. The same bench run fixed
+  a packed-weight-layout bug in the bench itself (36-byte float-scale
+  blocks against the kernels' 34-byte `block_q8_0`) that had corrupted
+  earlier runs with deterministic NaNs; kernel timings were unaffected.
+  Artifacts `flint-c9-kv-w8a8-matrix.log`, `flint-c9-kv-w8a8-adoption.log`.
 
 ## Rejected / investigated, no adoptable lever
 

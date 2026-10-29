@@ -564,6 +564,18 @@ pair in one tool call (AGENTS protocol).
               2238.33/2248.36), no regression, gate tests pass
               (artifacts `flint-c8b-w8a8-config-matrix.log`,
               `flint-c8b-adoption.log`).
+            - [x] C9 int8 W8A8 attn_k/attn_v prefill projections:
+              `W8A8Eligible` extended with `rows >= 512 && batch >= 1024`
+              and `kv8_ok` reuses attn_q's `qa8` sidecar. Kernel-level
+              wins 52/30/54 % at batch {1024,2048,4096} (mmq keeps batch
+              512, +53 %); E2E pp2048 2842.47/2851.07 (+2.5 %), pp8192
+              2282.92 (+1.6 %), pp16384 1703.15 (+4.6 %), tg1 unchanged.
+              Gate tests pass; byte-identical outputs below batch 1024
+              (850-token control), and the 2116-token probe A/B diverges
+              only at the shipped int8 accumulation-order class (a
+              layer-0-only variant flips the same near-tie top-1 and
+              matches the full-C9 chain). Artifacts
+              `flint-c9-kv-w8a8-{matrix,adoption}.log`.
 
 ## Design notes
 
