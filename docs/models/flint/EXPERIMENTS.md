@@ -128,6 +128,21 @@ commands and matched numbers live in the numbered entries of
   measured stall share: removing all three in-loop barriers (invalid
   timing-only probe) buys only 8-12 % of kernel time, so an LDS-doubling
   residency trade cannot pay for itself.
+- C11 attention prefetch depth 2 (bit-identical K/V double-ahead staging
+  in a bench clone of the shipped kernel) — rejected:
+  bitwise-clean but -17 % slower (windowed 3.05 to 3.58 ms, full 7.83 to
+  9.25 ms); the staging latency is not the off-roofline term.
+- C12 gate/up weight prefetch ring in `RoutedHalfDownKernel` — rejected.
+  A bit-identical ring-depth knob (1..4 LDS row buffers plus register
+  slots, `tools/bench/flint_moe_down_probe.hip`) is -21 %/-25 % faster
+  than the shipped depth-1 pipeline at the probe's token-heavy
+  [gate|up] shapes, but the same rings measured end-to-end give no win
+  anywhere (-0.9 % to +0.1 % across ring depths 2 and 3 at
+  pp2048..pp16384 even though the geglu kernel total in a pp2048
+  profile improves 2.8 % at ring 2: the probe shapes are token-heavy
+  compared to production geglu tiles, and the ring's LDS growth (28.6
+  to 38.9/49.2 KB) trades residency the shipped shapes need. Confirms
+  C7s: geglu stays at ring depth 1.
 - C7w prefill chunk 4096 → 8192: the grouped route is not per-chunk
   weight-read floor-bound; pp8192 flat (−0.3 %), pp16384 −0.8 % across
   all matched rounds; 4096 stays.
