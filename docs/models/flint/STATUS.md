@@ -614,8 +614,18 @@ pair in one tool call (AGENTS protocol).
               sit at the same DRAM roofline (C13) and attention
               mechanisms are measured out (C7r/C10/C11); closing it
               needs the C9-quality class (SumExperts fused into the
-              down epilogue changes the reduction order). Artifact
-              `flint-c14-sumexperts-stream.log`.
+               down epilogue changes the reduction order). Artifact
+               `flint-c14-sumexperts-stream.log`.
+             - [x] C15 fused down-epilogue accumulation (the C14
+               follow-up candidate) rejected by exclusive measurement
+               before any production or quality work: 6-way per-element
+               f32 `atomicAdd` into the pp2048 `x` chunk costs +142 %
+               (704.5 → 1705.5 µs per layer piece,
+               `tools/bench/flint_fuse_sumexp_probe.hip`) instead of
+               staying L2-resident. The grouped-route data-movement
+               contract is closed; 2960.56 pp2048 stands without a
+               quality-class change. Artifact
+               `flint-c15-fused-atomic-rejected.log`.
 
 ## Design notes
 

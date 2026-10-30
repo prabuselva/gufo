@@ -179,7 +179,20 @@ commands and matched numbers live in the numbered entries of
   production for this kernel). Second recurrence of the C12
   probe-versus-production lesson: token-tile sizing and prefetch depth
   are both closed for `RoutedHalfDownKernel`. Artifact
-  `flint-c13-geglu-tile-rejected.log`.
+   `flint-c13-geglu-tile-rejected.log`.
+- C15 fused down-epilogue accumulation in place of `SumExperts` —
+  rejected by a standalone atomic-RMW probe before any production or
+  quality-evidence work. The fusion needs no new metadata
+  (`moe_rows_slot` already indexes weights), so the open risk was
+  whether 6-way per-element `atomicAdd` f32 into the 16.8 MB prefill
+  chunk of `x` would stay L2-resident or degenerate into RMW traffic.
+  Measured on `tools/bench/flint_fuse_sumexp_probe.hip` exclusive
+  (B=2048, H=2048, top-6 of 256, expert-sorted compact order):
+  shipped store+sum contract K1+K2 = 704.5 us (236.6 + 468.0,
+  consistent with C14's production averages) vs fused epilogue +
+  shared add K3+K4 = 1705.5 us — +142 %; atomics act as serialized
+  read-modify-write, not coalesced writes. Fusion contract closed for
+  the grouped route. Artifact `flint-c15-fused-atomic-rejected.log`.
 
 ## Known open levers (measured cost, not yet attacked)
 
@@ -189,7 +202,8 @@ commands and matched numbers live in the numbered entries of
   projections (~85 ms per pp8192 profile); a shared pre-encoded sidecar
   in the mmq layout is untried.
 - The grouped route's geglu and down kernels stream sparse weight rows
-  at the ~190-200 GB/s roofline at pp2048 (C13); only changing the data
-  movement contract, not the tile schedule, can move them — e.g. folding
-  `SumExperts` into the down epilogue, which needs the quality-evidence
-  class like C9.
+  at the ~190-200 GB/s roofline at pp2048 (C13), and the one alternative
+  data-movement contract that remained — folding `SumExperts` into the
+  down epilogue with atomic accumulation — measured +142 % exclusive
+  (C15). The grouped-route data movement is closed; further prefill
+  gains must come from elsewhere.
