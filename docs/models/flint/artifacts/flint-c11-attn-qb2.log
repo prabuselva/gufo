@@ -1,0 +1,53 @@
+# C11 WMMA attention <8,2> query-block config -- evidence (2026-10-30)
+
+## Kernel config sweep, bitwise vs shipped <2,4> (flint_attn_wmma_bench)
+windowed513  cfg <1,8>     6.716 ms  mismatches=0
+windowed513  cfg <2,4>     4.804 ms  mismatches=0
+windowed513  cfg <4,2>     3.916 ms  mismatches=0
+windowed513  cfg <8,1>     3.286 ms  mismatches=0
+windowed513  cfg <8,2>     3.089 ms  mismatches=0
+full         cfg <1,8>    10.836 ms  mismatches=0
+full         cfg <2,4>     9.537 ms  mismatches=0
+full         cfg <4,2>     8.868 ms  mismatches=0
+full         cfg <8,1>     8.465 ms  mismatches=0
+full         cfg <8,2>     7.946 ms  mismatches=0
+BITWISE OK
+
+## Barrier-removal diagnostic (<8,2>; NB=INVALID timing-only probe)
+windowed513  cfg <1,8>     6.680 ms  mismatches=0
+windowed513  cfg <2,4>     4.797 ms  mismatches=0
+windowed513  cfg <4,2>     3.835 ms  mismatches=0
+windowed513  cfg <8,1>     3.368 ms  mismatches=0
+windowed513  cfg <8,2>     3.080 ms  mismatches=0
+windowed513  cfg NB<8,2>    2.821 ms  mismatches=0
+windowed513  cfg =<8,2>    3.118 ms  mismatches=0
+full         cfg <1,8>    10.768 ms  mismatches=0
+full         cfg <2,4>     9.495 ms  mismatches=0
+full         cfg <4,2>     8.796 ms  mismatches=0
+full         cfg <8,1>     8.501 ms  mismatches=0
+full         cfg <8,2>     7.939 ms  mismatches=0
+full         cfg NB<8,2>    6.945 ms  mismatches=0
+full         cfg =<8,2>    7.701 ms  mismatches=0
+BITWISE OK
+
+## Gates (candidate, exclusive GPU): all bitwise oracles
+1/3 Test #249: flint.engine .....................   Passed   13.30 sec
+2/3 Test #250: flint.rocm.forward ...............   Passed   12.57 sec
+3/3 Test #251: flint.attention.op ...............   Passed    8.92 sec
+100% tests passed out of 3
+
+## Matched e2e (candidate c11time)
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2893.14 ± 1.80 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         46.02 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2403.31 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         45.90 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp16384 |       1797.72 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         46.08 ± 0.00 |
+
+## Matched e2e (same-afternoon control = C10 tree, file stashed + rebuilt)
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2887.75 ± 7.24 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         45.21 ± 0.12 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2311.78 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         45.30 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp16384 |       1712.85 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         46.10 ± 0.00 |

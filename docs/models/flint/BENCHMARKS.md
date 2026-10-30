@@ -38,22 +38,26 @@ rows are incremental 512-token prefills, not whole-prompt rate.
 
 | prompt tokens | pp (tok/s) | tg128 (tok/s) |
 |--------------:|-----------:|-------------:|
-| 2048    | 2858.40 | 42.01 |
-| 8192    | 2298.76 | 41.19 |
-| 16384   | 1723.65 | 42.69 |
+| 2048    | 2893.14 | 42.01 |
+| 8192    | 2403.31 | 41.19 |
+| 16384   | 1797.72 | 42.69 |
 | 32768   | 1077.38 | 42.66 |
 | 65536   |  642.31 | 42.22 |
 | 131072  |  332.55 | 42.37 |
 
-The 2048/8192/16384 rows were re-measured after the C10 QkEpilogue
-8-token walk (+0.8/+1.0/+1.9 % matched against the same-morning pre-C10
-control 2836.80 / 2276.36 / 1692.00; the C9 record 2842.47/2851.07,
-2282.92, 1703.15 sat ~0.3 % above that control — session-anchored
-deltas, not overlap). Earlier lineage: C9 replaced 2778.63 / 2246.51 /
-1628.35 (+2.3/+1.6/+4.6 %), which had replaced the C8a 2677.90 / 2159.85;
-the remaining rows are still at the C7v-revision measurements. tg128
-columns stay at their original measurements (decode paths untouched by
-C7-C10; C10 samples tg1 43.4-45.7). The
+The 2048/8192/16384 rows were re-measured after the C11 WMMA attention
+`<8, 2>` query-block config (+4.0/+5.0 % on the deterministic 8192 and
+16384 runs over the same-afternoon rebuilt pre-C11 control
+2887.75 / 2311.78 / 1712.85; pp2048 +0.2 % inside its ±7.2 r2 noise).
+Prior C10 lineage: 2858.40 / 2298.76 / 1723.65 (+0.8/+1.0/+1.9 % matched
+against the same-morning pre-C10 control 2836.80 / 2276.36 / 1692.00;
+the C9 record 2842.47/2851.07, 2282.92, 1703.15 sat ~0.3 % above that
+control — session-anchored deltas, not overlap). Earlier lineage: C9
+replaced 2778.63 / 2246.51 / 1628.35 (+2.3/+1.6/+4.6 %), which had
+replaced the C8a 2677.90 / 2159.85; the remaining rows are still at the
+C7v-revision measurements. tg128 columns stay at their original
+measurements (decode paths untouched by C7-C11; C11 samples tg1
+43.4-46.1). The
 whole-prompt rate falls with prompt length because the global
 (sliding-window-off) layers attend the whole prefix; the per-chunk MoE and
 GEMM tiers are flat (chunk 8192 trial C7w changed nothing — see

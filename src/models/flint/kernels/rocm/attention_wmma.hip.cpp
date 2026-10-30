@@ -170,19 +170,22 @@ __global__ void __launch_bounds__(32 * kHeads * kQueryBlocks)
   const auto* v_cache = a.v_cache;
   const std::size_t kv_stride = a.kv_stride;
 
-  // Each thread stages one 8-half chunk of K and V per tile (kChunks ==
-  // kThreads for D = 128); the next tile's chunks load into registers while
-  // the current one computes. K chunk: key tid % 16, dims 8 (tid / 16).
+  // Each thread stages one 8-half chunk of K and V per tile (exactly 256
+  // chunks: 16 keys x 16 dim chunks); the next tile's chunks load into
+  // registers while the current one computes. K chunk: key tid % 16, dims
+  // 8 (tid / 16). Blocks with more than 8 row blocks reuse one staged tile
+  // across more query rows, so only the first 256 lanes stage.
   const std::uint32_t chunk_key = tid & (kKeys - 1);
-  const std::uint32_t chunk_d8 = (tid >> 4) * 8;
-  const __half* const key_base = k_cache + kv_head * kD + chunk_d8;
+  const std::uint32_t chunk_d8 = ((tid >> 4) & (kD / 8 - 1)) * 8;
+  const bool staging = kThreads == 256U ? true : tid < 256U;
+  const auto* key_base = k_cache + kv_head * kD + chunk_d8;
   uint4 k_next;
   uint4 v_next;
   const auto fetch = [&](std::uint32_t key0) {
     const std::uint32_t position = key0 + chunk_key;
     k_next = make_uint4(0U, 0U, 0U, 0U);
     v_next = make_uint4(0U, 0U, 0U, 0U);
-    if (position < block_hi) {
+    if (staging && position < block_hi) {
       k_next = *reinterpret_cast<const uint4*>(
           key_base + static_cast<std::size_t>(position) * kv_stride);
       v_next = *reinterpret_cast<const uint4*>(
@@ -191,6 +194,9 @@ __global__ void __launch_bounds__(32 * kHeads * kQueryBlocks)
     }
   };
   const auto store_keys = [&] {
+    if (!staging) {
+      return;
+    }
     *reinterpret_cast<uint4*>(&k_lds[chunk_key * kKStride + chunk_d8]) = k_next;
   };
   // V transposed: keys 2m and 2m + 1 pair into 32-bit words. Even and odd
@@ -199,6 +205,9 @@ __global__ void __launch_bounds__(32 * kHeads * kQueryBlocks)
   // key, so lane 2m writes column key/2 of dims 0..3 and lane 2m + 1 dims
   // 4..7.
   const auto store_values = [&] {
+    if (!staging) {
+      return;
+    }
     const bool even = (tid & 1U) == 0;
     const uint4 v = v_next;
     const std::uint32_t send0 = even ? v.z : v.x;
@@ -430,14 +439,16 @@ bool LaunchWmmaAttention(const float* q, const __half* k_cache,
   const WmmaArgs a{q,      k_cache, v_cache,        sinks,        out,
                    scale,  batch,   pos0,           pos0 + batch, window,
                    n_head, n_kv,    kv_row_elements};
-  // Eight heads x one 16-query block: the staged K/V tile serves the whole
-  // GQA group of Flint's 8:1 layout, quartering the staging traffic per
-  // score work. Swept bitwise against <2, 4>, <4, 2> and <1, 8> on the
-  // measured windowed-513 and full-causal pp2048 shapes
-  // (tools/bench/flint_attn_wmma_bench): identical outputs, 31 % faster
-  // windowed, 10 % faster full. <2, 4> remains the fallback for head
-  // counts whose GQA group is smaller than 8.
-  return Launch<8, 1>(a, stream) || Launch<2, 4>(a, stream);
+  // Eight heads x two 16-query blocks: the staged K/V tile serves the whole
+  // GQA group of Flint's 8:1 layout, and the second query block reuses the
+  // same staged tile for another 32 queries while 512 threads keep the
+  // 54.5 KB LDS block within one resident block per CU. Swept bitwise
+  // against <1, 8>, <2, 4>, <4, 2> and <8, 1> on the measured windowed-513
+  // and full-causal pp2048 shapes (tools/bench/flint_attn_wmma_bench):
+  // identical outputs, 9 % faster windowed and 7 % faster full than the
+  // previous <8, 1>. <2, 4> remains the fallback for head counts whose GQA
+  // group is smaller than 8.
+  return Launch<8, 2>(a, stream) || Launch<2, 4>(a, stream);
 }
 
 }  // namespace gufo::models::flint::rocm

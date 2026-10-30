@@ -587,6 +587,19 @@ pair in one tool call (AGENTS protocol).
               pass. pp2048 target 3000 still open (attention 26.3 %, MoE
               down-path ~32 % remain the big stages). Artifact
               `flint-c10-qk-epilogue.log`.
+            - [x] C11 WMMA attention `<8, 2>` query blocks: generalized
+              the C7g `kRowBlocks = 8` staging limit to `kThreads`
+              (guarded stores, byte-identical at 256) and re-swept;
+              `<8, 2>` (512 threads, 54.5 KB LDS) is bitwise-identical
+              again (windowed 3.37 → 3.08 ms, full 8.50 → 7.94 ms vs
+              `<8, 1>`, `tools/bench/flint_attn_wmma_bench`) and became
+              the dispatch default with `<2, 4>` fallback. A timing-only
+              barrier-kill probe showed the three in-loop
+              `__syncthreads` cost only 8-12 %, closing off
+              double-buffered staging. Gates 3/3 bitwise; matched e2e
+              pp8192 +4.0 % (2403.31), pp16384 +5.0 % (1797.72), pp2048
+              +0.2 % within noise (2893.14). Artifact
+              `flint-c11-attn-qb2.log`.
 
 ## Design notes
 

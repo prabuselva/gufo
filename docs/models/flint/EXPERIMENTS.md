@@ -91,6 +91,25 @@ commands and matched numbers live in the numbered entries of
   over the same-morning pre-C10 control (2836.80/2276.36/1692.00 →
   2858.40/2298.76/1723.65), tg unchanged; three gate tests clean and
   bitwise-safe by construction. Artifact `flint-c10-qk-epilogue.log`.
+- C11 WMMA attention `<8, 2>` query blocks: the attention kernel runs at
+  18-25 % of the KV streaming roofline (3.2 ms windowed-513 / 6.5 ms full
+  per layer at pp2048 against ~0.58/~1.13 ms minima), so the shipped
+  `<8, 1>` block shape was re-swept wider after generalizing the 256
+  -thread staging assumption to `kThreads` (guarded `store_keys`/
+  `store_values`, byte-identical at 256). `<8, 2>` (512 threads, 16 row
+  blocks, 54.5 KB LDS) is bitwise-identical to `<2, 4>` on both measured
+  shapes in `tools/bench/flint_attn_wmma_bench` and beat `<8, 1>` by
+  9 % windowed / 7 % full (3.37 → 3.08 and 8.50 → 7.94 ms). A
+  timing-only probe clone in the same bench showed the three in-loop
+  `__syncthreads` cost just 8-12 % (windowed 3.08 → 2.82, full 7.94 →
+  6.95 with barriers removed — invalid numbers, diagnostic only), which
+  rules out double-buffered staging as the missing term. Production
+  dispatch `Launch<8, 2> || Launch<2, 4>`; gates 3/3 bitwise. Matched
+  same-afternoon e2e: pp8192 2311.78 → 2403.31 (+4.0 %) and pp16384
+  1712.85 → 1797.72 (+5.0 %), both single deterministic runs; pp2048
+  2887.75 → 2893.14 (+0.2 %) inside its ±7.2 r2 noise — the global
+  layers that grow with context carry the gain. Artifact
+  `flint-c11-attn-qb2.log`.
 
 ## Rejected / investigated, no adoptable lever
 
@@ -105,6 +124,10 @@ commands and matched numbers live in the numbered entries of
 - C7s gate/up prefetch ring — investigated, no adoptable lever.
 - C7t attention long-context scheduling — investigated, no adoptable
   change; the WMMA partition and read masks stay.
+- C11 barrier double-buffering for attention staging — rejected on the
+  measured stall share: removing all three in-loop barriers (invalid
+  timing-only probe) buys only 8-12 % of kernel time, so an LDS-doubling
+  residency trade cannot pay for itself.
 - C7w prefill chunk 4096 → 8192: the grouped route is not per-chunk
   weight-read floor-bound; pp8192 flat (−0.3 %), pp16384 −0.8 % across
   all matched rounds; 4096 stays.
