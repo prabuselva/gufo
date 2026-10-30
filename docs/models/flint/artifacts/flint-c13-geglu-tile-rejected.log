@@ -45,7 +45,7 @@ chunk 2048 tokens, 12288 slots, 382 tiles
 === [gpu_exclusive] done (benchmark exit 0) ===
 END 2026-10-30T17:02:10+08:00 rc=0
 
-## probe sweep 2 - geglu token tiles 96/64/32 vs shipped reference (chunk 4096: 12.050 ms baseline; chunk 2048: 6.663 ms)
+## probe sweep 2 - geglu token tiles 96/64/32 vs shipped reference (chunk 4096: 12.052 ms baseline; chunk 2048: 6.821 ms)
 START 2026-10-30T17:10:40+08:00 name=c13probe2 inner_timeout=420s pid=22766 pgid=22766
 CMD: /tmp/flint_moe_down_probe
 

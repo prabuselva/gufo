@@ -149,7 +149,7 @@ commands and matched numbers live in the numbered entries of
 - C13 gate/up token tiles 128 → 96/64/32 in `RoutedHalfDownKernel` —
   rejected. A dual tile map (96-row tiles for geglu, 128-row for down)
   is bit-identical (probe bit-diff 0 at every shape; gates 3/3) and the
-  probe sweeps `gateup w+up` from 12.050 → 4.645/5.294/6.592 ms at chunk
+  probe sweeps `gateup w+up` from 12.052 → 4.645/5.294/6.592 ms at chunk
   4096 (−61/−56/−45 %), but matched e2e gives nothing: pp2048
   2893.14 → 2892.61, pp8192 2403.31 → 2385.39, pp16384 1797.72 →
   1789.13, and a profile confirms the 96-row kernel *is* resident with a
