@@ -642,10 +642,14 @@ pair in one tool call (AGENTS protocol).
                43.04/42.95 → 46.15/45.67 (+7.2/+6.3 %), pp2048 flat;
                frontier tg128 re-measure 45.5-45.8 flat at ctx
                2048-16384 (−5.1…+3.5 % vs llama.cpp).
-               Remaining decode lever: k-split geglu/down rows=1
-               kernels (~5.5 ms/token), numeric-quality class.
-               Artifacts `flint-c16b-router-argmax.log`,
-               `flint-c16a-mmq-decode-rejected.log`.
+                C16d roofline audit on the C16b profile closed the
+                remaining lever: geglu streams 13.4 MB in 68 us
+                (197 GB/s, at the DRAM roofline); the down kernel
+                (130 GB/s, 1.7x headroom) is worth at most ~+1.3 t/s
+                and only via numeric-quality split-K, so no bit-safe
+                decode lever >=3 % of token time remains and the
+                campaign stops. Artifacts `flint-c16b-router-argmax.log`,
+                `flint-c16a-mmq-decode-rejected.log`.
 
 ## Design notes
 

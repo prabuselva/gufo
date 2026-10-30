@@ -224,13 +224,21 @@ commands and matched numbers live in the numbered entries of
 
 ## Known open levers (measured cost, not yet attacked)
 
-- Decode at depth ≤ 16 K trailed llama.cpp (41.7–42.4 vs 43.7–47.7 tg);
-  C16b closed most of it (frontier tg128 45.5–45.8 flat, −5.1…+3.5 %
-  over the reference rows). The remaining decode lever is the grouped
-  geglu/down rows=1 kernels: ~118 µs per MoE layer
-  (~5.5 ms per token) at the rows=1 weight-stream floor, attacked only
-  by a k-split expert GEMV that reassociates the reduction —
-  numeric-quality class, not bitwise-safe.
+- Decode roofline audit (C16d) — closed, no further decode campaign.
+  A steady-state decode profile on the C16b build (warm-up cluster
+  excluded; geglu steady median 68.3 µs, no regression vs the
+  pre-C16b control) ranked the remaining per-token time: geglu
+  13.4 MB in 68 µs = 197 GB/s, already at the DRAM roofline; the
+  grouped down kernel is the best remaining headroom at 6.7 MB in
+  52 µs = 130 GB/s (1.7x), worth at most ~15 µs per MoE layer
+  (~0.7 ms/token, ~+1.3 t/s) and only via a split-K expert GEMV that
+  reassociates the reduction — numeric-quality class, not
+  bitwise-safe, for a ≤2 % gain. Router `GemvBf16` (15.0 µs) and
+  `RouterTopK` (~5 µs) are fixed (C16b); q/o/kv/lm_head and the
+  decode attention all sit at or near the rows=1 weight-stream
+  floor. With C16b at frontier tg128 45.5–45.8 (−5.1…+3.5 % over
+  llama.cpp, ahead from ctx 16384) no bit-safe decode lever ≥3 %
+  of token time remains; the campaign stops here.
 - Dense `mul_mat_q` re-encodes its activation per call on the small-col
   projections (~85 ms per pp8192 profile); a shared pre-encoded sidecar
   in the mmq layout is untried.
