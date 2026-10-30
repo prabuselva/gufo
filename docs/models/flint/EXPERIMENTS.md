@@ -75,7 +75,22 @@ commands and matched numbers live in the numbered entries of
   a packed-weight-layout bug in the bench itself (36-byte float-scale
   blocks against the kernels' 34-byte `block_q8_0`) that had corrupted
   earlier runs with deterministic NaNs; kernel timings were unaffected.
-  Artifacts `flint-c9-kv-w8a8-matrix.log`, `flint-c9-kv-w8a8-adoption.log`.
+   Artifacts `flint-c9-kv-w8a8-matrix.log`, `flint-c9-kv-w8a8-adoption.log`.
+- C10 QkEpilogue 8-token walk: the single-token epilogue ran at 54 % of the
+  DRAM model (launch/block overhead + per-token `powf` and cos/sin). One
+  block now walks `kTokensPerBlock = 8` tokens with the block-uniform
+  gamma/frequency/row-base setup hoisted out of the token loop and
+  `sincosf` replacing the cosf/sinf pair; the per-token reduce tree, FP
+  order and rounding are untouched, and
+  `tools/bench/flint_qk_bench.hip` audits both bit-identical whole-buffer
+  output against the shipped kernel at every probed shape (B 1-class..4096)
+  and sincosf-vs-cosf/sinf equality over the full rope domain (theta
+  1e4..5e6, pos < 131072, 0 mismatches). Kernel level 1.44x (rope) / 1.12x
+  (NoPE) at B=2048 → 230 GB/s of the modelled traffic; the pp2048 profile
+  confirms 575.0 → 366.6 µs/call (3.6 % → 2.33 %). Matched e2e +0.8/+1.0/+1.9 %
+  over the same-morning pre-C10 control (2836.80/2276.36/1692.00 →
+  2858.40/2298.76/1723.65), tg unchanged; three gate tests clean and
+  bitwise-safe by construction. Artifact `flint-c10-qk-epilogue.log`.
 
 ## Rejected / investigated, no adoptable lever
 
@@ -101,4 +116,3 @@ commands and matched numbers live in the numbered entries of
 - Dense `mul_mat_q` re-encodes its activation per call on the small-col
   projections (~85 ms per pp8192 profile); a shared pre-encoded sidecar
   in the mmq layout is untried.
-- QkEpilogue ~111 ms per pp8192 profile: not yet analyzed.

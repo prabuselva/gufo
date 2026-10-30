@@ -182,59 +182,89 @@ __global__ void SiluMulKernel(const float* __restrict__ a,
   }
 }
 
+// opt-c10-qk: the epilogue walks kTokensPerBlock tokens per block instead of
+// one, hoisting block-uniform setup (gamma load, rope frequency, row base
+// pointers) out of the token loop and replacing the paired cosf/sinf with
+// sincosf. Every per-token FP operation, the 128-thread reduce tree and the
+// rounding stay identical: tools/bench/flint_qk_bench.hip audits sincosf
+// against cosf/sinf over the full (pos, d, theta) rope domain (0 mismatches
+// for theta 1e4..5e6, pos < 131072) and verifies bit-identical whole-buffer
+// output against the previous kernel at the pp2048/pp4096 and decode shapes,
+// while the 8-token walk cuts blocks per launch 8x and reaches 230 GB/s of
+// the modelled traffic (155 GB/s before; ~239 GB/s measured DRAM ceiling).
 __global__ void QkEpilogueKernel(
     float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ q_gamma, const float* __restrict__ k_gamma,
     float eps, float theta, int rope, std::uint32_t pos0, std::uint32_t n_head,
     std::uint32_t n_kv, std::uint32_t head_dim, __half* __restrict__ k_cache,
-    __half* __restrict__ v_cache, std::uint32_t kv_row) {
-  const std::uint32_t t = blockIdx.y;
+    __half* __restrict__ v_cache, std::uint32_t kv_row, std::uint32_t batch) {
+  constexpr std::uint32_t kTokensPerBlock = 8U;
   const std::uint32_t h = blockIdx.x;
   const bool is_q = h < n_head;
   const std::uint32_t d = threadIdx.x;
-  float* __restrict__ x =
-      is_q ? q + (static_cast<std::size_t>(t) * n_head + h) * head_dim
-           : k + (static_cast<std::size_t>(t) * n_kv + (h - n_head)) * head_dim;
   __shared__ float sm_head[128];
   __shared__ float sm_part[8];
-  const float xv = d < head_dim ? x[d] : 0.0F;
-  float ss = xv * xv;
-  ss = BlockReduceSum(ss, sm_part);
-  const float scale = 1.0F / sqrtf(ss / static_cast<float>(head_dim) + eps);
-  const float* gamma = is_q ? q_gamma : k_gamma;
-  sm_head[d] = xv * scale * gamma[d];
-  __syncthreads();
-  const std::uint32_t pos = pos0 + t;
+
+  float* __restrict__ xbase =
+      is_q ? q + static_cast<std::size_t>(h) * head_dim
+           : k + static_cast<std::size_t>(h - n_head) * head_dim;
+  const std::size_t x_row = is_q ? static_cast<std::size_t>(n_head) * head_dim
+                                 : static_cast<std::size_t>(n_kv) * head_dim;
+  const float* __restrict__ gamma = is_q ? q_gamma : k_gamma;
+  const float gam = d < head_dim ? gamma[d] : 0.0F;
+  float freq = 0.0F;
   if (rope != 0 && d < head_dim / 2) {
-    const float freq = powf(
-        theta, -2.0F * static_cast<float>(d) / static_cast<float>(head_dim));
-    const float angle = static_cast<float>(pos) * freq;
-    const float c = cosf(angle);
-    const float s = sinf(angle);
-    const float a = sm_head[d];
-    const float b = sm_head[d + head_dim / 2];
-    sm_head[d] = a * c - b * s;
-    sm_head[d + head_dim / 2] = a * s + b * c;
+    freq = powf(theta,
+                -2.0F * static_cast<float>(d) / static_cast<float>(head_dim));
   }
-  // The rope threads also rewrite the partner half of the head; the output
-  // threads must not read those lanes until every rotation has landed.
-  __syncthreads();
-  if (is_q) {
-    if (d < head_dim) {
-      x[d] = sm_head[d];
+
+  const std::uint32_t t0 = blockIdx.y * kTokensPerBlock;
+#pragma unroll
+  for (std::uint32_t i = 0; i < kTokensPerBlock; ++i) {
+    const std::uint32_t t = t0 + i;
+    if (t >= batch) {
+      break;  // block-uniform: never skips a barrier
     }
-    return;
-  }
-  const std::uint32_t kvh = h - n_head;
-  __half* __restrict__ krow =
-      k_cache + static_cast<std::size_t>(pos) * kv_row + kvh * head_dim;
-  const float* __restrict__ vrow =
-      v + (static_cast<std::size_t>(t) * n_kv + kvh) * head_dim;
-  __half* __restrict__ vwrite =
-      v_cache + static_cast<std::size_t>(pos) * kv_row + kvh * head_dim;
-  if (d < head_dim) {
-    krow[d] = __float2half_rn(sm_head[d]);
-    vwrite[d] = __float2half_rn(vrow[d]);
+    float* __restrict__ x = xbase + static_cast<std::size_t>(t) * x_row;
+    const float xv = d < head_dim ? x[d] : 0.0F;
+    float ss = xv * xv;
+    ss = BlockReduceSum(ss, sm_part);
+    const float scale = 1.0F / sqrtf(ss / static_cast<float>(head_dim) + eps);
+    sm_head[d] = xv * scale * gam;
+    __syncthreads();
+    const std::uint32_t pos = pos0 + t;
+    if (rope != 0 && d < head_dim / 2) {
+      const float angle = static_cast<float>(pos) * freq;
+      float c;
+      float s;
+      sincosf(angle, &s, &c);
+      const float a = sm_head[d];
+      const float b = sm_head[d + head_dim / 2];
+      sm_head[d] = a * c - b * s;
+      sm_head[d + head_dim / 2] = a * s + b * c;
+    }
+    // The rope threads also rewrite the partner half of the head; the output
+    // threads must not read those lanes until every rotation has landed.
+    __syncthreads();
+    if (is_q) {
+      if (d < head_dim) {
+        x[d] = sm_head[d];
+      }
+      continue;
+    }
+    const std::uint32_t kvh = h - n_head;
+    __half* __restrict__ krow =
+        k_cache + static_cast<std::size_t>(pos) * kv_row + kvh * head_dim;
+    const float* __restrict__ vrow =
+        v + (static_cast<std::size_t>(t) * n_kv + kvh) * head_dim;
+    __half* __restrict__ vwrite =
+        v_cache + static_cast<std::size_t>(pos) * kv_row + kvh * head_dim;
+    if (d < head_dim) {
+      krow[d] = __float2half_rn(sm_head[d]);
+      vwrite[d] = __float2half_rn(vrow[d]);
+    }
+    // sm_head carries over between rows exactly like the previous kernel
+    // across blocks: every lane rewrites its slot before the next use.
   }
 }
 
@@ -555,10 +585,12 @@ void QkEpilogue(float* q, float* k, const float* v, const float* q_gamma,
                 std::uint32_t n_kv, std::uint32_t head_dim, __half* k_cache,
                 __half* v_cache, std::uint32_t kv_row_elements,
                 hipStream_t stream) {
-  const dim3 grid(n_head + n_kv, batch);
+  constexpr std::uint32_t kTokensPerBlock = 8U;
+  const dim3 grid(n_head + n_kv,
+                  (batch + kTokensPerBlock - 1U) / kTokensPerBlock);
   QkEpilogueKernel<<<grid, 128, 0, stream>>>(
       q, k, v, q_gamma, k_gamma, eps, theta, rope ? 1 : 0, pos0, n_head, n_kv,
-      head_dim, k_cache, v_cache, kv_row_elements);
+      head_dim, k_cache, v_cache, kv_row_elements, batch);
 }
 
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,

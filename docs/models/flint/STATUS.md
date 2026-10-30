@@ -576,6 +576,17 @@ pair in one tool call (AGENTS protocol).
               layer-0-only variant flips the same near-tie top-1 and
               matches the full-C9 chain). Artifacts
               `flint-c9-kv-w8a8-{matrix,adoption}.log`.
+            - [x] C10 QkEpilogue 8-token walk (`kTokensPerBlock = 8`,
+              hoisted gamma/rope-frequency setup, `sincosf`): kernel
+              bit-identical to the shipped one at every probed shape plus a
+              full-rope-domain sincosf audit (`tools/bench/
+              flint_qk_bench.hip`, 0 mismatches); 1.44x/1.12x kernel-level
+              at B=2048 (rope/NoPE), production profile 575.0 → 366.6 us/call.
+              Matched e2e +0.8/+1.0/+1.9 % over the same-morning pre-C10
+              control (2858.40/2298.76/1723.65), tg unchanged, gate tests
+              pass. pp2048 target 3000 still open (attention 26.3 %, MoE
+              down-path ~32 % remain the big stages). Artifact
+              `flint-c10-qk-epilogue.log`.
 
 ## Design notes
 

@@ -38,19 +38,22 @@ rows are incremental 512-token prefills, not whole-prompt rate.
 
 | prompt tokens | pp (tok/s) | tg128 (tok/s) |
 |--------------:|-----------:|-------------:|
-| 2048    | 2842.47 | 42.01 |
-| 8192    | 2282.92 | 41.19 |
-| 16384   | 1703.15 | 42.69 |
+| 2048    | 2858.40 | 42.01 |
+| 8192    | 2298.76 | 41.19 |
+| 16384   | 1723.65 | 42.69 |
 | 32768   | 1077.38 | 42.66 |
 | 65536   |  642.31 | 42.22 |
 | 131072  |  332.55 | 42.37 |
 
-The 2048/8192/16384 rows were re-measured after the C9 attn_k/attn_v
-W8A8 dispatch (+2.3/+1.6/+4.6 % over 2778.63 / 2246.51 / 1628.35; second
-pp2048 sample 2851.07 — the C8a values they replaced were +3.7/+4.0 %
-over 2677.90 / 2159.85); the remaining rows are still at the C7v-revision
-measurements. tg128 columns stay at their original measurements (decode
-paths untouched by C7-C9; C9 samples tg1 45-46). The
+The 2048/8192/16384 rows were re-measured after the C10 QkEpilogue
+8-token walk (+0.8/+1.0/+1.9 % matched against the same-morning pre-C10
+control 2836.80 / 2276.36 / 1692.00; the C9 record 2842.47/2851.07,
+2282.92, 1703.15 sat ~0.3 % above that control — session-anchored
+deltas, not overlap). Earlier lineage: C9 replaced 2778.63 / 2246.51 /
+1628.35 (+2.3/+1.6/+4.6 %), which had replaced the C8a 2677.90 / 2159.85;
+the remaining rows are still at the C7v-revision measurements. tg128
+columns stay at their original measurements (decode paths untouched by
+C7-C10; C10 samples tg1 43.4-45.7). The
 whole-prompt rate falls with prompt length because the global
 (sliding-window-off) layers attend the whole prefix; the per-chunk MoE and
 GEMM tiers are flat (chunk 8192 trial C7w changed nothing — see
