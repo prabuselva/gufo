@@ -29,6 +29,9 @@ Gufo's incremental pp512 and decode stay flat to the deepest frontier
 at 131 K); llama-bench degrades on both from ctx 32 K. The remaining
 reference wins are the short-depth decode rows (ctx ≤ 16384): the C7
 campaign optimized prefill only — decode stays a follow-up lever.
+C16b later measured tg128 46.2 at ctx 2048 in the chunked harness
+(below), inside the llama.cpp band; these decode columns have not been
+re-measured incrementally since.
 
 ## Full-prompt chunked prefill (Gufo scope)
 
@@ -38,7 +41,7 @@ rows are incremental 512-token prefills, not whole-prompt rate.
 
 | prompt tokens | pp (tok/s) | tg128 (tok/s) |
 |--------------:|-----------:|-------------:|
-| 2048    | 2960.56 | 42.01 |
+| 2048    | 2960.56 | 46.15 |
 | 8192    | 2409.51 | 41.19 |
 | 16384   | 1795.68 | 42.69 |
 | 32768   | 1077.38 | 42.66 |
@@ -58,8 +61,10 @@ the C9 record 2842.47/2851.07, 2282.92, 1703.15 sat ~0.3 % above that
 control — session-anchored deltas, not overlap). Earlier lineage: C9
 replaced 2778.63 / 2246.51 / 1628.35 (+2.3/+1.6/+4.6 %), which had
 replaced the C8a 2677.90 / 2159.85; the remaining rows are still at the
-C7v-revision measurements. tg128 columns stay at their original
-measurements (decode paths untouched by C7-C14; C14 re-sampled tg128 at
+C7v-revision measurements. The 2048 tg128 row is the C16b router
+re-measurement (matched -r2 43.04/42.95 control → 46.15/45.67; other
+tg128 rows keep the pre-C16b measurements — the router fix applies at
+every depth but is not yet re-sampled there; C14 re-sampled tg128 at
 2048/16384 — 40.90/42.39 candidate vs 41.82/41.93 control, session
 noise — and its rows=1 SumExperts is launch-bound at 1.9 µs; C11 samples tg1
 43.4-46.1). The

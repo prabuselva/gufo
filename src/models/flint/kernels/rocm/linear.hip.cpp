@@ -120,6 +120,11 @@ __global__ void GemvBf16Kernel(const std::uint16_t* __restrict__ w,
   const std::uint16_t* __restrict__ wr =
       w + static_cast<std::size_t>(row) * cols;
   float acc = 0.0F;
+  // Unrolling keeps the per-lane k order (lane, lane+kWarp, ...) and the
+  // dependent fma chain bitwise-identical; it only issues the scalar loads
+  // several iterations ahead, which is what the 32-block router GEMV needs
+  // (2 B/lane loads left it at ~36 GB/s; docs/models/flint/EXPERIMENTS.md C16).
+#pragma unroll 4
   for (std::uint32_t k = lane; k < cols; k += kWarp) {
     acc = fmaf(Bf16ToF16(wr[k]), x[k], acc);
   }

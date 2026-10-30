@@ -125,8 +125,23 @@ commands and matched numbers live in the numbered entries of
   2902.11 → 2960.56 (+2.0 %), pp8192 2374.38 → 2409.51 (+1.5 %),
   pp16384 1787.89 → 1795.68 (+0.4 %); a single-run pp2048
   generate-coupled probe read −0.4 % (tg128 ran 40.90 vs 41.82 — the
-  rows=1 kernel is launch-bound at 1.9 µs, so decode stays within its
-  session noise). Artifact `flint-c14-sumexperts-stream.log`.
+   rows=1 kernel is launch-bound at 1.9 µs, so decode stays within its
+   session noise). Artifact `flint-c14-sumexperts-stream.log`.
+- C16b router-stage decode fixes: a fresh decode-step profile
+  (`-p 2048 -n 8`, rocpd; its grid columns are thread counts — earlier
+  C16 readings that treated them as blocks were wrong) attributed the
+  per-MoE-layer router stage to two latency-bound kernels: the bf16
+  router GEMV (256x2048 from 32 blocks at ~36 GB/s — a dependency-chain
+  of 2-byte scalar loads) and `RouterTopK` (~18.7 µs, six serial
+  256-entry argmax scans on thread 0). `#pragma unroll 4` on the
+  unchanged per-lane k loop and a block-wide argmax (warp-shuffle
+  max with tie → smallest index, reproducing the serial first-max scan;
+  thread 0 still masks, sums and normalizes in the same sequence) keep
+  the output bitwise-identical — gates 3/3 with the oracle forward
+  bitwise. Same-session matched -r2 A/B at ctx 2048: tg128 43.04/42.95
+  → 46.15/45.67 (+7.2/+6.3 %), pp2048 2948/2954 → 2990/2992 (flat
+  within the day's ±29 band). Artifact
+  `flint-c16b-router-argmax.log` (A/B plus the gate transcript).
 
 ## Rejected / investigated, no adoptable lever
 
@@ -193,11 +208,27 @@ commands and matched numbers live in the numbered entries of
   shared add K3+K4 = 1705.5 us — +142 %; atomics act as serialized
   read-modify-write, not coalesced writes. Fusion contract closed for
   the grouped route. Artifact `flint-c15-fused-atomic-rejected.log`.
+- C16a mmq Q8_0 route for the decode projections — rejected. Routing
+  the batch-1 decode GEMVs through the batched mmq tier (the
+  `B >= 8U` predicate lowered toward the decode shapes
+  (`src/models/flint/kernels/rocm/executor.cpp`)) regressed matched
+  tg128 42.31/42.30 → 42.21/41.00 at pp2048-flat and crashed the MoE
+  raw sidecar path (`flint_mmq_q8_0_moe_raw: null pointer`); reverted
+  to HEAD before further work. The bitwise SIMT `Gemv` stays the
+  decode tier; the router's actual problem was latency inside
+  `GemvBf16`/`RouterTopK`, not the route choice — see C16b. Artifact
+  `flint-c16a-mmq-decode-rejected.log`.
 
 ## Known open levers (measured cost, not yet attacked)
 
-- Decode at depth ≤ 16 K trails llama.cpp (41.7–42.4 vs 43.7–47.7 tg);
-  the C7 campaign was prefill-only.
+- Decode at depth ≤ 16 K trailed llama.cpp (41.7–42.4 vs 43.7–47.7 tg);
+  C16b closed most of it (tg128 45.9 at ctx 2048, inside the reference
+  band). The BENCHMARKS.md comparison table's decode columns are still
+  pre-C16b measurements pending a matched rerun. The remaining decode
+  lever is the grouped geglu/down rows=1 kernels: ~118 µs per MoE layer
+  (~5.5 ms per token) at the rows=1 weight-stream floor, attacked only
+  by a k-split expert GEMV that reassociates the reduction —
+  numeric-quality class, not bitwise-safe.
 - Dense `mul_mat_q` re-encodes its activation per call on the small-col
   projections (~85 ms per pp8192 profile); a shared pre-encoded sidecar
   in the mmq layout is untried.

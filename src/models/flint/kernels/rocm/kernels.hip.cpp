@@ -427,29 +427,61 @@ __global__ void RouterTopKKernel(const float* __restrict__ logits,
                                  std::uint32_t used, int normalize,
                                  float weight_scale) {
   __shared__ float sp[256];
+  __shared__ float wv[8];
+  __shared__ std::int32_t wi[8];
   const std::uint32_t t = blockIdx.x;
-  if (threadIdx.x < 256) {
-    const float x = logits[static_cast<std::size_t>(t) * 256 + threadIdx.x];
-    sp[threadIdx.x] = 1.0F / (1.0F + expf(-x));
+  const std::uint32_t tid = threadIdx.x;
+  if (tid < 256) {
+    const float x = logits[static_cast<std::size_t>(t) * 256 + tid];
+    sp[tid] = 1.0F / (1.0F + expf(-x));
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    float sel[8];
-    float wsum = 0.0F;
-    for (std::uint32_t r = 0; r < used; ++r) {
-      int best = -1;
+  // Block-wide argmax rounds (256 threads, blockDim == 256). A candidate
+  // wins on value with ties resolved to the smallest index, which is the
+  // exact winner order of the serial left-to-right scan this replaces
+  // (docs/models/flint/EXPERIMENTS.md C16); the selected values feed the
+  // same thread-0 wsum/division sequence, so ids and weights stay
+  // bitwise-identical.
+  float sel[8];
+  float wsum = 0.0F;
+  for (std::uint32_t r = 0; r < used; ++r) {
+    // Reload each round so the previous round's mask from thread 0 is
+    // visible after the trailing __syncthreads.
+    float lv = tid < 256 ? sp[tid] : -FLT_MAX;
+    std::int32_t li = static_cast<std::int32_t>(tid);
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(__activemask(), lv, off);
+      const std::int32_t oi = __shfl_down_sync(__activemask(), li, off);
+      if (ov > lv || (ov == lv && oi < li)) {
+        lv = ov;
+        li = oi;
+      }
+    }
+    if ((tid & 31U) == 0U) {
+      wv[tid >> 5] = lv;
+      wi[tid >> 5] = li;
+    }
+    __syncthreads();
+    if (tid == 0) {
       float bv = -FLT_MAX;
-      for (int i = 0; i < 256; ++i) {
-        if (sp[i] > bv) {
-          bv = sp[i];
+      int best = -1;
+      for (int g = 0; g < 8; ++g) {
+        const float v = wv[g];
+        const std::int32_t i = wi[g];
+        if (v > bv || (v == bv && i < best)) {
+          bv = v;
           best = i;
         }
       }
-      ids[static_cast<std::size_t>(t) * used + r] = best;
+      ids[static_cast<std::size_t>(t) * used + r] =
+          static_cast<std::int32_t>(best);
       sel[r] = bv;
       wsum += bv;
       sp[best] = -FLT_MAX;
     }
+    __syncthreads();
+  }
+  if (tid == 0) {
     if (normalize != 0) {
       if (wsum < kWeightSumFloor) {
         wsum = kWeightSumFloor;
