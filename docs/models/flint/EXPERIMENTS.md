@@ -140,7 +140,10 @@ commands and matched numbers live in the numbered entries of
   the output bitwise-identical — gates 3/3 with the oracle forward
   bitwise. Same-session matched -r2 A/B at ctx 2048: tg128 43.04/42.95
   → 46.15/45.67 (+7.2/+6.3 %), pp2048 2948/2954 → 2990/2992 (flat
-  within the day's ±29 band). Artifact
+  within the day's ±29 band). Frontier re-measure
+  (`pp {ctx-640,512}` + tg128): tg128 45.5-45.8 flat at ctx
+  2048-16384 — the llama.cpp decode gap shrinks to −1.0…−5.1 % and
+  flips to +3.5 % at 16384 (`flint-c16b-frontier.log`). Artifact
   `flint-c16b-router-argmax.log` (A/B plus the gate transcript).
 
 ## Rejected / investigated, no adoptable lever
@@ -222,10 +225,9 @@ commands and matched numbers live in the numbered entries of
 ## Known open levers (measured cost, not yet attacked)
 
 - Decode at depth ≤ 16 K trailed llama.cpp (41.7–42.4 vs 43.7–47.7 tg);
-  C16b closed most of it (tg128 45.9 at ctx 2048, inside the reference
-  band). The BENCHMARKS.md comparison table's decode columns are still
-  pre-C16b measurements pending a matched rerun. The remaining decode
-  lever is the grouped geglu/down rows=1 kernels: ~118 µs per MoE layer
+  C16b closed most of it (frontier tg128 45.5–45.8 flat, −5.1…+3.5 %
+  over the reference rows). The remaining decode lever is the grouped
+  geglu/down rows=1 kernels: ~118 µs per MoE layer
   (~5.5 ms per token) at the rows=1 weight-stream floor, attacked only
   by a k-split expert GEMV that reassociates the reduction —
   numeric-quality class, not bitwise-safe.

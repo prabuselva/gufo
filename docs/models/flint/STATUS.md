@@ -639,7 +639,9 @@ pair in one tool call (AGENTS protocol).
                then the unchanged thread-0 mask/sum/normalize) is
                bitwise-identical (gates 3/3 exclusive, oracle forward
                bitwise). Matched -r2 A/B at ctx 2048: tg128
-               43.04/42.95 → 46.15/45.67 (+7.2/+6.3 %), pp2048 flat.
+               43.04/42.95 → 46.15/45.67 (+7.2/+6.3 %), pp2048 flat;
+               frontier tg128 re-measure 45.5-45.8 flat at ctx
+               2048-16384 (−5.1…+3.5 % vs llama.cpp).
                Remaining decode lever: k-split geglu/down rows=1
                kernels (~5.5 ms/token), numeric-quality class.
                Artifacts `flint-c16b-router-argmax.log`,

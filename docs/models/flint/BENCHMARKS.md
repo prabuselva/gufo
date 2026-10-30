@@ -16,22 +16,24 @@ one warmed sample, mean `± sd` degenerate by design.
 
 | ctx      | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
 |----------|----------------:|---------------------:|-----:|----------------:|---------------------:|-----:|
-| 2048     | 2065.42 | 1425.93 | +44.8 % | 42.69 | 48.05 | −11.2 % |
-| 4096     | 2065.62 | 1381.61 | +49.5 % | 41.65 | 47.44 | −12.2 % |
-| 8192     | 2064.02 | 1269.81 | +62.5 % | 41.94 | 46.26 |  −9.3 % |
-| 16384    | 2023.39 | 1093.01 | +85.1 % | 42.65 | 44.19 |  −3.5 % |
+| 2048     | 2065.42 | 1425.93 | +44.8 % | 45.62 | 48.05 | −5.1 % |
+| 4096     | 2065.62 | 1381.61 | +49.5 % | 45.49 | 47.44 | −4.1 % |
+| 8192     | 2064.02 | 1269.81 | +62.5 % | 45.78 | 46.26 | −1.0 % |
+| 16384    | 2023.39 | 1093.01 | +85.1 % | 45.73 | 44.19 | +3.5 % |
 | 32768    | 2019.60 |  881.95 | +129.0 % | 42.89 | 40.49 |  +5.9 % |
 | 65536    | 2011.00 |  619.08 | +224.8 % | 42.25 | 34.53 | +22.4 % |
 | 131072   | 1962.88 |  385.39 | +409.3 % | 41.19 | 27.05 | +52.3 % |
 
 Gufo's incremental pp512 and decode stay flat to the deepest frontier
 (4 KV heads → the global layers read only 3.8 GB of KV per 512-token block
-at 131 K); llama-bench degrades on both from ctx 32 K. The remaining
-reference wins are the short-depth decode rows (ctx ≤ 16384): the C7
-campaign optimized prefill only — decode stays a follow-up lever.
-C16b later measured tg128 46.2 at ctx 2048 in the chunked harness
-(below), inside the llama.cpp band; these decode columns have not been
-re-measured incrementally since.
+at 131 K); llama-bench degrades on both from ctx 32 K. The reference's
+short-depth decode lead (the prefill-only C7 campaign left decode at
+41.7-42.7 here) is closed: the C16b router fixes were re-measured on
+these frontier rows in a later exclusive session (r2, artifact
+`flint-c16b-frontier.log`) — Gufo decode now 45.5-45.8 flat,
+−1.0…−5.1 % vs the unchanged llama.cpp rows at ctx 2048-8192 and
++3.5 % at 16384; the pp columns and the ctx ≥ 32768 rows keep the
+original matched-session measurements.
 
 ## Full-prompt chunked prefill (Gufo scope)
 
