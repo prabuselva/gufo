@@ -110,6 +110,23 @@ commands and matched numbers live in the numbered entries of
   2887.75 → 2893.14 (+0.2 %) inside its ±7.2 r2 noise — the global
   layers that grow with context carry the gain. Artifact
   `flint-c11-attn-qb2.log`.
+- C14 SumExperts streaming group path: the grouped-route expert sum ran at
+  ~132 GB/s modelled (94 × 742.5 µs at pp2048) because the used-expert
+  loop is runtime-bounded — six serially dependent 8-byte bf16 loads per
+  channel — and the rows are read in 8-byte steps. `SumExpertsKernel`'s
+  vector arithmetic is unchanged; for columns divisible by 8 and
+  `used` ∈ {2,4,6,8} (compile-time in the wrapper's dispatch) a group
+  kernel hoists the weights to registers and reads each slot row with
+  independent 16-byte loads, keeping the per-channel ascending-slot add
+  order bitwise. Gates 3/3, rocm.forward bitwise against the oracle; the
+  first iteration's grid-base bug proves the parity bite. Kernel
+  742.5 → 534.6 µs (69.8 → 50.3 ms, ~184 GB/s at the streaming roofline
+  the down kernel shares). Same-session matched -r2 controls: pp2048
+  2902.11 → 2960.56 (+2.0 %), pp8192 2374.38 → 2409.51 (+1.5 %),
+  pp16384 1787.89 → 1795.68 (+0.4 %); a single-run pp2048
+  generate-coupled probe read −0.4 % (tg128 ran 40.90 vs 41.82 — the
+  rows=1 kernel is launch-bound at 1.9 µs, so decode stays within its
+  session noise). Artifact `flint-c14-sumexperts-stream.log`.
 
 ## Rejected / investigated, no adoptable lever
 

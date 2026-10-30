@@ -600,6 +600,22 @@ pair in one tool call (AGENTS protocol).
               pp8192 +4.0 % (2403.31), pp16384 +5.0 % (1797.72), pp2048
               +0.2 % within noise (2893.14). Artifact
               `flint-c11-attn-qb2.log`.
+            - [x] C14 SumExperts streaming group path: the grouped-route
+              sum ran at ~132 GB/s from a runtime-bounded used-expert
+              loop and 8-byte bf16 loads; for `used` ∈ {2,4,6,8} and
+              8-aligned columns a register-hoisted group kernel reads
+              16-byte rows with identical per-channel add order
+              (bitwise-safe). Kernel 742.5 → 534.6 µs (~184 GB/s),
+              gates 3/3 with the oracle bitwise; same-session matched
+              -r2 controls pp2048 2902.11 → 2960.56 (+2.0 %), pp8192
+              2374.38 → 2409.51 (+1.5 %), pp16384 1787.89 → 1795.68
+              (+0.4 %), decode unchanged. The remaining ~1.3 % to the
+              3000 target has no bitwise-safe stage left: geglu/down
+              sit at the same DRAM roofline (C13) and attention
+              mechanisms are measured out (C7r/C10/C11); closing it
+              needs the C9-quality class (SumExperts fused into the
+              down epilogue changes the reduction order). Artifact
+              `flint-c14-sumexperts-stream.log`.
 
 ## Design notes
 

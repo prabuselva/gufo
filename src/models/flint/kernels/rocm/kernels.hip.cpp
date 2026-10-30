@@ -483,6 +483,87 @@ __device__ inline float4 LoadRouted4(const __half* p) {
                      __half2float(v.h[1].x), __half2float(v.h[1].y));
 }
 
+__device__ inline void LoadRouted8(const __half* p, float4* out) {
+  union {
+    uint4 u;
+    __half2 h[4];
+  } v;
+  v.u = *reinterpret_cast<const uint4*>(p);
+  out[0] = make_float4(__half2float(v.h[0].x), __half2float(v.h[0].y),
+                       __half2float(v.h[1].x), __half2float(v.h[1].y));
+  out[1] = make_float4(__half2float(v.h[2].x), __half2float(v.h[2].y),
+                       __half2float(v.h[3].x), __half2float(v.h[3].y));
+}
+
+// Streaming group path for the grouped route: the used-expert count is a
+// compile-time constant, so all slot rows and weights load as independent
+// 16-byte-wide reads instead of a chain of runtime-bound 8-byte steps.
+// The per-channel arithmetic is identical to the vector path above (same
+// ascending slot order and add sequence per channel).
+template<std::uint32_t USED>
+__global__ void SumExpertsHalfKernel(float* __restrict__ x,
+                                     const __half* __restrict__ routed,
+                                     const float* __restrict__ weights,
+                                     const float* __restrict__ shared,
+                                     std::uint32_t cols) {
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t cols8 = cols / 8U;
+  const std::size_t base8 = static_cast<std::size_t>(t) * USED * cols8;
+  float wu[USED];
+#pragma unroll
+  for (std::uint32_t s = 0; s < USED; ++s) {
+    wu[s] = weights[static_cast<std::size_t>(t) * USED + s];
+  }
+  for (std::uint32_t i = threadIdx.x; i < cols8; i += blockDim.x) {
+    float4 acc[2] = {make_float4(0.0F, 0.0F, 0.0F, 0.0F),
+                     make_float4(0.0F, 0.0F, 0.0F, 0.0F)};
+#pragma unroll
+    for (std::uint32_t s = 0; s < USED; ++s) {
+      float4 r[2];
+      LoadRouted8(
+          routed + (base8 + static_cast<std::size_t>(s) * cols8 + i) * 8U, r);
+      acc[0].x += wu[s] * r[0].x;
+      acc[0].y += wu[s] * r[0].y;
+      acc[0].z += wu[s] * r[0].z;
+      acc[0].w += wu[s] * r[0].w;
+      acc[1].x += wu[s] * r[1].x;
+      acc[1].y += wu[s] * r[1].y;
+      acc[1].z += wu[s] * r[1].z;
+      acc[1].w += wu[s] * r[1].w;
+    }
+    float4* __restrict__ xv =
+        reinterpret_cast<float4*>(x + static_cast<std::size_t>(t) * cols) +
+        2U * i;
+    float4 a0 = xv[0];
+    float4 a1 = xv[1];
+    if (shared != nullptr) {
+      const float4* __restrict__ sv = reinterpret_cast<const float4*>(shared) +
+                                      2U * static_cast<std::size_t>(t) * cols8 +
+                                      2U * i;
+      const float4 sh0 = sv[0];
+      const float4 sh1 = sv[1];
+      acc[0].x += sh0.x;
+      acc[0].y += sh0.y;
+      acc[0].z += sh0.z;
+      acc[0].w += sh0.w;
+      acc[1].x += sh1.x;
+      acc[1].y += sh1.y;
+      acc[1].z += sh1.z;
+      acc[1].w += sh1.w;
+    }
+    a0.x += acc[0].x;
+    a0.y += acc[0].y;
+    a0.z += acc[0].z;
+    a0.w += acc[0].w;
+    a1.x += acc[1].x;
+    a1.y += acc[1].y;
+    a1.z += acc[1].z;
+    a1.w += acc[1].w;
+    xv[0] = a0;
+    xv[1] = a1;
+  }
+}
+
 template<typename RoutedT>
 __global__ void SumExpertsKernel(float* __restrict__ x,
                                  const RoutedT* __restrict__ routed,
@@ -649,6 +730,28 @@ void SumExperts(float* x, const __half* routed, const float* weights,
                 const float* shared, std::uint32_t rows, std::uint32_t cols,
                 std::uint32_t used, hipStream_t stream) {
   const dim3 grid(1, rows);
+  if ((cols & 7U) == 0U) {
+    switch (used) {
+      case 2U:
+        SumExpertsHalfKernel<2U><<<grid, kNormThreads, 0, stream>>>(
+            x, routed, weights, shared, cols);
+        return;
+      case 4U:
+        SumExpertsHalfKernel<4U><<<grid, kNormThreads, 0, stream>>>(
+            x, routed, weights, shared, cols);
+        return;
+      case 6U:
+        SumExpertsHalfKernel<6U><<<grid, kNormThreads, 0, stream>>>(
+            x, routed, weights, shared, cols);
+        return;
+      case 8U:
+        SumExpertsHalfKernel<8U><<<grid, kNormThreads, 0, stream>>>(
+            x, routed, weights, shared, cols);
+        return;
+      default:
+        break;
+    }
+  }
   SumExpertsKernel<__half><<<grid, kNormThreads, 0, stream>>>(
       x, routed, weights, shared, cols, used);
 }
