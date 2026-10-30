@@ -146,6 +146,23 @@ commands and matched numbers live in the numbered entries of
 - C7w prefill chunk 4096 → 8192: the grouped route is not per-chunk
   weight-read floor-bound; pp8192 flat (−0.3 %), pp16384 −0.8 % across
   all matched rounds; 4096 stays.
+- C13 gate/up token tiles 128 → 96/64/32 in `RoutedHalfDownKernel` —
+  rejected. A dual tile map (96-row tiles for geglu, 128-row for down)
+  is bit-identical (probe bit-diff 0 at every shape; gates 3/3) and the
+  probe sweeps `gateup w+up` from 12.050 → 4.645/5.294/6.592 ms at chunk
+  4096 (−61/−56/−45 %), but matched e2e gives nothing: pp2048
+  2893.14 → 2892.61, pp8192 2403.31 → 2385.39, pp16384 1797.72 →
+  1789.13, and a profile confirms the 96-row kernel *is* resident with a
+  slightly worse production average (1.728 vs 1.65-1.70 ms). Production
+  geglu launches ~256 live tiles at ~12-row buckets with a 3824-block
+  grid — far past any residency limit and already streaming the sparse
+  weight rows at the ~190-200 GB/s roofline the down kernel shares; the
+  probe grid is small enough that its 128-row staging hurts residency,
+  which is what the sweep measured instead (probe absolutes are ~7x off
+  production for this kernel). Second recurrence of the C12
+  probe-versus-production lesson: token-tile sizing and prefetch depth
+  are both closed for `RoutedHalfDownKernel`. Artifact
+  `flint-c13-geglu-tile-rejected.log`.
 
 ## Known open levers (measured cost, not yet attacked)
 
@@ -154,3 +171,8 @@ commands and matched numbers live in the numbered entries of
 - Dense `mul_mat_q` re-encodes its activation per call on the small-col
   projections (~85 ms per pp8192 profile); a shared pre-encoded sidecar
   in the mmq layout is untried.
+- The grouped route's geglu and down kernels stream sparse weight rows
+  at the ~190-200 GB/s roofline at pp2048 (C13); only changing the data
+  movement contract, not the tile schedule, can move them — e.g. folding
+  `SumExperts` into the down epilogue, which needs the quality-evidence
+  class like C9.
