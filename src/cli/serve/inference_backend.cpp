@@ -3855,6 +3855,9 @@ bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
     return false;
   }
   try {
+    // Read the vision flag before the model is moved into the runner; a loaded
+    // `gemma4v` mmproj tower is what lets the HTTP layer accept image inputs.
+    const bool has_vision = model->HasVision();
     auto runner = models::gemma4::CreateTextRunner(
         std::move(model), max_context, session_count, speculative_config,
         disk_cache_config, error);
@@ -3863,6 +3866,7 @@ bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
     }
     auto new_state = std::make_shared<Impl::State>();
     new_state->model_id = runner->Descriptor().model_id;
+    new_state->supports_images = has_vision;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(

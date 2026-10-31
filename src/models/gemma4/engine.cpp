@@ -144,6 +144,13 @@ std::string Model::Decode(std::span<const std::int32_t> tokens) const {
 }
 
 std::string Model::TokenText(std::int32_t token) const {
+  // Stop tokens are end-of-generation markers, never visible text: the EOT is
+  // the assistant-turn terminator GGUF metadata resolves to EOS. Suppress it
+  // here so no decoding path surfaces the raw turn marker, including streamed
+  // speculative drafts that emit `TokenText` per accepted token.
+  if (token == tokenizer_->EosId()) {
+    return {};
+  }
   return tokenizer_->TokenToPiece(token);
 }
 
