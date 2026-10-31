@@ -650,6 +650,26 @@ pair in one tool call (AGENTS protocol).
                 decode lever >=3 % of token time remains and the
                 campaign stops. Artifacts `flint-c16b-router-argmax.log`,
                 `flint-c16a-mmq-decode-rejected.log`.
+             - [x] C17 prefill campaign — closed at both remaining
+               terms. C17a: the mmq activation re-encode lever was
+               stale (quantize passes 0.55 ms/pp8192, activation
+               quantization already at the DRAM roofline; pp8192 is
+               99.3 % GPU busy). C17b bounded the WMMA attention
+               kernel, the last off-roofline term (18-25 % of its KV
+               streaming roofline): a bitwise bench refactor
+               (`tools/bench/flint_attn_lds2_bench.hip`) halved block
+               LDS (54,528 -> 28,928 B) and cut the tile loop to two
+               barriers with `BITWISE OK`, yet the occupancy API kept
+               1 block/CU (256-VGPR cap; `__launch_bounds__(512, 2)`
+               does not move the allocator), and a reload-Q variant
+               that cut spills 608 -> 132 B/thread ran 10-14 %
+               slower. All variants landed within ±1 % windowed /
+               −1…−2.5 % full — below the acceptance floor; the
+               register-resident softmax plan was premised on the
+               occupancy headroom that does not exist, so prefill
+               stops here with the shipped kernel unchanged. Artifacts
+               `flint-c17a-mmq-lever-stale.log`,
+               `flint-c17b-attention-bounded.log`.
 
 ## Design notes
 

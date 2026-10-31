@@ -260,11 +260,30 @@ commands and matched numbers live in the numbered entries of
   down epilogue with atomic accumulation — measured +142 % exclusive
   (C15). The grouped-route data movement is closed; further prefill
   gains must come from elsewhere.
-- After C17a the only measurable off-roofline term left anywhere in
-  Flint prefill is the WMMA attention kernel: 18-25 % of the KV
-  streaming roofline (C11), ~45 % of pp8192 busy (C17a profile).
-  Every suspect C11 could isolate — barrier stalls (8-12 %), staging
-  prefetch depth, scheduling, the correction chain (C7r/C7t) — has
-  been measured and rejected; recovering it needs a structural
-  rewrite (larger key tiles or register-resident softmax P within
-  the 64 KB LDS budget) in the numeric-quality class, not a knob.
+- C17b WMMA attention restructuring — bounded by measurement, rejected.
+  The register-resident softmax plan assumed the 54.5 KB LDS block of
+  `<8, 2>` — 42 KB of it wave-private score/probability rows — capped
+  one resident block per CU. The standalone bench
+  `tools/bench/flint_attn_lds2_bench.hip` merged the score and hi/lo
+  probability rows into one 64 B wave-private row (softmax reads the
+  scores, `__syncwarp`, overwrites the same bytes with the probability
+  pair, the PV reads stay wave-private), halving block LDS to 28,928 B
+  and cutting the loop to the two barriers cross-wave K/V staging
+  truly needs; the occupancy API still reports 1 block/CU because the
+  256-VGPR register budget is the cap, and `__launch_bounds__(512, 2)`
+  does not move the allocator. The spills are real (608 B/thread, 109
+  scratch instructions in the per-key tile loop) but downstream of
+  that cap: a bitwise variant that reloads and re-splits the Q hi/lo
+  fragments from the L2-hot Q rows every tile instead of keeping them
+  live drops spills to 132 B/thread and runs 10-14 % slower. Every
+  bitwise variant stayed within ±1 % windowed and −1…−2.5 % full — at
+  or below the acceptance floor, with `BITWISE OK` throughout. With
+  occupancy pinned by registers and neither spill traffic nor LDS/
+  barrier traffic moving the clock, the kernel's sub-roofline share
+  lives in the per-tile dependency structure (the serial 16-step wmma
+  correction chains and the online softmax feeding them), which no
+  bit-parity-preserving restructure touches. Artifact
+  `flint-c17b-attention-bounded.log`. Closing this also closes the
+  register-resident softmax P idea: its premise was occupancy
+  headroom from the freed LDS, which does not exist. The documented
+  prefill campaign is complete at every off-roofline term.

@@ -1,0 +1,28 @@
+START 2026-10-31T12:35:09+08:00 name=attnlds2d inner_timeout=600s pid=5634 pgid=5634
+CMD: /tmp/flint_attn_lds2_bench
+
+=== [gpu_exclusive] captured serve command for respawn -> /tmp/gufo_serve_cmdline ===
+
+=== [gpu_exclusive] stopping gufo serve (pid 5044) ===
+
+=== [gpu_exclusive] server stopped; VRAM released ===
+
+=== [gpu_exclusive] running benchmark: /tmp/flint_attn_lds2_bench ===
+=== windowed513 ===
+=== full ===
+shipped  regs/thread=256 spill=608 B lds=54528 B occupancy=1 blocks/CU
+union1   regs/thread=256 spill=624 B lds=28928 B occupancy=1 blocks/CU
+union2   regs/thread=256 spill=624 B lds=28928 B occupancy=1 blocks/CU
+reloadq  regs/thread=256 spill=132 B lds=28928 B occupancy=1 blocks/CU
+windowed513  cfg shipped    3.057 ms  mismatches=0
+windowed513  cfg union1    3.087 ms  mismatches=0
+windowed513  cfg union2    3.115 ms  mismatches=0
+windowed513  cfg reloadq    3.355 ms  mismatches=0
+full         cfg shipped    7.977 ms  mismatches=0
+full         cfg union1    7.781 ms  mismatches=0
+full         cfg union2    7.779 ms  mismatches=0
+full         cfg reloadq    9.096 ms  mismatches=0
+BITWISE OK
+
+=== [gpu_exclusive] done (benchmark exit 0) ===
+END 2026-10-31T12:35:17+08:00 rc=0
