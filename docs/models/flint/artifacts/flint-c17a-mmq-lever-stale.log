@@ -1,0 +1,22 @@
+C17a dense mul_mat_q re-encode lever stale-closed evidence
+bench: build/release/gufo bench -p 8192 -n 1 (Flint Q8_0), rocpd via tools/prof/prof.py run
+DB: /tmp/prof_pp8/prof_results.db, 2026-10-31, GPU-exclusive (server stopped)
+
+-- mmq route + activation quantize kernels --
+void gufo::models::flint::rocm::(anonymous namespace)::RmsNormQuantizeQ8 gx= 1048576 n= 196   161.57 ms  824.3 us
+void gufo::models::flint::rocm::(anonymous namespace)::RmsNormQuantizeQ8 gx= 1048576 n= 196    88.90 ms  453.6 us
+void gufo::hip::QuantizeActivation4ToQ8_1Kernel<true>(float const*, void gx= 4194304 n= 196    84.07 ms  428.9 us
+void flint_mmq::mul_mat_q<(flint_mmq::ggml_type)8, 16, false, true, fals gx=    1024 n=  98     3.43 ms   35.0 us
+void flint_mmq::mul_mat_q<(flint_mmq::ggml_type)8, 16, false, true, fals gx=    2048 n=  49     2.56 ms   52.2 us
+void flint_mmq::mul_mat_q<(flint_mmq::ggml_type)8, 16, false, true, fals gx=     512 n=  94     1.60 ms   17.0 us
+void flint_mmq::mul_mat_q<(flint_mmq::ggml_type)8, 16, false, true, fals gx=     256 n=  98     1.47 ms   15.0 us
+void flint_mmq::quantize_mmq_q8_1<(flint_mmq::mmq_q8_1_ds_layout)0>(floa gx=    2048 n= 343     0.55 ms    1.6 us
+void flint_mmq::mul_mat_q<(flint_mmq::ggml_type)8, 16, false, true, fals gx=    3072 n=   4     0.41 ms  103.7 us
+
+mmq route total 10.02 ms of 7626 ms trace kernel time (2 pp runs in trace)
+
+largest pp pass span 7591.7 ms busy 7536.8 ms (99.3%)
+
+roofline note: at B=8192 a fused RmsNormQuantize row pass moves ~80 MB
+(x,o read f32; normed f32 + qa8 write): ~343 us true (measured 824 us mean,
+local ~2.4x profiler inflation) = ~233 GB/s of the ~240 GB/s ceiling.

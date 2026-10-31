@@ -239,12 +239,32 @@ commands and matched numbers live in the numbered entries of
   floor. With C16b at frontier tg128 45.5–45.8 (−5.1…+3.5 % over
   llama.cpp, ahead from ctx 16384) no bit-safe decode lever ≥3 %
   of token time remains; the campaign stops here.
-- Dense `mul_mat_q` re-encodes its activation per call on the small-col
-  projections (~85 ms per pp8192 profile); a shared pre-encoded sidecar
-  in the mmq layout is untried.
+- C17a dense `mul_mat_q` activation re-encode — lever stale, closed
+  on measurement. The ~85 ms/pp8192 figure predates C8/C9 and the
+  fused SwiGLU epilogue; a fresh pp8192 profile (rocpd, full-batch
+  B=8192) shows all `quantize_mmq_q8_1` launches together at 0.55 ms
+  (343 calls, mean 1.6 us) and the whole mmq route at 10.0 ms
+  (0.13 % of busy): the remaining `mul_mat_q` calls are the router
+  and a few small-col shapes, and there is nothing left to share an
+  encoded sidecar between. The shared tiled-Q8_1 reuse the lever
+  asked for already exists (`qa8`/`ao8`/`qd8` in
+  `src/models/flint/kernels/rocm/executor.cpp`). The remaining
+  activation passes (`RmsNormQuantizeQ8_1` fused/unfused pair
+  824/454 us, `QuantizeActivation4ToQ8_1` 429 us at B=8192) deconvolve
+  through the profiler inflation to 230-235 GB/s — at the DRAM
+  roofline. pp8192 runs 99.3 % GPU busy; there is no host slack
+  either. Artifact `flint-c17a-mmq-lever-stale.log`.
 - The grouped route's geglu and down kernels stream sparse weight rows
   at the ~190-200 GB/s roofline at pp2048 (C13), and the one alternative
   data-movement contract that remained — folding `SumExperts` into the
   down epilogue with atomic accumulation — measured +142 % exclusive
   (C15). The grouped-route data movement is closed; further prefill
   gains must come from elsewhere.
+- After C17a the only measurable off-roofline term left anywhere in
+  Flint prefill is the WMMA attention kernel: 18-25 % of the KV
+  streaming roofline (C11), ~45 % of pp8192 busy (C17a profile).
+  Every suspect C11 could isolate — barrier stalls (8-12 %), staging
+  prefetch depth, scheduling, the correction chain (C7r/C7t) — has
+  been measured and rejected; recovering it needs a structural
+  rewrite (larger key tiles or register-resident softmax P within
+  the 64 KB LDS budget) in the numeric-quality class, not a knob.
