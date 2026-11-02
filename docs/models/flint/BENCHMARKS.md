@@ -1,0 +1,85 @@
+# Flint Preview 40B-A2B — Benchmarks
+
+Strix Halo gfx1151, exclusive GPU, Q8_0 GGUF. Dates and provenance:
+[QUALITY.md](QUALITY.md). Raw rows: full depth sweep
+[`artifacts/flint-full-sweep.log`](artifacts/flint-full-sweep.log), earlier
+native sweeps [`artifacts/flint-c7-native-sweep.log`](artifacts/flint-c7-native-sweep.log).
+
+## Single user, autoregressive
+
+Native CLI scope on both sides (no HTTP): Gufo `gufo bench`, llama.cpp
+`llama-bench` @ b11879 (`-ngl 99 -fa 1 -r 3`, KV f16). Each row matches
+llama-bench's depth semantics: prefill a 512-token block at frontier
+`depth = ctx − 640`, generate 128 tokens at that frontier. Both engines were
+measured in one exclusive session (full sweep log in `artifacts/`). Gufo is
+one warmed sample, mean `± sd` degenerate by design.
+
+| ctx      | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
+|----------|----------------:|---------------------:|-----:|----------------:|---------------------:|-----:|
+| 2048     | 2065.42 | 1425.93 | +44.8 % | 45.62 | 48.05 | −5.1 % |
+| 4096     | 2065.62 | 1381.61 | +49.5 % | 45.49 | 47.44 | −4.1 % |
+| 8192     | 2064.02 | 1269.81 | +62.5 % | 45.78 | 46.26 | −1.0 % |
+| 16384    | 2023.39 | 1093.01 | +85.1 % | 45.73 | 44.19 | +3.5 % |
+| 32768    | 2019.60 |  881.95 | +129.0 % | 42.89 | 40.49 |  +5.9 % |
+| 65536    | 2011.00 |  619.08 | +224.8 % | 42.25 | 34.53 | +22.4 % |
+| 131072   | 1962.88 |  385.39 | +409.3 % | 41.19 | 27.05 | +52.3 % |
+
+Gufo's incremental pp512 and decode stay flat to the deepest frontier
+(4 KV heads → the global layers read only 3.8 GB of KV per 512-token block
+at 131 K); llama-bench degrades on both from ctx 32 K. The reference's
+short-depth decode lead (the prefill-only C7 campaign left decode at
+41.7-42.7 here) is closed: the C16b router fixes were re-measured on
+these frontier rows in a later exclusive session (r2, artifact
+`flint-c16b-frontier.log`) — Gufo decode now 45.5-45.8 flat,
+−1.0…−5.1 % vs the unchanged llama.cpp rows at ctx 2048-8192 and
++3.5 % at 16384; the pp columns and the ctx ≥ 32768 rows keep the
+original matched-session measurements.
+
+## Full-prompt chunked prefill (Gufo scope)
+
+Whole prompt of `ctx` tokens prefilled in 4096-token chunks, tg128 after
+the last chunk, one warmed sample. No llama.cpp counterpart: llama-bench
+rows are incremental 512-token prefills, not whole-prompt rate.
+
+| prompt tokens | pp (tok/s) | tg128 (tok/s) |
+|--------------:|-----------:|-------------:|
+| 2048    | 2960.56 | 46.15 |
+| 8192    | 2409.51 | 41.19 |
+| 16384   | 1795.68 | 42.69 |
+| 32768   | 1077.38 | 42.66 |
+| 65536   |  642.31 | 42.22 |
+| 131072  |  332.55 | 42.37 |
+
+The 2048/8192/16384 rows were re-measured after the C14 SumExperts
+group path, matched same-session against a dispatch-disabled control in
+the repeated pp2048 style (+2.0/+1.5/+0.4 %, 2902.11 / 2374.38 /
+1787.89 → 2960.56 / 2409.51 / 1795.68). Earlier lineage: C11 WMMA
+attention `<8, 2>` query-block config (+4.0/+5.0 % on the deterministic
+8192 and 16384 runs over the same-afternoon rebuilt pre-C11 control
+2887.75 / 2311.78 / 1712.85; pp2048 +0.2 % inside its ±7.2 r2 noise).
+Prior C10 lineage: 2858.40 / 2298.76 / 1723.65 (+0.8/+1.0/+1.9 % matched
+against the same-morning pre-C10 control 2836.80 / 2276.36 / 1692.00;
+the C9 record 2842.47/2851.07, 2282.92, 1703.15 sat ~0.3 % above that
+control — session-anchored deltas, not overlap). Earlier lineage: C9
+replaced 2778.63 / 2246.51 / 1628.35 (+2.3/+1.6/+4.6 %), which had
+replaced the C8a 2677.90 / 2159.85; the remaining rows are still at the
+C7v-revision measurements. The 2048 tg128 row is the C16b router
+re-measurement (matched -r2 43.04/42.95 control → 46.15/45.67; other
+tg128 rows keep the pre-C16b measurements — the router fix applies at
+every depth but is not yet re-sampled there; C14 re-sampled tg128 at
+2048/16384 — 40.90/42.39 candidate vs 41.82/41.93 control, session
+noise — and its rows=1 SumExperts is launch-bound at 1.9 µs; C11 samples tg1
+43.4-46.1). The
+whole-prompt rate falls with prompt length because the global
+(sliding-window-off) layers attend the whole prefix; the per-chunk MoE and
+GEMM tiers are flat (chunk 8192 trial C7w changed nothing — see
+[EXPERIMENTS.md](EXPERIMENTS.md)).
+
+## Not measured / not supported
+
+- HTTP serve sweep, loading time and memory tables: `TODO` — the C5 Flint
+  serve runner is single-session and has not been through the shared
+  `model-bench.py` harness.
+- Concurrency and speculative tables: `N/A` — Flint serve is one serial
+  session and no draft model exists for Flint.
+- Q8 is the only quantized artifact in scope (`file_type=7` imatrix Q8_0).

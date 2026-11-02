@@ -1,0 +1,31 @@
+
+
+=== [gpu_exclusive] captured serve command for respawn -> /tmp/gufo_serve_cmdline ===
+
+=== [gpu_exclusive] stopping gufo serve (pid 34908) ===
+
+=== [gpu_exclusive] server stopped; VRAM released ===
+
+=== [gpu_exclusive] running benchmark: bash /tmp/c16_tg.sh ===
+== C p2048
+[Model Load]: 11.1145 s
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2927.76 ± 2.61 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.31 ± 0.00 |
+
+== K p2048
+[Model Load]: 24.1687 s
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2937.08 ± 2.36 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.21 ± 0.28 |
+
+== K p2048
+[Model Load]: 10.9944 s
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2942.36 ± 5.95 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.00 ± 0.33 |
+
+== C p2048
+[Model Load]: 10.7126 s
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2949.36 ± 0.78 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.30 ± 0.08 |
+
+
+=== [gpu_exclusive] done (benchmark exit 0) ===

@@ -1,0 +1,37 @@
+# C14 SumExperts streaming group path - captured 2026-10-30
+
+## gates on candidate, ctest gpu-test
+1/3 Test #249: flint.engine .....................   Passed   12.44 sec
+2/3 Test #250: flint.rocm.forward ...............   Passed   14.98 sec
+3/3 Test #251: flint.attention.op ...............   Passed    8.92 sec
+100% tests passed out of 3
+
+## candidate, matched -r2 style (c14time)
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2960.56 ± 0.97 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2409.51 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp16384 |       1795.68 ± 0.00 |
+
+## control (fast-path dispatch disabled), matched -r2 same session (c14r2c)
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2902.11 ± 0.95 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2374.38 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp16384 |       1787.89 ± 0.00 |
+
+## candidate, -n128 style with tg128 (c14tg)
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2877.94 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         40.90 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2394.32 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         44.91 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp16384 |       1791.40 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.39 ± 0.00 |
+
+## control (dispatch disabled), -n128 style same session (c14ctrl)
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2891.21 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.82 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2377.74 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |                tg1 |         44.79 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp16384 |       1771.01 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.93 ± 0.00 |
+
+## pp2048 profile on candidate (prof_c14)
+  SumExpertsHalfKernel y=2048  n=94 avg=534.6us sum=50.3ms  (HEAD SumExpertsKernel<__half> y=2048: n=94 avg=742.5us sum=69.8ms)
+  SumExpertsHalfKernel y=1  n=47 avg=1.9us  (decode row, launch-bound)

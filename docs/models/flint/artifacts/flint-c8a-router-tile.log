@@ -1,0 +1,42 @@
+# C8a multi-row Bf16 router tile: flint gate tests + pp2048/pp8192 whole-prompt A/B (redacted)
+# host: gfx1151 Strix Halo, exclusive GPU, 2026-10-29; rev c4bc7277 + linear.hip.cpp GemvBatchBf16TileRKernel,
+# binary build/release/gufo (SHA-256 prefix 61b96b414aa90e3b).
+# Baselines: pp2048 2677.90, pp8192 2159.85 (BENCHMARKS.md, C7v revision).
+# One gpu_exclusive session (server stopped): ctest flint gate, then gufo bench -p 2048 -n 128 x2, -p 8192 -n 128.
+rev c4bc7277 1 dirty files
+Test project ~/projects/llm/halo_forks/gufo/build/gpu-test
+    Start 249: flint.engine
+1/3 Test #249: flint.engine .....................   Passed   12.15 sec
+    Start 250: flint.rocm.forward
+2/3 Test #250: flint.rocm.forward ...............   Passed   32.10 sec
+    Start 251: flint.attention.op
+3/3 Test #251: flint.attention.op ...............   Passed    8.92 sec
+
+100% tests passed out of 3
+
+Label Time Summary:
+external-model    =  44.25 sec*proc (2 tests)
+flint             =  53.17 sec*proc (3 tests)
+gpu               =  53.17 sec*proc (3 tests)
+slow              =  44.25 sec*proc (2 tests)
+
+Total Test time (real) =  53.17 sec
+=== gate rc=0 ===
+=== pp2048 run1 ===
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2778.63 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         42.01 ± 0.00 |
+=== pp2048 run2 ===
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp2048 |       2760.90 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         43.57 ± 0.00 |
+=== pp8192 ===
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp8192 |       2246.51 ± 0.00 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         41.19 ± 0.00 |
+=== ALL DONE ===
+
+END 2026-10-29T19:08:28+08:00 rc=0

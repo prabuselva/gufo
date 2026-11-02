@@ -1,0 +1,45 @@
+START 2026-10-30T23:32:24+08:00 name=c16tab inner_timeout=600s pid=41180 pgid=41180
+CMD: bash /tmp/c16_tab.sh
+
+=== [gpu_exclusive] captured serve command for respawn -> /tmp/gufo_serve_cmdline ===
+
+=== [gpu_exclusive] stopping gufo serve (pid 39752) ===
+
+=== [gpu_exclusive] server stopped; VRAM released ===
+
+=== [gpu_exclusive] running benchmark: bash /tmp/c16_tab.sh ===
+== frontier ctx 2048
+[Model Load]: 11.058 s
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp1408 |      2851.07 ± 28.23 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |      2173.89 ± 10.90 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         45.62 ± 0.19 |
+
+== frontier ctx 4096
+[Model Load]: 11.284 s
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp3456 |       2879.24 ± 9.16 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2139.32 ± 8.34 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         45.49 ± 0.38 |
+
+== frontier ctx 8192
+[Model Load]: 11.1294 s
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |             pp7552 |       2458.43 ± 0.99 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2166.84 ± 8.78 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         45.78 ± 0.03 |
+
+== frontier ctx 16384
+[Model Load]: 11.1083 s
+| model                            |       size | backend    |               test |                   t/s |
+| -------------------------------- | ---------- | ---------- | ------------------ | --------------------- |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |            pp15744 |       1800.99 ± 7.78 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              pp512 |       2118.08 ± 9.71 |
+| Flint Preview                    |  39.40 GiB | ROCm (HIP) |              tg128 |         45.73 ± 0.15 |
+
+
+=== [gpu_exclusive] done (benchmark exit 0) ===
+END 2026-10-30T23:34:23+08:00 rc=0

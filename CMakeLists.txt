@@ -100,6 +100,10 @@ add_subdirectory(src/models/ling3_0)
 # MoE engine. Model-private kernels only; no other model tree is modified.
 add_subdirectory(src/models/nemotron_h_moe)
 
+# Flint Preview 40B-A2B (flint) — dense-lead MoE with gated rotary/window
+# attention, QK norms and attention sinks. Metadata loader first.
+add_subdirectory(src/models/flint)
+
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -261,7 +265,7 @@ target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next gufo_qwen36_a3b_engine gufo_gemma4_engine
-    gufo_ling3_0_engine gufo_nemotron_h_moe_engine)
+    gufo_ling3_0_engine gufo_nemotron_h_moe_engine gufo_flint_engine)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -309,6 +313,7 @@ add_executable(gufo
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
+  src/models/flint/serve_runner.cpp
   src/models/gemma4/serve_runner.cpp
   src/models/ling3_0/serve_runner.cpp
   src/models/nemotron_h_moe/serve_runner.cpp
@@ -542,6 +547,7 @@ if (BUILD_TESTING)
   add_subdirectory(tests/models/gemma4)
   add_subdirectory(tests/models/ling3_0)
   add_subdirectory(tests/models/nemotron_h_moe)
+  add_subdirectory(tests/models/flint)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test

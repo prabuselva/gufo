@@ -1,0 +1,26 @@
+# C15 fused down-epilogue atomic accumulation - REJECTED (probe only)
+Host: gfx1151 Strix Halo, exclusive GPU via gpu_exclusive.sh (--no-respawn)
+Harness: tools/bench/flint_fuse_sumexp_probe.hip (clang HIP -O3, ROCm same as C14)
+Shape: B=2048 tokens, H=2048, top-6 of 256 experts, expert-sorted compact
+order (production tile walk: grid.x=16x128-col tiles, grid.y=expert tiles,
+16 threads/token x 8 cols); id fill (i*7)%256; 5 warmup + 40 timed iters.
+K1 = scattered bf16 slot store (down epilogue today), K2 = shipped C14
+SumExperts half group path, K3 = 6-way f32 atomicAdd epilogue, K4 =
+shared-expert-only add.
+
+rows=12288 tiles=256 (capacity order: expert-sorted)
+K1 store bf16 rows              236.6 us
+K2 SumExperts (shipped)         468.0 us
+K3 fused atomic 6-way          1653.0 us
+K4 add shared only               52.5 us
+
+baseline K1+K2   =    704.5 us
+fused    K3+K4   =   1705.5 us (142.1 %)
+
+
+Conclusion: K3+K4 = 1705.5 us vs K1+K2 = 704.5 us -> +142 %. 6-way
+per-element f32 atomicAdd into the 16.8 MB x chunk behaves as serialized
+RMW traffic, not L2-coalesced writes. Fusion closed without production
+or quality-class work. (An earlier pre-fix run showed K2 at 16.5 us due
+to a probe-only slot-stride under-read; fixed before the numbers above.
+Production kernels were never affected.)
