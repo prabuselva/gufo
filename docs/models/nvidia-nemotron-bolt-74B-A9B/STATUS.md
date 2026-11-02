@@ -1,0 +1,239 @@
+# NVIDIA Nemotron 3.5 Bolt 74B-A9B 24GB — Implementation Status
+
+Working memory lane for bringing `nemotron_h_moe` up in Gufo on gfx1151.
+Update every phase transition; keep evidence pointers, not prose. Companion
+files: [EXPERIMENTS.md](EXPERIMENTS.md), [BENCHMARKS.md](BENCHMARKS.md).
+
+Branch: `feat/support_nvidia_nemotron_bolt`. Artifact:
+`~/projects/llm/models/gguf/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF/`
+(NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf ~23 GiB IQ2 mixed +
+mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf CLIP/C-RADIO, `clip` arch,
+projector `nemotron_omni`).
+
+Legend: `[x]` done+verified · `[~]` in progress · `[ ]` todo · `[!]` blocked.
+
+Tooling: inspect GGUFs with the repo venv `.venv/bin/python` (has `gguf`
+0.19; `ReaderTensor` attrs are `.name/.shape/.tensor_type.name/.data`), run
+test binaries/ctest with `LD_LIBRARY_PATH=/opt/rocm/lib` on this host (built
+binaries carry no RPATH for ROCm libs), and run every GPU benchmark through
+`tools/bench/gpu_exclusive.sh` or the `bench_bg.sh` + `bench_wait.sh` pair in
+one tool call (AGENTS protocol).
+
+## Golden rules (this model)
+
+- **Control-token safety.** Never emit a raw model control token (e.g. the
+  `
+` endoftext / EOS literal) in edits or tool output: it clashes with
+  the agent's own stop token and truncates generation (seen 2026-10-18 as a
+  stray NUL byte in this file). Spell it as the ASCII placeholder `EOSLIT`
+  while implementing; at the very end run a specialized Python script to bulk
+  replace `EOSLIT` -> the real control sequence, then verify zero placeholders
+  remain. Same rule for `im_start`/`im_end`/tool-call literals: keep them in
+  placeholder form until that final pass.
+- **Model-private code only.** All new kernels and quant support (NVFP4 GEMM,
+  Mamba-2, ReLU2 MoE, IQ2_XXS) live under `src/models/nemotron_h_moe/`. Never
+  modify existing model trees (`deepseek_v4_flash`, `qwen*`, ...) to add
+  nemotron capability — vendor the needed subset instead (each model already
+  keeps its own mmq copy; precedent `qwen38_flash_next/kernels/rocm/mmq/`).
+  Additive core infra (type id in `GgmlType`, size cases) is allowed only when
+  no existing model's behavior changes.
+
+## Facts nailed from the GGUF (verified 2026-10-18, `file_type=19`, 843 tensors)
+
+- 88 layers, all RMS `attn_norm` pre-norm + residual; exactly one job per layer:
+  - 40 Mamba-2 layers (n_head_kv=0, n_ff=0): `ssm_in` 4096→18560 NVFP4
+    (+`.scale`), conv1d×4 over 10240 (x‖B‖C) + f32 bias, `ssm_a`/`ssm_d`/
+    `ssm_dt.bias` (1,128) f32 one-per-head ⇒ **heads 128, headdim 64,
+    dstate 128** (B/C = 8 groups × 128; `ssm_norm` (1024,8) over
+    heads×headdim), `ssm_out` 8192→4096 NVFP4 (+`.scale`).
+  - 8 NoPE attention layers at 7,16,25,36,47,58,69,78 (llama.cpp
+    `LLAMA_ROPE_TYPE_NONE` for `nemotron_h_moe`): full 4096 q, GQA kv
+    `head_count_kv=2`, head_dim 128, Q8_0, kq_scale 1/√128.
+  - 40 latent-MoE-only layers (no attention/mamba): router `ffn_gate_inp`
+    4096→n_expert_layer (heterogeneous: 240×12, 432×10, 368×9, 304×6, 496×3)
+    + `exp_probs_b`, sigmoid gating, top-k=9 per layer-array; experts IQ2_XXS
+    with **no gate matrix**, ReLU² act (`LLM_FFN_RELU_SQR`), per-layer
+    `n_ff_exp` from `expert_feed_forward_length` array (2048/1536/…);
+    `expert_weights_norm=true`, `expert_weights_scale=5.0`; shared expert
+    IQ2_XXS 4096↔5376 (up/down only); latent down/up Q8_0 4096↔1024
+    (`moe_latent_size=1024`) around routed experts only.
+- dtype ids in this file: 8=Q8_0 (1.0625 B/elem verified from offsets:
+  attn, latent, embd, output), 16=IQ2_XXS (2.0625 bpw), 40=NVFP4; NVFP4 block
+  = 16-elem UE4M3 scales + packed fp4 (vendored mmq `block_nvfp4`).
+- d_in_proj = 2·8192 (x,z) + 2·8·128 (B,C) + 128 (dt) = 18560; conv on xBC
+  (10240 channels, kernel 4).
+- Tokenizer: `gpt2` BPE, `pre=pixtral`, vocab 131072, eos=11 (`<end_of_turn>`-family),
+  add_bos=false; jinja chat template 12.5 KB with `enable_thinking` macro +
+  tool calling.
+- Memory semantics (llama.cpp hybrid filters): attention cache iff
+  `!is_recr && n_ff==0`; recurrent state iff `is_recr && n_ff==0`; MoE-only
+  layers hold **no cache**.
+- Reference: llama.cpp `origin/master@ff5a23376` (re-fetched 2026-10-19 for
+  the parity gate; includes Nemotron Bolt support on top of the earlier
+  5aeac37a3) `src/models/nemotron-h.cpp` (trunk graph + hparams + tensors)
+  and `nemotron-h-moe.cpp` (MTP drafter head only; LiLiCorr GGUF not
+  downloaded). Mamba-2 base: `src/models/mamba-base.cpp`.
+
+## Phase 0 — Analysis and reference setup
+
+- [x] GGUF metadata + tensor-layout dump (`/tmp/opencode/dump_gguf_meta.py`,
+  layer classification script; counts above).
+- [x] mmproj metadata dump (CLIP, 32 blocks, embd 1280, patch 16, image 512,
+  `nemotron_omni`, `scale_factor=2`, min/max pixels).
+- [x] llama.cpp reference fetched (`.../llama.cpp/llama.cpp`, `origin/master`
+  = 5aeac37a3); graph refs saved to `/tmp/opencode/ref_nemotron-h.cpp`,
+  `ref_nemotron-h-moe.cpp`, `ref_mamba-base.cpp`, `ref_llama-model.cpp`.
+- [x] Gufo integration map (dispatch sites, module template, ops inventory,
+  test harness) — see Decision log 2026-10-18.
+
+## Phase 1 — Core plumbing (CPU-visible)
+
+- [x] Core type plumbing (additive, all existing tests green
+  `ctest -R 'gguf|quant'` in cpu-test): NVFP4=40 in `GgmlType`
+  (`src/core/gguf_reader.hpp`) + `ToString`, `QuantizedBlockElements`=64,
+  `QuantizedRowBytes` 36 B/block (4×UE4M3 + 32 B fp4, matches vendored mmq
+  `block_nvfp4`). CPU dequant **not** added to core per Golden rule — lives in
+  the model folder (Phase 2 oracle).
+- [x] `src/models/nemotron_h_moe/config.*`: heterogeneous arrays
+  (`n_ff[i]`, `n_head_kv[i]`, `n_expert_used[i]`, `n_ff_exp[i]`), per-layer
+  kind Attn|Mamba|Moe from arrays, no `rotary_dim` requirement (NoPE OK).
+  Verified against the real 24GB GGUF (ad-hoc harness): 88 = 8 attn + 40
+  mamba + 40 MoE; heads 128 (dt width), headdim 64, in_proj 18560 and conv
+  10240 match the tensor table exactly. Registered as `gufo_nemotron_h_moe`
+  static lib (top-level `add_subdirectory`, unconditional like ling3_0).
+- [x] `weights.*`: tensor binder (ling3_0 pattern) binding all 88 blocks and
+  validating shape/format; whitelist F32/Q8_0/IQ2_XXS(66B/256)/NVFP4(36B/64).
+  Per-layer expert counts read from router tensor rows (240..496, metadata
+  only stores the max). NVFP4 trunk `.scale` tensors ARE required and bound
+  (`ssm_in.scale`, `ssm_out.scale`). Corrected 2026-10-19: `ffn_latent_up/
+  down.weight` are standard `[output rows × reduction cols]` row-major like
+  every other projection (the earlier "stored output-first, must transpose"
+  note was wrong); bound and consumed as plain mat-vecs, verified by the
+  real-GGUF CPU oracle.
+- [x] `tokenizer`: GPT-2 BPE + `pre=pixtral` pre-tokenization (model-private,
+  gemma4 precedent); staged-EOS contract — `Encode()` never emits the raw
+  EOS literal, `<GUFO_EOT_STAGE>` sentinel + `FinalizeEndOfTurnText()` swap.
+  `nemotron_h_moe.tokenizer` ctest green.
+- [ ] `chat_template` + control tokens: parse/validate the GGUF jinja
+  semantics (enable_thinking, <|im_start|>/EOSLIT, tool
+  <tool_call> JSON); model-private constants file (AGENTS rule: do not
+  reuse Qwen constants).
+
+## Phase 2 — CPU reference oracle (`reference.cpp`, EXCLUDE_FROM_ALL)
+
+- [x] Forward per layer-kind with dequant-to-f32 matvec (cpu_ops); Mamba-2
+  recurrence (softplus dt, clamps per reference, D skip, group-norm, z gate),
+  sigmoid+bias router top-9 → norm → ×5.0, ReLU² experts, shexp add, latent
+  down/up order; NoPE attention with GQA. Semantics mirrored from pinned
+  llama.cpp (`mamba-base.cpp` build_mamba2_layer, CPU ssm_conv/ssm_scan/swiglu,
+  ggml-quants dequants vendored in `cpu_ops.cpp` + `cpu_tables.hpp`).
+- [x] Unit tests: `tests/models/nemotron_h_moe/reference_test.cpp` — in-memory
+  synthetic 4-layer trunk (mamba/attn/moe) with snapshot goldens, determinism
+  (bit-identical `Reset()` replay), order-sensitivity, context-capacity and
+  error paths; real-GGUF greedy probe behind `GUFO_NEMOTRON_H_MOE_GGUF`
+  (skip 77). llama.cpp parity gate GREEN vs `ff5a23376`: two IQ2_XXS dequant
+  bugs fixed in `cpu_ops.cpp` (sub-block `qs` byte stride 4→8; per-`ib32`
+  output advance so writes append instead of rewriting each block's first 32
+  floats); oracle IQ2 output now bit-matches `dequantize_row_iq2_xxs` on raw
+  expert bytes. See ledger 2026-10-19 parity rows.
+
+## Phase 3 — HIP engine (`kernels/rocm/`)
+
+- [x] Mamba-2 kernels: decode recurrence + chunked prefill
+  (dt A/d discretization; no deltanet reuse); conv-history state tail shared
+  with cache design.
+- [ ] MoE: reuse vendored mmq/mmid/moe_wave64 path (already IQ2_XXS+NVFP4
+  capable) for grouped expert gemm; ReLU² fused act; router top-k kernel with
+  sigmoid+bias and per-layer expert counts; latent up/down dense gemms (Q8_0).
+- [x] NoPE attention: attention prefill/decode minus rope (gemma4 closest).
+- [ ] Session state: per-layer tagged caches (KV for 8 attn layers,
+  conv+ssm state for 40 mamba layers), snapshot/rollback for speculative later.
+- [ ] Engine `Model::Load/CreateSession` + executor prefill/step.
+
+## Phase 4 — Runners + dispatch
+
+- [ ] `cli_runner` (IsNemotronHMoe, Load, Generate, RunBenchmark),
+  `serve_runner` (`LoadServeModel`, `CreateTextRunner`).
+- [ ] Dispatch entries: `src/cli/prompt/prompt.cpp`, `src/cli/serve/inference_backend.{hpp,cpp}`,
+  `src/cli/bench/bench.cpp`, `src/core/text_sampling_defaults.hpp`
+  (temp 1.0 / top_p 0.95 from GGUF).
+- [ ] CMake: `src/models/nemotron_h_moe/CMakeLists.txt` + add_subdirectory
+  (HIP-gated) + `gufo_llm_cli` link + `gufo` serve_runner list.
+
+## Phase 5 — Tests + exclusive-GPU verification
+
+- [ ] `tests/models/nemotron_h_moe/` + CMake; targets `nemotron_h_moe.<case>`,
+  labels `nemotron_h_moe;cpu` / `...;hip;gpu;gfx1151`; external-model cases
+  behind `GUFO_NEMOTRON_H_MOE_GGUF` (skip 77).
+- [ ] `python3 tools/ci/check-format.py` clean before every commit.
+- [ ] gpu-test preset: `ctest --preset gpu-full -R '^nemotron_h_moe'`.
+- [ ] Functional smoke through `gufo serve` + `tests/functional` wiring
+  (impact.json profile `bolt-q2`, vision:false initially).
+- [ ] All GPU benchmarks via `tools/bench/gpu_exclusive.sh` or
+  `bench_bg.sh`+`bench_wait.sh` pair in ONE tool call (AGENTS protocol);
+  iterate ≤16K context first.
+
+## Phase 6 — Deferred (documented scope cuts)
+
+- [ ] Vision: `nemotron_omni` CLIP projector + C-RADIO tower in mmproj path
+  (gemma4 model-private vision precedent). Text-only first.
+- [ ] MTP/LiLiCorr speculative decoding (drafter GGUF not local; MTP-on-hybrid
+  has no Gufo precedent until state rollback lands).
+- [ ] cache::Adapter continuation (qwen36 precedent: serve without adapter
+  first).
+
+## Verification ledger
+
+| date | revision | check | result |
+| --- | --- | --- | --- |
+| 2026-10-18 | pre-impl | GGUF parse, arch facts vs llama.cpp master | consistent (no IQ2 size drift; Q8_0 B/elem exact) |
+| 2026-10-18 | feat branch | NVFP4 mmq hardware probe (exclusive GPU): dense-vec N=1/3/8 + dense gemm tile boundaries vs exact f32 — probe now at `src/models/nemotron_h_moe/tools/nvfp4_probe.hip` (`nmb_` ABI) | 7/7 PASS, rel/scale ≤ 3.8e-3 (Q8_1-act floor); ssm_in-shape 5.27 ms, ssm_out-shape 3.01 ms |
+| 2026-10-18 | feat branch | Core NVFP4=40 plumbing; `cmake --preset cpu-test` build + `ctest -R 'gguf\|quant\|dequant'` | 297/297 built, 3/3 pass |
+| 2026-10-18 | feat branch | `Config::FromGguf` on the real 24GB GGUF; derived shapes vs tensor table (`.venv` gguf 0.19 sweep of all 843 tensors) | PASS: layer mix 8/40/40, heads 128 headdim 64, in_proj 18560, conv 10240; expert counts {240,304,368,432,496} × ff {1536,2048,2304,2560} |
+| 2026-10-19 | feat branch | `ModelWeights::Bind` on the real 24GB GGUF (ad-hoc harness, per-layer shape/format/offset check); latent orientation fixed to stored [ne0=1024/4096] | PASS: 88 layers bound, payload 20.50 GiB, all shapes/formats match tensor sweep; `check-format` PASS |
+| 2026-10-19 | feat branch | Latent orientation re-check: `ffn_latent_{up,down}` are standard [output rows × reduction cols], no transpose; weights.cpp comment corrected; oracle/real-GGUF runs confirm | PASS (supersedes the stored-output-first claim above) |
+| 2026-10-19 | feat branch | CPU oracle `nemotron_h_moe.reference`: synthetic trunk — finite/non-degenerate logits, bit-identical `Reset()` replay, order sensitivity, capacity + error paths, locked goldens (tok-argmax 3 / sum 0.793073; seq 2 / 5.106880); `ctest -R '^nemotron_h_moe\.'` = tokenizer Pass + reference Skip; `check-format` PASS (756 files) | PASS |
+| 2026-10-19 | feat branch | Real 24GB GGUF oracle probe (exclusive RAM via bench_bg/bench_wait): 3-token greedy steps + replay — argmax 103288 → 48756 → 70587, logit sums -436497/-355020/-283120, all finite, replay bit-stable; evidence `evidence/reference-cpu-oracle-2026-10-19.log` | SUPERSEDED by the two `DequantizeIq2Xxs` fixes below — those sums/argmax came from the broken IQ2 path |
+| 2026-10-19 | feat branch | IQ2_XXS dequant fixes in `src/models/nemotron_h_moe/cpu_ops.cpp` vs ggml ground truth (byte-level probe on real expert rows decoded by `dequantize_row_iq2_xxs`): sub-block code stride `qs+4*ib32` (uint8) → `qs+8*ib32` (ggml field is `uint16_t qs[32]`); output pointer advanced `+32` per `ib32` (was rewriting each 256-block's first 32 floats, leaving 87.5% zeros). Post-fix oracle matches ggml element-for-element (up_r0 norm 0.427721 nz 2048/2048; shexp norm 0.548900). check-format PASS | PASS; nemotron ctest suite 2/2 green (with `LD_LIBRARY_PATH=/opt/rocm/lib`) |
+| 2026-10-19 | feat branch | llama.cpp parity (exclusive RAM, probe @ pin `ff5a23376` incl. Nemotron Bolt support): per-layer bisection `parity_layers.py` — all 88 layer inputs match cos ≥ 0.99 for 3 steps; logits `parity_compare.py` (gate now top-100 rel ≤ 5%, cos ≥ 0.99, argmax): step argmax 1044/1010/1010 MATCH both sides, top-100 rel ≤ 0.0295, cos ≥ 0.999988, top-10 overlap 9–10; tail max_rel(all) ≤ 0.074 is summation-order noise on rank>100 logits. Evidence `evidence/llama-parity-{run-parity5-full,layers-parity5,compare-parity5}.log` | PASS — oracle valid as Phase-3 quality reference |
+| 2026-10-19 | feat branch | Phase-3 vendored mmq: qwen38 tree copied to `kernels/rocm/mmq` renamed `qfn_`→`nmb_`; NVFP4+IQ2_XXS wired into MMVQ dispatch and dense/dense-vec adapter entries; `gufo_nemotron_h_moe_mmq` builds clean (gpu-test, release); `tools/nvfp4_probe.hip` rerun against the vendored library (exclusive GPU): 7/7 PASS rel/scale ≤ 3.81e-3, ssm_in-shape 5.267 ms / ssm_out-shape 2.960 ms — matches the pre-vendoring evidence | PASS — evidence `evidence/rocm-mmq-nvfp4-probe-vendored.log` |
+| 2026-10-19 | feat branch | GPU contract `nemotron_h_moe.rocm_mmq` (exclusive GPU): synthetic IQ2_XXS/NVFP4 through dense-vec (rows 128/512 × N 1–8), MMQ tier (rows 64/256 × N 16/32) and routed moe_vec (1 of 4 experts, N 1/3/4) vs oracle dequant + double dots; scale-relative metric (per-element relative explodes on near-zero dots); `moe_vector_projection` gate widened to IQ2_XXS/NVFP4 (gated vec still rejects both); check-format PASS | PASS 34/34, rel/scale ≤ 4.97e-3 — evidence `evidence/rocm-mmq-test-gfx1151.log` |
+| 2026-10-19 | feat branch | `nmb_mmq_q8_0_dense_vec` entry (attn q/out, latent up/down, LM head decode); contract extended with Q8_0 rows across dense-vec, MMQ dense and moe_vec; check-format PASS | PASS 51/51, rel/scale ≤ 5.19e-3 — evidence `evidence/rocm-mmq-test-gfx1151.log` |
+| 2026-10-19 | feat branch | `nmb_mmq_iq2_xxs_moe_raw`/`nmb_mmq_nvfp4_moe_raw` routed MMQ entries over the existing `nmb_mmq_moe_impl` template; contract rows N=16/32 × used 1/3 from 4 stacked experts; check-format PASS | PASS 59/59 (moe_raw rel/scale ≤ 4.22e-3) — evidence `evidence/rocm-mmq-test-gfx1151.log` |
+| 2026-10-19 | feat branch | Fused elementwise kernels `gufo_nemotron_h_moe_kernels` (`kernels/rocm/nb_ops`): nbl_rms_norm (wave-size-agnostic reduce), nbl_add, nbl_relu_sqr, nbl_dequant_row_q8_0, nbl_router (iterated argmax mirroring the oracle incl. tie-to-lowest-index, renorm by max(sum, 2⁻¹⁴)×scale, tail −1/0 pad), nbl_moe_combine; contract `nemotron_h_moe.rocm_ops` vs cpu oracle; check-format PASS | PASS (rel ≤ 1.1e-7, add/relu_sqr/dequant exact) — evidence `evidence/rocm-ops-test-gfx1151.log` |
+| 2026-10-19 | feat branch | Mamba-2 scan `kernels/rocm/nb_mamba2` (`nbl_mamba_scan`): conv kernel (thread per xBC channel, register window shift, chunk-parallel with running state) + templated SSM kernel (4-thread quads per (h,i) row, state in registers across the chunk, shfl butterfly y-reduce; stream-ordered scratch); nbl_scale added to nb_ops; contract `nemotron_h_moe.rocm_mamba` vs independent fp32 + fp64 fixtures at T=1×6/8×2/128×1 (bug found via the contract: hipMalloc state buffers were read uninitialized; the test now uploads zero-init states and the fp64 oracle bounds the summation-order noise floor); check-format PASS | PASS (y ≤ 4.9e-7 rel vs fp32+fp64, conv_state exact, ssm_state ≤ 1.4e-6 abs — expf vs std::exp in dA) — evidence `evidence/rocm-mamba-test-gfx1151.log` |
+
+| 2026-10-19 | feat branch | NoPE attention `kernels/rocm/nb_attention` (`nbl_attn_append`, `nbl_attn`): causal GQA SDPA with flash-style online softmax, 8-token rows x heads grid, 128 dim-lane threads, kTile=32 smem tiles (sq/sk/sv + se/sm/sl/sa), NoPE head->kv-group map, decode uses the guarded partial-tile path; contract `nemotron_h_moe.rocm_attention` vs independent double CPU fixture over the same cache rows for T5 prefill, decode x4, T6 midcache, T17 unaligned on three shapes incl. hd!=hdv; append checked exact | PASS (y <= 2e-5 rel, append exact) - evidence `evidence/rocm-attention-test-gfx1151.log` |
+| 2026-10-19 | feat branch | GPU device executor `gufo_nemotron_h_moe_device` (`kernels/rocm/device_model`): one-shot quantized-artifact upload, per-layer mamba/attention/MoE step graph over the nbl_ kernels. Decode GEMMs use the new F32-activation GEMV family `nbl_gemv_f32`/`nbl_gemv_moe_f32` (Q8_0/IQ2_XXS/NVFP4/F32 decodes transcribed from cpu_ops; block-per-row + wave reduce; MoE gather via ids with per-slot x-stride for down-experts and shared x for up-experts) — Q8_1-activation mmv paths lose ~3%/GEMM and blow past the 2% end-to-end gate across 40 MoE layers. Fixed mamba SSM cc-index bug (kernel read next group's B region; contract fixtures had the same bug duplicated — both now derive cc from the C-region base `groups*state`). Contract `nemotron_h_moe.device_step`: 3 real-artifact greedy steps + reset replay vs CPU oracle, `argmax match && rel < 0.02`; check-format PASS | PASS (rel_logits 2.4e-7/1.0e-6/6.7e-7, argmax 1044/1010/1010, replay bit-stable; whole `ctest -R '^nemotron_h_moe\.'` suite 7/7 exclusive GPU) — evidence `evidence/rocm-device-step-gfx1151.log` |
+| 2026-10-19 | feat branch | Row-batched prefill GEMMs `nbl_gemv_rows`/`nbl_expert_index` (`nb_ops`, wide path for tokens ≥ `kRowsBatchMin`=64, decode untouched): Q8_0/IQ2_XXS block-per-row over token tiles of `NBL_ROW_NT`=4 (CE=32 lane chunks, LDS k-slices); NVFP4 keeps the k-split cooperative shape (thread s owns 16-float sub-blocks s, s+256, ...; warp-coalesced 36 B block reads) so each weight byte is reused across the tile; `ExpertIndexKernel` counts+scatters tokens per expert so routed IQ2 latents read one contiguous run (up xdiv=top_k, down xdiv=0). Contracts `RunGemvRowsDense` (Q8/IQ2/NVFP4, N=1..33, oracle dequant + double dot, rel ≤ 1.1e-6) and `RunExpertIndexAndMoeRows`. Matched exclusive benches: prefill 30.81 → 63.19 t/s pp2048 (2.05×), 28.41 → 53.89 t/s pp16384 (1.90×), tg64 14.37 unchanged. rocprof stages: NVFP4 rows 55.3 %, IQ2 rows 28.9 %, router F32 5.9 %; wave-64 device code (`-mwavefrontsize64`) means all row math derives from `warpSize`; check-format PASS | PASS (`ctest -R '^nemotron_h_moe\.'` 7/7 exclusive GPU, no skips; rocm_ops rel ≤ 1.2e-6) |
+
+| 2026-10-20 | feat branch | `NBL_ROW_NT` 4→8 (row-batch tile rows/block, `nb_ops.h`) | pp2048 63.19 → 90.06 t/s (exclusive), decode untouched |
+| 2026-10-20 | feat branch | MMQ prefill tiers in the wide device path (`device_model.cpp`): `nmb_mmq_nvfp4_dense` (ssm_in/out), `nmb_mmq_q8_0_dense` (q/k/v/attn_out/latent), `nmb_mmq_iq2_xxs_dense` (shared experts), `nmb_mmq_iq2_xxs_moe_raw` (`up_exps`, per-token expert ids, token-major `nrows_dst=M` layout match); `down_experts` keeps `nbl_gemv_rows_moe` (per-slot activations); `nmb_mmq_init` in `DeviceModel::Init`; device lib links `gufo_nemotron_h_moe_mmq`. Quality: `device_step` wide gate extended (2 prompts 132/197 tok vs CPU oracle, margin-aware rule — flip accepted iff rel < 0.025 and top-pair preserved under oracle tie margin < 0.5); `rocm_mmq` routed tier extended to 512 experts (proves `moe_raw` semantics incl. ids>255); bisection traced 1.5e-2 logit rel to Q8_1-activation quant noise accumulation (per-site ≤4e-3) on oracle near-ties, rows-only 7.9e-3, HEAD-kernel-wide 3.8e-3. Matched exclusive benches (release): pp2048 90.06 → 293.09 (3.25×), pp16384 53.89 → 165.30 (3.07×, llama.cpp ref 488.8), tg64 14.44 unchanged; `ctest --preset gpu-full -R '^nemotron_h_moe\.'` 7/7 (model-gated device_step/reference verified green standalone with `GUFO_NEMOTRON_H_MOE_GGUF`); check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_{gate4,mmqpp,mmq16,mmqtg}.log` |
+
+## Blockers / risks
+
+- IQ2_XXS×fp16 activation grouped GEMM perf for 2–9B active params is the
+  decode bottleneck hypothesis (240–496 experts/layer, top-k 9); validate with
+  `tools/bench/moe_gemv_bench.hip` patterns early.
+- Heterogeneous per-layer expert counts (240…496) — mmid launch params must be
+  per-layer, not global `expert_count=496`.
+- [resolved 2026-10-18] NVFP4 hardware path: probed end-to-end (generic Q8_1
+  MMQ/MMVQ path via `mul_mat_q_case<GGML_TYPE_NVFP4>`, no FP4 tensor cores on
+  gfx1151 — see ledger). Proven with a temporary additive instantiation in
+  deepseek's mmq, since **reverted** per Golden rule; vendored into
+  `src/models/nemotron_h_moe/kernels/rocm/mmq/` on 2026-10-19 and re-proven
+  there (see ledger).
+  Tensor-scale (`ssm_in.scale`/`ssm_out.scale`, per-tensor f32) is applied as
+  a nemotron-side output epilogue multiply, never inside vendored mmq common
+  code paths shared with other quant types.
+- gpt2/pixtral pre-tokenizer fidelity vs HF (BPE regressions are silent).
+| 2026-10-20 | feat branch | `AttnKernel` prefill depth lever: K staged LDS-transposed `skT[d][j+1]` (padded, removes the 32-way bank conflict of `sk[j][d]` with lane-distributed j) and token tile `AttnKernel<8,kTile32>` -> `<24,16>`; template-ized `(TR,kTile)`; grid `(tokens+23)/24`; microbench `tools/bench/nem_attn_bench.hip` exclusive grid: winner tr24/kt16/skT 2.4 -> 8.8 t/s at pp16384 shapes (3.2x; skT alone +53%, +tr24 doubles again; tr20/28/32, kt24/kt32 worse, kt64 spills static LDS); quality: `rocm_attention` contract passes (norm-rel 1.2e-7 in microbench vs f64), `device_step` gates (narrow + wide, exclusive with `GUFO_NEMOTRON_H_MOE_GGUF`) PASS rel 5.2e-3/1.4e-2 margin-aware as before. Matched exclusive benches (release): pp2048 293.09 -> 304.63, pp16384 165.30 -> 240.69 (+45.6%, llama.cpp ref 488.80), tg64 14.44 -> 14.52; check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_{attn8b,dstep,at3}.log` |
+| 2026-10-20 | feat branch | Router GEMM prefill lever: naive thread-per-output `GemmF32Kernel` (26.9 s of pp16384, ~0.15 TF/s) replaced by LDS-tiled SGEMM (64 tok x 64 experts tile, k-step 32, 256 threads, thread tile 8T x 2R, float4 staging into `+1`-padded rows); microbench `tools/bench/nem_router_bench.hip` exclusive sweep of naive/k-split/ks16-64/TN32-64/TGT8-16/thread-tile-ratio grid: winner 3.0-4.4 TF/s (~20x; register-prefetch, ks64, TN32 and 128-token tiles all worse; 8T x 2R beat 4T x 4R); k%32!=0 keeps the naive fallback; quality: `rocm_ops` contract + `rocm_attention` regression PASS, `device_step` gate (exclusive, `GUFO_NEMOTRON_H_MOE_GGUF`) PASS 252 s. Matched exclusive benches (release): pp2048 304.63 -> 425.83 (+39.8%), pp16384 240.69 -> 318.66 (+32.4%, llama.cpp ref 488.80), tg64 14.52 -> 14.71; check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_{rtr2,rtr3,rtr4,rtr5,rtr6}.log` |
+| 2026-10-20 | feat branch | Routed `down_experts` prefill lever: per-slot row-batched `nbl_gemv_rows_moe` (20.2 % of pp16384 GPU time, ~1.2 TF/s, LDS/issue-bound vs 4.2 TF/s of the up-side MMQ tier at equal FLOPs) replaced by the MQ id-tier `nmb_mmq_iq2_xxs_moe_raw` with `n_tokens=slots, n_expert_used=1` (X rows = per-slot act_ rows, ids = flat router ids, Q8_1-quantized gated gather, expert-sorted tiles in `mul_mat_q`); combine layout unchanged (rows stay slot-ordered). Dead path removed: `GemvRows(Nvfp4)Kernel`, `GemvChunkWEff`, `ExpertIndexKernel`, `nbl_expert_index`/`nbl_gemv_rows_*`/`NBL_ROW_NT`, exp_list/desc buffers, their rocm_ops sections. Quality: `rocm_ops` + `rocm_attention` + `rocm_mmq` contracts PASS, `device_step` (exclusive, `GUFO_NEMOTRON_H_MOE_GGUF`) PASS. Matched exclusive benches (release): pp2048 425.83 -> 508.61 (+19.4%), pp16384 318.66 -> 357.58 (+12.2%, llama.cpp ref 488.80), tg64 14.71 (narrow path untouched, 14.61 within noise); check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_mqdown.log`, `/tmp/opencode/gufo_bench_dstepmq.log` |
+| 2026-10-20 | feat branch | Attention score-phase 2D register tile: `AttnKernel` score loop computes rows (r0,r0+1) x kv cols (j0,j0+1) per thread with four accumulators so every LDS word feeds two FFMAs; per-cell causal masks keep each output's d-ascending chain bit-identical to the scalar loop. Microbench (`nem_attn_bench`, median round-robin + duplicate controls): KJ column tiling / unroll variants all lose ~10% vs production G; RP/JP grid winner T22 tr24/kt16 +24.1/+19.1/+18.4% median (2048/8192/16384 attn-only), T41/T12 smaller, E22 tr32 halved blocks/CU; gfx1151 has no `v_pk_fma_f32` — dual FP32 issue is automatic VOPD. Quality: `rocm_attention`/`rocm_ops`/`rocm_mmq` contracts PASS, `device_step` PASS (exclusive). Matched exclusive A/B (interleaved, 2 reps, one window): pp2048 485.08/485.14 -> 490.85/491.98 (+1.2% both reps), pp16384 parity (mean 353.6 -> 354.6); the isolated-kernel +18–24% shrinks because 256-token chunking makes the score phase a minor share; cross-window clock drift ±5% explains the apparent regression vs prior-window table history (same-window base 485 vs old 508.61). Canonical exclusive run of the committed build: pp2048 486.51, pp16384 354.24, pp1 14.97, tg64 14.77; check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_{attrp,attnport,abt22,abt22i,t22fin}.log` |
+| 2026-10-20 | feat branch | Prefill chunk lever (gemma4 3.2c donor — the fork's biggest single lever): `kPrefillChunk` 256 → 2048 (`device_model.hpp`, single constant; scratch, expert slot buffers and per-chunk uploads all derive from it). Wider chunks amortize per-chunk weight re-streams of the row-batched/MMQ GEMM family and cut per-chunk Mamba conv/ssm state round-trips 8×; numerics unchanged because every kernel keeps its per-output K-chain order and the Mamba prefill scan is token-sequential. Matched interleaved exclusive A/B, 2 rounds, order swapped (`/tmp/gufo_c256` vs HEAD build): pp2048 476.07/476.33 → 582.17/578.53 (+21.9 %), pp8192 423.64/420.17 → 508.87/509.55 (+20.7 %), pp16384 353.81/351.49 → 425.52/421.91 (+20.2 %, gap vs llama.cpp ref 488.80 −27.5 % → −13.3 %), tg64/pp1 flat, no scratch OOM. Quality: `device_step` PASS 266 s, `rocm_attention`/`rocm_ops`/`rocm_mmq` contracts PASS; check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_chunk_ab.log` |
+
+| 2026-10-20 | feat branch | Contract audit + wide tie-cluster rule: the gpu-test `nemotron_h_moe_*_test` targets are `EXCLUDE_FROM_ALL`, so the bare `cmake --build --preset gpu-test` never recompiles them (`ctest` never builds) — the 12:22 `dstepmq`, 13:34 `attnport` and chunk-era `device_step` gate verdicts ran a stale ~10:56 binary. First fresh exposure bisected the `wide prefill p1` flip to `5de773aa` (down-experts MQ id tier): rel_logits improves 1.446e-2 → 4.690e-3 (5× budget headroom unchanged) but the device picks the third member of the oracle's 0.039-logit top cluster; the `9a26c6bc` rule only blessed a top-two swap, while its 0.5-margin cluster can hold >2 tokens. Rule now requires the device pick to sit inside the oracle's 0.5-cluster — tie margin, rel budget and prompts unchanged. A chunk-256 rebuild of the current tree produces bit-identical logits, exonerating `2d1cec25` (whose ledger `device_step PASS` was stale evidence). Gate protocol going forward: rebuild model-kernel test targets explicitly (`cmake --build --preset gpu-test --target nemotron_h_moe_device_step_test nemotron_h_moe_rocm_*_test`) after every kernel edit. Router (`d14103a8`) re-verified fresh: PASS | PASS — evidence `/tmp/opencode/gufo_bench_{devstep,dstepab,c256v,bisect,devstep2}.log` |
+| 2026-10-20 | feat branch | Attention phase decomposition probe (closed lever): `nem_attn_bench` MODE ladder at pp16384 shapes — staging roofline alone (float4 loads of K/V per block) 35310-36667 t/s (411-440 GB/s, L3-resident), no-V-phase 18814-19268, full T22 12032-12505: staging ≈34 %, V-phase ≈36 %, score+softmax ≈30 % of the kernel; a no-expf variant proved dead-code-eliminated (63M t/s) and was dropped. Kernel is LDS/issue-bound — bf16/Q8 KV staging and expf tricks have no headroom at these shapes; attention set aside for other levers | REJECTED (probe record) — evidence `/tmp/opencode/gufo_bench_attnprobe{,2}.log` |
+| 2026-10-20 | feat branch | SqReLU folded into down-expert activation quantize: the wide MoE path materialized `act_ = relu_sqr(up_out_)` (full f32 write + reload) purely to feed `quantize_mmq_q8_1`; the quantize template gained `ReluSqr` that applies `v > 0 ? v*v : 0` in-register before block stats (operator-identical to `ReluSqrKernel`), exported as `nmb_mmq_iq2_xxs_moe_raw_sqract` via `nmb_mmq_moe_impl(act_relu_sqr)`. Bit-identical by construction and by contract (`rocm_mmq` fused equivalence: `Download`ed `_moe_raw_sqract(x)` memcmps equal `_moe_raw(relu_sqr(x))`, incl. 512-expert layouts). Narrow/gemv path keeps the standalone `nbl_relu_sqr`. Matched interleaved exclusive A/B (`/tmp/gufo_prefuse` vs fused, 2 rounds order-swapped): pp2048 +1.1/+2.0 %, pp8192 +0.2/+0.6 %, pp16384 +0.2/+0.7 %, tg64 flat (6/6 positive). Canonical exclusive: pp2048 617.06, pp8192 546.34, pp16384 455.37, pp1 14.91, tg64 14.62. Quality: `rocm_attention`/`rocm_ops`/`rocm_mmq` PASS on explicitly rebuilt targets, `device_step` PASS (exclusive, rc=0); check-format PASS | PASS — evidence `/tmp/opencode/gufo_bench_{fusab,canfus,devstep2}.log` |
+| 2026-10-20 | feat branch | Prefill chunk 2048 → 8192 rows: single `kPrefillChunk` constant (device-wide, all scratch/slots derive from it). With `top_k`=16 the routed experts are saturated well below 2048 rows, so every MoE chunk re-streams (nearly) the full expert weights; doubling the chunk halves weight bytes/token — the same mechanism as the 256→2048 lever, second bite. Fresh profile of the committed fused build (pp16384, timed pass 116: Attn 31.1 %, mul_mat_q IQ2 23.5 % + NVFP4 22.5 % + Q8 2.4 %, MambaSsm 5.7 %) confirmed the GEMM families dominate and that mmq tile geometry is exhausted (`get_mmq_x_max_host` swept 24–128, WMMA 4-wave tile); weight traffic is the only headroom. Ladder measured (see EXPERIMENTS): 8192 adopted — matched interleaved exclusive A/B 2 rounds order-swapped: pp8192 +2.5/+2.4 %, pp16384 +3.3/+0.6 %, tg64 flat; pp2048 (identical single-chunk code) 5 matched pairs average flat; 16384 rejected on `nmb_stack_pool: arena exhausted`. Quality: `rocm_mmq`/`rocm_ops`/`rocm_mamba`/`rocm_attention` + `device_step` (268.7 s) all PASS on explicitly rebuilt targets (chunking changes sort/mamba splits, gate re-run mandatory under the cluster rule); check-format PASS. Canonical exclusive runs of the adopted build (same window as controls): pp2048 623.80, pp8192 560.28, pp16384 464.20 (−5.0 % vs ref 488.80), tg64 14.57 | PASS — evidence `/tmp/opencode/gufo_bench_{c4ab,c8probe,c16probe,c8ab,c8pp2k}.log` |

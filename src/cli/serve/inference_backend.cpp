@@ -46,6 +46,8 @@
 #include "src/models/gemma4/vision/prompt.hpp"
 #include "src/models/ling3_0/engine.hpp"
 #include "src/models/ling3_0/serve_runner.hpp"
+#include "src/models/nemotron_h_moe/engine.hpp"
+#include "src/models/nemotron_h_moe/serve_runner.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -3430,6 +3432,17 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
   }
+  if (reader->GetMetadataString("general.architecture") == "nemotron_h_moe") {
+    auto model = models::nemotron_h_moe::LoadServeModel(
+        model_path, *reader, max_context, speculative_config, &load_error);
+    if (model == nullptr) {
+      SetError(error, load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
+  }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
@@ -3878,6 +3891,40 @@ bool InferenceBackend::load(std::shared_ptr<models::ling3_0::Model> model,
   }
   try {
     auto runner = models::ling3_0::CreateTextRunner(
+        std::move(model), max_context, session_count, speculative_config,
+        disk_cache_config, error);
+    if (runner == nullptr) {
+      return false;
+    }
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::nemotron_h_moe::Model> model, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSpeculativeConfig speculative_config,
+    TextDiskCacheConfig disk_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Nemotron Bolt model must not be null");
+    return false;
+  }
+  try {
+    auto runner = models::nemotron_h_moe::CreateTextRunner(
         std::move(model), max_context, session_count, speculative_config,
         disk_cache_config, error);
     if (runner == nullptr) {

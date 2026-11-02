@@ -38,6 +38,10 @@ namespace gufo::models::ling3_0 {
 class Model;
 }
 
+namespace gufo::models::nemotron_h_moe {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -155,6 +159,17 @@ public:
   /// to 16 concurrent sessions with a divided context window.
   bool load(std::shared_ptr<models::ling3_0::Model> model, std::string* error,
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
+
+  /// Installs a previously loaded Nemotron 3.5 Bolt model. The KV and
+  /// recurrent state live inside the single shared device executor, so the
+  /// runner pool accepts exactly one session.
+  bool load(std::shared_ptr<models::nemotron_h_moe::Model> model,
+            std::string* error, std::uint32_t max_context = 4096,
+            std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
