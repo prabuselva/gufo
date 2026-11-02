@@ -727,20 +727,62 @@ int RunGemma4Chat(const cli::PromptOptions& opt, const core::GgufReader& reader,
   if (!opt.system_prompt.empty()) {
     history.push_back({.role = "system", .content = opt.system_prompt});
   }
+  // Images from `--image` attach to the first user turn, mirroring the Qwen
+  // chat: `--mmproj` loads the tower and `EncodeChatVision` expands the
+  // `<|image|>` markers into spliced rows. Each turn re-syncs the whole
+  // history, so the image stays in context for the conversation.
+  std::vector<core::Image> images;
+  for (const auto& path : opt.image_paths) {
+    images.push_back(core::DecodeImage(core::ReadImageFile(path)));
+  }
+  if (!images.empty() && !model->HasVision()) {
+    std::cerr << "Gemma-4 image input requires --mmproj\n";
+    return 1;
+  }
+  const bool use_vision = !images.empty();
   const auto chat_options = Gemma4ChatOptions(opt);
   std::cout << "=== Gufo Interactive Chat (Gemma-4-26B-A4B) ===\n"
-            << "Type 'exit' or Ctrl+D to quit.\n\n";
+            << "Type 'exit' or Ctrl+D to quit.\n";
+  if (use_vision) {
+    std::cout << "Attached " << images.size()
+              << " image(s) to the first turn.\n";
+  }
+  std::cout << '\n';
+  bool first_turn = true;
   for (std::string input;;) {
     std::cout << ">>> User: " << std::flush;
     if (!std::getline(std::cin, input) || input == "exit" || input == "quit")
       break;
     if (input.empty())
       continue;
-    history.push_back({.role = "user", .content = input});
-    const auto tokens = model->EncodeChat(history, {}, chat_options);
+    ChatMessage turn{.role = "user", .content = input};
+    if (first_turn && use_vision) {
+      turn.image_count = static_cast<std::uint32_t>(images.size());
+    }
+    first_turn = false;
+    history.push_back(std::move(turn));
+
+    std::vector<vision::VisionSlot> vision_slots;
+    std::vector<std::int32_t> tokens;
+    if (use_vision) {
+      std::string error;
+      auto prepared =
+          model->EncodeChatVision(history, {}, chat_options, images, &error);
+      if (prepared.tokens.empty()) {
+        std::cerr << "Gemma-4 vision prompt failed: " << error << '\n';
+        return 1;
+      }
+      tokens = std::move(prepared.tokens);
+      vision_slots = std::move(prepared.images);
+    } else {
+      tokens = model->EncodeChat(history, {}, chat_options);
+    }
+
     std::cout << "<<< Assistant: ";
     std::string reply;
-    if (GenerateGemma4Response(opt, model, *session, tokens, &reply) != 0)
+    if (GenerateGemma4Response(
+            opt, model, *session, tokens, &reply,
+            vision_slots.empty() ? nullptr : &vision_slots) != 0)
       return 1;
     ChatMessage response;
     response.role = "assistant";

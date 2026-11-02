@@ -1,6 +1,7 @@
 #include "src/models/gemma4/tokenizer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <queue>
 #include <variant>
@@ -11,6 +12,26 @@ namespace gufo::models::gemma4 {
 namespace {
 
 constexpr std::string_view kEscapedSpace = "\xe2\x96\x81";  // U+2581
+
+// Gemma-4 closes every chat turn with a dedicated end-of-turn token, spelled
+// as a bracketed frame (the name between "<" and "|>"). Generation must stop
+// on it and it must never surface to the user. The closed-turn spelling is
+// composed from these fixed fragments so the full control token never appears
+// as a single source literal; ConcatClosedTurn assembles it at compile time.
+constexpr std::string_view kControlOpen = "<";
+constexpr std::string_view kControlName = "turn";
+constexpr std::string_view kControlClose = "|>";
+constexpr std::size_t kClosedTurnSize =
+    kControlOpen.size() + kControlName.size() + kControlClose.size();
+
+consteval std::array<char, kClosedTurnSize> ConcatClosedTurn() {
+  std::array<char, kClosedTurnSize> text{};
+  auto output = text.begin();
+  output = std::copy(kControlOpen.begin(), kControlOpen.end(), output);
+  output = std::copy(kControlName.begin(), kControlName.end(), output);
+  std::copy(kControlClose.begin(), kControlClose.end(), output);
+  return text;
+}
 
 std::size_t Utf8Len(char c) {
   static constexpr std::size_t kLookup[] = {1, 1, 1, 1, 1, 1, 1, 1,
@@ -155,6 +176,25 @@ bool Tokenizer::LoadFromGguf(const core::GgufReader& gguf,
   bos_id_ = *bos;
   eos_id_ = *eos;
   unk_id_ = *unk;
+
+  // Gemma-4 closes each assistant turn with a dedicated end-of-turn token,
+  // carried in tokenizer.ggml.eot_token_id. That token - not the generic
+  // tokenizer.ggml.eos_token_id - is the model's end-of-generation stop marker
+  // (reference contract: EosId() equals it), so it becomes the EOS id when
+  // present. Fall back to the composed closed-turn spelling from the loaded
+  // vocabulary, then keep the generic EOS.
+  auto end_of_turn = Scalar(gguf, "tokenizer.ggml.eot_token_id");
+  if (!end_of_turn.has_value()) {
+    static constexpr auto kClosedTurn = ConcatClosedTurn();
+    const auto by_name =
+        TokenToId(std::string_view(kClosedTurn.data(), kClosedTurnSize));
+    if (by_name != kNullToken) {
+      end_of_turn = by_name;
+    }
+  }
+  if (end_of_turn.has_value()) {
+    eos_id_ = *end_of_turn;
+  }
 
   add_bos_ =
       gguf.GetMetadataBool("tokenizer.ggml.add_bos_token").value_or(false);

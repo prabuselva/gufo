@@ -1293,10 +1293,6 @@ int RunChat(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   if (models::gemma4::IsGemma4(*reader)) {
-    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
-      std::cerr << "Gemma-4 image input is not yet available\n";
-      return 2;
-    }
     return models::gemma4::RunGemma4Chat(opt, *reader, model_load_start);
   }
 #else
