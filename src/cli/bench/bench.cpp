@@ -16,12 +16,8 @@
 #include "src/cli/sampling_options.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
-#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-#include "staging/models/flint/cli_runner.hpp"
-#include "staging/models/gemma4/cli_runner.hpp"
-#include "staging/models/ling3_0/cli_runner.hpp"
-#include "staging/models/nemotron_h_moe/cli_runner.hpp"
-#include "staging/models/qwen36_a3b/cli_runner.hpp"
+#if defined(GUFO_STAGING_MODELS)
+#include "staging/integration/staging_cli.hpp"
 #endif
 
 namespace gufo::cli {
@@ -341,23 +337,10 @@ int RunBench(std::span<const char* const> args) {
   ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->bench_driver == nullptr) {
-#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-    if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
-      return models::qwen36_a3b::RunQwen36A3BBenchmark(opt, reader,
-                                                       model_load_start);
-    }
-    if (models::gemma4::IsGemma4(*reader)) {
-      return models::gemma4::RunGemma4Benchmark(opt, reader, model_load_start);
-    }
-    if (models::ling3_0::IsLing3Model(*reader)) {
-      return models::ling3_0::RunLing3Benchmark(opt, reader, model_load_start);
-    }
-    if (models::nemotron_h_moe::IsNemotronHBolt(*reader)) {
-      return models::nemotron_h_moe::RunNemotronBenchmark(opt, reader,
-                                                          model_load_start);
-    }
-    if (models::flint::IsFlint(*reader)) {
-      return models::flint::RunFlintBenchmark(opt, reader, model_load_start);
+#if defined(GUFO_STAGING_MODELS)
+    if (const auto staging_rc =
+            StagingRunBenchmark(opt, reader, model_load_start)) {
+      return *staging_rc;
     }
 #endif
     std::cerr << "Error: unsupported model architecture for benchmark\n";

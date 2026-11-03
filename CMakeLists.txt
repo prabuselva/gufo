@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(gufo LANGUAGES C CXX)
 
-# Fork-only model engines live under staging/ and are excluded from the
-# upstream build by default parity targets. ON keeps the fork selection.
+# Staging-only model engines live under staging/ and are excluded from
+# the upstream build by default parity targets. ON keeps the staging selection.
 option(STAGING_MODELS "Build the fork staging model engines" ON)
 if(STAGING_MODELS)
   add_compile_definitions(GUFO_STAGING_MODELS=1)
@@ -422,6 +422,13 @@ endif()
 
 add_subdirectory(src/ext)
 
+# Serve- and CLI-seam glue consumed by gufo_llm_cli and gufo_serving; added
+# after src/ext so the integration target can reference the extension runtime.
+if(STAGING_MODELS)
+  add_subdirectory(staging/integration)
+  target_link_libraries(gufo_llm_cli PUBLIC gufo_staging_integration)
+endif()
+
 # RFC step 6: the text-serving tier the gufo executable used to compile into
 # itself. Scheduler, runner pool, component text cache and InferenceBackend
 # live here; queueing, retention/admission and API policy stay on this core
@@ -446,13 +453,12 @@ if (BUILD_TESTING)
     target_compile_options(gufo_serving PRIVATE /UNDEBUG)
   endif()
 endif()
-# Fork model engines reach execution through the dispatch chain in
+# Staging model engines reach execution through the dispatch chain in
 # inference_backend.cpp; their serve runners compile into this tier.
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_serving PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next)
   if(STAGING_MODELS)
-    add_subdirectory(staging/integration)
     target_sources(gufo_serving PRIVATE
       staging/models/flint/serve_runner.cpp
       staging/models/gemma4/serve_runner.cpp

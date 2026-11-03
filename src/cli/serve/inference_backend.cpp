@@ -22,7 +22,7 @@
 #include "src/core/gguf_reader.hpp"
 
 #if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-#include "staging/integration/fork_backend.hpp"
+#include "staging/integration/staging_backend.hpp"
 #endif
 
 namespace gufo::server {

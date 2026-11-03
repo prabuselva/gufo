@@ -1,5 +1,5 @@
-#ifndef GUFO_STAGING_INTEGRATION_FORK_BACKEND_HPP_
-#define GUFO_STAGING_INTEGRATION_FORK_BACKEND_HPP_
+#ifndef GUFO_STAGING_INTEGRATION_STAGING_BACKEND_HPP_
+#define GUFO_STAGING_INTEGRATION_STAGING_BACKEND_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -25,7 +25,7 @@ struct StagingLoadedModel {
   bool supports_images{false};
 };
 
-// Fork model packages predate the extension registry; when no registered
+// Staging model packages predate the extension registry; when no
 // provider claims the architecture, build its runner here. Returns nullopt
 // when no staging model claims the architecture; on a handled load failure
 // it returns nullopt with `error` set.
@@ -39,4 +39,4 @@ std::optional<StagingLoadedModel> StagingLoadModel(
 
 }  // namespace gufo::server
 
-#endif  // GUFO_STAGING_INTEGRATION_FORK_BACKEND_HPP_
+#endif  // GUFO_STAGING_INTEGRATION_STAGING_BACKEND_HPP_

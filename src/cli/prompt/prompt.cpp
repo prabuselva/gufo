@@ -16,17 +16,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
 #if defined(GUFO_STAGING_MODELS)
-#include "staging/models/gemma4/cli_runner.hpp"
-#include "staging/models/ling3_0/cli_runner.hpp"
-#endif
-
-#if defined(ENGINE_ENABLE_HIP)
-#include "src/core/image.hpp"
-#include "src/families/qwen/text/chat_template.hpp"
-#include "src/families/qwen/vision/prompt.hpp"
-#if defined(GUFO_STAGING_MODELS)
-#include "staging/models/qwen36_a3b/cli_runner.hpp"
-#endif
+#include "staging/integration/staging_cli.hpp"
 #endif
 
 namespace gufo::cli {
@@ -68,56 +58,6 @@ std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   return std::nullopt;
 }
 
-#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-
-constexpr std::uint32_t kDefaultContext = 4096;
-
-ReasoningOptions PromptReasoningOptions(const PromptOptions& options) {
-  ReasoningOptions reasoning;
-  if (options.reasoning_mode == "on") {
-    reasoning.enabled = true;
-  } else if (options.reasoning_mode == "off") {
-    reasoning.enabled = false;
-  }
-  if (options.reasoning_effort != "auto") {
-    reasoning.effort = ParseReasoningEffort(options.reasoning_effort);
-    reasoning.enabled = true;
-  }
-  if (options.preserve_thinking == "on") {
-    reasoning.preserve_thinking = true;
-  } else if (options.preserve_thinking == "off") {
-    reasoning.preserve_thinking = false;
-  }
-  return reasoning;
-}
-
-void AttachImages(const PromptOptions& opt,
-                  tokenization::ChatMessage& message) {
-  for (const auto& path : opt.image_paths) {
-    message.images.push_back(
-        {0, std::make_shared<const std::vector<std::uint8_t>>(
-                core::ReadImageFile(path))});
-  }
-}
-
-std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
-    const PromptOptions& opt, const tokenization::QwenTokenizer& tokenizer,
-    std::span<const tokenization::ChatMessage> messages,
-    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
-  if (!encoder) {
-    throw std::invalid_argument(
-        "image input requires a matching --mmproj BF16 sidecar");
-  }
-  const auto reasoning = PromptReasoningOptions(opt);
-  return std::make_shared<models::qwen::vision::Prompt>(
-      models::qwen::vision::Prepare(
-          tokenizer, messages, {},
-          tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id),
-          encoder->identity(), kDefaultContext));
-}
-
-#endif
-
 void RegisterImageOptions(ArgParser& parser, PromptOptions& opt) {
   parser.AddFlag("", "--add-vision-id",
                  "Prefix image inputs with Picture N: in the chat template",
@@ -146,14 +86,9 @@ void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
-  parser.AddOption("", "--attn-window", "N",
-                   "Qwen3.6-35B-A3B prefill attention: sliding-window tokens "
-                   "(0 = dense, default)",
-                   "Model", &opt.attn_window);
-  parser.AddOption("", "--attn-sink", "N",
-                   "Qwen3.6-35B-A3B prefill attention: always-attended initial "
-                   "tokens when --attn-window is set (default 0)",
-                   "Model", &opt.attn_sink);
+#if defined(GUFO_STAGING_MODELS)
+  RegisterStagingTextOptions(parser, opt);
+#endif
   RegisterImageOptions(parser, opt);
 
   // Prompt & Formatting
@@ -447,52 +382,10 @@ int RunPrompt(std::span<const char* const> args) {
   ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->prompt_driver == nullptr) {
-#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-    if (models::gemma4::IsGemma4(*reader)) {
-      return models::gemma4::RunGemma4Prompt(opt, *reader, model_load_start);
-    }
-    if (models::ling3_0::IsLing3Model(*reader)) {
-      if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
-        std::cerr << "Ling 3.0 Flash does not support image input\n";
-        return 2;
-      }
-      return models::ling3_0::RunLing3Prompt(opt, *reader, model_load_start,
-                                             PromptReasoningOptions(opt));
-    }
-    if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
-      std::string rendered_prompt = opt.prompt_text;
-      std::vector<tokenization::ChatMessage> messages;
-      if (opt.use_chat_template) {
-        if (!opt.system_prompt.empty()) {
-          messages.push_back(
-              {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
-        }
-        messages.push_back(
-            {tokenization::ChatRole::kUser, opt.prompt_text, "", ""});
-        const auto reasoning = PromptReasoningOptions(opt);
-        const auto rendered = tokenization::QwenChatTemplate::Render(
-            messages, {},
-            tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id));
-        if (!rendered.has_value()) {
-          std::cerr << "Error formatting chat template.\n";
-          return 1;
-        }
-        rendered_prompt = *rendered;
-      }
-      return models::qwen36_a3b::RunQwen36A3BPrompt(
-          opt, *reader, model_load_start, rendered_prompt, messages,
-          AttachImages, PrepareVision);
-    }
-#elif defined(GUFO_STAGING_MODELS)
-    if (models::gemma4::IsGemma4(*reader)) {
-      std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
-      PrintModelLoadTime(model_load_start, false);
-      return 1;
-    }
-    if (models::ling3_0::IsLing3Model(*reader)) {
-      std::cerr << "Ling 3.0 Flash requires ENGINE_ENABLE_HIP=ON\n";
-      PrintModelLoadTime(model_load_start, false);
-      return 1;
+#if defined(GUFO_STAGING_MODELS)
+    if (const auto staging_rc =
+            StagingRunPrompt(opt, *reader, model_load_start)) {
+      return *staging_rc;
     }
 #endif
     std::cerr << "Error: unsupported model architecture for prompt\n";
@@ -538,32 +431,10 @@ int RunChat(std::span<const char* const> args) {
   ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->chat_driver == nullptr) {
-#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-    if (models::gemma4::IsGemma4(*reader)) {
-      return models::gemma4::RunGemma4Chat(opt, *reader, model_load_start);
-    }
-    if (models::ling3_0::IsLing3Model(*reader)) {
-      if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
-        std::cerr << "Ling 3.0 Flash does not support image input\n";
-        return 2;
-      }
-      return models::ling3_0::RunLing3Chat(opt, *reader, model_load_start,
-                                           PromptReasoningOptions(opt));
-    }
-    if (models::qwen36_a3b::IsQwen36A3B(*reader)) {
-      return models::qwen36_a3b::RunQwen36A3BChat(opt, *reader,
-                                                  model_load_start);
-    }
-#elif defined(GUFO_STAGING_MODELS)
-    if (models::gemma4::IsGemma4(*reader)) {
-      std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
-      PrintModelLoadTime(model_load_start, false);
-      return 1;
-    }
-    if (models::ling3_0::IsLing3Model(*reader)) {
-      std::cerr << "Ling 3.0 Flash requires ENGINE_ENABLE_HIP=ON\n";
-      PrintModelLoadTime(model_load_start, false);
-      return 1;
+#if defined(GUFO_STAGING_MODELS)
+    if (const auto staging_rc =
+            StagingRunChat(opt, *reader, model_load_start)) {
+      return *staging_rc;
     }
 #endif
     std::cerr << "Error: unsupported model architecture for chat\n";
