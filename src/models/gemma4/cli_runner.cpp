@@ -36,10 +36,10 @@ bool IsGemma4(const core::GgufReader& reader) {
 #include "src/core/image.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/gemma4/chat_template.hpp"
 #include "src/models/gemma4/engine.hpp"
 #include "src/models/gemma4/vision/prompt.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::models::gemma4 {
 namespace {

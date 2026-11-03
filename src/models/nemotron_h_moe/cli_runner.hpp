@@ -10,8 +10,8 @@ namespace gufo::core {
 class GgufReader;
 }
 
-namespace gufo::cli {
-struct BenchOptions;
+namespace gufo::ext {
+struct TextBenchOptions;
 }
 
 namespace gufo::models::nemotron_h_moe {
@@ -21,7 +21,7 @@ namespace gufo::models::nemotron_h_moe {
 bool IsNemotronHBolt(const core::GgufReader& reader);
 
 int RunNemotronBenchmark(
-    const cli::BenchOptions& options,
+    const ext::TextBenchOptions& options,
     const std::shared_ptr<const core::GgufReader>& reader,
     std::chrono::steady_clock::time_point model_load_start);
 

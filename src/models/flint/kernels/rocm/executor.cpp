@@ -16,11 +16,11 @@
 #include "flint_mmq.h"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/models/flint/kernels/rocm/kernels.hpp"
 #include "src/models/flint/kernels/rocm/linear.hpp"
 #include "src/models/flint/kernels/rocm/moe/moe_prefill.hpp"
 #include "src/models/flint/kernels/rocm/moe/routed_compact.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::models::flint {
 namespace {

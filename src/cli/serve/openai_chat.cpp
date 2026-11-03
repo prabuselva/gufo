@@ -18,22 +18,24 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "gufo/ext/text.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/quote_tracker.hpp"
 #include "src/cli/serve/response_format.hpp"
+#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
-#include "src/models/deepseek_v4_flash/chat_template.hpp"
-#include "src/models/deepseek_v4_flash/tool_calls.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/gemma4/chat_template.hpp"
 #include "src/models/gemma4/tool_syntax.hpp"
-#include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
 
@@ -84,12 +86,45 @@ struct ParsedGeneration {
   std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
   bool hide_tool_markup{false};
+  std::vector<TextSourceSpan> text_spans;
 };
+
+void AppendTextSpans(std::vector<TextSourceSpan>& output,
+                     std::span<const TextSourceSpan> source, std::size_t offset,
+                     std::size_t size) {
+  for (const auto& span : source) {
+    if (offset >= span.size) {
+      offset -= span.size;
+      continue;
+    }
+    const auto count = std::min(size, span.size - offset);
+    if (count)
+      output.push_back({span.begin + offset, count});
+    size -= count;
+    if (!size)
+      break;
+    offset = 0;
+  }
+}
+
+void SetParsedText(ParsedGeneration& parsed, std::string_view text,
+                   std::string_view source, bool track) {
+  parsed.text = std::string(text);
+  parsed.text_spans.clear();
+  if (track && !text.empty())
+    parsed.text_spans.push_back(
+        {static_cast<std::size_t>(text.data() - source.data()), text.size()});
+}
+
+void RebaseTextSpans(ParsedGeneration& parsed, std::size_t offset) {
+  for (auto& span : parsed.text_spans)
+    span.begin += offset;
+}
 
 constexpr std::array<std::string_view, 7> kToolMarkers{
     tokenization::QwenToolSyntax::kCallOpen,
     "<｜DSML｜tool_calls｜>",
-    models::deepseek_v4_flash::DeepSeekToolSyntax::kCallsOpen,
+    "<｜DSML｜tool_calls>",
     "<DSML｜tool_calls｜>",
     "<DSML｜tool_calls>",
     "<tool_calls｜>",
@@ -106,8 +141,7 @@ ToolMarkerSet ToolMarkers(
   // common/parsers/deepseek.cpp (TC_SEPARATOR + FC_START), that separator is
   // framing: returning it as content would double it when history is replayed.
   static constexpr std::array<std::string_view, 2> deepseek{
-      models::deepseek_v4_flash::DeepSeekToolSyntax::kCallsOpenWithSeparator,
-      models::deepseek_v4_flash::DeepSeekToolSyntax::kCallsOpen};
+      "\n\n<｜DSML｜tool_calls>", "<｜DSML｜tool_calls>"};
   static constexpr std::array<std::string_view, 1> gemma{
       models::gemma4::kToolCallStart};
   // Ling 3.0 Flash writes the name directly after this opener, so the
@@ -135,15 +169,12 @@ ToolMarkerSet ReasoningToolMarkers(ToolMarkerSet markers) {
   static constexpr std::array<std::string_view, 1> qwen{
       tokenization::QwenToolSyntax::kNativeCallOpen};
   static constexpr std::array<std::string_view, 2> deepseek{
-      models::deepseek_v4_flash::DeepSeekToolSyntax::
-          kNativeCallOpenWithSeparator,
-      models::deepseek_v4_flash::DeepSeekToolSyntax::kNativeCallOpen};
+      "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"",
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\""};
   if (markers.size() == 1 &&
       markers.front() == tokenization::QwenToolSyntax::kCallOpen)
     return qwen;
-  if (markers.size() == 2 &&
-      markers.back() ==
-          models::deepseek_v4_flash::DeepSeekToolSyntax::kCallsOpen)
+  if (markers.size() == 2 && markers.back() == "<｜DSML｜tool_calls>")
     return deepseek;
   return {};
 }
@@ -175,9 +206,9 @@ constexpr std::array<std::string_view, 9> kToolClosers{
     "</function_results>",
     "</tool_calls>",
     // Model-native dialects, which this fallback admits like any other opener.
-    models::deepseek_v4_flash::DeepSeekToolSyntax::kParameterCloses[0],
-    models::deepseek_v4_flash::DeepSeekToolSyntax::kInvokeCloses[0],
-    models::deepseek_v4_flash::DeepSeekToolSyntax::kCallsClose,
+    "</｜DSML｜parameter>",
+    "</｜DSML｜invoke>",
+    "</｜DSML｜tool_calls>",
 };
 using ToolCloserSet = std::span<const std::string_view>;
 
@@ -318,18 +349,27 @@ bool ParseContent(const json::Value* content,
         *error = "image_url requires a user or tool message and a string URL";
         return false;
       }
-      // Resolution is model-owned; accept only the automatic policy rather
-      // than silently ignoring a requested low/high preprocessing policy.
+      // Resolution is model-owned, except that 'low' bounds it. The other
+      // standard values behave as 'auto', since clients such as Codex always
+      // send one; anything else is still a malformed request.
       const auto* detail = image->find("detail");
       if (detail != nullptr &&
-          (!detail->is_string() || detail->get_str() != "auto")) {
-        *error = "image_url.detail supports only 'auto'";
+          (!detail->is_string() ||
+           (detail->get_str() != "auto" && detail->get_str() != "low" &&
+            detail->get_str() != "high" && detail->get_str() != "original"))) {
+        *error = "image_url.detail must be 'auto', 'low', 'high' or 'original'";
         return false;
       }
+      const auto image_detail =
+          detail != nullptr && detail->get_str() == "low"
+              ? tokenization::ChatMessage::ImageDetail::kLow
+              : tokenization::ChatMessage::ImageDetail::kAuto;
       try {
         message->images.push_back(
-            {output->size(), std::make_shared<const std::vector<std::uint8_t>>(
-                                 core::ReadImageUrl(url->get_str(), budget))});
+            {output->size(),
+             std::make_shared<const std::vector<std::uint8_t>>(
+                 core::ReadImageUrl(url->get_str(), budget)),
+             image_detail});
       } catch (const std::exception& exception) {
         *error = exception.what();
         return false;
@@ -480,9 +520,10 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   return true;
 }
 
-bool ParseTools(const json::Value* tools,
-                std::vector<tokenization::ChatTool>* output, std::string* error,
-                bool allow_non_function = false) {
+bool ParseToolList(const json::Value* tools,
+                   std::vector<tokenization::ChatTool>* output,
+                   std::unordered_set<std::string>* names, std::string* error,
+                   bool allow_non_function) {
   if (tools == nullptr || tools->is_null()) {
     return true;
   }
@@ -505,7 +546,7 @@ bool ParseTools(const json::Value* tools,
         *error = "namespace tools require a tools array";
         return false;
       }
-      if (!ParseTools(nested, output, error, allow_non_function))
+      if (!ParseToolList(nested, output, names, error, allow_non_function))
         return false;
       continue;
     }
@@ -544,9 +585,9 @@ bool ParseTools(const json::Value* tools,
       *error = std::string(kToolNameRule);
       return false;
     }
-    if (std::ranges::any_of(*output, [&](const auto& previous) {
-          return previous.name == tool.name;
-        })) {
+    // A set keeps the check linear: only the request body size bounds the
+    // number of functions.
+    if (!names->insert(tool.name).second) {
       *error = "function names must be unique";
       return false;
     }
@@ -588,15 +629,18 @@ bool ParseTools(const json::Value* tools,
     definition["type"] = "function";
     definition["function"] = std::move(function_obj);
     tool.definition_json = definition.dump();
-    // Counted per flattened function, so namespace recursion cannot exceed
-    // the cap by ordering hosted-adjacent entries around a full namespace.
-    if (output->size() >= 128) {
-      *error = "'tools' supports at most 128 functions";
-      return false;
-    }
     output->push_back(std::move(tool));
   }
   return true;
+}
+
+bool ParseTools(const json::Value* tools,
+                std::vector<tokenization::ChatTool>* output, std::string* error,
+                bool allow_non_function = false) {
+  std::unordered_set<std::string> names;
+  for (const auto& tool : *output)
+    names.insert(tool.name);
+  return ParseToolList(tools, output, &names, error, allow_non_function);
 }
 
 bool ParseToolChoice(const json::Value* value, ParsedChatRequest* request,
@@ -760,6 +804,31 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
   return true;
 }
 
+// Match llama.cpp's canonical field and its older compatibility spelling.
+// An explicit canonical value takes precedence; -1 keeps the server default.
+std::optional<HttpResponse> ParseReasoningBudget(const json::Value& body,
+                                                 ReasoningOptions* options) {
+  const char* field = "reasoning_budget_tokens";
+  const auto* budget = body.find(field);
+  if (budget == nullptr || budget->is_null()) {
+    field = "thinking_budget_tokens";
+    budget = body.find(field);
+  }
+  if (budget == nullptr || budget->is_null())
+    return {};
+  const double value = budget->is_number() ? budget->as_double() : -2.0;
+  if (!std::isfinite(value) || value < -1.0 ||
+      value > std::numeric_limits<std::int32_t>::max() ||
+      std::floor(value) != value)
+    return Error(400, "Bad Request",
+                 "'" + std::string(field) +
+                     "' must be an integer between -1 and 2147483647",
+                 "invalid_reasoning");
+  if (value >= 0.0)
+    options->budget_tokens = static_cast<std::size_t>(value);
+  return {};
+}
+
 std::optional<HttpResponse> ParseToolControls(const json::Value& body,
                                               ParsedChatRequest* output,
                                               bool nullable_parallel = false,
@@ -794,50 +863,10 @@ std::optional<HttpResponse> ParseToolControls(const json::Value& body,
   return {};
 }
 
-json::Value NormalizeToolSchema(const json::Value& schema,
-                                std::size_t depth = 0) {
-  if (!schema.is_object() || depth > 16 || (depth && schema.empty()))
-    throw std::invalid_argument("tool schema cannot be made strict");
-  auto out = schema;
-  for (const auto* key : {"properties", "$defs", "definitions"}) {
-    if (const auto* fields = schema.find(key); fields && fields->is_object()) {
-      auto normalized = json::Value::object();
-      for (const auto& [name, field] : fields->members())
-        normalized.append_member(name, NormalizeToolSchema(field, depth + 1));
-      out[key] = std::move(normalized);
-    }
-  }
-  if (const auto* items = schema.find("items"))
-    out["items"] = NormalizeToolSchema(*items, depth + 1);
-  for (const auto* key : {"anyOf", "allOf", "oneOf"}) {
-    if (const auto* choices = schema.find(key);
-        choices && choices->is_array()) {
-      auto normalized = json::Value::array();
-      for (const auto& choice : choices->items())
-        normalized.push_back(NormalizeToolSchema(choice, depth + 1));
-      out[key] = std::move(normalized);
-    }
-  }
-  if (schema.empty() || schema.member_str("type") == "object" ||
-      schema.contains("properties")) {
-    if (!out.contains("type"))
-      out["type"] = "object";
-    if (!out.contains("properties"))
-      out["properties"] = json::Value::object();
-    if (!out.contains("additionalProperties"))
-      out["additionalProperties"] = false;
-    out["required"] = json::Value::array();
-    for (const auto& [name, value] : out.find("properties")->members()) {
-      (void)value;
-      out["required"].push_back(name);
-    }
-  }
-  return out;
-}
-
 std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                                          TextGenerationBackend& backend,
-                                         ParsedChatRequest* output) {
+                                         ParsedChatRequest* output,
+                                         bool require_model = true) {
   json::Value body;
   try {
     body = json::parse(request.body);
@@ -855,10 +884,13 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "invalid_model");
   }
   output->model = body.member_str("model");
+  if (output->model.empty() && !require_model) {
+    output->model = backend.model_id();
+  }
   if (output->model.empty()) {
     return Error(400, "Bad Request", "'model' is required", "missing_model");
   }
-  if (output->model != backend.model_id()) {
+  if (!backend.serves_model(output->model)) {
     return Error(404, "Not Found",
                  "model '" + output->model + "' is not served by this process",
                  "model_not_found");
@@ -885,6 +917,14 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                    "invalid_cache_prompt");
     }
     output->chat.cache_prompt = cache_prompt->as_bool();
+  }
+  if (const auto* cache_persist = body.find("cache_persist");
+      cache_persist != nullptr && !cache_persist->is_null()) {
+    if (!cache_persist->is_bool()) {
+      return Error(400, "Bad Request", "'cache_persist' must be a boolean",
+                   "invalid_cache_persist");
+    }
+    output->chat.cache_persist = cache_persist->as_bool();
   }
   if (const auto error =
           ParseStopSequences(body.find("stop"), StopSequenceFormat::kOpenAi,
@@ -917,6 +957,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", std::move(parse_error),
                  "invalid_reasoning");
   }
+  if (auto error = ParseReasoningBudget(body, &output->chat.reasoning))
+    return error;
   if (const auto* kwargs = body.find("chat_template_kwargs")) {
     if (const auto* vision_id = kwargs->find("add_vision_id")) {
       if (!vision_id->is_bool())
@@ -935,6 +977,9 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
   if (!output->chat.reasoning.preserve_thinking.has_value()) {
     output->chat.reasoning.preserve_thinking = defaults.preserve_thinking;
+  }
+  if (!output->chat.reasoning.budget_tokens.has_value()) {
+    output->chat.reasoning.budget_tokens = defaults.budget_tokens;
   }
 
   if (const json::Value* stream = body.find("stream");
@@ -1013,13 +1058,12 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "request field 'ignore_eos' is not supported on this endpoint",
                  "unsupported_field");
   }
-  for (const std::string_view unsupported :
-       {"logprobs", "top_logprobs", "modalities", "audio"}) {
+  if (const auto error = ParseLogprobs(body, true, &output->sampling))
+    return Error(400, "Bad Request", error->message, error->code.c_str());
+  for (const std::string_view unsupported : {"modalities", "audio"}) {
     if (const auto* value = body.find(std::string(unsupported));
         value != nullptr && !value->is_null()) {
-      if ((unsupported == "logprobs" && value->is_bool() &&
-           !value->as_bool()) ||
-          (unsupported == "modalities" && value->is_array() &&
+      if ((unsupported == "modalities" && value->is_array() &&
            value->size() == 1 && value->items().front().is_string() &&
            value->items().front().str() == "text"))
         continue;
@@ -1288,6 +1332,10 @@ std::string_view ContentBefore(std::string_view full, std::size_t begin,
       begin = cursor;
   }
   const auto slice = full.substr(begin, stop - begin);
+  // The newline a model writes between or after its calls is layout, not a
+  // reply: a turn of parallel calls would otherwise carry content "\n" (#673).
+  if (after_call && Trim(slice).empty())
+    return {};
   const bool adjacent_envelope =
       after_call && Trim(slice).starts_with(kEnvelopeHeads.front());
   if (const auto block = EnvelopeBlockStart(full, stop, begin, closers, tools,
@@ -1690,8 +1738,7 @@ void ParseQwenCalls(
 // unknown parameters stay as the dialect wrote them.
 std::size_t DeepSeekAcceptedArgumentCount(
     std::span<const tokenization::ChatTool> tools, std::string_view name,
-    std::span<const models::deepseek_v4_flash::ChatMessage::ToolArgument>
-        arguments) {
+    std::span<const ext::ScannedToolArgument> arguments) {
   const auto tool =
       std::ranges::find(tools, name, &tokenization::ChatTool::name);
   if (tool == tools.end())
@@ -1719,8 +1766,7 @@ std::size_t DeepSeekAcceptedArgumentCount(
 
 // Converts a scanned DeepSeek argument list to the shared API form.
 std::vector<tokenization::ChatMessage::ToolArgument> DeepSeekArguments(
-    std::span<const models::deepseek_v4_flash::ChatMessage::ToolArgument>
-        arguments) {
+    std::span<const ext::ScannedToolArgument> arguments) {
   std::vector<tokenization::ChatMessage::ToolArgument> converted;
   converted.reserve(arguments.size());
   for (const auto& argument : arguments)
@@ -1945,9 +1991,12 @@ void ParseDsmlCalls(
     if (marker != tokenization::QwenToolSyntax::kCallOpen)
       dialect_markers.push_back(marker);
   }
-  std::vector<models::deepseek_v4_flash::ScannedToolCall> scanned;
-  models::deepseek_v4_flash::ScanDeepSeekToolCalls(text, dialect_markers,
-                                                   &scanned, spans, partial);
+  const auto* dialect =
+      ext::FindToolDialect(sampling::JsonConstraint::ToolFormat::kDeepSeek);
+  if (dialect == nullptr || dialect->scan_tool_calls == nullptr)
+    return;
+  std::vector<ext::ScannedToolCall> scanned;
+  dialect->scan_tool_calls(text, dialect_markers, &scanned, spans, partial);
   for (auto& invocation : scanned) {
     const auto accepted = DeepSeekAcceptedArgumentCount(tools, invocation.name,
                                                         invocation.arguments);
@@ -1983,7 +2032,7 @@ ParsedGeneration ParseGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false, bool ling = false) {
+    bool partial = false, bool track_text = false, bool ling = false) {
   quotes.Reset(raw);
   ParsedGeneration parsed;
   std::string_view content = raw;
@@ -2018,12 +2067,13 @@ ParsedGeneration ParseGeneration(
       }
       reasoning_call_context = content;
       unfinished_reasoning_quote = quotes.UnclosedAt(marker);
-      parsed.text = std::string(content.substr(marker));
+      SetParsedText(parsed, content.substr(marker), raw, track_text);
     } else {
       parsed.reasoning_content =
           std::string(Trim(content.substr(0, think_end)));
       content.remove_prefix(think_end + kThinkEnd.size());
-      parsed.text = std::string(AfterReasoningSeparator(content, markers));
+      SetParsedText(parsed, AfterReasoningSeparator(content, markers), raw,
+                    track_text);
     }
   } else if (initial_output_state ==
              TextGenerationBackend::InitialOutputState::kAuto) {
@@ -2049,28 +2099,38 @@ ParsedGeneration ParseGeneration(
             content.substr(think_end + kThinkEnd.size());
         remaining = AfterReasoningSeparator(remaining, markers);
         if (think_start > 0) {
-          parsed.text = std::string(content.substr(0, think_start)) +
-                        std::string(remaining);
+          SetParsedText(parsed, content.substr(0, think_start), raw,
+                        track_text);
+          parsed.text += remaining;
+          if (track_text && !remaining.empty())
+            parsed.text_spans.push_back(
+                {static_cast<std::size_t>(remaining.data() - raw.data()),
+                 remaining.size()});
         } else {
-          parsed.text = std::string(remaining);
+          SetParsedText(parsed, remaining, raw, track_text);
         }
       } else {
         const auto remaining = content.substr(think_content_start);
         const auto marker = tool_marker(remaining);
         parsed.reasoning_content =
             std::string(Trim(remaining.substr(0, marker)));
-        parsed.text = std::string(content.substr(0, think_start));
+        SetParsedText(parsed, content.substr(0, think_start), raw, track_text);
         if (marker != std::string_view::npos) {
           reasoning_call_context = remaining;
           unfinished_reasoning_quote = quotes.UnclosedAt(marker);
           parsed.text += remaining.substr(marker);
+          if (track_text)
+            parsed.text_spans.push_back(
+                {static_cast<std::size_t>(remaining.data() - raw.data()) +
+                     marker,
+                 remaining.size() - marker});
         }
       }
     } else {
-      parsed.text = std::string(content);
+      SetParsedText(parsed, content, raw, track_text);
     }
   } else {
-    parsed.text = std::string(content);
+    SetParsedText(parsed, content, raw, track_text);
   }
 
   quotes.Reset(parsed.text);
@@ -2108,9 +2168,15 @@ ParsedGeneration ParseGeneration(
         parsed = ParseGeneration(
             reasoning_call_context.substr(end + kThinkEnd.size()),
             TextGenerationBackend::InitialOutputState::kContent, tools, choice,
-            enforce_required, markers, closers, quotes, false, ling);
+            enforce_required, markers, closers, quotes, false, track_text,
+            ling);
+        RebaseTextSpans(parsed,
+                        static_cast<std::size_t>(reasoning_call_context.data() -
+                                                 raw.data()) +
+                            end + kThinkEnd.size());
       } else {
         parsed.text.clear();
+        parsed.text_spans.clear();
       }
       parsed.reasoning_content =
           std::string(reasoning_call_context.substr(0, end));
@@ -2126,11 +2192,19 @@ ParsedGeneration ParseGeneration(
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
       const std::string full = std::move(parsed.text);
-      std::string text(ContentBefore(full, 0, marker, closers, quotes, tools));
+      const auto old_spans = std::move(parsed.text_spans);
+      std::string text;
+      const auto append = [&](std::string_view part) {
+        text += part;
+        if (!part.empty())
+          AppendTextSpans(parsed.text_spans, old_spans,
+                          part.data() - full.data(), part.size());
+      };
+      append(ContentBefore(full, 0, marker, closers, quotes, tools));
       std::size_t cursor = marker;
       for (const auto& [begin, end] : spans) {
-        text += ContentBefore(full, cursor, marker + begin, closers, quotes,
-                              tools, cursor > marker);
+        append(ContentBefore(full, cursor, marker + begin, closers, quotes,
+                             tools, cursor > marker));
         cursor = marker + end;
       }
       if (!spans.empty()) {
@@ -2140,8 +2214,8 @@ ParsedGeneration ParseGeneration(
           if (const auto held =
                   HeldMarkerPrefix(full, full.size(), markers, quotes))
             unfinished = full.size() - held;
-        text += ContentBefore(full, cursor, unfinished, closers, quotes, tools,
-                              true);
+        append(ContentBefore(full, cursor, unfinished, closers, quotes, tools,
+                             true));
       }
       parsed.text = std::move(text);
       parsed.hide_tool_markup = true;
@@ -2150,8 +2224,14 @@ ParsedGeneration ParseGeneration(
     // No marker: the text is content, but the framing it carries still goes.
     // The streamed response drops it as the turn ends, and both transports
     // must report the same content.
-    parsed.text = std::string(ContentBefore(parsed.text, 0, parsed.text.size(),
-                                            closers, quotes, tools));
+    const auto part = ContentBefore(parsed.text, 0, parsed.text.size(), closers,
+                                    quotes, tools);
+    std::vector<TextSourceSpan> spans;
+    if (!part.empty())
+      AppendTextSpans(spans, parsed.text_spans,
+                      part.data() - parsed.text.data(), part.size());
+    parsed.text = std::string(part);
+    parsed.text_spans = std::move(spans);
   }
   if (enforce_required && choice == ChatRequest::ToolChoice::kRequired &&
       parsed.tool_calls.empty())
@@ -2237,8 +2317,10 @@ ParsedGeneration ParseStructuredGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false, bool gemma = false, bool ling = false) {
+    bool partial = false, bool track_text = false, bool gemma = false,
+    bool ling = false) {
   ParsedGeneration parsed;
+  const auto source = raw;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
     if (leading != std::string_view::npos &&
@@ -2289,7 +2371,9 @@ ParsedGeneration ParseStructuredGeneration(
     // must reach the dialect parser wherever they appear.
     auto native = ParseGeneration(
         content, TextGenerationBackend::InitialOutputState::kContent, tools,
-        choice, enforce_required, markers, closers, quotes, partial, ling);
+        choice, enforce_required, markers, closers, quotes, partial, track_text,
+        ling);
+    RebaseTextSpans(native, content.data() - source.data());
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
@@ -2318,10 +2402,17 @@ ParsedGeneration ParseStructuredGeneration(
     ParseQwenCalls(content, tools, &call.tool_calls,
                    tool_only ? &spans : nullptr, false, partial);
     if (tool_only) {
+      const auto append = [&](std::string_view part) {
+        call.text += part;
+        if (track_text && !part.empty())
+          call.text_spans.push_back(
+              {static_cast<std::size_t>(part.data() - source.data()),
+               part.size()});
+      };
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {
-        call.text += ContentBefore(content, cursor, begin, closers, quotes,
-                                   tools, cursor > 0);
+        append(ContentBefore(content, cursor, begin, closers, quotes, tools,
+                             cursor > 0));
         cursor = end;
       }
       const auto tail = content.substr(cursor);
@@ -2341,13 +2432,13 @@ ParsedGeneration ParseStructuredGeneration(
                                    : std::min(cursor + limit, content.size());
       // The model repeats the framing of the call it just made; that echo is
       // markup, not prose the client should replay on the next turn (#383).
-      call.text += ContentBefore(content, cursor, stop, closers, quotes, tools,
-                                 cursor > 0);
+      append(ContentBefore(content, cursor, stop, closers, quotes, tools,
+                           cursor > 0));
     }
     if (call.tool_calls.empty() && marker != std::string_view::npos &&
         quotes.UnclosedAt(marker) &&
         choice != ChatRequest::ToolChoice::kRequired) {
-      parsed.text = std::string(raw);
+      SetParsedText(parsed, raw, source, track_text);
       return parsed;
     }
     call.hide_tool_markup = true;
@@ -2366,9 +2457,11 @@ ParsedGeneration ParseStructuredGeneration(
   // A constrained turn that produced no call is still reported without
   // framing: the streamed response drops it as the turn ends, and both
   // transports must report the same content.
-  parsed.text = tool_only ? std::string(ContentBefore(raw, 0, raw.size(),
-                                                      closers, quotes, tools))
-                          : std::string(raw);
+  SetParsedText(parsed,
+                tool_only
+                    ? ContentBefore(raw, 0, raw.size(), closers, quotes, tools)
+                    : raw,
+                source, track_text);
   return parsed;
 }
 
@@ -2394,6 +2487,9 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   json::Value prompt_details = json::Value::object();
   prompt_details["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_details"] = std::move(prompt_details);
+  json::Value completion_details = json::Value::object();
+  completion_details["reasoning_tokens"] = result.reasoning_tokens;
+  usage["completion_tokens_details"] = std::move(completion_details);
 
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double predicted_per_second =
@@ -2484,12 +2580,15 @@ json::Value BaseChunk(std::string_view id, long long created,
 
 json::Value ChoiceChunk(std::string_view id, long long created,
                         std::string_view model, json::Value delta,
-                        const char* finish_reason = nullptr) {
+                        const char* finish_reason = nullptr,
+                        const json::Value* logprobs = nullptr) {
   json::Value chunk = BaseChunk(id, created, model);
   json::Value choices = json::Value::array();
   json::Value choice = json::Value::object();
   choice["index"] = 0;
   choice["delta"] = std::move(delta);
+  if (logprobs)
+    choice["logprobs"] = *logprobs;
   if (finish_reason == nullptr) {
     choice["finish_reason"] = json::Value();
   } else {
@@ -2503,7 +2602,8 @@ json::Value ChoiceChunk(std::string_view id, long long created,
 class StreamingTextFilter {
 public:
   using EmitCallback =
-      std::function<bool(std::string_view piece, bool is_reasoning)>;
+      std::function<bool(std::string_view piece, bool is_reasoning,
+                         std::span<const TextSourceSpan> source)>;
 
   StreamingTextFilter(
       TextGenerationBackend::InitialOutputState initial_output_state,
@@ -2660,7 +2760,7 @@ public:
             recognize_tools_
                 ? ContentBefore(raw_, offset, found, closers_, quotes_, tools_)
                 : std::string_view(pending_).substr(0, marker);
-        if (!prose.empty() && !Emit(prose, false)) {
+        if (!prose.empty() && !Emit(prose, false, prose.data() - raw_.data())) {
           return false;
         }
         hidden_ = pending_.substr(marker);
@@ -2678,7 +2778,7 @@ public:
                          pending_.size())
               : 0;
       const std::size_t ready = pending_.size() - held;
-      if (ready > 0 && !Emit(pending_.substr(0, ready), false)) {
+      if (ready > 0 && !Emit(pending_.substr(0, ready), false, offset)) {
         return false;
       }
       pending_.erase(0, ready);
@@ -2689,19 +2789,25 @@ public:
   }
 
   bool Finish(bool hide_tool_markup, std::string_view content = {},
-              std::string_view reasoning = {}) {
+              std::string_view reasoning = {},
+              std::span<const TextSourceSpan> content_spans = {}) {
+    const auto emit_content = [&](std::size_t offset) {
+      std::vector<TextSourceSpan> spans;
+      AppendTextSpans(spans, content_spans, offset, content.size() - offset);
+      return EmitMapped(content.substr(offset), false, spans);
+    };
     if (tool_mode_ && state_ == State::kThinking) {
       const auto tail = reasoning.substr(
           std::min(emitted_reasoning_bytes_, reasoning.size()));
       return (tail.empty() || Emit(tail, true)) &&
-             (content.empty() || Emit(content, false));
+             (content.empty() || emit_content(0));
     }
     if (tool_only_ && tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
       // or after complete calls without exposing their markup or partial calls.
       const auto offset = std::min(emitted_content_bytes_, content.size());
       const auto tail = content.substr(offset);
-      return tail.empty() || Emit(tail, false);
+      return tail.empty() || emit_content(offset);
     }
     if (raw_content_ && !structured_started_ && hide_tool_markup) {
       pending_.clear();
@@ -2717,7 +2823,7 @@ public:
                                               closers_, quotes_, tools_)
                               : std::string_view(pending_);
         const bool is_reasoning = (state_ == State::kThinking);
-        const bool emitted = Emit(text, is_reasoning);
+        const bool emitted = Emit(text, is_reasoning, offset);
         pending_.clear();
         if (!emitted) {
           return false;
@@ -2726,7 +2832,7 @@ public:
       return true;
     }
     if (!hide_tool_markup && !hidden_.empty()) {
-      return Emit(hidden_, false);
+      return Emit(hidden_, false, raw_.size() - hidden_.size());
     }
     return true;
   }
@@ -2741,8 +2847,18 @@ public:
   }
 
 private:
-  bool Emit(std::string_view piece, bool reasoning) {
-    if (!emit_piece_(piece, reasoning))
+  bool Emit(std::string_view piece, bool reasoning,
+            std::size_t offset = std::string_view::npos) {
+    const TextSourceSpan span{offset, piece.size()};
+    return EmitMapped(piece, reasoning,
+                      offset == std::string_view::npos
+                          ? std::span<const TextSourceSpan>{}
+                          : std::span(&span, 1));
+  }
+
+  bool EmitMapped(std::string_view piece, bool reasoning,
+                  std::span<const TextSourceSpan> source) {
+    if (!emit_piece_(piece, reasoning, source))
       return false;
     if (reasoning)
       emitted_reasoning_bytes_ += piece.size();
@@ -2758,7 +2874,7 @@ private:
       if (start != std::string::npos) {
         const auto prose =
             ContentBefore(raw_, offset, found, closers_, quotes_, tools_);
-        if (!prose.empty() && !Emit(prose, false)) {
+        if (!prose.empty() && !Emit(prose, false, prose.data() - raw_.data())) {
           return false;
         }
         emitted_content_bytes_ += prose.size();
@@ -2776,7 +2892,7 @@ private:
       if (ready) {
         const auto text = ContentBefore(raw_, offset, offset + ready, closers_,
                                         quotes_, tools_);
-        if (!text.empty() && !Emit(text, false)) {
+        if (!text.empty() && !Emit(text, false, text.data() - raw_.data())) {
           return false;
         }
         emitted_content_bytes_ += text.size();
@@ -2796,8 +2912,9 @@ private:
         return true;
       }
     }
+    const auto offset = pending_offset();
     auto text = std::exchange(pending_, {});
-    return text.empty() || Emit(text, false);
+    return text.empty() || Emit(text, false, offset);
   }
   enum class State : std::uint8_t {
     kInitial,
@@ -2904,7 +3021,8 @@ ParsedGeneration StreamingGeneration(
     const StreamingTextFilter& filter, const ChatRequest& chat,
     TextGenerationBackend::InitialOutputState initial, ToolMarkerSet markers,
     ToolCloserSet closers, QuoteTracker& quotes, bool enforce_required,
-    bool partial = false, bool gemma = false, bool ling = false) {
+    bool partial = false, bool track_text = false, bool gemma = false,
+    bool ling = false) {
   // Native grammars establish argument framing before the value completes.
   // Recovery from unconstrained/JSON fallback text still requires a full call.
   partial = partial && markers.size() <= 2;
@@ -2913,10 +3031,10 @@ ParsedGeneration StreamingGeneration(
                    filter.raw(), initial, chat.tools, chat.tool_choice,
                    enforce_required,
                    chat.constrained_tools && !chat.response_format, markers,
-                   closers, quotes, partial, gemma, ling)
+                   closers, quotes, partial, track_text, gemma, ling)
              : ParseGeneration(filter.raw(), initial, chat.tools,
                                chat.tool_choice, enforce_required, markers,
-                               closers, quotes, partial, ling);
+                               closers, quotes, partial, track_text, ling);
 }
 
 // Responses uses semantic SSE events, rather than Chat Completions chunks.
@@ -2925,7 +3043,9 @@ class ResponsesOutput {
 public:
   ResponsesOutput(std::string model, HttpResponse::BodyWriter writer,
                   const ChatRequest& chat)
-      : writer_(std::move(writer)), namespaces_(chat.tool_namespaces) {
+      : writer_(std::move(writer)),
+        namespaces_(chat.tool_namespaces),
+        cache_persist_(chat.cache_persist) {
     response_ = json::Value::object();
     response_["id"] = RandomId("resp_");
     response_["object"] = "response";
@@ -2970,7 +3090,13 @@ public:
     return Emit(std::move(event));
   }
 
-  bool Append(std::string_view text, bool reasoning) {
+  void SetLogprobs(std::optional<std::uint32_t> count) {
+    if (count)
+      response_["top_logprobs"] = static_cast<int>(*count);
+  }
+
+  bool Append(std::string_view text, bool reasoning,
+              json::Value logprobs = json::Value::array()) {
     if (text.empty())
       return true;
     if (!CloseTool("incomplete"))
@@ -2992,6 +3118,7 @@ public:
       if (!Emit(std::move(added)))
         return false;
       text_.clear();
+      logprobs_ = json::Value::array();
       auto part = PartEvent(reasoning ? "response.reasoning_summary_part.added"
                                       : "response.content_part.added");
       part["part"] = Part();
@@ -3002,8 +3129,11 @@ public:
     auto delta = PartEvent(reasoning ? "response.reasoning_summary_text.delta"
                                      : "response.output_text.delta");
     delta["delta"] = std::string(text);
-    if (!reasoning)
-      delta["logprobs"] = json::Value::array();
+    if (!reasoning) {
+      for (const auto& entry : logprobs.items())
+        logprobs_.push_back(entry);
+      delta["logprobs"] = ResponsesStreamLogprobs(logprobs);
+    }
     return Emit(std::move(delta));
   }
 
@@ -3079,6 +3209,7 @@ public:
     usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
     response_["usage"] = std::move(usage);
     response_["timings"] = GenerationTimings(result);
+    response_["cache_persist"] = cache_persist_;
     Lifecycle(limited || unfinished_tool_ ? "response.incomplete"
                                           : "response.completed");
     return response_;
@@ -3114,7 +3245,7 @@ private:
     part["text"] = text_;
     if (!reasoning_) {
       part["annotations"] = json::Value::array();
-      part["logprobs"] = json::Value::array();
+      part["logprobs"] = logprobs_;
     }
     return part;
   }
@@ -3126,7 +3257,7 @@ private:
                                      : "response.output_text.done");
     done["text"] = text_;
     if (!reasoning_)
-      done["logprobs"] = json::Value::array();
+      done["logprobs"] = ResponsesStreamLogprobs(logprobs_);
     if (!Emit(std::move(done)))
       return false;
     auto part = Part();
@@ -3166,11 +3297,14 @@ private:
 
   HttpResponse::BodyWriter writer_;
   std::map<std::string, std::string> namespaces_;
+  // Echoed in the final response, as the applied `cache_persist`.
+  bool cache_persist_;
   json::Value response_;
   json::Value item_;
   json::Value tool_;
   std::string tool_arguments_;
   std::string text_;
+  json::Value logprobs_ = json::Value::array();
   std::size_t sequence_{0};
   std::size_t output_index_{0};
   bool active_{false};
@@ -3202,18 +3336,20 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes, false, gemma_format, ling_format)
+                markers, closers, quotes, false, false, gemma_format,
+                ling_format)
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
-                            markers, closers, quotes, false, ling_format);
+                            markers, closers, quotes, false, false,
+                            ling_format);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
   response["object"] = "chat.completion";
   response["created"] = Now();
-  response["model"] = backend.model_id();
+  response["model"] = request.model;
   json::Value choices = json::Value::array();
   json::Value choice = json::Value::object();
   choice["index"] = 0;
@@ -3230,12 +3366,16 @@ HttpResponse NonStreamingResponse(
   if (!generated.tool_calls.empty()) {
     message["tool_calls"] = ToolCallsJson(generated.tool_calls);
   }
+  if (request.sampling.logprobs)
+    choice["logprobs"] =
+        ChatLogprobs(result.logprobs, *request.sampling.logprobs);
   choice["message"] = std::move(message);
   choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
   response["timings"] = GenerationTimings(result);
+  response["cache_persist"] = request.chat.cache_persist;
   RecordServerMetrics(result);
 
   std::ostringstream timing;
@@ -3259,7 +3399,7 @@ HttpResponse StreamingResponse(
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
-  const std::string model = backend.model_id();
+  const std::string model = request.model;
   const auto format = generation->ToolFormat();
   const bool gemma_format =
       *format == sampling::JsonConstraint::ToolFormat::kGemma4;
@@ -3298,10 +3438,19 @@ HttpResponse StreamingResponse(
               generation->Cancel();
               return;
             }
+            std::optional<json::Value> pending_logprobs;
+            const auto write_choice = [&](json::Value delta) {
+              auto chunk =
+                  ChoiceChunk(id, created, model, std::move(delta), nullptr,
+                              pending_logprobs ? &*pending_logprobs : nullptr);
+              pending_logprobs.reset();
+              return writer(Sse(chunk));
+            };
             QuoteTracker quotes;
             StreamingTextFilter filter(
                 initial_output_state,
-                [&](std::string_view text, bool is_reasoning) {
+                [&](std::string_view text, bool is_reasoning,
+                    std::span<const TextSourceSpan>) {
                   if (text.empty()) {
                     return true;
                   }
@@ -3311,8 +3460,7 @@ HttpResponse StreamingResponse(
                   } else {
                     delta["content"] = std::string(text);
                   }
-                  connected = writer(
-                      Sse(ChoiceChunk(id, created, model, std::move(delta))));
+                  connected = write_choice(std::move(delta));
                   return connected;
                 },
                 request.chat.response_format != nullptr,
@@ -3335,8 +3483,7 @@ HttpResponse StreamingResponse(
               auto delta = json::Value::object();
               delta["tool_calls"] = json::Value::array();
               delta["tool_calls"].push_back(std::move(item));
-              connected = writer(
-                  Sse(ChoiceChunk(id, created, model, std::move(delta))));
+              connected = write_choice(std::move(delta));
               return connected;
             });
 
@@ -3354,16 +3501,24 @@ HttpResponse StreamingResponse(
 
             try {
               const auto result = generation->Wait(
-                  [&](std::string_view piece) {
-                    if (!begin() || !filter.Push(piece))
+                  [&](const TokenPiece& piece) {
+                    if (piece.logprobs && request.sampling.logprobs)
+                      pending_logprobs =
+                          ChatLogprobs(std::span(piece.logprobs, 1),
+                                       *request.sampling.logprobs);
+                    if (!begin() || !filter.Push(piece.text))
                       return false;
-                    return !filter.in_tools() || markers.size() > 2 ||
-                           tools.Update(StreamingGeneration(
-                                            filter, request.chat,
-                                            initial_output_state, markers,
-                                            closers, quotes, false, true,
-                                            gemma_format, ling_format)
-                                            .tool_calls);
+                    if (filter.in_tools() && markers.size() <= 2 &&
+                        !tools.Update(StreamingGeneration(
+                                          filter, request.chat,
+                                          initial_output_state, markers,
+                                          closers, quotes, false, true, false,
+                                          gemma_format, ling_format)
+                                          .tool_calls))
+                      return false;
+                    if (pending_logprobs)
+                      connected = write_choice(json::Value::object());
+                    return connected;
                   },
                   on_progress, begin);
               stream_log->details = GenerationLogDetails(result);
@@ -3381,7 +3536,8 @@ HttpResponse StreamingResponse(
                   TextGenerationBackend::FinishReason::kStop;
               const auto generated = StreamingGeneration(
                   filter, request.chat, initial_output_state, markers, closers,
-                  quotes, !interrupted, false, gemma_format, ling_format);
+                  quotes, !interrupted, false, false, gemma_format,
+                  ling_format);
               if (!tools.Finish(generated.tool_calls, interrupted))
                 return;
               if (!filter.Finish(generated.hide_tool_markup, generated.text,
@@ -3396,6 +3552,7 @@ HttpResponse StreamingResponse(
               // of the optional OpenAI usage chunk. Proxies need these even
               // when a client does not request stream_options.include_usage.
               terminal_chunk["timings"] = GenerationTimings(result);
+              terminal_chunk["cache_persist"] = request.chat.cache_persist;
               if (!writer(Sse(terminal_chunk))) {
                 return;
               }
@@ -3404,6 +3561,7 @@ HttpResponse StreamingResponse(
                 usage_chunk["choices"] = json::Value::array();
                 usage_chunk["usage"] = Usage(result);
                 usage_chunk["timings"] = GenerationTimings(result);
+                usage_chunk["cache_persist"] = request.chat.cache_persist;
                 if (!writer(Sse(usage_chunk))) {
                   return;
                 }
@@ -3546,27 +3704,10 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
           parsed.chat.tool_namespaces[tool.member_str("name")] = name;
     }
   }
-  // Responses attempts strict normalization when strict is omitted; Chat
-  // Completions keeps its best-effort default. Explicit true/false wins.
-  for (auto& tool : parsed.chat.tools) {
-    auto definition = json::parse(tool.definition_json);
-    auto& function = definition["function"];
-    const auto* strict = function.find("strict");
-    if (strict && !strict->is_null())
-      continue;
-    try {
-      auto schema = NormalizeToolSchema(json::parse(tool.parameters_json));
-      sampling::JsonConstraint::Compile(schema, true);
-      function["parameters"] = std::move(schema);
-      function["strict"] = true;
-      tool.parameters_json = function.find("parameters")->dump();
-      parsed.chat.constrained_tools |=
-          parsed.chat.tool_choice != ChatRequest::ToolChoice::kNone;
-    } catch (const std::invalid_argument&) {
-      function["strict"] = false;
-    }
-    tool.definition_json = definition.dump();
-  }
+  // Like llama.cpp, retain the supplied parameter schema when strict is
+  // omitted or null. Promoting optional fields to required ones forces agents
+  // to invent values. ParseToolControls still validates explicit strict:true
+  // and enables tool constraints regardless of strictness.
   *chat = std::move(parsed.chat);
 
   if (const auto* progress = body.find("return_progress");
@@ -3582,6 +3723,13 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
       return Error(400, "Bad Request", "'cache_prompt' must be a boolean",
                    "invalid_cache_prompt");
     chat->cache_prompt = cache->as_bool();
+  }
+  if (const auto* persist = body.find("cache_persist");
+      persist != nullptr && !persist->is_null()) {
+    if (!persist->is_bool())
+      return Error(400, "Bad Request", "'cache_persist' must be a boolean",
+                   "invalid_cache_persist");
+    chat->cache_persist = persist->as_bool();
   }
   if (const auto* reasoning = body.find("reasoning");
       reasoning && !reasoning->is_null()) {
@@ -3610,6 +3758,8 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
         chat->reasoning.effort = options.effort;
     }
   }
+  if (auto error = ParseReasoningBudget(body, &chat->reasoning))
+    return error;
   if (const auto* text = body.find("text"); text && !text->is_null()) {
     if (!text->is_object())
       return Error(400, "Bad Request", "'text' must be an object",
@@ -4079,10 +4229,13 @@ template<typename Output>
 HttpResponse CreateCompatibilityResponse(
     const HttpRequest& request, TextGenerationBackend& backend,
     const ChatRequest& chat, std::size_t max_tokens,
-    const sampling::SamplingConfig& sampling, bool stream) {
+    const sampling::SamplingConfig& sampling, bool stream,
+    std::string_view requested_model) {
   const auto initial = backend.initial_output_state(chat);
+  const bool observe =
+      std::is_same_v<Output, ResponsesOutput> && sampling.logprobs.has_value();
   auto generation = backend.start_chat(chat, max_tokens, sampling,
-                                       request.is_cancelled, stream);
+                                       request.is_cancelled, stream || observe);
   const auto format = generation->ToolFormat();
   const bool gemma_format =
       *format == sampling::JsonConstraint::ToolFormat::kGemma4;
@@ -4093,9 +4246,18 @@ HttpResponse CreateCompatibilityResponse(
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
   const auto run = [generation, initial, chat, markers, closers, gemma_format,
-                    ling_format, model = backend.model_id(), stream_log,
+                    ling_format,
+                    model = requested_model.empty()
+                                ? backend.model_id()
+                                : std::string(requested_model),
+                    stream_log, observe, count = sampling.logprobs,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
+    std::optional<ResponsesLogprobs> probabilities;
+    if (observe)
+      probabilities.emplace(*count);
+    if constexpr (std::is_same_v<Output, ResponsesOutput>)
+      output.SetLogprobs(count);
     bool started = false;
     const auto begin = [&] {
       if (started)
@@ -4111,8 +4273,18 @@ HttpResponse CreateCompatibilityResponse(
     QuoteTracker quotes;
     StreamingTextFilter filter(
         initial,
-        [&](std::string_view piece, bool reasoning) {
-          if (output.Append(piece, reasoning))
+        [&](std::string_view piece, bool reasoning,
+            std::span<const TextSourceSpan> source) {
+          bool connected;
+          if constexpr (std::is_same_v<Output, ResponsesOutput>) {
+            connected = output.Append(piece, reasoning,
+                                      probabilities && !reasoning
+                                          ? probabilities->Take(source)
+                                          : json::Value::array());
+          } else {
+            connected = output.Append(piece, reasoning);
+          }
+          if (connected)
             return true;
           generation->Cancel();
           return false;
@@ -4137,19 +4309,22 @@ HttpResponse CreateCompatibilityResponse(
             };
       }
       const auto result =
-          writer ? generation->Wait(
-                       [&](std::string_view piece) {
-                         if (!begin() || !filter.Push(piece))
-                           return false;
-                         return !filter.in_tools() || markers.size() > 2 ||
-                                tools.Update(StreamingGeneration(
-                                                 filter, chat, initial, markers,
-                                                 closers, quotes, false, true,
-                                                 gemma_format, ling_format)
-                                                 .tool_calls);
-                       },
-                       on_progress, begin)
-                 : generation->Wait();
+          (writer || observe)
+              ? generation->Wait(
+                    [&](const TokenPiece& piece) {
+                      if (probabilities)
+                        probabilities->Push(piece);
+                      if (!begin() || !filter.Push(piece.text))
+                        return false;
+                      return !filter.in_tools() || markers.size() > 2 ||
+                             tools.Update(StreamingGeneration(
+                                              filter, chat, initial, markers,
+                                              closers, quotes, false, true,
+                                              false, gemma_format, ling_format)
+                                              .tool_calls);
+                    },
+                    on_progress, begin)
+              : generation->Wait();
       stream_log->details = GenerationLogDetails(result);
       RecordServerMetrics(result);
       if (!writer) {
@@ -4164,23 +4339,25 @@ HttpResponse CreateCompatibilityResponse(
         return json::Value();
       if (!begin())
         return json::Value();
-      if (!writer)
+      if (!writer && !observe)
         filter.Push(result.text);
+      if (probabilities)
+        probabilities->Push(TokenPiece(""), true);
       if (!filter.Push({}, true)) {
         generation->Cancel();
         return json::Value();
       }
       const bool interrupted =
           result.finish_reason != TextGenerationBackend::FinishReason::kStop;
-      const auto generated =
-          StreamingGeneration(filter, chat, initial, markers, closers, quotes,
-                              !interrupted, false, gemma_format, ling_format);
+      const auto generated = StreamingGeneration(
+          filter, chat, initial, markers, closers, quotes, !interrupted, false,
+          observe, gemma_format, ling_format);
       if (!tools.Finish(generated.tool_calls, interrupted)) {
         generation->Cancel();
         return json::Value();
       }
       if (!filter.Finish(generated.hide_tool_markup, generated.text,
-                         generated.reasoning_content)) {
+                         generated.reasoning_content, generated.text_spans)) {
         generation->Cancel();
         return json::Value();
       }
@@ -4232,9 +4409,9 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   const ChatRequest& chat,
                                   std::size_t max_tokens,
                                   const sampling::SamplingConfig& sampling,
-                                  bool stream) {
+                                  bool stream, std::string_view model) {
   return CreateCompatibilityResponse<ResponsesOutput>(
-      request, backend, chat, max_tokens, sampling, stream);
+      request, backend, chat, max_tokens, sampling, stream, model);
 }
 
 HttpResponse CreateAnthropicMessage(const HttpRequest& request,
@@ -4242,9 +4419,9 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
                                     const ChatRequest& chat,
                                     std::size_t max_tokens,
                                     const sampling::SamplingConfig& sampling,
-                                    bool stream) {
+                                    bool stream, std::string_view model) {
   return CreateCompatibilityResponse<AnthropicOutput>(
-      request, backend, chat, max_tokens, sampling, stream);
+      request, backend, chat, max_tokens, sampling, stream, model);
 }
 
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
@@ -4269,6 +4446,81 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
                                 initial_output_state);
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);
+  } catch (const std::invalid_argument& exception) {
+    return Error(400, "Bad Request", exception.what(), "invalid_prompt");
+  } catch (const std::length_error& exception) {
+    return Error(400, "Bad Request", exception.what(),
+                 "context_length_exceeded");
+  }
+}
+
+HttpResponse CountOpenAiInputTokens(const ChatRequest& chat,
+                                    TextGenerationBackend& backend) {
+  try {
+    const auto tokens = backend.count_chat_tokens(chat);
+    if (!tokens) {
+      json::Value response = json::Value::object();
+      json::Value error = json::Value::object();
+      error["message"] = "endpoint not implemented on this text model";
+      error["type"] = "server_error";
+      error["code"] = "not_implemented";
+      response["error"] = std::move(error);
+      return {
+          .status = 501, .reason = "Not Implemented", .body = response.dump()};
+    }
+    json::Value response = json::Value::object();
+    response["object"] = "response.input_tokens";
+    response["input_tokens"] = *tokens;
+    HttpResponse counted;
+    counted.body = response.dump();
+    return counted;
+  } catch (const TextGenerationError& exception) {
+    return GenerationError(exception);
+  } catch (const std::invalid_argument& exception) {
+    return Error(400, "Bad Request", exception.what(), "invalid_prompt");
+  } catch (const std::length_error& exception) {
+    return Error(400, "Bad Request", exception.what(),
+                 "context_length_exceeded");
+  }
+}
+
+HttpResponse HandleOpenAiChatInputTokens(const HttpRequest& request,
+                                         TextGenerationBackend& backend) {
+  ParsedChatRequest parsed;
+  if (auto error = ParseRequest(request, backend, &parsed))
+    return std::move(*error);
+  return CountOpenAiInputTokens(parsed.chat, backend);
+}
+
+HttpResponse HandleApplyTemplate(const HttpRequest& request,
+                                 TextGenerationBackend& backend) {
+  ParsedChatRequest parsed;
+  if (auto error = ParseRequest(request, backend, &parsed,
+                                /*require_model=*/false);
+      error.has_value()) {
+    return std::move(*error);
+  }
+  // As in llama-server, `stream` is ignored: the prompt is one JSON response.
+  try {
+    auto prompt = backend.render_chat_prompt(parsed.chat);
+    if (!prompt) {
+      json::Value response = json::Value::object();
+      json::Value error = json::Value::object();
+      error["message"] = "endpoint not implemented on this text model";
+      error["type"] = "server_error";
+      error["code"] = "not_implemented";
+      response["error"] = std::move(error);
+      HttpResponse unavailable;
+      unavailable.status = 501;
+      unavailable.reason = "Not Implemented";
+      unavailable.body = response.dump();
+      return unavailable;
+    }
+    json::Value response = json::Value::object();
+    response["prompt"] = std::move(*prompt);
+    HttpResponse rendered;
+    rendered.body = response.dump();
+    return rendered;
   } catch (const std::invalid_argument& exception) {
     return Error(400, "Bad Request", exception.what(), "invalid_prompt");
   } catch (const std::length_error& exception) {

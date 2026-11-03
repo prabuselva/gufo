@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/experimental/host_allocations.hpp>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -16,9 +18,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "src/core/session_mode.hpp"
-#include "src/models/qwen/hip/ops/token.hpp"
-#include "src/models/qwen/vision/device_input.hpp"
+#include "src/families/qwen/kernels/ops/token.hpp"
+#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -119,6 +120,10 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// PLE rows this session has gathered, including prefetches, since creation.
+  [[nodiscard]] NgramTotals NgramRowTotals() const noexcept {
+    return ngram_counters_.Load();
+  }
   [[nodiscard]] bool OwnsSnapshot(
       const SnapshotState& snapshot) const noexcept {
     return snapshots_ == snapshot.registry_;
@@ -126,6 +131,7 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
+  void PrepareVision(hipStream_t stream);
   void RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
                            hipStream_t stream);
   [[nodiscard]] const qwen::vision::RopeLayout& VisionLayout() const noexcept {
@@ -191,6 +197,8 @@ private:
   RollbackRows ple_snapshots_;   ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
+  // Prefetches count against the const session that will consume them.
+  mutable NgramCounters ngram_counters_;
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
@@ -236,6 +244,9 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// Largest session context. Zero selects the native context; values
+    /// above it require YaRN (Config::MaxContextLength()).
+    std::uint32_t max_context{0};
   };
 
   ~Executor();
@@ -258,6 +269,10 @@ public:
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
+  /// Commits the in-pass checkpoint arena on first use. False when the device
+  /// lacks headroom for it; the caller then captures at a pass boundary.
+  [[nodiscard]] bool ReservePrefillCheckpoint(const Session& session) const;
+  /// Requires ReservePrefillCheckpoint.
   [[nodiscard]] std::unique_ptr<PrefillCheckpoint> MakePrefillCheckpoint(
       Session& session, std::span<const std::int32_t> tokens,
       std::uint32_t prefix, std::string* error_msg) const;
@@ -312,9 +327,11 @@ public:
   /// when only the draft state is needed.
   struct MtpOutput {
     std::int32_t* token{nullptr};
+    /// With `token`: the draft head's softmax probability of it.
+    float* confidence{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
-    /// Prefill needs only persistent KV. A subsequent full forward with
+    /// Prefill and headless steps need only persistent KV. A full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
     /// Draft through the small head (the output() prefix plus the
@@ -329,6 +346,7 @@ public:
     Session* session;
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
+    bool kv_only{false};
   };
   /// Copies output() rows `ids` into the session's draft table from slot
   /// `first` on. Enqueued on stream(); never during graph capture.
@@ -358,6 +376,14 @@ public:
   /// Greedy verification keeps full logit rows on the GPU, including penalties.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error_msg) const;
+  [[nodiscard]] static bool CanCompactMtpVerification(
+      const sampling::SamplerState& sampler);
+  /// Candidate spans remain valid until this executor next verifies a
+  /// request. One transfer serves all rows; no full CPU rows are reconstructed.
+  [[nodiscard]] bool SampledMtpCandidates(
+      std::span<std::span<const sampling::LogitCandidate>> rows,
       const sampling::SamplerState& sampler,
       std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
@@ -487,9 +513,14 @@ private:
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
   /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
-  /// partials in s_.inject (inject_fused_).
+  /// partials in s_.inject (inject_fused_). A decode combine whose `next`
+  /// mixer HcMix runs immediately after, with nothing reading res or xn in
+  /// between, is left to that mixer's single launch (FusedMixer).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr) const;
+               const float* inject_w = nullptr,
+               const DeviceMixer* next = nullptr) const;
+  /// Whether HcMix runs a decode batch of `m` as one HcMixQ8Fused launch.
+  bool FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -521,6 +552,8 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  std::uint32_t checkpoint_tokens = 0) const;
+  /// Orders the main stream after the work queued on side_stream_.
+  bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
@@ -575,7 +608,13 @@ private:
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
-  hipStream_t stream_{nullptr};
+  /// The stream kernels are queued on. Overlapped work swaps in side_stream_
+  /// for its launches and joins back through side_done_ (JoinSide).
+  mutable hipStream_t stream_{nullptr};
+  hipStream_t side_stream_{nullptr};
+  hipEvent_t side_start_{nullptr};
+  hipEvent_t side_done_{nullptr};
+  mutable bool side_pending_{false};  ///< side_done_ not yet waited on
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
@@ -685,6 +724,12 @@ private:
   /// Shared transient storage, grown only for penalty-aware verification.
   mutable sampling::TokenPenalty* verification_penalties_{nullptr};
   mutable std::size_t verification_penalty_capacity_{0};
+  static constexpr std::size_t kCompactPenaltyLimit = 4096;
+  std::uint32_t* verification_ids_{nullptr};
+  std::uint32_t* verification_scratch_ids_{nullptr};
+  sampling::LogitCandidate* verification_candidates_{nullptr};
+  sampling::LogitCandidate* verification_candidates_host_{nullptr};
+  mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
@@ -699,23 +744,33 @@ private:
     return selected_logits_ != nullptr ? selected_logits_ : s_.logits;
   }
   std::uint32_t mask_words_{0};
+  /// Session capacity the sparse-mask rows and score scratch are sized for:
+  /// max(native context, Options::max_context).
+  std::uint32_t context_capacity_{0};
+  /// YaRN constants every rope launch receives (disabled: original path).
+  YarnRope yarn_{};
   /// Bounded score scratch, shared by sequential selector chunks.
   std::size_t select_score_floats_{0};
   std::vector<void*> allocations_;
   /// Coherent pinned storage, read directly by the GPU through s_.ple_emb.
   /// Reused only after the preceding forward has drained its stream.
+  mutable hip::HostAllocations host_allocations_;
   float* host_emb_{nullptr};
   mutable std::vector<std::uint32_t> host_rows_;
+  mutable std::vector<NgramGatherOwner> ngram_owners_;
   mutable bool ple_pending_{false};
   /// The rows a prefill chunk reads are a pure function of its tokens and
   /// the n-gram history before them, so prefetched rows are claimed only by
-  /// a batch with exactly those tokens and that history, whichever session
-  /// it belongs to. A claim copies them into host_emb_, whose stable address
-  /// is retained by captured graphs.
+  /// a batch with that history whose tokens extend, or are extended by, the
+  /// prefetched ones, whichever session it belongs to. A claim copies them
+  /// into host_emb_, whose stable address is retained by captured graphs.
   struct PlePrefetch {
     bool pending{false};  ///< read in flight
     bool ready{false};    ///< rows complete in `rows`
-    bool claimed{false};  ///< WaitPle collects them for the current batch
+    /// Leading batch tokens whose rows WaitPle collects from `rows`.
+    std::size_t claimed{0};
+    /// The batch extends past `tokens`; the table reads its remaining rows.
+    bool tail{false};
     NgramHistory before;
     NgramHistory after;
     std::vector<std::int32_t> tokens;
@@ -727,12 +782,10 @@ private:
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
-  std::int32_t* tiles_host_{nullptr};         ///< routed tile map staging
-  mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
-  mutable std::uint32_t routed_n_tiles_{0};   ///< routed_tile_rows_ tiles
-  mutable std::uint32_t routed_64_tiles_{0};  ///< wide batches' down tiles
-  mutable std::uint32_t routed_pair_offset_{0};
-  mutable std::uint32_t routed_pair_tiles_{0};
+  std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
+  mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
+  mutable std::uint32_t routed_n_tiles_{0};     ///< routed_tile_rows_ tiles
+  mutable std::uint32_t routed_wide_tiles_{0};  ///< prefill 128-row tiles
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
@@ -777,6 +830,21 @@ private:
   };
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+  /// A decode combine left to the next mixer's one-launch HcMixQ8Fused
+  /// (see Combine): HcCombineQ8_1's operands when Combine ran.
+  struct PendingCombine {
+    const DeviceMixer* mixer{nullptr};
+    float* res{nullptr};
+    const float* gamma{nullptr};
+    const float* block_out{nullptr};
+    const float* inject{nullptr};
+    std::uint32_t inject_parts{1};
+    float* xn{nullptr};
+    void* xn_q8{nullptr};
+    std::uint32_t n{0};
+  };
+  mutable PendingCombine pending_combine_;
+  void* hc_fused_state_{nullptr};  ///< HcMixQ8Fused's counters (zeroed)
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -41,7 +41,7 @@ int flint_mmq_q8_0_dense(const void* W_q8_0, const float* X_f32,
                          hipStream_t stream);
 }
 
-#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hip"
+#include "src/families/qwen/kernels/prefill_quant_gemm.hip"
 
 #define CHECK(call)                                                     \
   do {                                                                  \

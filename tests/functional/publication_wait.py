@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue #617: held disk publication must not cost more than saved prefill.
+"""Held disk publication must respect saved prefill and reclaim staging RAM.
 
 Opt-in GPU test, outside hosted CI. The cap expectation is a main timing
 control; candidate correctness uses the default bounded expectation.
@@ -22,6 +22,20 @@ import urllib.request
 from run import option, provenance, server, write_json
 
 
+RECLAIM_RAM_BYTES = 256 * 1024**2
+
+
+def reclaim_evidence(segment):
+    """Reject a pressure case that published without exercising reclamation."""
+    events = [dict(re.findall(r"(\w+)=([^\s]+)", line))
+              for line in segment.splitlines() if "event=retention " in line]
+    removed = [event for event in events
+               if event.get("action") == "2" and event.get("reason") == "1"
+               and int(event.get("unique_bytes_freed", "0")) > 0]
+    assert removed, "deep capture did not reclaim retained RAM checkpoints"
+    return removed
+
+
 def wait_until(predicate, timeout, description):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -36,6 +50,17 @@ def signature(answer):
     return (answer["choices"], answer["usage"]["completion_tokens"])
 
 
+def answer_of(result):
+    # A waiter that re-prefills from a shallow checkpoint splits prefill into
+    # different passes than a cold run. That can change its reasoning text
+    # without a cache bug, as cache_growth.py notes, so compare the answer
+    # and whether it reasoned.
+    choice = result["choices"][0]
+    message = choice["message"]
+    return (message.get("content"), message.get("tool_calls"), choice["finish_reason"],
+            bool((message.get("reasoning_content") or "").strip()))
+
+
 def archive():
     rng = random.Random(617)
     words = ("configuration checkpoint retention validation filesystem scheduler "
@@ -46,6 +71,7 @@ def archive():
 
 
 def run_case(args, command, case, report):
+    publish = case in ("publish", "reclaim")
     output = args.output / case
     output.mkdir()
     disk, gate = output / "disk", output / "gate"
@@ -57,7 +83,8 @@ def run_case(args, command, case, report):
     command = [*command, "--host", "127.0.0.1", "--port", str(port),
                "--cache-disk", str(disk), "--cache-disk-bytes", str(8 * 1024**3)]
     if option(command, "--cache-ram-bytes") is None:
-        command += ["--cache-ram-bytes", str(1024**3)]
+        command += ["--cache-ram-bytes", str(
+            RECLAIM_RAM_BYTES if case == "reclaim" else 1024**3)]
     environment = {**os.environ, "LD_PRELOAD": str(args.fault_library),
                    "GUFO_TEST_DISK_GATE": str(gate),
                    "GUFO_TEST_DISK_DIRECTORY": str(disk),
@@ -103,6 +130,11 @@ def run_case(args, command, case, report):
     timer = None
     try:
         with server(command, log, 300, environment):
+            requested_mode = option(command, "--speculative", "off")
+            loaded_modes = re.findall(
+                r"event=load_completed .*kind=text .*speculative=(\w+)", log.read_text())
+            assert loaded_modes == [requested_mode], (requested_mode, loaded_modes)
+            row["loaded_mode"] = loaded_modes[0]
             seed = [{"role": "system", "content": "Issue617 gate experiment. Reply with only ACK."},
                     {"role": "user", "content": "Initialize the archive."}]
             first = chat("seed", seed)
@@ -110,10 +142,15 @@ def run_case(args, command, case, report):
             (gate / "armed").touch()
             deep = seed + [first["choices"][0]["message"],
                 {"role": "user", "content": archive() + "\nReply with only ACK."}]
+            deep_start = log.stat().st_size
             answer = chat("deep", deep)
             assert 50000 <= answer["usage"]["prompt_tokens"] <= 60000, answer["usage"]
             wait_until(lambda: (gate / "blocked").exists(), 60, "held manifest")
             row["blocked_file"] = (gate / "blocked").read_text()
+            if case == "reclaim":
+                with log.open() as stream:
+                    stream.seek(deep_start)
+                    row["reclaimed"] = reclaim_evidence(stream.read())
             # A new user message branches before the previous assistant tail.
             # The pending semantic boundary matches but its live frontier does not.
             follow = deep + [{"role": "user", "content":
@@ -121,12 +158,12 @@ def run_case(args, command, case, report):
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(chat, "waiter", follow)
                 try:
-                    if case == "publish":
+                    if publish:
                         starts = wait_until(lambda: wait_events("start"), 60,
                                             "waiter admission wait")
                         assert len(starts) == 1, starts
                         row["wait_start"] = starts[0]
-                    timer = threading.Timer(.25 if case == "publish" else 130, release)
+                    timer = threading.Timer(.25 if publish else 130, release)
                     timer.start()
                     waited = future.result(timeout=240)
                 finally:
@@ -136,14 +173,18 @@ def run_case(args, command, case, report):
             wait_until(lambda: max(published()) >= 50000, 60, "deep publication")
             retried = chat("retry", follow)
             cold = chat("cold", follow, cache=False)
-            assert signature(waited) == signature(retried) == signature(cold)
+            assert signature(retried) == signature(cold)
+            if publish:
+                assert signature(waited) == signature(cold)
+            else:
+                assert answer_of(waited) == answer_of(cold), (answer_of(waited), answer_of(cold))
             usage = waited["usage"]
             timing = usage["gufo"]
             assert retried["usage"]["gufo"]["cache_disk_hit"], retried["usage"]
             assert cold["usage"]["cached_tokens"] == 0, cold["usage"]
             if option(command, "--speculative", "off") != "off":
                 assert usage.get("draft_tokens", 0) > 0, usage
-            if case == "publish":
+            if publish:
                 assert timing["cache_disk_hit"], timing
                 assert timing["prefill_tokens"] < 64, timing
                 start = row["wait_start"]
@@ -155,8 +196,24 @@ def run_case(args, command, case, report):
                 assert ended["release"] == "not_pending", ended
                 assert 0 < float(ended["wait_ms"]) < float(start["limit_ms"]), (start, ended)
                 row["wait_release"] = ended
+                if case == "reclaim":
+                    # Identify the held checkpoint itself, rather than any
+                    # unrelated or shallow publication in the same run.
+                    events = [dict(re.findall(r"(\w+)=([^\s]+)", line))
+                              for line in log.read_text().splitlines()
+                              if "event=published " in line]
+                    checkpoint = [event for event in events
+                                  if event["checkpoint_id"] == start["checkpoint_id"]]
+                    assert len(checkpoint) == 1, checkpoint
+                    row["publication"] = checkpoint[0]
+                    boundary = int(checkpoint[0]["tokens"])
+                    assert boundary == int(start["pending_tokens"]) >= 50000, checkpoint
+                    assert usage["cached_tokens"] == boundary, usage
+                    assert int(checkpoint[0]["payload_bytes"]) > RECLAIM_RAM_BYTES, checkpoint
             else:
-                assert not timing["cache_disk_hit"], timing
+                # A tight RAM budget can leave only a shallow seed checkpoint
+                # on disk. The waiter may restore it, but not the held checkpoint.
+                assert usage["cached_tokens"] < 4096, usage
                 assert timing["prefill_tokens"] > 4096, timing
                 if args.expect == "cap":
                     limit = 120000
@@ -173,6 +230,8 @@ def run_case(args, command, case, report):
             # Qualify a real over-RAM publication, not just a queued job.
             payloads = [int(n) for n in re.findall(r"event=published .*payload_bytes=(\d+)", log.read_text())]
             capacity = int(re.search(r"event=configured .*?\bcapacity_bytes=(\d+)", log.read_text())[1])
+            if case == "reclaim":
+                assert capacity == RECLAIM_RAM_BYTES, capacity
             assert max(payloads) > capacity, (payloads, capacity)
             row.update(status="passed", max_payload_bytes=max(payloads), ram_capacity_bytes=capacity)
     except BaseException as exc:
@@ -190,7 +249,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fault-library", type=Path, required=True)
-    parser.add_argument("--case", action="append", choices=("bound", "publish"))
+    parser.add_argument("--case", action="append", choices=("bound", "publish", "reclaim"))
     parser.add_argument("--expect", choices=("bounded", "cap"), default="bounded")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -201,13 +260,17 @@ def main():
         parser.error("pass a production gufo serve llm command after --")
     if int(option(command, "--context", "0")) < 60000:
         parser.error("use context >= 60000 for the 55K-token controlled workload")
-    for reserved in ("--host", "--port", "--cache-disk", "--cache-disk-bytes", "--api-key"):
+    if "reclaim" in (args.case or ()) and int(option(
+            command, "--cache-ram-bytes", str(RECLAIM_RAM_BYTES))) != RECLAIM_RAM_BYTES:
+        parser.error("the reclaim case requires --cache-ram-bytes 268435456")
+    for reserved in ("--host", "--port", "--cache-disk", "--cache-disk-bytes"):
         if option(command, reserved) is not None:
             parser.error(f"the runner owns {reserved}")
     if option(command, "--served-model-name") is None:
         command += ["--served-model-name", "publication-wait"]
     args.output.mkdir(parents=True, exist_ok=False)
     report = {**provenance(), "cases": {}, "expect": args.expect,
+              "workload_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "fault_library_sha256": hashlib.file_digest(args.fault_library.open("rb"), "sha256").hexdigest()}
     try:
         for case in dict.fromkeys(args.case or ("bound", "publish")):

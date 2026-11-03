@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/models/qwen/vision/rope.hpp"
+#include "src/families/qwen/hip_common/rope.hpp"
 
 /// Model-private HIP launchers for the Qwen3.6-35B-A3B (qwen35moe) graph: the
 /// fused operators outside the quantized GEMM tier. Activations are row-major

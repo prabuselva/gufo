@@ -7,8 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "src/families/qwen/kernels/prefill_quant_gemm.hpp"
 
 namespace gufo::models::flint::rocm {
 namespace {

@@ -54,7 +54,7 @@ for t in "${targets[@]}"; do
   fi
   echo "==> $src -> $out"
   compile=(hipcc -O3 --offload-arch=gfx1151 -std=c++20
-    -I. "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
+    -I. -I./include "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
   if [[ "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
     # The bench includes the production prefill GEMM unit, which gufo_core
     # compiles with SLP disabled (qwen CMakeLists).
@@ -67,11 +67,15 @@ for t in "${targets[@]}"; do
   native_sources=()
   if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ||
         "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
-    native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
-    native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
+    native_sources+=(src/families/qwen/kernels/small_batch_wave64.hip)
+    native_sources+=(src/families/qwen/kernels/small_batch_quant16_wave64.hip)
   fi
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
-    native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
+    native_sources+=(src/families/qwen/kernels/prefill_quant_wave64.hip)
+  fi
+  if [[ "$src" -ef tools/qwen27b/attention_bench.hip ]]; then
+    native_sources+=(
+      src/families/qwen/kernels/attention_decode_verify_wave64.hip)
   fi
   if [[ "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
     # Wave64 WKQuantA8 tile configs (this unit also defines the shipped
@@ -102,7 +106,7 @@ for t in "${targets[@]}"; do
       for unit in "${native_sources[@]}"; do
         object="$objects/$(basename "$unit").o"
         native_extra=()
-        if [[ "$unit" == src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip ]]; then
+        if [[ "$unit" == src/families/qwen/kernels/small_batch_quant16_wave64.hip ]]; then
           native_extra+=(-Xarch_device -mllvm=-amdgpu-sched-strategy=iterative-ilp)
         fi
         if [[ "$unit" == tools/bench/flint_w8a8_wave64.hip ]]; then

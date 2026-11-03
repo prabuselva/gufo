@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/qwen/vision/device_input.hpp"
+#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen36_a3b/config.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_a3b/kernels/rocm/profile.hpp"

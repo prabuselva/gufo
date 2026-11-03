@@ -7,8 +7,6 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/qwen/chat_template.hpp"
-
 namespace {
 
 using gufo::models::ling3_0::ChatTemplateOptions;

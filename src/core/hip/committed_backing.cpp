@@ -1,21 +1,19 @@
 #include "src/core/hip/committed_backing.hpp"
 
 #include <hip/hip_runtime.h>
-#include <linux/io_uring.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#include <sys/uio.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#include "src/core/hip/host_allocations.hpp"
+#include "src/core/platform/page_pin.hpp"
+#include "src/core/platform/pages.hpp"
 
 namespace gufo::hip {
 namespace detail {
@@ -26,103 +24,28 @@ struct CommittedPages {
   explicit operator bool() const { return data != nullptr; }
 };
 
-// GPU registration uses movable userptr pages. A Linux long-term pin also
-// prevents ordinary compaction from moving them and evicting the process's
-// GPU queues. An io_uring registered buffer supplies that pin without I/O,
-// polling threads or a mapped submission/completion ring.
-int PinPages(void* data, std::size_t bytes) {
-  // Linux caps each registered buffer at 1 GiB. Keep one ring per segment,
-  // including models whose private state needs a larger contiguous segment.
-  constexpr std::size_t max_buffer = 1ULL << 30;
-  std::vector<iovec> ranges;
-  try {
-    for (std::size_t offset = 0; offset < bytes;) {
-      const auto length = std::min(max_buffer, bytes - offset);
-      ranges.push_back({static_cast<std::byte*>(data) + offset, length});
-      offset += length;
-    }
-  } catch (const std::bad_alloc&) {
-    return -1;
-  }
-  io_uring_params parameters{};
-  const int ring = syscall(SYS_io_uring_setup, 1, &parameters);
-  if (ring < 0)
-    return -1;
-  if (syscall(SYS_io_uring_register, ring, IORING_REGISTER_BUFFERS,
-              ranges.data(), ranges.size()) == 0)
-    return ring;
-  close(ring);
-  // Restricted io_uring or memlock limits retain the existing registration
-  // path and cache capacity; they must not turn cache admission into failure.
-  return -1;
-}
-
-void UnpinPages(int ring) {
-  if (ring >= 0) {
-    // Drop pins synchronously before unmapping and releasing ledger charges.
-    (void)syscall(SYS_io_uring_register, ring, IORING_UNREGISTER_BUFFERS,
-                  nullptr, 0);
-    close(ring);
-  }
-}
-
-// Ordinary anonymous pages, then registered with the GPU. Opt out of THP
-// before population: later huge-page promotion can invalidate GPU mappings.
+// Ordinary anonymous pages, then registered with the GPU. The platform leaf
+// commits, opts out of THP and populates; registration stays here.
 CommittedPages CommitPages(std::size_t bytes) {
-  constexpr std::size_t page = 4096;
-  const auto workers = std::min<std::size_t>(4, bytes / (32ULL << 20));
-  void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (data == MAP_FAILED)
+  void* data = platform::CommitZeroedPages(bytes);
+  if (data == nullptr)
     return {};
-  // Kernels built without THP reject this advice with EINVAL; their pages
-  // cannot be promoted. All other failures must release the mapping.
-  if (madvise(data, bytes, MADV_NOHUGEPAGE) != 0 && errno != EINVAL) {
-    munmap(data, bytes);
-    return {};
-  }
-  std::atomic<bool> populated{true};
-  const auto populate = [&](std::size_t begin, std::size_t end) {
-    if (madvise(static_cast<std::byte*>(data) + begin, end - begin,
-                MADV_POPULATE_WRITE) != 0)
-      populated.store(false, std::memory_order_relaxed);
-  };
-  if (workers >= 2) {
-    // Large serial page faults can hold up inference even when growth runs
-    // on a background thread. Populate disjoint ordinary-page ranges, then
-    // join before registering or exposing any of the backing.
-    std::array<std::jthread, 3> faults;
-    std::size_t next = 0;
-    for (std::size_t i = 0; i + 1 < workers; ++i) {
-      const auto end = (bytes / page) * (i + 1) / workers * page;
-      try {
-        faults[i] = std::jthread(populate, next, end);
-      } catch (...) {
-        // Thread exhaustion falls back to populating the remaining range
-        // here. Every started worker still joins before registration.
-        break;
-      }
-      next = end;
-    }
-    populate(next, bytes);
-  } else
-    populate(0, bytes);
-  if (!populated.load(std::memory_order_relaxed)) {
-    munmap(data, bytes);
-    return {};
-  }
-  const int pin = PinPages(data, bytes);
+  const int pin = platform::PinHostPages(data, bytes);
   if (hipHostRegister(data, bytes, hipHostRegisterDefault) != hipSuccess) {
-    UnpinPages(pin);
-    munmap(data, bytes);
+    platform::UnpinHostPages(pin);
+    platform::ReleaseCommittedPages(data, bytes);
     return {};
   }
   return {data, pin};
 }
+bool HeapFree(std::size_t& free_bytes) {
+  std::size_t total_bytes = 0;
+  return hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess;
+}
 void ReleasePages(CommittedPages pages, std::size_t bytes) {
   (void)hipHostUnregister(pages.data);
-  UnpinPages(pages.pin);
-  munmap(pages.data, bytes);
+  platform::UnpinHostPages(pages.pin);
+  platform::ReleaseCommittedPages(pages.data, bytes);
 }
 }  // namespace
 struct BackingState {
@@ -140,6 +63,7 @@ struct BackingState {
       std::numeric_limits<std::size_t>::max()};
   cache::ResourceLedger* ledger{};
   std::function<bool(std::size_t)> admit_segment;
+  std::function<bool(std::size_t, std::size_t, std::size_t)> keep_segment;
   std::mutex growth;
   std::atomic<bool> growing_ahead{};
   std::byte* Address(std::size_t index) const {
@@ -175,10 +99,20 @@ struct BackingState {
     } catch (const std::bad_alloc&) {
       return false;
     }
+    std::size_t heap_before = 0, heap_after = 0;
+    if (keep_segment && !HeapFree(heap_before))
+      return false;
     auto& data = segments[first / segment_blocks];
     data = CommitPages(count * block_bytes);
     if (!data)
       return false;
+    if (keep_segment &&
+        !(HeapFree(heap_after) &&
+          keep_segment(count * block_bytes, heap_before, heap_after))) {
+      ReleasePages(data, count * block_bytes);
+      data = {};
+      return false;
+    }
     try {
       for (std::size_t i = 0; i < count; ++i)
         blocks[first + i] = reservations[i].Convert();
@@ -308,6 +242,7 @@ CommittedBackingPool::CommittedBackingPool(cache::ResourceLedger& ledger,
       (count + state->segment_blocks - 1) / state->segment_blocks + 1);
   state->ledger = &ledger;
   state->admit_segment = std::move(config.admit_segment);
+  state->keep_segment = std::move(config.keep_segment);
   if (!config.segment_bytes && count) {
     std::vector<cache::ResourceReservation> reservations;
     reservations.reserve(count);
@@ -434,18 +369,16 @@ std::optional<BackingBlock> CommittedBackingPool::TryAcquire(
       return std::nullopt;
   }
 }
-void CommittedBackingPool::GrowAhead(std::size_t segments) {
+void CommittedBackingPool::GrowAhead(std::size_t reserve_bytes) {
   const auto committed = state_->committed.load(std::memory_order_acquire);
-  if (!segments || committed == state_->capacity)
+  if (!reserve_bytes || committed == state_->capacity ||
+      state_->growing_ahead.load(std::memory_order_acquire))
     return;
   const auto free_bytes =
       state_->ledger->Snapshot().bytes[static_cast<std::size_t>(
           cache::ResourceCategory::kBackingFree)];
-  const auto target_blocks =
-      segments >= 1 + (state_->capacity - 1) / state_->segment_blocks
-          ? state_->capacity
-          : segments * state_->segment_blocks;
-  const auto target_bytes = target_blocks * state_->block_bytes;
+  const auto target_bytes =
+      std::min(reserve_bytes, state_->capacity * state_->block_bytes);
   if (free_bytes >= target_bytes)
     return;
   const std::lock_guard lock(ahead_mutex_);

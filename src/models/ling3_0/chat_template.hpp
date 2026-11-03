@@ -7,7 +7,7 @@
 #include <string_view>
 
 #include "src/core/reasoning.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 
 namespace gufo::models::ling3_0 {
 

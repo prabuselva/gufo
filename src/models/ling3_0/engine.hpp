@@ -10,8 +10,8 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/ling3_0/config.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::core {
 class GgufReader;

@@ -1,7 +1,9 @@
 #ifndef GUFO_CORE_HIP_COMMITTED_BACKING_HPP_
 #define GUFO_CORE_HIP_COMMITTED_BACKING_HPP_
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -12,8 +14,28 @@
 #include "src/cache/checkpoint.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cache/slot.hpp"
+#include "src/core/hip/heap_placement.hpp"
 
 namespace gufo::hip {
+
+/// True when a host-page registration that moved device heap free memory
+/// from `free_before` to `free_after` still leaves kDispatchReserve, or took
+/// nothing from the heap. Whether registered pages are charged to the heap
+/// differs between hosts, so the caller measures it rather than assuming.
+[[nodiscard]] inline bool RegistrationKeepsReserve(std::uint64_t free_before,
+                                                   std::uint64_t free_after) {
+  return free_after >= std::min(free_before, kDispatchReserve);
+}
+
+/// True when registering `bytes` took at least half of them from the device
+/// heap, so this host charges registered pages. Smaller drops are taken as
+/// concurrent allocations rather than the registration itself.
+[[nodiscard]] inline bool RegistrationCharged(std::uint64_t bytes,
+                                              std::uint64_t free_before,
+                                              std::uint64_t free_after) {
+  return free_before > free_after && free_before - free_after >= bytes / 2;
+}
+
 namespace detail {
 struct BackingState;
 }
@@ -78,6 +100,10 @@ struct BackingPoolConfig {
   // Asked before each on-demand segment with its bytes; false keeps the pool
   // at its current size, for example to leave host memory to the OS.
   std::function<bool(std::size_t)> admit_segment;
+  // Asked after each on-demand segment is registered, with its bytes and the
+  // device heap's free bytes before and after; false releases the segment
+  // and keeps the pool at its current size. A failed heap query refuses it.
+  std::function<bool(std::size_t, std::size_t, std::size_t)> keep_segment;
 };
 
 class CommittedBackingPool {
@@ -96,11 +122,10 @@ public:
   // uncommitted capacity. Does not allocate or change the search cursor.
   // Fragmentation, growth limits and races still need TryAcquire's checks.
   [[nodiscard]] bool CanFit(std::span<const cache::PayloadRequest>) const;
-  // Starts committing the next on-demand segment on a background thread when
-  // less than one segment of free backing remains, so a later TryAcquire
-  // finds it ready instead of allocating on its own thread. Returns at once.
-  // The count is the desired free-segment reserve, bounded by capacity.
-  void GrowAhead(std::size_t segments = 1);
+  // Prepares free backing on a background thread so a later TryAcquire finds
+  // it ready. Reserve bytes are independent of the physical segment size;
+  // zero does nothing and oversized reserves are bounded by capacity.
+  void GrowAhead(std::size_t reserve_bytes);
   void WaitForGrowth();
   // Committed blocks and bytes; both grow with on-demand segments.
   [[nodiscard]] std::size_t BlockCount() const noexcept;

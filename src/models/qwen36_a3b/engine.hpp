@@ -10,9 +10,9 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen36_a3b/config.hpp"
 
 namespace gufo::core {

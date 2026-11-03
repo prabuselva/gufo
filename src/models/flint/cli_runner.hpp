@@ -10,8 +10,8 @@ namespace gufo::core {
 class GgufReader;
 }
 
-namespace gufo::cli {
-struct BenchOptions;
+namespace gufo::ext {
+struct TextBenchOptions;
 }
 
 namespace gufo::models::flint {
@@ -20,7 +20,7 @@ namespace gufo::models::flint {
 
 bool IsFlint(const core::GgufReader& reader);
 
-int RunFlintBenchmark(const cli::BenchOptions& options,
+int RunFlintBenchmark(const ext::TextBenchOptions& options,
                       const std::shared_ptr<const core::GgufReader>& reader,
                       std::chrono::steady_clock::time_point model_load_start);
 

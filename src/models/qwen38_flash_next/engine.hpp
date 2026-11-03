@@ -4,21 +4,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/prompt_lookup.hpp>
+#include <gufo/ext/sampling.hpp>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "src/core/sampling.hpp"
-#include "src/core/session_mode.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
-#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
+#include "src/models/qwen38_flash_next/ngram.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -28,7 +30,6 @@ namespace gufo::models::qwen38_flash_next {
 
 struct ModelWeights;
 struct MtpWeights;
-class NgramTable;
 struct MtpCandidateLogits;
 class ContinuationAdapter;
 class ContinuationHooks;
@@ -51,6 +52,11 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Static YaRN scaling, derived by the caller (serve, bench) from the
+  /// requested context via `RopeScalingForContext`. Empty leaves the
+  /// artifact's own setting, which is always off: no GGUF metadata key sets
+  /// it today.
+  std::optional<RopeScaling> rope_scaling{};
 };
 
 class Session;
@@ -84,6 +90,10 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// Trunk tensors the official GGUF keeps in F32 but this artifact stores
+  /// as Q8_0 (see `ExpandedQ8_0Tensors`). The official MTP sidecar ships its
+  /// inject as Q8_0, so the draft block is not counted.
+  [[nodiscard]] std::size_t ExpandedQ8_0Tensors() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -155,6 +165,8 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::vector<sampling::TokenLogprobs> logprobs;
+    std::optional<sampling::TokenLogprobs> terminal_logprobs;
   };
   /// Greedy decoding verifies deterministic drafts. Sampled decoding draws
   /// compact MTP proposals and uses target/draft rejection with a residual
@@ -163,11 +175,14 @@ public:
   /// RNG consumption includes proposal and verification draws. A
   /// one-token budget or a model without MTP uses ordinary decoding.
   /// Benchmarks may continue past EOS by setting stop_at_eos to false.
+  /// A greedy step prices its drafts as one of `occupancy` decoding requests,
+  /// as DecodeBatch does for an unplanned cohort of that width.
   [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
                                 sampling::SamplerState& sampler,
                                 DecodeResult* result,
                                 std::string* error_msg = nullptr,
-                                bool stop_at_eos = true);
+                                bool stop_at_eos = true,
+                                std::uint32_t occupancy = 1);
   struct BatchOutcome {
     bool completed{false};
     std::string error{};
@@ -223,6 +238,9 @@ public:
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
   }
+  /// PLE rows gathered by this execution slot since creation; zero without
+  /// a PLE table.
+  [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
   static constexpr std::uint32_t kSnapshotPayloadVersion = 18;
@@ -254,7 +272,9 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
 
-  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
+  /// Consumes an in-pass checkpoint, or null when the live session is at
+  /// the boundary.
+  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint*)>;
   bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
                              const PrefillCapture&, std::string*);
 
@@ -286,7 +306,8 @@ private:
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
-                                std::string* error_msg);
+                                std::string* error_msg,
+                                std::span<const std::uint8_t> propose = {});
   template<class Request>
   static bool RunIsolatedBatch(std::span<const Request> requests,
                                std::string* error_msg);
@@ -297,11 +318,14 @@ private:
   struct PendingDecode;
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
                      std::string* error_msg, bool defer_head = false,
-                     std::optional<std::uint32_t> batch_drafts = {});
+                     std::optional<std::uint32_t> batch_drafts = {},
+                     std::uint32_t occupancy = 1);
   static void AppendDraft(PendingDecode& pending);
+  /// Whether the chain ends after its latest neural proposal.
+  static bool GateStops(const PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
-                    std::size_t minimum = 1);
+                    std::size_t minimum = 1, bool require_resume = false);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 
@@ -310,11 +334,12 @@ private:
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
   std::int32_t draft_token_{0};
+  float draft_confidence_{1.0F};  ///< the head's probability of draft_token_
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
-  PromptLookup lookup_;
+  speculative::PromptLookup<> lookup_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

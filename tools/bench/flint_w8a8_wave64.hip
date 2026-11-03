@@ -1,6 +1,6 @@
 // Wave64 tile-config launchers for the Flint dense W8A8 tuning bench.
 // Compiled with -mwavefrontsize64 (see tools/bench/build.sh) exactly like
-// src/models/qwen/hip/kernels/prefill_quant_wave64.hip, whose shipped
+// src/families/qwen/kernels/prefill_quant_wave64.hip, whose shipped
 // TryLaunchQuantPrefillWave64 also links into the bench as the baseline.
 // The configuration list lives in flint_w8a8_wave64_cfgs.def.
 #define ENGINE_ENABLE_HIP 1
@@ -8,8 +8,8 @@
 
 #include <hip/hip_runtime.h>
 
-#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
-#include "src/models/qwen/hip/kernels/prefill_quant_wave64.hip"
+#include "src/families/qwen/kernels/prefill_quant_gemm.hpp"
+#include "src/families/qwen/kernels/prefill_quant_wave64.hip"
 
 namespace {
 

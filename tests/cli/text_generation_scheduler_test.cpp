@@ -28,9 +28,13 @@
 
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/json.hpp"
+#include "src/core/platform/env.hpp"
+#include "src/core/platform/os_info.hpp"
 
 namespace {
 
@@ -111,6 +115,8 @@ struct Event {
 };
 
 struct FakeControl {
+  gufo::sampling::TextModelPreset sampling_preset{
+      gufo::sampling::TextModelPreset::kUnspecified};
   void Log(Event event) {
     const std::lock_guard<std::mutex> lock(mutex);
     events.push_back(event);
@@ -193,6 +199,9 @@ struct FakeControl {
   bool release_prefill{false};
   std::atomic<std::size_t> invalidations{0};
   std::atomic<std::size_t> states_created{0};
+  bool structured_output{false};
+  bool vocabulary_failure{false};
+  std::atomic<std::size_t> vocabulary_builds{0};
   std::atomic<std::size_t> decode_calls{0};
   std::atomic<std::size_t> batch_preparations{0};
   std::atomic<std::int64_t> first_request_advance_ns{0};
@@ -275,6 +284,7 @@ public:
                 .prefix_reuse = control_->prefix_reuse,
             },
         .persistence = std::nullopt,
+        .sampling_preset = control_->sampling_preset,
     };
   }
 
@@ -311,6 +321,20 @@ public:
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
     return {static_cast<TextRunnerToken>(text.size())};
+  }
+
+  [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    if (!control_->structured_output)
+      return TextModelRunner::BuildConstraintVocabulary();
+    if (control_->vocabulary_failure)
+      throw std::runtime_error("vocabulary build failed");
+    control_->vocabulary_builds.fetch_add(1, std::memory_order_relaxed);
+    return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+        256, [](std::uint32_t id) {
+          return gufo::sampling::ConstraintVocabulary::Piece{
+              std::string(1, static_cast<char>(id)), false};
+        });
   }
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
@@ -385,13 +409,18 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
+      TextRunnerState& state,
+      gufo::sampling::SamplerState& sampler) const override {
     const auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
     }
+    auto probabilities = sampler.config().logprobs
+                             ? std::optional(gufo::sampling::TokenLogprobs{
+                                   {*fake.frontier, -0.25}, {}})
+                             : std::nullopt;
     if (control_->stop_after && fake.decode_count >= *control_->stop_after)
-      return {.stop = true};
+      return {.stop = true, .logprobs = probabilities};
     if (control_->eos_after && fake.decode_count >= *control_->eos_after &&
         fake.stop_at_eos())
       return {.stop = true};
@@ -400,12 +429,15 @@ public:
           static_cast<std::size_t>(*fake.frontier - fake.label * 100);
       if (index >= control_->output_pieces.size())
         return {.stop = true};
-      return {.token = *fake.frontier, .piece = control_->output_pieces[index]};
+      return {.token = *fake.frontier,
+              .piece = control_->output_pieces[index],
+              .logprobs = probabilities};
     }
     return {
         .stop = false,
         .token = *fake.frontier,
         .piece = std::to_string(*fake.frontier),
+        .logprobs = probabilities,
     };
   }
 
@@ -509,6 +541,7 @@ public:
       auto selection = SelectNext(state, sampler);
       if (selection.stop) {
         step.stop = true;
+        step.terminal_logprobs = selection.logprobs;
         break;
       }
       Advance(state, selection.token);
@@ -917,9 +950,9 @@ void TestGenerationTraceRecordsPromptAndOutput() {
   Expect(control->decode_calls.load(std::memory_order_relaxed) == 0,
          "an unarmed trace decodes no prompt");
 
-  const auto path =
-      fs::temp_directory_path() /
-      ("gufo-scheduler-trace-" + std::to_string(::getpid()) + ".jsonl");
+  const auto path = fs::temp_directory_path() /
+                    ("gufo-scheduler-trace-" +
+                     std::to_string(gufo::platform::ProcessId()) + ".jsonl");
   fs::remove(path);
   Expect(!Trace::Open(path.string()).has_value(), "trace file opens");
   gufo::sampling::SamplingConfig sampling;
@@ -2287,11 +2320,17 @@ void TestStopSequencesPreserveExecutedState() {
         TextGenerationScheduler::RequestMetadata metadata;
         metadata.stop_sequences = {"<STOP>"};
         std::string streamed;
-        auto request = scheduler->Submit({1, 10}, 8, 0.0F, {}, true, metadata);
-        const auto result = request.Wait([&](std::string_view piece) {
-          streamed += piece;
-          return true;
-        });
+        gufo::sampling::SamplingConfig config;
+        config.logprobs = 2;
+        std::size_t logprob_tokens = 0;
+        auto request =
+            scheduler->Submit({1, 10}, 8, config, {}, true, metadata);
+        const auto result =
+            request.Wait([&](const gufo::server::TokenPiece& piece) {
+              streamed += piece.text;
+              logprob_tokens += piece.logprobs != nullptr;
+              return true;
+            });
         Expect(
             result.finish_reason == Finish::kStopSequence && !result.cancelled,
             "stop sequence is a successful completion");
@@ -2302,10 +2341,14 @@ void TestStopSequencesPreserveExecutedState() {
         Expect(result.tokens.size() == (first ? 1U : 2U) &&
                    result.completion_tokens == result.tokens.size(),
                "usage includes the token that completed the stop");
+        Expect(logprob_tokens == result.tokens.size() &&
+                   result.logprobs.size() == result.tokens.size(),
+               "stop filtering retains selected metadata and discards the "
+               "speculative tail");
         // Repeating the prompt must not resume from an incorrectly labelled
         // generated frontier, including when preview or a speculative tail ran.
         const auto replay =
-            scheduler->Submit({1, 10}, 8, 0.0F, {}, true, metadata).Wait();
+            scheduler->Submit({1, 10}, 8, config, {}, true, metadata).Wait();
         Expect(replay.tokens == result.tokens && replay.text == result.text,
                "a stopped request leaves a safe reusable prompt cache");
       }
@@ -2614,6 +2657,62 @@ void TestShutdownCancelsRunnerAcquisition() {
   stopped.get();
 }
 
+void TestStructuredOutputIsPreparedBeforeServing() {
+  // The scheduler is created during model loading, before load_completed and
+  // before the server listens. The vocabulary is ready when
+  // construction returns, and constrained requests reuse it.
+  const auto control = std::make_shared<FakeControl>();
+  control->structured_output = true;
+  std::ostringstream output;
+  auto* previous = std::clog.rdbuf(output.rdbuf());
+  auto scheduler = MakeScheduler(control, 1);
+  std::clog.rdbuf(previous);
+  Expect(control->vocabulary_builds == 1,
+         "the vocabulary is built before the scheduler admits a request");
+  const auto log = output.str();
+  Expect(log.find("event=structured_output_prepared vocabulary_tokens=256 "
+                  "prepare_ms=") != std::string::npos &&
+             log.find(" rss_delta_kib=") != std::string::npos,
+         "preparation reports its time and memory");
+  const auto grammar = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{},"additionalProperties":false})"),
+      false);
+  const auto binding = scheduler->runner().BindConstraint(grammar);
+  Expect(binding->vocabulary && control->vocabulary_builds == 1,
+         "a constrained request reuses the prepared vocabulary");
+  Expect(scheduler->Submit({7, 70}, 2, 0.0F).Wait().tokens.size() == 2,
+         "a prepared scheduler serves requests");
+
+  // Runners without structured output can still serve ordinary text, but
+  // reject an explicit constrained request as before.
+  const auto plain = MakeScheduler(std::make_shared<FakeControl>(), 1);
+  Expect(plain->runner().PrepareConstraintVocabulary() == 0 &&
+             plain->Submit({7, 70}, 2, 0.0F).Wait().tokens.size() == 2,
+         "unsupported runners retain ordinary text serving");
+  std::string error;
+  try {
+    (void)plain->runner().BindConstraint(grammar);
+  } catch (const std::invalid_argument& exception) {
+    error = exception.what();
+  }
+  Expect(error.find("does not support structured output") != std::string::npos,
+         "unsupported runners still reject structured output");
+
+  // A supported runner with a broken vocabulary must fail startup.
+  const auto broken = std::make_shared<FakeControl>();
+  broken->structured_output = true;
+  broken->vocabulary_failure = true;
+  error.clear();
+  try {
+    (void)MakeScheduler(broken, 1);
+  } catch (const std::runtime_error& exception) {
+    error = exception.what();
+  }
+  Expect(error == "vocabulary build failed",
+         "vocabulary build failures stop startup");
+}
+
 void TestProgressLoggingIsOptInAndBounded() {
   auto run = [](bool enabled) {
     auto control = std::make_shared<FakeControl>();
@@ -2903,12 +3002,129 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
+void TestTokenLogprobs() {
+  for (const bool multi : {false, true}) {
+    for (const bool preview : {false, true}) {
+      auto control = std::make_shared<FakeControl>();
+      control->multi_token_decode = multi;
+      control->preview_first_token = preview;
+      control->stop_after = 3;
+      auto scheduler = MakeScheduler(control, 2);
+      gufo::sampling::SamplingConfig config;
+      config.logprobs = 2;
+      auto request = scheduler->Submit({1, 10, 11}, 8, config, {}, true);
+      auto peer =
+          scheduler->Submit({2, 20, 21}, 2, gufo::sampling::SamplingConfig{});
+      std::vector<gufo::sampling::TokenId> observed;
+      const auto result =
+          request.Wait([&](const gufo::server::TokenPiece& piece) {
+            Expect(piece.logprobs != nullptr,
+                   "every selected token carries metadata");
+            observed.push_back(piece.logprobs->entries.front().id);
+            return true;
+          });
+      Expect(result.tokens == ExpectedTokens(1, 3) &&
+                 observed == ExpectedTokens(1, 4),
+             "preview and speculative blocks publish each token and EOS "
+             "exactly once");
+      Expect(result.logprobs.size() == observed.size(),
+             "stream and buffered records agree");
+      Expect(peer.Wait().logprobs.empty(),
+             "concurrent disabled requests retain no metadata");
+      const auto resumed = scheduler->Submit({1, 10, 11}, 2, config).Wait();
+      Expect(resumed.logprobs.size() == 2,
+             "a reused session owns fresh logprob state");
+      auto cancelled = scheduler->Submit({3, 30, 31}, 8, config, {}, true);
+      std::size_t delivered = 0;
+      const auto cancelled_result =
+          cancelled.Wait([&](const gufo::server::TokenPiece& piece) {
+            Expect(piece.logprobs != nullptr,
+                   "cancelled stream retains delivered metadata");
+            ++delivered;
+            return false;
+          });
+      Expect(cancelled_result.cancelled && delivered == 1,
+             "cancellation stops metadata delivery with text");
+      const auto after_cancel =
+          scheduler->Submit({4, 40, 41}, 2, config).Wait();
+      Expect(after_cancel.logprobs.size() == 2 &&
+                 after_cancel.logprobs.front().entries.front().id ==
+                     ExpectedTokens(4, 1).front(),
+             "reclaimed sessions do not leak cancelled metadata");
+    }
+  }
+  for (const bool stream : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    TextSchedulerPolicy policy;
+    if (stream) {
+      policy.max_buffered_output_bytes_per_request = 32;
+      policy.max_buffered_output_bytes_total = 32;
+    } else {
+      policy.max_output_bytes_per_request = 32;
+    }
+    auto scheduler = MakeScheduler(control, 1, {}, policy);
+    gufo::sampling::SamplingConfig config;
+    config.logprobs = 0;
+    bool failed = false;
+    std::size_t scored = 0;
+    try {
+      scored = scheduler->Submit({1, 10}, 2, config, {}, stream)
+                   .Wait()
+                   .logprobs.size();
+    } catch (const TextGenerationError& error) {
+      failed = error.code() == TextGenerationErrorCode::kOutputBackpressure;
+    }
+    Expect(stream ? failed : scored == 2,
+           stream ? "metadata counts toward backpressure limits"
+                  : "metadata does not count toward the text byte limit");
+  }
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+void TestBackendPreservesModelSamplingPreset() {
+  using gufo::sampling::TextModelPreset;
+  for (const auto preset :
+       {TextModelPreset::kQwen38, TextModelPreset::kDeepSeekV4Flash}) {
+    auto control = std::make_shared<FakeControl>();
+    control->sampling_preset = preset;
+    gufo::server::InferenceBackend backend;
+    std::string error;
+    Expect(backend.load(std::make_shared<FakeRunner>(control), &error), error);
+    Expect(backend.sampling_defaults().model == preset,
+           "loading an extension preserves its sampling preset");
+    for (const bool thinking : {false, true}) {
+      const auto defaults = backend.sampling_defaults().Resolve(thinking);
+      const bool qwen_off = preset == TextModelPreset::kQwen38 && !thinking;
+      Expect(
+          defaults.temperature == (qwen_off ? 0.7F : 1.0F) &&
+              defaults.top_p == (qwen_off ? 0.8F : 0.95F) &&
+              defaults.top_k == (preset == TextModelPreset::kQwen38 ? 20 : 0) &&
+              defaults.presence_penalty == (qwen_off ? 1.5F : 0.0F),
+          "omitted sampling settings use the model's thinking preset");
+    }
+    gufo::sampling::SamplingConfig configured;
+    configured.temperature = 0.25F;
+    backend.set_sampling_defaults(32, configured, {.temperature = true});
+    const auto defaults = backend.sampling_defaults();
+    Expect(defaults.model == preset && defaults.max_tokens == 32 &&
+               defaults.Resolve(true).temperature == 0.25F &&
+               defaults.Resolve(true).top_p == 0.95F,
+           "server overrides retain the model preset for omitted fields");
+  }
+}
+#endif
+
 int main() {
+#if defined(ENGINE_ENABLE_HIP)
+  TestBackendPreservesModelSamplingPreset();
+#endif
+  TestTokenLogprobs();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
-  ::setenv("NO_COLOR", "1", 1);
+  gufo::platform::SetEnv("NO_COLOR", "1");
   TestProgressLoggingIsOptInAndBounded();
+  TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();
   TestPromptProgressPrecedesStreamedTokens();
   TestStreamStartPrecedesPrefill();

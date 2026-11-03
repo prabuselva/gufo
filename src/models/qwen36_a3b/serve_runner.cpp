@@ -18,9 +18,9 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
-#include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 
 namespace gufo::models::qwen36_a3b {
 namespace {

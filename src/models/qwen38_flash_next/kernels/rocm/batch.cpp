@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
+#include <gufo/ext/experimental/managed_alloc.hpp>
 #include <stdexcept>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -189,7 +191,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (item.session == nullptr || item.session->owner_ != this ||
         !item.session->mtp_enabled_ || n == 0 || n > kDecodeRows ||
         (item.hidden_row < 0 &&
-         (n != 1 || !item.session->mtp_.residual_valid)) ||
+         (n != 1 || !item.session->mtp_.residual_valid || item.kv_only)) ||
         (item.hidden_row >= 0 &&
          static_cast<std::uint32_t>(item.hidden_row) + n >
              options_.max_speculative) ||
@@ -214,7 +216,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     return true;
   if (items.size() == 1) {
     const auto& item = items.front();
-    return MtpForward(*item.session, item.tokens, item.hidden_row, {}, error);
+    return MtpForward(*item.session, item.tokens, item.hidden_row,
+                      {.kv_only = item.kv_only}, error);
   }
   for (const auto& item : items) {
     auto& session = *item.session;
@@ -232,8 +235,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                                       item.session->mtp_.position);
   if (!AllocateBatch(error) ||
       (batch_controls_ == nullptr &&
-       !Check(hipHostMalloc(&batch_controls_,
-                            kBatchSessions * sizeof(Session::Control)),
+       !Check(host_allocations_.Allocate(
+                  &batch_controls_, kBatchSessions * sizeof(Session::Control)),
               error))) {
     return false;
   }
@@ -248,6 +251,9 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   }
   const Scratch base = s_;
   const auto& l = model_->mtp();
+  const bool cache_only =
+      !l.attn_qkv.empty() &&
+      std::ranges::all_of(items, [](const auto& item) { return item.kv_only; });
   const auto body = [&]() {
     if (!AnyActive(items))
       return true;
@@ -285,9 +291,52 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       return false;
     MtpAddEmbedding(base.mtp_eproj, base.mtp_res, rows, c.hidden_size,
                     c.hc_count, stream_);
-    if (!HcMixBatch(l.hc_attn, base.mtp_res, false, base.mixed, base.inject,
-                    rows, error))
+    if (!HcMixBatch(l.hc_attn, base.mtp_res, false, base.mixed,
+                    cache_only ? nullptr : base.inject, rows, error))
       return false;
+    if (cache_only) {
+      // A copy or ordinary target step needs only predictor KV. Batch the
+      // same invariant projections, then stop before queries, attention,
+      // the output projection and FFN whose residual would be discarded.
+      auto kv = l.attn_qkv;
+      const TensorRef layout{.type = kv.type, .cols = kv.cols};
+      kv.data = static_cast<std::uint8_t*>(kv.data) +
+                std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
+      kv.rows = 2 * c.AttentionKvDim();
+      if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
+          !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
+        return false;
+      for (std::size_t i = 0; i < items.size(); ++i) {
+        auto& session = *items[i].session;
+        if (!session.CheckCancellation(nullptr))
+          continue;
+        ++session.mutation_epoch_;
+        session.mtp_.residual_valid = false;
+        const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+        const auto capacity = session.index_capacity_;
+        if (!PrepareAttention(
+                base.qg + std::size_t{offsets[i]} * kv.rows, kv.rows, nullptr,
+                l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
+                session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
+                c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
+                c.rms_eps, stream_, session.vision_input_.rope(), false, yarn_))
+          return Fail(error, "batched MTP cache projection failed");
+        StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
+                  session.mtp_.index_k, n, c.indexer_head_dim,
+                  &session.control_->mtp_position, capacity, stream_);
+        if (session.mtp_.position + n > c.indexer_top_k) {
+          const auto pool = (session.mtp_.position + n) / c.compress_ratio -
+                            session.mtp_.blocks;
+          PoolIndexerBlocks(session.mtp_.index_k, l.indexer_k_norm.f32(),
+                            session.mtp_.block_k, &session.control_->mtp_blocks,
+                            &session.control_->mtp_position, n, pool,
+                            c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+                            c.rope_theta, c.rms_eps, capacity, stream_,
+                            session.vision_input_.rope(), yarn_);
+        }
+      }
+      return true;
+    }
     if (!l.attn_qkv.empty()) {
       if (!DenseBatch(l.attn_qkv, base.mixed, base.qg, rows, error))
         return false;
@@ -368,7 +417,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       return false;
     CombineBatch(tail.mtp_res, nullptr, tail_rows);
     for (std::size_t i = 0; i < items.size(); ++i) {
-      if (!items[i].session->CheckCancellation(nullptr))
+      if (!items[i].session->CheckCancellation(nullptr) || items[i].kv_only)
         continue;
       if (!Check(
               hipMemcpyAsync(
@@ -396,7 +445,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (item.session->Cancelled())
       continue;
     item.session->mtp_.position += item.tokens.size();
-    item.session->mtp_.residual_valid = true;
+    item.session->mtp_.residual_valid = !item.kv_only;
     if (item.session->mtp_.position > c.indexer_top_k)
       item.session->mtp_.blocks =
           item.session->mtp_.position / c.compress_ratio;
@@ -442,8 +491,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
-      if (item.output.token != nullptr)
-        *item.output.token = *mtp_token_host_;
+      if (item.output.token != nullptr) {
+        *item.output.token = mtp_token_host_[0];
+        if (item.output.confidence != nullptr)
+          *item.output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
+      }
       if (item.output.candidates != nullptr)
         *item.output.candidates = *mtp_candidates_host_;
     }
@@ -453,8 +505,9 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     return false;
   }
   if (batch_candidates_host_ == nullptr) {
-    if (!Check(hipHostMalloc(&batch_candidates_host_,
-                             kBatchSessions * sizeof(MtpCandidateLogits)),
+    if (!Check(host_allocations_.Allocate(
+                   &batch_candidates_host_,
+                   kBatchSessions * sizeof(MtpCandidateLogits)),
                error))
       return false;
     for (std::uint32_t i = 0; i < kBatchSessions; ++i)
@@ -556,12 +609,15 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           slot[i] < subset_rows ? items[i].session->mtp_.draft_ids : nullptr;
       const auto count = std::min<std::size_t>(rows, kMtpCandidates);
       if (items[i].output.candidates == nullptr) {
+        // The token and its confidence (float bits) land in ids[0..1].
         Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+        ArgmaxConfidence(logits_of(i), s_.mtp_token, rows, stream_);
         if (table != nullptr)
           RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
-                        static_cast<std::uint32_t>(prefix), table, stream_);
+                        static_cast<std::uint32_t>(prefix), table,
+                        kMtpDraftExtraRows, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
-                                  s_.mtp_token, sizeof(std::int32_t),
+                                  s_.mtp_token, 2 * sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
                    error))
           return false;
@@ -571,7 +627,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                        s_.mtp_scores, rows, stream_);
       if (table != nullptr)
         RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count),
-                      static_cast<std::uint32_t>(prefix), table, stream_);
+                      static_cast<std::uint32_t>(prefix), table,
+                      kMtpDraftExtraRows, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),
@@ -598,8 +655,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].session->Cancelled())
       continue;
-    if (items[i].output.token != nullptr)
+    if (items[i].output.token != nullptr) {
       *items[i].output.token = batch_candidates_host_[i].ids[0];
+      if (items[i].output.confidence != nullptr)
+        std::memcpy(items[i].output.confidence,
+                    batch_candidates_host_[i].ids.data() + 1, sizeof(float));
+    }
     if (items[i].output.candidates != nullptr)
       *items[i].output.candidates = batch_candidates_host_[i];
   }
@@ -813,8 +874,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     return false;
   }
   if (batch_controls_ == nullptr &&
-      !Check(hipHostMalloc(&batch_controls_,
-                           kBatchSessions * sizeof(Session::Control)),
+      !Check(host_allocations_.Allocate(
+                 &batch_controls_, kBatchSessions * sizeof(Session::Control)),
              error)) {
     return false;
   }
@@ -824,7 +885,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     const std::size_t bytes =
         std::size_t{c.num_layers} * kBatchSessions * sizeof(GdnBatchItem);
     if ((batch_gdn_host_ == nullptr &&
-         !Check(hipHostMalloc(&batch_gdn_host_, bytes, hipHostMallocMapped),
+         !Check(host_allocations_.Allocate(&batch_gdn_host_, bytes,
+                                           hipHostMallocMapped),
                 error)) ||
         (batch_gdn_ == nullptr &&
          !Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&batch_gdn_),
@@ -837,6 +899,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   }
   FinishPrefetch();
   batch_rows_ = 0;
+  ngram_owners_.clear();
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     auto& session = *item.session;
@@ -848,6 +911,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     std::copy(item.tokens.begin(), item.tokens.end(),
               tokens_host_ + offsets[i]);
     if (c.ple_layer >= 0) {
+      ngram_owners_.push_back(
+          {item.tokens.size() * c.ple_heads, &session.ngram_counters_});
       for (std::size_t t = 0; t < item.tokens.size(); ++t) {
         HashNgramRows(
             c, session.ngram_, item.tokens.subspan(t, 1),
@@ -863,7 +928,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (ngram_ == nullptr ||
         !ngram_->StartRead(std::span(host_rows_).first(rows * c.ple_heads),
                            std::span(host_emb_, static_cast<std::size_t>(rows) *
-                                                    c.PleEmbeddingDim()))) {
+                                                    c.PleEmbeddingDim()),
+                           ngram_owners_)) {
       return Fail(error, "batched n-gram read could not start");
     }
     ple_pending_ = true;

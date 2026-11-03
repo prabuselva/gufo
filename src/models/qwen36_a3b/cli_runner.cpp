@@ -20,10 +20,12 @@
 #include "src/cli/prompt/prompt.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/image.hpp"
+#include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
-#include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 
 namespace gufo::models::qwen36_a3b {
 namespace {
@@ -84,6 +86,25 @@ std::string MakeTestName(std::string_view prefix, std::size_t count,
     result += " @ d" + std::to_string(depth);
   }
   return result;
+}
+
+ReasoningOptions ChatReasoningOptions(const cli::PromptOptions& options) {
+  ReasoningOptions reasoning;
+  if (options.reasoning_mode == "on") {
+    reasoning.enabled = true;
+  } else if (options.reasoning_mode == "off") {
+    reasoning.enabled = false;
+  }
+  return reasoning;
+}
+
+void AttachToMessage(const cli::PromptOptions& opt,
+                     tokenization::ChatMessage& message) {
+  for (const auto& path : opt.image_paths) {
+    message.images.push_back(
+        {0, std::make_shared<const std::vector<std::uint8_t>>(
+                core::ReadImageFile(path))});
+  }
 }
 
 }  // namespace
@@ -443,6 +464,96 @@ bool LoadQwen36A3BChat(const cli::PromptOptions& opt,
   // cache must be filled during prefill.
   (*session)->SetMtpEnabled(true);
   return true;
+}
+
+int RunQwen36A3BChat(const cli::PromptOptions& opt,
+                     const core::GgufReader& reader,
+                     std::chrono::steady_clock::time_point model_load_start) {
+  std::shared_ptr<Model> model;
+  std::unique_ptr<Session> session;
+  if (!LoadQwen36A3BChat(opt, reader, model_load_start, &model, &session))
+    return 1;
+  const tokenization::QwenTokenizer& tokenizer = model->tokenizer();
+  PrintModelLoadTime(model_load_start);
+
+  std::cout << "=== Gufo Interactive Chat (qwen35moe) ===\n"
+            << "Type 'exit' or Ctrl+D to quit.\n\n";
+
+  std::vector<tokenization::ChatMessage> history;
+  if (!opt.system_prompt.empty()) {
+    history.push_back(
+        {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
+  }
+
+  const auto chat_options = tokenization::ResolveQwenChatOptions(
+      ChatReasoningOptions(opt), opt.add_vision_id);
+
+  bool first_turn = true;
+  std::string user_input;
+  while (true) {
+    std::cout << ">>> User: " << std::flush;
+    if (!std::getline(std::cin, user_input)) {
+      break;
+    }
+    if (user_input == "exit" || user_input == "quit") {
+      break;
+    }
+    if (user_input.empty()) {
+      continue;
+    }
+
+    history.push_back({tokenization::ChatRole::kUser, user_input, "", ""});
+    if (first_turn) {
+      AttachToMessage(opt, history.back());
+    }
+    first_turn = false;
+
+    std::vector<tokenization::TokenId> prompt_tokens;
+    try {
+      if (!opt.image_paths.empty()) {
+        auto vision =
+            std::make_shared<qwen::vision::Prompt>(qwen::vision::Prepare(
+                tokenizer, history, {}, chat_options,
+                model->VisionEncoder()->identity(), kDefaultContext));
+        session->ConfigureVision(vision);
+        prompt_tokens = vision->tokens;
+      } else {
+        const auto rendered =
+            tokenization::QwenChatTemplate::Render(history, {}, chat_options);
+        if (!rendered.has_value()) {
+          std::cerr << "Error formatting chat template.\n";
+          return 1;
+        }
+        prompt_tokens = tokenization::QwenChatTemplate::EncodeRendered(
+            tokenizer, *rendered, 0, rendered->size(), {}, {});
+      }
+    } catch (const std::exception& exception) {
+      std::cerr << "Prompt failed: " << exception.what() << '\n';
+      return 1;
+    }
+
+    std::cout << "<<< Assistant: ";
+    std::string assistant_reply;
+    if (GenerateQwen36A3BResponse(opt, *model, *session, prompt_tokens,
+                                  &assistant_reply) != 0) {
+      return 1;
+    }
+    std::cout << '\n';
+
+    tokenization::ChatMessage reply{tokenization::ChatRole::kAssistant, ""};
+    if (chat_options.enable_thinking) {
+      constexpr std::string_view end = "</think>";
+      const auto boundary = assistant_reply.find(end);
+      reply.thought = assistant_reply.substr(0, boundary);
+      if (boundary != std::string::npos) {
+        reply.content = assistant_reply.substr(boundary + end.size());
+      }
+    } else {
+      reply.content = std::move(assistant_reply);
+    }
+    history.push_back(std::move(reply));
+  }
+  return 0;
 }
 
 }  // namespace gufo::models::qwen36_a3b
