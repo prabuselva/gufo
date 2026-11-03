@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "staging/core/quant/prefill_wave4.hpp"
 #include "src/families/qwen/kernels/prefill_quant_gemm.hpp"
 
 namespace gufo::models::flint::rocm {

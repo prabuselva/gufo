@@ -17,6 +17,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "staging/core/quant/prefill_wave4.hpp"
 #include "staging/models/flint/kernels/rocm/kernels.hpp"
 #include "staging/models/flint/kernels/rocm/linear.hpp"
 #include "staging/models/flint/kernels/rocm/moe/moe_prefill.hpp"
