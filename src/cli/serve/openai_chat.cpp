@@ -134,6 +134,8 @@ constexpr std::array<std::string_view, 7> kToolMarkers{
 };
 using ToolMarkerSet = std::span<const std::string_view>;
 
+#include "staging/integration/openai_chat_staging_markers.inl"
+
 ToolMarkerSet ToolMarkers(
     std::optional<sampling::JsonConstraint::ToolFormat> format) {
   using Format = sampling::JsonConstraint::ToolFormat;
@@ -144,13 +146,6 @@ ToolMarkerSet ToolMarkers(
   // framing: returning it as content would double it when history is replayed.
   static constexpr std::array<std::string_view, 2> deepseek{
       "\n\n<｜DSML｜tool_calls>", "<｜DSML｜tool_calls>"};
-#if defined(GUFO_STAGING_MODELS)
-  static constexpr std::array<std::string_view, 1> gemma{
-      models::gemma4::kToolCallStart};
-#endif
-  // Ling 3.0 Flash writes the name directly after this opener, so the
-  // dialect needs its own set even though the opener text matches Qwen.
-  static constexpr std::array<std::string_view, 1> ling{"<tool_call>"};
   // The JSON fallback has no native counterpart in llama.cpp. Its grammar
   // leaves text before <tool_call> unconstrained, where models still write
   // their native call syntax; keep recognizing every opener there.
@@ -162,10 +157,10 @@ ToolMarkerSet ToolMarkers(
     return ToolMarkerSet(deepseek);
 #if defined(GUFO_STAGING_MODELS)
   if (*format == Format::kGemma4)
-    return ToolMarkerSet(gemma);
+    return ToolMarkerSet(kGemmaMarkers);
 #endif
   if (*format == Format::kLing3)
-    return ToolMarkerSet(ling);
+    return ToolMarkerSet(kLingMarkers);
   return ToolMarkerSet(qwen);
 }
 
@@ -192,13 +187,6 @@ constexpr std::array<std::string_view, 4> kQwenClosers{
     tokenization::QwenToolSyntax::kFunctionClose,
     tokenization::QwenToolSyntax::kCallClose,
     // The client's envelope, whose block rules already strip it whole.
-    "</invoke>",
-};
-// Ling 3.0 Flash frames each argument with its own closer; nothing else in
-// its output is framing.
-constexpr std::array<std::string_view, 3> kLingClosers{
-    "</arg_value>",
-    "</tool_call>",
     "</invoke>",
 };
 constexpr std::array<std::string_view, 9> kToolClosers{
