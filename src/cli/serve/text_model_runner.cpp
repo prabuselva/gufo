@@ -15,7 +15,9 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
-#include "src/models/gemma4/chat_template.hpp"
+#if defined(GUFO_STAGING_MODELS)
+#include "staging/models/gemma4/chat_template.hpp"
+#endif
 
 namespace gufo::server {
 
@@ -90,21 +92,28 @@ std::optional<ChatRequest> ConstrainChatRequest(
                                 std::move(message));
   }
   const auto initial_state = runner.InitialOutputState(request);
-  const bool gemma4 =
+  [[maybe_unused]] const bool gemma4 =
       runner.ToolFormat() == sampling::JsonConstraint::ToolFormat::kGemma4;
   if (grammar && initial_state == ext::InitialOutputState::kReasoning) {
     // The model template has opened the thought channel: the model must
     // close it before the constrained answer. Without a model-specific
     // marker the grammar takes the shared reasoning close token.
+#if defined(GUFO_STAGING_MODELS)
     grammar = gemma4 ? sampling::JsonConstraint::WithReasoning(
                            grammar, models::gemma4::kThoughtEnd)
                      : sampling::JsonConstraint::WithReasoning(grammar);
-  } else if (gemma4 && grammar &&
-             initial_state == ext::InitialOutputState::kAuto) {
+#else
+    grammar = sampling::JsonConstraint::WithReasoning(grammar);
+#endif
+  }
+#if defined(GUFO_STAGING_MODELS)
+  else if (gemma4 && grammar &&
+           initial_state == ext::InitialOutputState::kAuto) {
     // The model may open and close the thought channel inside its turn.
     grammar = sampling::JsonConstraint::WithReasoning(
         grammar, models::gemma4::kThoughtEnd, models::gemma4::kThoughtStart);
   }
+#endif
   sampling->constraint = runner.BindConstraint(grammar);
   return constrained;
 }

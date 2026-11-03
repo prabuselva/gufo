@@ -21,17 +21,17 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
 
-#if defined(ENGINE_ENABLE_HIP)
-#include "src/models/flint/engine.hpp"
-#include "src/models/flint/serve_runner.hpp"
-#include "src/models/gemma4/engine.hpp"
-#include "src/models/gemma4/serve_runner.hpp"
-#include "src/models/ling3_0/engine.hpp"
-#include "src/models/ling3_0/serve_runner.hpp"
-#include "src/models/nemotron_h_moe/engine.hpp"
-#include "src/models/nemotron_h_moe/serve_runner.hpp"
-#include "src/models/qwen36_a3b/engine.hpp"
-#include "src/models/qwen36_a3b/serve_runner.hpp"
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
+#include "staging/models/flint/engine.hpp"
+#include "staging/models/flint/serve_runner.hpp"
+#include "staging/models/gemma4/engine.hpp"
+#include "staging/models/gemma4/serve_runner.hpp"
+#include "staging/models/ling3_0/engine.hpp"
+#include "staging/models/ling3_0/serve_runner.hpp"
+#include "staging/models/nemotron_h_moe/engine.hpp"
+#include "staging/models/nemotron_h_moe/serve_runner.hpp"
+#include "staging/models/qwen36_a3b/engine.hpp"
+#include "staging/models/qwen36_a3b/serve_runner.hpp"
 #endif
 
 namespace gufo::server {
@@ -218,6 +218,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
   }
 }
 
+#if defined(GUFO_STAGING_MODELS)
 namespace {
 
 // Fork model packages predate the extension registry; when no registered
@@ -307,6 +308,8 @@ std::optional<bool> ForkModelFallback(
 
 }  // namespace
 
+#endif  // GUFO_STAGING_MODELS
+
 bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::uint32_t max_context,
                             std::size_t session_count,
@@ -327,6 +330,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->create == nullptr) {
+#if defined(GUFO_STAGING_MODELS)
     if (const auto fallback = ForkModelFallback(
             *this, model_path, *reader, max_context, session_count,
             prefill_policy, scheduler_policy, speculative_config,
@@ -334,6 +338,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             error)) {
       return *fallback;
     }
+#endif
     SetError(error, "No text provider found for model architecture");
     return false;
   }
@@ -355,6 +360,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   return load(std::move(runner), error, session_count, prefill_policy,
               scheduler_policy, disk_cache_config, ram_cache_config);
 }
+
+#if defined(GUFO_STAGING_MODELS)
 bool InferenceBackend::load(std::shared_ptr<models::qwen36_a3b::Model> model,
                             std::string* error, std::uint32_t max_context,
                             std::size_t session_count,
@@ -532,6 +539,8 @@ bool InferenceBackend::load(std::shared_ptr<models::flint::Model> model,
     return false;
   }
 }
+
+#endif  // GUFO_STAGING_MODELS
 
 #else
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,

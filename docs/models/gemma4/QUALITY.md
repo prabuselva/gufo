@@ -1,6 +1,6 @@
 # Gemma-4-26B-A4B — Quality Contracts
 
-The CPU scalar oracle (`src/models/gemma4/reference/`) is the numerical
+The CPU scalar oracle (`staging/models/gemma4/reference/`) is the numerical
 ground truth. Every GPU path must reproduce it within the tolerances below;
 end-to-end greedy token streams are the final gate.
 
@@ -9,7 +9,7 @@ end-to-end greedy token streams are the final gate.
 - Plain C++ (double-accumulated where noted), built only by validation
   targets (`gufo_gemma4_reference`, `-O2`).
 - Pins the exact operation order of the reference graph
-  (`llama.cpp/src/models/gemma4.cpp`, `gemma4-assistant.cpp`):
+  (`llama.cpp/staging/models/gemma4.cpp`, `gemma4-assistant.cpp`):
   embedding scale √2816 on token rows only; per-head RMSNorm (eps 1e-6) on
   Q and K with weights, on V without weight; proportional rope on full
   layers (`inv_freq[i] × rope_freqs[i]`); V = rms_norm(wk·x) on full layers,
@@ -50,7 +50,7 @@ argmax-exact requirement is unchanged, and greedy generation is the final gate.
 
 ## Golden vectors
 
-- Tokenizer: `tests/models/gemma4/tokenizer_golden.h` — token id vectors for
+- Tokenizer: `staging/tests/models/gemma4/tokenizer_golden.h` — token id vectors for
   a pinned corpus (prose, code, CJK, newline runs, tool-call markup),
   generated with the llama.cpp fork and regenerated only by an explicit
   decision recorded in EXPERIMENTS.md.
@@ -58,7 +58,7 @@ argmax-exact requirement is unchanged, and greedy generation is the final gate.
   thinking) compared against the GGUF `tokenizer.chat_template` rendered by
   the llama.cpp fork's chat parser.
 - Forward: `GUFO_GEMMA4_GGUF` prompts pinned in
-  `tests/models/gemma4/rocm_forward_test.cpp`; output hash recorded per
+  `staging/tests/models/gemma4/rocm_forward_test.cpp`; output hash recorded per
   phase so regressions are visible.
 - Serve (M7): greedy HTTP chat through `Gemma4TextRunner` returns the correct
   answer with `finish_reason=stop` (exclusive-GPU smoke); the full end-to-end

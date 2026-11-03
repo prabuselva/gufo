@@ -34,8 +34,10 @@
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
-#include "src/models/gemma4/chat_template.hpp"
-#include "src/models/gemma4/tool_syntax.hpp"
+#if defined(GUFO_STAGING_MODELS)
+#include "staging/models/gemma4/chat_template.hpp"
+#include "staging/models/gemma4/tool_syntax.hpp"
+#endif
 
 namespace gufo::server {
 
@@ -142,8 +144,10 @@ ToolMarkerSet ToolMarkers(
   // framing: returning it as content would double it when history is replayed.
   static constexpr std::array<std::string_view, 2> deepseek{
       "\n\n<｜DSML｜tool_calls>", "<｜DSML｜tool_calls>"};
+#if defined(GUFO_STAGING_MODELS)
   static constexpr std::array<std::string_view, 1> gemma{
       models::gemma4::kToolCallStart};
+#endif
   // Ling 3.0 Flash writes the name directly after this opener, so the
   // dialect needs its own set even though the opener text matches Qwen.
   static constexpr std::array<std::string_view, 1> ling{"<tool_call>"};
@@ -156,8 +160,10 @@ ToolMarkerSet ToolMarkers(
   // dialects are ordinary prose under that grammar, not additional calls.
   if (*format == Format::kDeepSeek)
     return ToolMarkerSet(deepseek);
+#if defined(GUFO_STAGING_MODELS)
   if (*format == Format::kGemma4)
     return ToolMarkerSet(gemma);
+#endif
   if (*format == Format::kLing3)
     return ToolMarkerSet(ling);
   return ToolMarkerSet(qwen);
@@ -2257,6 +2263,7 @@ ParsedGeneration ParseGeneration(
   return false;
 }
 
+#if defined(GUFO_STAGING_MODELS)
 // Native Gemma 4 calls: `<|tool_call>call:NAME{...}<tool_call|>` blocks under
 // the mandatory thought channel. Grammar guarantees the framing; this splits
 // complete blocks from prose. An unclosed block is held: a streamed turn
@@ -2311,6 +2318,7 @@ ParsedGeneration ParseGemmaGeneration(
   parsed.hide_tool_markup = true;
   return parsed;
 }
+#endif  // GUFO_STAGING_MODELS
 
 ParsedGeneration ParseStructuredGeneration(
     std::string_view raw, TextGenerationBackend::InitialOutputState initial,
@@ -2324,18 +2332,27 @@ ParsedGeneration ParseStructuredGeneration(
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
     if (leading != std::string_view::npos &&
+#if defined(GUFO_STAGING_MODELS)
         raw.substr(leading).starts_with(
             gemma ? std::string_view(models::gemma4::kThoughtStart)
                   : kThinkStart)) {
+#else
+        raw.substr(leading).starts_with(kThinkStart)) {
+#endif
       raw.remove_prefix(leading);
       initial = TextGenerationBackend::InitialOutputState::kReasoning;
     }
   }
   if (initial == TextGenerationBackend::InitialOutputState::kReasoning) {
+#if defined(GUFO_STAGING_MODELS)
     const std::string_view opener =
-        gemma ? std::string_view(models::gemma4::kThoughtStart) : "<think>";
+        gemma ? std::string_view(models::gemma4::kThoughtStart) : kThinkStart;
     const std::string_view closer =
-        gemma ? std::string_view(models::gemma4::kThoughtEnd) : "</think>";
+        gemma ? std::string_view(models::gemma4::kThoughtEnd) : kThinkEnd;
+#else
+    const std::string_view opener = kThinkStart;
+    const std::string_view closer = kThinkEnd;
+#endif
     if (raw.starts_with(opener))
       raw.remove_prefix(opener.size());
     const auto end = raw.find(closer);
@@ -2377,12 +2394,14 @@ ParsedGeneration ParseStructuredGeneration(
     native.reasoning_content = std::move(parsed.reasoning_content);
     return native;
   }
+#if defined(GUFO_STAGING_MODELS)
   if (gemma) {
     auto generated = ParseGemmaGeneration(content, tools, choice,
                                           enforce_required, quotes, closers);
     generated.reasoning_content = std::move(parsed.reasoning_content);
     return generated;
   }
+#endif
   constexpr std::string_view tool_start =
       tokenization::QwenToolSyntax::kCallOpen;
   auto marker = tool_only ? EarliestMarker(content, markers, quotes) : 0;
@@ -2609,7 +2628,8 @@ public:
       TextGenerationBackend::InitialOutputState initial_output_state,
       EmitCallback emit_piece, bool structured, bool tool_only,
       bool recognize_tools, ToolMarkerSet markers, ToolCloserSet closers,
-      std::span<const tokenization::ChatTool> tools, bool gemma)
+      std::span<const tokenization::ChatTool> tools,
+      [[maybe_unused]] bool gemma)
       : emit_piece_(std::move(emit_piece)),
         raw_content_(structured || tool_only),
         tool_only_(tool_only),
@@ -2617,10 +2637,12 @@ public:
         markers_(markers),
         closers_(closers),
         tools_(tools) {
+#if defined(GUFO_STAGING_MODELS)
     if (gemma) {
       reasoning_open_ = models::gemma4::kThoughtStart;
       reasoning_close_ = models::gemma4::kThoughtEnd;
     }
+#endif
     if (initial_output_state ==
         TextGenerationBackend::InitialOutputState::kReasoning) {
       state_ = State::kThinking;

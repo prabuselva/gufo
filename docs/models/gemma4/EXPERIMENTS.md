@@ -33,7 +33,7 @@ Hypothesis: the qwen36 dequant-after-LDS WMMA MoE extends to gemma4
 geometry (K=2816, N=1408 fused gate+up / 2816 down, 128 experts, top-8,
 Q8_0 **and BF16** expert types, per-expert `.scale` on down) with the
 softmax router weights applied in the down epilogue.
-Change: `src/models/gemma4/kernels/rocm/routed_f16.{hpp,hip.cpp}`.
+Change: `staging/models/gemma4/kernels/rocm/routed_f16.{hpp,hip.cpp}`.
 Measurement: pending M5.
 Quality: `gemma4_rocm_moe_test` vs CPU formula.
 Verdict: pending
@@ -318,7 +318,7 @@ them: Q8_1 0.74, BF16 0.066, **binary16 3.7e-5** — i.e. F16 is *more* accurate
 than the production int8 path, not less. Test the two levers directly at the
 kernel level: is the F16 WMMA GEMM faster, and is it more accurate, than the
 int8 `qfn_mmq_q8_0_dense` path gemma4 runs today?
-Change: standalone `tests/models/gemma4/dense_f16_bench.cpp` (CMake target
+Change: standalone `staging/tests/models/gemma4/dense_f16_bench.cpp` (CMake target
 `gemma4_dense_f16_bench`, EXCLUDE_FROM_ALL). Both kernels consume the same
 synthetic `block_q8_0` bytes; the int8 path takes FP32 activations, the F16 path
 (`qwen38_flash_next::rocm::DenseF16Gemm`, already built but never called by the

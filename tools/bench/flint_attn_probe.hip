@@ -22,7 +22,7 @@
 #include <cstring>
 #include <vector>
 
-#include "src/models/flint/kernels/rocm/attention_wmma.hip.cpp"
+#include "staging/models/flint/kernels/rocm/attention_wmma.hip.cpp"
 
 // --- probe kernel (generated copy of the shipped kernel, correction stripped)
 namespace gufo::models::flint::rocm {

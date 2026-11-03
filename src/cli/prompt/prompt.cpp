@@ -15,14 +15,18 @@
 #include "src/cli/sampling_options.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
-#include "src/models/gemma4/cli_runner.hpp"
-#include "src/models/ling3_0/cli_runner.hpp"
+#if defined(GUFO_STAGING_MODELS)
+#include "staging/models/gemma4/cli_runner.hpp"
+#include "staging/models/ling3_0/cli_runner.hpp"
+#endif
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/image.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
-#include "src/models/qwen36_a3b/cli_runner.hpp"
+#if defined(GUFO_STAGING_MODELS)
+#include "staging/models/qwen36_a3b/cli_runner.hpp"
+#endif
 #endif
 
 namespace gufo::cli {
@@ -64,7 +68,7 @@ std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   return std::nullopt;
 }
 
-#if defined(ENGINE_ENABLE_HIP)
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
 
 constexpr std::uint32_t kDefaultContext = 4096;
 
@@ -443,7 +447,7 @@ int RunPrompt(std::span<const char* const> args) {
   ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->prompt_driver == nullptr) {
-#if defined(ENGINE_ENABLE_HIP)
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
     if (models::gemma4::IsGemma4(*reader)) {
       return models::gemma4::RunGemma4Prompt(opt, *reader, model_load_start);
     }
@@ -479,7 +483,7 @@ int RunPrompt(std::span<const char* const> args) {
           opt, *reader, model_load_start, rendered_prompt, messages,
           AttachImages, PrepareVision);
     }
-#else
+#elif defined(GUFO_STAGING_MODELS)
     if (models::gemma4::IsGemma4(*reader)) {
       std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
       PrintModelLoadTime(model_load_start, false);
@@ -534,7 +538,7 @@ int RunChat(std::span<const char* const> args) {
   ext::RegisterBuiltExtensions(registry);
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->chat_driver == nullptr) {
-#if defined(ENGINE_ENABLE_HIP)
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
     if (models::gemma4::IsGemma4(*reader)) {
       return models::gemma4::RunGemma4Chat(opt, *reader, model_load_start);
     }
@@ -550,7 +554,7 @@ int RunChat(std::span<const char* const> args) {
       return models::qwen36_a3b::RunQwen36A3BChat(opt, *reader,
                                                   model_load_start);
     }
-#else
+#elif defined(GUFO_STAGING_MODELS)
     if (models::gemma4::IsGemma4(*reader)) {
       std::cerr << "Gemma-4-26B-A4B requires ENGINE_ENABLE_HIP=ON\n";
       PrintModelLoadTime(model_load_start, false);

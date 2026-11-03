@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — ROCm Kernel Map
 
-All kernels for `qwen36_a3b` live in `src/models/qwen36_a3b/kernels/rocm/`
+All kernels for `qwen36_a3b` live in `staging/models/qwen36_a3b/kernels/rocm/`
 and are model-private. Geometry (Qwen3.5-MoE variant, Q8_K_XL artifact):
 hidden 2048, 40 layers (GDN linear attention unless `(layer + 1) % 4 == 0`,
 then GQA), attention 16 q-heads / 2 kv-heads / head_dim 256 / rotary 64,

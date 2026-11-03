@@ -2,7 +2,7 @@
 
 Goal: implement GGUF arch `gemma4` (trunk), `gemma4-assistant` (MTP draft) and
 the `gemma4v` vision projector in Gufo on Strix Halo `gfx1151`, isolated in
-`src/models/gemma4` with model-private ROCm WMMA kernels, a CPU scalar oracle
+`staging/models/gemma4` with model-private ROCm WMMA kernels, a CPU scalar oracle
 and GPU parity tests. Each phase below is self-contained and auto-continuable:
 it names its deliverables, its focused check, and its exit criterion. Update
 the Status log at the bottom as phases land.
@@ -25,12 +25,12 @@ GPU benchmarks run exclusively through `tools/bench/gpu_exclusive.sh` (see
 AGENTS.md); iterate levers at ≤16K context first. The benchmark reference
 column is the local llama.cpp fork (`$LLAMA_CPP/
 llama.cpp`, ROCm build) which carries the ground-truth graphs
-`src/models/gemma4.cpp`, `gemma4-assistant.cpp` and
+`staging/models/gemma4.cpp`, `gemma4-assistant.cpp` and
 `tools/mtmd/models/gemma4v.cpp`.
 
 ## Phases
 
-### M1 — Config (`src/models/gemma4/config.{hpp,cpp}`)
+### M1 — Config (`staging/models/gemma4/config.{hpp,cpp}`)
 
 Parse and validate `gemma4.*` / `gemma4-assistant.*` metadata: layer count,
 hidden, vocab (from `tokenizer.ggml.tokens`), context, RMS eps, logit
@@ -217,20 +217,20 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
 - 2026-10-05 M0: docs scaffold; architecture contract pinned from the GGUFs
   and the llama.cpp fork graphs (correction: SWA layers **do** have
   `attn_v`; only full layers derive V from the K projection).
-- 2026-10-05 M1: `src/models/gemma4/config.{hpp,cpp}` (`gufo_gemma4`),
-  `tests/models/gemma4/config_test.cpp` (`gemma4.config`, labels
+- 2026-10-05 M1: `staging/models/gemma4/config.{hpp,cpp}` (`gufo_gemma4`),
+  `staging/tests/models/gemma4/config_test.cpp` (`gemma4.config`, labels
   `gemma4;cpu`) pass; both real artifacts parse (trunk 30×2816, draft
   4×1024→2816) and `DraftMatches` validates the share contract.
-- 2026-10-05 M2: `src/models/gemma4/weights.{hpp,cpp}` +
-  `tests/models/gemma4/weights_test.cpp` (`gemma4.weights`, labels
+- 2026-10-05 M2: `staging/models/gemma4/weights.{hpp,cpp}` +
+  `staging/tests/models/gemma4/weights_test.cpp` (`gemma4.weights`, labels
   `gemma4;cpu;external-model`, skips 77) pass on both real artifacts; every
   trunk and draft tensor resolves with the pinned shape and a decodable
   format (correction: layers carry **seven** norms — `post_ffw_norm` applies
   to the combined FFN output before the residual add, then
   `layer_output_scale`).
-- 2026-10-05 M3: `src/models/gemma4/{cpu_ops,reference}.{hpp,cpp}`
+- 2026-10-05 M3: `staging/models/gemma4/{cpu_ops,reference}.{hpp,cpp}`
   (`gufo_gemma4_reference`, EXCLUDE_FROM_ALL, -O2) +
-  `tests/models/gemma4/reference_test.cpp` (`gemma4.reference`, labels
+  `staging/tests/models/gemma4/reference_test.cpp` (`gemma4.reference`, labels
   `gemma4;cpu;external-model;slow`, skips 77) pass on both real artifacts:
   3 trunk steps, draft step and replay are finite, non-degenerate and stable
   (10.9 s wall). Semantics pinned from the fork graphs: NEOX rope with the
@@ -238,8 +238,8 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   attention scale 1.0, weightless V norm, geglu experts with renormalized
   top-8 softmax weights (sum clamp 6.1e-5) and per-expert down scales, draft
   concat order [target emb ×√2816, trunk h].
-- 2026-10-05 M4: `src/models/gemma4/tokenizer.{hpp,cpp}` (in
-  `gufo_gemma4`) + `tests/models/gemma4/tokenizer_test.cpp`
+- 2026-10-05 M4: `staging/models/gemma4/tokenizer.{hpp,cpp}` (in
+  `gufo_gemma4`) + `staging/tests/models/gemma4/tokenizer_test.cpp`
   (`gemma4.tokenizer`, labels `gemma4;cpu;external-model`, skips 77) pass:
   synthetic merge-engine checks plus nine golden vectors (ids and decode)
   captured from the llama.cpp fork (`vocab_only` load) on the real artifact.
@@ -247,7 +247,7 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   looked up directly, longest-first special partition, priority-queue merges
   (min rank, min left) with lazy staleness via recorded side lengths,
   per-byte `<0xXX>` fallback, `▁` space escape, add_bos forced true.
-- 2026-10-05 M5 (kernels tier): `src/models/gemma4/kernels/rocm/`
+- 2026-10-05 M5 (kernels tier): `staging/models/gemma4/kernels/rocm/`
   (`gufo_gemma4_kernels`): `gemv`/`gemm`/`routed_f16` ported from the qwen36
   tier (geometry-agnostic; arch tag renamed), new `fused.{hpp,hip.cpp}` with
   `RmsNormRows`, `FusedAddRmsNorm`, `Add`, `RouterTopK` (softmax top-8,
@@ -255,7 +255,7 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   `MoeEpilogue` (gemma4 variant: `ids` + per-expert `expert_scale`, no shared
   expert), and `GegluF32`/`GegluF16` (gelu-tanh × up over the fused
   [rows][2·704] gate/up tensor; the routed path never uses the SwiGLU
-  epilogues). `tests/models/gemma4/rocm_kernels_test.cpp`
+  epilogues). `staging/tests/models/gemma4/rocm_kernels_test.cpp`
   (`gemma4.rocm_kernels`, labels `gemma4;hip;gpu;gfx1151`) passes: GEMV
   Q8_0/BF16, EmbedRow, GemvGrouped + fused-layout GemvGroupedPair, Geglu
   F32/F16, RouterTopK vs a double reference, norms/Add, Q8_0 mmq GEMM batch 8,
@@ -289,7 +289,7 @@ OPTIMIZATIONS.md/EXPERIMENTS.md.
   KvNormRopeWrite → AttentionDecode/Prefill → O-proj → the five-norm residual
   flow → shared FFN + routed top-8 MoE → `layer_output_scale`; head =
   RmsNorm(cur, output_norm) → h_out → MatVec(output) → softcap).
-  `tests/models/gemma4/rocm_forward_test.cpp` (`gemma4.rocm_forward`, labels
+  `staging/tests/models/gemma4/rocm_forward_test.cpp` (`gemma4.rocm_forward`, labels
   `gemma4;hip;gpu;gfx1151;slow`) runs the GPU executor and the double oracle
   side by side over `GUFO_GEMMA4_GGUF` prompts and compares `h_out` and logits
   at positions 0–4. Two bugs found and fixed: the `act_` scratch was sized to

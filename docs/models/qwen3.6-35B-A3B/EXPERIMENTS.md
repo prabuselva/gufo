@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — Kernel Experiments
 
-Concise retained/rejected log for `src/models/qwen36_a3b` on gfx1151. Current
+Concise retained/rejected log for `staging/models/qwen36_a3b` on gfx1151. Current
 production speeds live in `OPTIMIZATIONS.md`; quality evidence in the model's
 tests. Every row is a matched same-session comparison through
 `tools/bench/gpu_exclusive.sh` (exclusive VRAM), not a cross-run guess.
@@ -877,7 +877,7 @@ measured 55.2 TF/s WMMA ceiling, and a clean pp8192 capture put this kernel
 tier at ~3300 ms of 11037 ms busy (30 % of prefill) — enough headroom to re-
 open plan tuning even though the *arithmetic* question stayed closed.
 
-**Change.** `tests/models/qwen36_a3b/dense_f16_bench.cpp` now races five wide
+**Change.** `staging/tests/models/qwen36_a3b/dense_f16_bench.cpp` now races five wide
 tile plans over the six production shapes (attn q/o, GDN qkv/gate/out,
 shared-expert down) at batch 2048 against a strided double reference:
 the auto 4×2-wave single-stage, `<256,128,2,4,2>`, and `<128,128,1,4,2>`
@@ -918,7 +918,7 @@ the prefetch buffers break the 256-VGPR cap.
 **Candidate tiles.** `kStaged128` `<128,128,2,2,4>` and `kTile64`
 `<64,128,2,2,4>` (both spill-shaped: 64 live accumulators; kStaged128
 stagings two K blocks per barrier). New harness
-`tests/models/qwen36_a3b/dense_f16_w16_bench.cpp` uploads each weight twice
+`staging/tests/models/qwen36_a3b/dense_f16_w16_bench.cpp` uploads each weight twice
 (Q8_0 bytes and binary16) and races all seven plans against the Q8_0
 dequant ceiling on one double reference.
 

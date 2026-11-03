@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — Fused Operators (`kernels.hip.cpp`)
 
-Source: `src/models/qwen36_a3b/kernels/rocm/kernels.hip.cpp` (1319 lines).
+Source: `staging/models/qwen36_a3b/kernels/rocm/kernels.hip.cpp` (1319 lines).
 Public API: `kernels.hpp`. Everything except `ExpertCountsKernel` is in an
 anonymous namespace. Activations are row-major F32. The scalar oracle in
 `reference.cpp` pins every formula; the elementwise helpers below use

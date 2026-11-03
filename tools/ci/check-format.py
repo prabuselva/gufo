@@ -16,8 +16,8 @@ def main() -> int:
         "src/models/deepseek_v4_flash/kernels/rocm/",
         "src/models/deepseek_v4_flash/runtime/",
         "src/models/qwen38_flash_next/kernels/rocm/mmq/",
-        "src/models/flint/kernels/rocm/mmq/",
-        "src/models/flint/kernels/rocm/moe/",
+        "staging/models/flint/kernels/rocm/mmq/",
+        "staging/models/flint/kernels/rocm/moe/",
     )
     # END GENERATED VENDORED PATHS
     files = sorted(

@@ -4,7 +4,7 @@
 # same-morning pre-C10 control session c10ctl, identical tree minus the
 # kernel change).
 # host: gfx1151 Strix Halo, 2026-10-30; rev 2b2d92e8 + QkEpilogueKernel walk
-# in src/models/flint/kernels/rocm/kernels.hip.cpp (this commit's tree),
+# in staging/models/flint/kernels/rocm/kernels.hip.cpp (this commit's tree),
 # candidate build/release/gufo SHA-256 prefix 9eac29e1d46b82e5.
 # Baselines (BENCHMARKS.md, C9): pp2048 2842.47/2851.07, pp8192 2282.92,
 # pp16384 1703.15.

@@ -1,5 +1,5 @@
 // C7s probe for the Flint grouped routed GEMM stage (RoutedHalfDownKernel,
-// src/models/flint/kernels/rocm/moe/moe_prefill.hip.cpp) at the production
+// staging/models/flint/kernels/rocm/moe/moe_prefill.hip.cpp) at the production
 // chunk shapes: gate/up geglu (m=1024 via [gate|up], K=2048, half slot rows
 // out) and down (m=H=2048, K=expert_ff=512, half slot rows out). The
 // production TU is included so the probe runs the shipped kernels and their
@@ -8,16 +8,16 @@
 //
 //   PATH=/opt/rocm/lib/llvm/bin:$PATH clang++ --offload-arch=gfx1151 \
 //     --driver-mode=g++ -L/opt/rocm/lib --hip-link -O3 -std=c++20 \
-//     -I . -I src/models/flint/kernels/rocm/mmq -x hip \
+//     -I . -I staging/models/flint/kernels/rocm/mmq -x hip \
 //     tools/bench/flint_moe_down_probe.hip -x none \
-//     build/release/src/models/flint/libgufo_flint_moe.a \
-//     build/release/src/models/flint/libgufo_flint_mmq.a \
+//     build/release/staging/models/flint/libgufo_flint_moe.a \
+//     build/release/staging/models/flint/libgufo_flint_mmq.a \
 //     -lhipblas -o /tmp/flint_moe_down_probe
 //
 // Usage: /tmp/flint_moe_down_probe [reps]
-#include "src/models/flint/kernels/rocm/moe/moe_prefill.hip.cpp"
+#include "staging/models/flint/kernels/rocm/moe/moe_prefill.hip.cpp"
 
-#include "src/models/flint/kernels/rocm/moe/routed_compact.hpp"
+#include "staging/models/flint/kernels/rocm/moe/routed_compact.hpp"
 
 #include <algorithm>
 #include <cmath>

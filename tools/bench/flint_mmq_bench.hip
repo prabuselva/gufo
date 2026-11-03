@@ -5,9 +5,9 @@
 //
 //   clang++ --offload-arch=gfx1151 --driver-mode=g++ -L/opt/rocm/lib \
 //     --hip-link -O3 -std=c++20 -x hip \
-//     -I src/models/flint/kernels/rocm/mmq \
+//     -I staging/models/flint/kernels/rocm/mmq \
 //     tools/bench/flint_mmq_bench.hip -x none \
-//     build/release/src/models/flint/libgufo_flint_mmq.a \
+//     build/release/staging/models/flint/libgufo_flint_mmq.a \
 //     -lhipblas -o /tmp/flint_mmq_bench
 //
 // Usage: /tmp/flint_mmq_bench [--save ref.bin] [--ref ref.bin] [reps]

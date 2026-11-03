@@ -20,7 +20,7 @@ pair in one tool call (AGENTS protocol).
 ## Golden rules (this model)
 
 - Commit at every checkpoint; update this file in the same commit.
-- Model-private code only: everything lives under `src/models/flint/`; reuse
+- Model-private code only: everything lives under `staging/models/flint/`; reuse
   shared core/hip helpers, never edit other model trees.
 - Control-token literals (`<|...|>`, XML tool tags) stay as ASCII-safe
   placeholders in docs and code output until the final tokenizer pass.
@@ -72,20 +72,20 @@ pair in one tool call (AGENTS protocol).
 ## Checkpoints
 
 - [x] C0+C1 module skeleton + metadata loader:
-  `src/models/flint/{CMakeLists.txt,config.hpp,config.cpp}`, registered in
+  `staging/models/flint/{CMakeLists.txt,config.hpp,config.cpp}`, registered in
   root `CMakeLists.txt`; `flint.config` CPU test
-  (`tests/models/flint/config_test.cpp`) — geometry profile gate, bool-array
+  (`staging/tests/models/flint/config_test.cpp`) — geometry profile gate, bool-array
   pattern parsing, vocab-from-tokenizer, rejection cases.
-- [x] C2 weights: `src/models/flint/weights.{hpp,cpp}` — `TensorRef`
+- [x] C2 weights: `staging/models/flint/weights.{hpp,cpp}` — `TensorRef`
   (native encodings, no dequant; shard/offset + bounds check; `Expert()`
   stride), `LayerWeights` (per-layer q/k/v/o + `attn_q_norm`/`attn_k_norm`/
   `attn_sinks`; dense ffn on layers 0-1 vs BF16-router + 3D `_exps` +
   single `_shexp` on 2-48), `ModelWeights::Bind` with exact-shape/format
   gate and tied-embedding fallback. `flint.weights` test
-  (`tests/models/flint/weights_test.cpp`, `GUFO_FLINT_GGUF`, skip 77):
+  (`staging/tests/models/flint/weights_test.cpp`, `GUFO_FLINT_GGUF`, skip 77):
   expected-name table == all 779 file tensors exactly, per-layer kind/shape
   checks. Passes on the real artifact.
-- [x] C3 scalar reference oracle: `src/models/flint/{cpu_ops.hpp,cpu_ops.cpp,
+- [x] C3 scalar reference oracle: `staging/models/flint/{cpu_ops.hpp,cpu_ops.cpp,
   reference.hpp,reference.cpp}` (built only via `gufo_flint_reference`,
   EXCLUDE_FROM_ALL, -O2) + `flint.reference` test (build target explicitly).
   Passes on the artifact: 3 tokens finite/non-degenerate logits, repeat-stable,
@@ -102,9 +102,9 @@ pair in one tool call (AGENTS protocol).
   for dense/attention projections incl. batched prefill, f16 KV planes,
   windowed attention with sinks + per-head QK norm + NEOX rope gated per
   layer, sigmoid top-6 gate + clamped L2 norm + single shared expert).
-  `src/models/flint/kernels/rocm/{kernels,linear}.{hpp,cpp}`,
+  `staging/models/flint/kernels/rocm/{kernels,linear}.{hpp,cpp}`,
   `executor.{hpp,cpp}`; test `flint.rocm.forward`
-  (`tests/models/flint/rocm_forward_test.cpp`, EXCLUDE_FROM_ALL target,
+  (`staging/tests/models/flint/rocm_forward_test.cpp`, EXCLUDE_FROM_ALL target,
   `GUFO_FLINT_GGUF`, skip 77). Passes: decode steps 0-3 max|logit diff|
   0.21-0.91 vs oracle budgets ≤1.13 with argmax match, batched prefill
   identical to sequential decode (0.637). Debug aids kept (off by default):
@@ -116,12 +116,12 @@ pair in one tool call (AGENTS protocol).
   values at pos>0), and mmq dense prefill exceeding the oracle envelope
   (→ fp32 `GemvBatch` tier until the speed phase).
 - [x] gpt2 BPE tokenizer with the `flint` pre-tokenizer
-  (`src/models/flint/tokenizer.{hpp,cpp}`): specials from `token_type`
+  (`staging/models/flint/tokenizer.{hpp,cpp}`): specials from `token_type`
   CONTROL metadata (spelling-free), eog ∪ eos stop set, collapsed-letters
   pre-split reproducing llama.cpp's generic splitter (digit ≤3, CJK split
   before letters, whitespace/punct prefixes, clitics, whitespace run
   rules), request-local piece memo. Test `flint.tokenizer`
-  (`tests/models/flint/tokenizer_test.cpp`: byte coverage, piece
+  (`staging/tests/models/flint/tokenizer_test.cpp`: byte coverage, piece
   boundaries, CJK split trap, specials/stops, BOS/EOS, roundtrips, GGUF
   validation); passes.
 - [x] Engine: `engine.{hpp,cpp}` (Model/Session over FlintExecutor; chunked
@@ -162,7 +162,7 @@ pair in one tool call (AGENTS protocol).
   interior bounds keyed on the wave's own rows only (never `a.rows`, so a
   row's arithmetic path is identical across prefix lengths) and exact
   per-element accumulation on boundary tiles. New `flint.attention.op` test
-  (`tests/models/flint/attention_op_test.cpp`): fp64-oracle parity for WMMA
+  (`staging/tests/models/flint/attention_op_test.cpp`): fp64-oracle parity for WMMA
   and dispatched kernels (worst 6.8e-7, scalar same) + 10 bitwise
   prefix/batch-invariance pairs — all pass. Matched `flint.rocm.forward`
   evidence (argmax matched everywhere): decode0 0.378 (wmma) vs 0.491
@@ -262,7 +262,7 @@ pair in one tool call (AGENTS protocol).
      Gates pass with the new chunking incl. the 24 K-activity engine replay
      (ck4k).
   - [x] C7i qfn_mmq fork for Flint: copied the whole vendored mmq tree to
-     `src/models/flint/kernels/rocm/mmq` (mechanical `flint_`/`FLINT_`
+     `staging/models/flint/kernels/rocm/mmq` (mechanical `flint_`/`FLINT_`
      rename, new `gufo_flint_mmq` target, `kernels/rocm/mmq/VENDOR.md`
      records provenance) so the Q8_0 pipeline restructure (double-buffered
      LDS staging) evolves without touching Flash-Next production kernels

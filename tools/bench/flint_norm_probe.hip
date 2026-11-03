@@ -10,7 +10,7 @@
 // the normed row and updated residual stream bit-identical to the chain.
 #if defined(ENGINE_ENABLE_HIP)
 
-#include "src/models/flint/kernels/rocm/kernels.hip.cpp"
+#include "staging/models/flint/kernels/rocm/kernels.hip.cpp"
 #include "src/families/qwen/kernels/prefill_quant_gemm.hpp"
 
 #include <cmath>

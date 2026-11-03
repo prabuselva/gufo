@@ -2,11 +2,11 @@
 // ggml mmvq (Q8_1-activation) tiers at the real t=1 Nemotron Bolt shapes.
 // Build (production static libs keep the exact release codegen):
 //   hipcc -x hip --offload-arch=gfx1151 -O3 -DNDEBUG \
-//     -I<repo> -I<repo>/src/models/nemotron_h_moe/kernels/rocm/mmq \
+//     -I<repo> -I<repo>/staging/models/nemotron_h_moe/kernels/rocm/mmq \
 //     -DGGML_HIP_NO_VMM -DENGINE_ENABLE_HIP=1 \
 //     tools/bench/nem_decode_mmvq_bench.hip \
-//     build/release/src/models/nemotron_h_moe/libgufo_nemotron_h_moe_mmq.a \
-//     build/release/src/models/nemotron_h_moe/libgufo_nemotron_h_moe_kernels.a \
+//     build/release/staging/models/nemotron_h_moe/libgufo_nemotron_h_moe_mmq.a \
+//     build/release/staging/models/nemotron_h_moe/libgufo_nemotron_h_moe_kernels.a \
 //     -lamdhip64 -o /tmp/nem_decode_mmvq_bench
 #include <hip/hip_runtime.h>
 
@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "nmb_mmq.h"
-#include "src/models/nemotron_h_moe/kernels/rocm/nb_ops.h"
+#include "staging/models/nemotron_h_moe/kernels/rocm/nb_ops.h"
 
 #define CU(x) do { hipError_t e = (x); if (e != hipSuccess) { \
   std::printf("hip err %s @%d\n", hipGetErrorString(e), __LINE__); exit(1); } } while (0)

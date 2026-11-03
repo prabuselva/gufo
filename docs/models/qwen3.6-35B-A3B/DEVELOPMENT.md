@@ -15,7 +15,7 @@ Implement Qwen3.6-35B-A3B (GGUF arch `qwen35moe`) in Gufo on Strix Halo
 gfx1151. The model is a hybrid: Gated DeltaNet (linear attention) layers +
 gated grouped-query attention layers + MoE + an MTP draft block. The
 implementation is isolated from Qwen27B / flash-next: new dir
-`src/models/qwen36_a3b`, own kernels, zero edits to `src/models/qwen` or
+`staging/models/qwen36_a3b`, own kernels, zero edits to `src/models/qwen` or
 flash-next.
 
 ## Model geometry (from the artifact)
@@ -77,16 +77,16 @@ Real GGUF: 36.41 GiB at the path above.
 
 ### Uncommitted working-tree changes
 
-- `src/models/qwen36_a3b/engine.{hpp,cpp}` — Model/Session wrapper around the
+- `staging/models/qwen36_a3b/engine.{hpp,cpp}` — Model/Session wrapper around the
   executor (no vision, no ngram, no speculative MTP).
-- `src/models/qwen36_a3b/CMakeLists.txt` — `gufo_qwen36_a3b_engine` target.
+- `staging/models/qwen36_a3b/CMakeLists.txt` — `gufo_qwen36_a3b_engine` target.
 - `CMakeLists.txt` (top-level) — `gufo_llm_cli` links
   `gufo_qwen36_a3b_engine`.
 - `src/cli/prompt/prompt.cpp` — `qwen35moe` wiring (LoadQwen36A3BModel,
   GenerateQwen36A3BResponse, architecture check before `qwen4exp`).
-- `tests/models/qwen36_a3b/rocm_inference_test.cpp` — NEW CPU+GPU greedy
+- `staging/tests/models/qwen36_a3b/rocm_inference_test.cpp` — NEW CPU+GPU greedy
   decode comparison on a real prompt.
-- `tests/models/qwen36_a3b/CMakeLists.txt` — registers
+- `staging/tests/models/qwen36_a3b/CMakeLists.txt` — registers
   `qwen36_a3b_rocm_inference_test`.
 
 ## The bug (root cause)
@@ -109,8 +109,8 @@ logits-update bug in the executor, but the executor was correct.
 Two call sites read it with `std::copy_n` (a plain host `memcpy` of the
 pointer) instead of `hipMemcpy`:
 
-- `tests/models/qwen36_a3b/rocm_inference_test.cpp` (prefill + decode read)
-- `src/models/qwen36_a3b/engine.cpp` `Session::Sync` / `Evaluate` /
+- `staging/tests/models/qwen36_a3b/rocm_inference_test.cpp` (prefill + decode read)
+- `staging/models/qwen36_a3b/engine.cpp` `Session::Sync` / `Evaluate` /
   `DecodeStep` (the production CLI path)
 
 On this system that host read of device memory returned stale/garbage values,
@@ -143,8 +143,8 @@ The blocking bug is fixed and verified. Remaining to land the model:
 
 1. Run the full `qwen36_a3b` GPU suite to confirm nothing else regressed:
    `ctest --test-dir build/gpu-test -R '^qwen36_a3b\.' --output-on-failure`.
-2. Commit the fix: `src/models/qwen36_a3b/engine.cpp` (3× `hipMemcpy`),
-   `tests/models/qwen36_a3b/rocm_inference_test.cpp` (per-step prefill
+2. Commit the fix: `staging/models/qwen36_a3b/engine.cpp` (3× `hipMemcpy`),
+   `staging/tests/models/qwen36_a3b/rocm_inference_test.cpp` (per-step prefill
    compare + `hipMemcpy`), plus the uncommitted engine/CLI wiring.
 3. Optional hardening: add a `Executor::DownloadLogits(float*, size_t)`
    helper so call sites cannot regress to a raw host read of the device
@@ -189,26 +189,26 @@ The blocking bug is fixed and verified. Remaining to land the model:
 
 ## Relevant files
 
-- `src/models/qwen36_a3b/kernels/rocm/executor.{hpp,cpp}` — Executor forward
+- `staging/models/qwen36_a3b/kernels/rocm/executor.{hpp,cpp}` — Executor forward
   pass. **Verified correct** (the bug was in the callers reading its device
   logits, not here).
-- `src/models/qwen36_a3b/kernels/rocm/device_model.{hpp,cpp}` —
+- `staging/models/qwen36_a3b/kernels/rocm/device_model.{hpp,cpp}` —
   DeviceTensor/DeviceLayer/DeviceModel::Upload.
-- `src/models/qwen36_a3b/kernels/rocm/kernels.hip.cpp` — 11 fused ops.
-- `src/models/qwen36_a3b/kernels/rocm/gemv.{hpp,hip.cpp}` — GEMV + EmbedRow.
-- `src/models/qwen36_a3b/weights.{hpp,cpp}` — weight loader.
-- `src/models/qwen36_a3b/config.{hpp,cpp}` — config.
-- `src/models/qwen36_a3b/cpu_ops.{hpp,cpp}` — CPU oracle (double accumulation).
-- `src/models/qwen36_a3b/reference.{hpp,cpp}` — ReferenceModel ground truth
+- `staging/models/qwen36_a3b/kernels/rocm/kernels.hip.cpp` — 11 fused ops.
+- `staging/models/qwen36_a3b/kernels/rocm/gemv.{hpp,hip.cpp}` — GEMV + EmbedRow.
+- `staging/models/qwen36_a3b/weights.{hpp,cpp}` — weight loader.
+- `staging/models/qwen36_a3b/config.{hpp,cpp}` — config.
+- `staging/models/qwen36_a3b/cpu_ops.{hpp,cpp}` — CPU oracle (double accumulation).
+- `staging/models/qwen36_a3b/reference.{hpp,cpp}` — ReferenceModel ground truth
   (verified correct: produces sensible text).
-- `src/models/qwen36_a3b/engine.{hpp,cpp}` — Model/Session wrapper. **Site of
+- `staging/models/qwen36_a3b/engine.{hpp,cpp}` — Model/Session wrapper. **Site of
   the bug** (3× `std::copy_n` device reads, now `hipMemcpy`).
-- `tests/models/qwen36_a3b/rocm_forward_test.cpp` — GPU forward test (passes;
+- `staging/tests/models/qwen36_a3b/rocm_forward_test.cpp` — GPU forward test (passes;
   downloads logits with `hipMemcpy`, which is why it never caught the bug).
-- `tests/models/qwen36_a3b/rocm_inference_test.cpp` — CPU+GPU greedy decode
+- `staging/tests/models/qwen36_a3b/rocm_inference_test.cpp` — CPU+GPU greedy decode
   comparison. **Site of the bug** (now `hipMemcpy` + per-step prefill
   compare); passes.
-- `tests/models/qwen36_a3b/hip_test.hpp` — GPU test scaffolding.
+- `staging/tests/models/qwen36_a3b/hip_test.hpp` — GPU test scaffolding.
 - `src/cli/prompt/prompt.cpp` — CLI wiring.
 - Reference (do not modify): `src/models/qwen38_flash_next/engine.{hpp,cpp}`,
   `src/models/qwen38_flash_next/kernels/rocm/*`.

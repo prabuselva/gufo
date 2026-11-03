@@ -36,9 +36,9 @@ consumed by every MoE model.
 
 ## Phase 1 — Quality harness (lands first; gates everything after)
 
-- Port `tests/models/gemma4/reference_probe.cpp`, `logit_file.hpp` and
+- Port `staging/tests/models/gemma4/reference_probe.cpp`, `logit_file.hpp` and
   `tools/gemma4/compare_logits.py`, `compare_stages.py` from the fork; adapt
-  to our `src/models/gemma4/reference.cpp`.
+  to our `staging/models/gemma4/reference.cpp`.
 - Add oracle `Storage` modes `kFloat32 / kHalfKv / kQ8Activations`
   (fork `reference.hpp:23-28`) to all three model oracles so a lever's KL can
   be predicted before its kernel exists and our binary16-KV assumption is
@@ -79,7 +79,7 @@ New fork-faithful primitives (fork refs):
 
 ## Phase 3 — gemma4 onto the shared core (target §3 cells → ~1.0–1.1×)
 
-Executor dispatch changes in `src/models/gemma4/kernels/rocm/executor.cpp`;
+Executor dispatch changes in `staging/models/gemma4/kernels/rocm/executor.cpp`;
 every lever A/B'd at ≤16K first, confirmed at 32K/65K/100K:
 
 1. `HalfPlan`-style plan selection (m==2816: staged-8 for K≥4096, row-groups-8

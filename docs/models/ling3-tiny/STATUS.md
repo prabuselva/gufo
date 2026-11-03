@@ -22,7 +22,7 @@ memory. Strategy and acceptance criteria: [PLAN.md](PLAN.md). Shape facts:
       KDA on the other 18; MoE on 1..23. Invalidated the earlier
       planning-time assumption of `(il+1)%6==0`.
 - [x] 0.3 Kernel-constant grep audit: no Flash geometry literals in
-      `src/models/ling3_0/kernels/`; executor sizes buffers from config
+      `staging/models/ling3_0/kernels/`; executor sizes buffers from config
       (`executor.cpp:312, 341-417`); model/weights layers are
       config-driven (`weights.cpp:198` nextn load is conditional).
 - [x] 0.4 Identified the four blockers: config pin `config.cpp:217-228`,
