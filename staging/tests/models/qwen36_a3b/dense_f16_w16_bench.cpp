@@ -21,7 +21,7 @@
 #include <memory>
 #include <vector>
 
-#include "src/core/hip/gemm/dense_f16_gemm.hpp"
+#include "staging/core/gemm/dense_f16_gemm.hpp"
 #include "staging/tests/models/qwen36_a3b/hip_test.hpp"
 
 namespace core = gufo::core::hip::gemm;

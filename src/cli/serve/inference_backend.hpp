@@ -14,42 +14,6 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
-namespace gufo::hip {
-class QwenGpuModel;
-}
-
-namespace gufo::models::deepseek_v4_flash {
-class Model;
-}
-
-namespace gufo::models::qwen38_flash_next {
-class Model;
-}
-
-namespace gufo::models::qwen36_a3b {
-class Model;
-}
-
-namespace gufo::models::gemma4 {
-class Model;
-}
-
-namespace gufo::models::ling3_0 {
-class Model;
-}
-
-namespace gufo::models::nemotron_h_moe {
-class Model;
-}
-
-namespace gufo::models::flint {
-class Model;
-}
-
-namespace gufo::tokenization {
-class QwenTokenizer;
-}
-
 namespace gufo::server {
 
 using TextSpeculativeBackend = ext::TextSpeculativeBackend;
@@ -107,58 +71,6 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             TextRunnerRamCacheOptions ram_cache_config = {});
-
-#if defined(ENGINE_ENABLE_HIP)
-  /// Installs a previously loaded Qwen3.6-35B-A3B model. The model owns a
-  /// single shared executor, so it serves exactly one concurrent session.
-  bool load(std::shared_ptr<models::qwen36_a3b::Model> model,
-            std::string* error, std::uint32_t max_context = 4096,
-            std::size_t session_count = 1,
-            TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
-
-  /// Installs a previously loaded Gemma-4 model. The model owns a single
-  /// shared executor, so it serves exactly one concurrent session.
-  bool load(std::shared_ptr<models::gemma4::Model> model, std::string* error,
-            std::uint32_t max_context = 4096, std::size_t session_count = 1,
-            TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
-
-  /// Installs a previously loaded Ling 3.0 Flash model. The model owns one
-  /// shared executor plus a private KV/recurrent state per session, bounded
-  /// to 16 concurrent sessions with a divided context window.
-  bool load(std::shared_ptr<models::ling3_0::Model> model, std::string* error,
-            std::uint32_t max_context = 4096, std::size_t session_count = 1,
-            TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
-
-  /// Installs a previously loaded Nemotron 3.5 Bolt model. The KV and
-  /// recurrent state live inside the single shared device executor, so the
-  /// runner pool accepts exactly one session.
-  bool load(std::shared_ptr<models::nemotron_h_moe::Model> model,
-            std::string* error, std::uint32_t max_context = 4096,
-            std::size_t session_count = 1,
-            TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
-
-  /// Installs a previously loaded Flint model. The KV caches live inside
-  /// the single shared device executor, so the runner pool accepts exactly
-  /// one session.
-  bool load(std::shared_ptr<models::flint::Model> model, std::string* error,
-            std::uint32_t max_context = 4096, std::size_t session_count = 1,
-            TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
-#endif
 
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;

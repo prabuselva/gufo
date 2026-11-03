@@ -6,7 +6,7 @@
 
 #include <cstddef>
 
-#include "src/core/hip/gemm/dense_f16_gemm.hpp"
+#include "staging/core/gemm/dense_f16_gemm.hpp"
 
 /// Model-private dense F16 WMMA GEMM for the Qwen3.6-35B-A3B (qwen35moe)
 /// prefill projections. The Q8_0 weights stay in their native encoding and are

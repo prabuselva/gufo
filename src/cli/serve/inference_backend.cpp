@@ -22,16 +22,7 @@
 #include "src/core/gguf_reader.hpp"
 
 #if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
-#include "staging/models/flint/engine.hpp"
-#include "staging/models/flint/serve_runner.hpp"
-#include "staging/models/gemma4/engine.hpp"
-#include "staging/models/gemma4/serve_runner.hpp"
-#include "staging/models/ling3_0/engine.hpp"
-#include "staging/models/ling3_0/serve_runner.hpp"
-#include "staging/models/nemotron_h_moe/engine.hpp"
-#include "staging/models/nemotron_h_moe/serve_runner.hpp"
-#include "staging/models/qwen36_a3b/engine.hpp"
-#include "staging/models/qwen36_a3b/serve_runner.hpp"
+#include "staging/integration/fork_backend.hpp"
 #endif
 
 namespace gufo::server {
@@ -218,98 +209,6 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
   }
 }
 
-#if defined(GUFO_STAGING_MODELS)
-namespace {
-
-// Fork model packages predate the extension registry; when no registered
-// provider claims the architecture, load it through its own serve seam.
-std::optional<bool> ForkModelFallback(
-    InferenceBackend& backend, const std::string& model_path,
-    const core::GgufReader& reader, std::uint32_t max_context,
-    std::size_t session_count, TextPrefillPolicy prefill_policy,
-    TextSchedulerPolicy scheduler_policy,
-    const TextSpeculativeConfig& speculative_config,
-    const TextDiskCacheConfig& disk_cache_config,
-    const std::string& vision_model_path, std::uint32_t attn_window,
-    std::uint32_t attn_sink, std::string* error) {
-  const auto architecture =
-      reader.GetMetadataString("general.architecture").value_or("");
-  if (max_context == 0) {
-    const auto native =
-        reader.GetMetadataUint64(std::string(architecture) + ".context_length")
-            .value_or(0);
-    if (native < 2 || native > std::numeric_limits<std::uint32_t>::max()) {
-      SetError(error,
-               "GGUF has no valid native context length; specify --context");
-      return false;
-    }
-    max_context = static_cast<std::uint32_t>(native);
-  }
-  std::string load_error;
-  if (architecture == "qwen35moe") {
-    auto model = models::qwen36_a3b::LoadServeModel(
-        model_path, reader, max_context, attn_window, attn_sink,
-        vision_model_path, speculative_config, &load_error);
-    if (model == nullptr) {
-      SetError(error, load_error);
-      return false;
-    }
-    return backend.load(std::move(model), error, max_context, session_count,
-                        prefill_policy, scheduler_policy, speculative_config,
-                        disk_cache_config);
-  }
-  if (architecture == "gemma4") {
-    auto model = models::gemma4::LoadServeModel(
-        model_path, reader, max_context, vision_model_path, speculative_config,
-        &load_error);
-    if (model == nullptr) {
-      SetError(error, load_error);
-      return false;
-    }
-    return backend.load(std::move(model), error, max_context, session_count,
-                        prefill_policy, scheduler_policy, speculative_config,
-                        disk_cache_config);
-  }
-  if (architecture == "bailingmoe3") {
-    auto model = models::ling3_0::LoadServeModel(
-        model_path, reader, max_context, speculative_config, &load_error);
-    if (model == nullptr) {
-      SetError(error, load_error);
-      return false;
-    }
-    return backend.load(std::move(model), error, max_context, session_count,
-                        prefill_policy, scheduler_policy, speculative_config,
-                        disk_cache_config);
-  }
-  if (architecture == "nemotron_h_moe") {
-    auto model = models::nemotron_h_moe::LoadServeModel(
-        model_path, reader, max_context, speculative_config, &load_error);
-    if (model == nullptr) {
-      SetError(error, load_error);
-      return false;
-    }
-    return backend.load(std::move(model), error, max_context, session_count,
-                        prefill_policy, scheduler_policy, speculative_config,
-                        disk_cache_config);
-  }
-  if (architecture == "flint") {
-    auto model = models::flint::LoadServeModel(model_path, reader, max_context,
-                                               speculative_config, &load_error);
-    if (model == nullptr) {
-      SetError(error, load_error);
-      return false;
-    }
-    return backend.load(std::move(model), error, max_context, session_count,
-                        prefill_policy, scheduler_policy, speculative_config,
-                        disk_cache_config);
-  }
-  return std::nullopt;
-}
-
-}  // namespace
-
-#endif  // GUFO_STAGING_MODELS
-
 bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::uint32_t max_context,
                             std::size_t session_count,
@@ -330,13 +229,31 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto* provider = ext::ProbeTextProvider(*reader);
   if (provider == nullptr || provider->create == nullptr) {
-#if defined(GUFO_STAGING_MODELS)
-    if (const auto fallback = ForkModelFallback(
-            *this, model_path, *reader, max_context, session_count,
-            prefill_policy, scheduler_policy, speculative_config,
-            disk_cache_config, vision_model_path, attn_window, attn_sink,
-            error)) {
-      return *fallback;
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_STAGING_MODELS)
+    if (auto staging = StagingLoadModel(model_path, *reader, max_context,
+                                        session_count, speculative_config,
+                                        disk_cache_config, vision_model_path,
+                                        attn_window, attn_sink, error)) {
+      try {
+        auto new_state = std::make_shared<Impl::State>();
+        new_state->model_id = staging->runner->Descriptor().model_id;
+        new_state->supports_images = staging->supports_images;
+        auto runner_pool = std::make_shared<TextRunnerPool>(
+            std::move(staging->runner), session_count);
+        new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+            std::move(runner_pool), prefill_policy, scheduler_policy);
+        {
+          const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+          impl_->state = std::move(new_state);
+        }
+        return true;
+      } catch (const std::exception& exception) {
+        SetError(error, exception.what());
+        return false;
+      }
+    }
+    if (error != nullptr && !error->empty()) {
+      return false;  // A staging engine claimed the architecture and failed.
     }
 #endif
     SetError(error, "No text provider found for model architecture");
@@ -360,187 +277,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   return load(std::move(runner), error, session_count, prefill_policy,
               scheduler_policy, disk_cache_config, ram_cache_config);
 }
-
-#if defined(GUFO_STAGING_MODELS)
-bool InferenceBackend::load(std::shared_ptr<models::qwen36_a3b::Model> model,
-                            std::string* error, std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
-  if (model == nullptr) {
-    SetError(error, "Qwen3.6-35B-A3B model must not be null");
-    return false;
-  }
-  try {
-    auto runner = models::qwen36_a3b::CreateTextRunner(
-        std::move(model), max_context, session_count, speculative_config,
-        disk_cache_config, error);
-    if (runner == nullptr) {
-      return false;
-    }
-    auto new_state = std::make_shared<Impl::State>();
-    new_state->model_id = runner->Descriptor().model_id;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
-    {
-      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-      impl_->state = std::move(new_state);
-    }
-    return true;
-  } catch (const std::exception& exception) {
-    SetError(error, exception.what());
-    return false;
-  }
-}
-
-bool InferenceBackend::load(std::shared_ptr<models::gemma4::Model> model,
-                            std::string* error, std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
-  if (model == nullptr) {
-    SetError(error, "Gemma-4 model must not be null");
-    return false;
-  }
-  try {
-    // Read the vision flag before the model is moved into the runner; a loaded
-    // `gemma4v` mmproj tower is what lets the HTTP layer accept image inputs.
-    const bool has_vision = model->HasVision();
-    auto runner = models::gemma4::CreateTextRunner(
-        std::move(model), max_context, session_count, speculative_config,
-        disk_cache_config, error);
-    if (runner == nullptr) {
-      return false;
-    }
-    auto new_state = std::make_shared<Impl::State>();
-    new_state->model_id = runner->Descriptor().model_id;
-    new_state->supports_images = has_vision;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
-    {
-      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-      impl_->state = std::move(new_state);
-    }
-    return true;
-  } catch (const std::exception& exception) {
-    SetError(error, exception.what());
-    return false;
-  }
-}
-
-bool InferenceBackend::load(std::shared_ptr<models::ling3_0::Model> model,
-                            std::string* error, std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
-  if (model == nullptr) {
-    SetError(error, "Ling 3.0 Flash model must not be null");
-    return false;
-  }
-  try {
-    auto runner = models::ling3_0::CreateTextRunner(
-        std::move(model), max_context, session_count, speculative_config,
-        disk_cache_config, error);
-    if (runner == nullptr) {
-      return false;
-    }
-    auto new_state = std::make_shared<Impl::State>();
-    new_state->model_id = runner->Descriptor().model_id;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
-    {
-      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-      impl_->state = std::move(new_state);
-    }
-    return true;
-  } catch (const std::exception& exception) {
-    SetError(error, exception.what());
-    return false;
-  }
-}
-
-bool InferenceBackend::load(
-    std::shared_ptr<models::nemotron_h_moe::Model> model, std::string* error,
-    std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
-    TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
-  if (model == nullptr) {
-    SetError(error, "Nemotron Bolt model must not be null");
-    return false;
-  }
-  try {
-    auto runner = models::nemotron_h_moe::CreateTextRunner(
-        std::move(model), max_context, session_count, speculative_config,
-        disk_cache_config, error);
-    if (runner == nullptr) {
-      return false;
-    }
-    auto new_state = std::make_shared<Impl::State>();
-    new_state->model_id = runner->Descriptor().model_id;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
-    {
-      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-      impl_->state = std::move(new_state);
-    }
-    return true;
-  } catch (const std::exception& exception) {
-    SetError(error, exception.what());
-    return false;
-  }
-}
-
-bool InferenceBackend::load(std::shared_ptr<models::flint::Model> model,
-                            std::string* error, std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
-  if (model == nullptr) {
-    SetError(error, "Flint model must not be null");
-    return false;
-  }
-  try {
-    auto runner = models::flint::CreateTextRunner(
-        std::move(model), max_context, session_count, speculative_config,
-        disk_cache_config, error);
-    if (runner == nullptr) {
-      return false;
-    }
-    auto new_state = std::make_shared<Impl::State>();
-    new_state->model_id = runner->Descriptor().model_id;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
-    {
-      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
-      impl_->state = std::move(new_state);
-    }
-    return true;
-  } catch (const std::exception& exception) {
-    SetError(error, exception.what());
-    return false;
-  }
-}
-
-#endif  // GUFO_STAGING_MODELS
 
 #else
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,

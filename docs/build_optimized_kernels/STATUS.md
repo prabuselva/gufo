@@ -52,8 +52,8 @@ accepted lever. The backlog below is never trusted from memory.
 
 - [x] 2.1 `gemm/dense_f16_gemm` + `DenseF16Plan` (staged row-groups-8 for
       K≥4096, row-groups-8 for K=2112; fork `kernels.hip.cpp:6227-6300`).
-      Landed as `src/core/hip/gemm/dense_f16_gemm.{hpp,hip.cpp}` (target
-      `gufo_core_hip_gemm`); planned launches gate on batch≥1024.
+      Landed as `staging/core/gemm/dense_f16_gemm.{hpp,hip.cpp}` (target
+      `gufo_staging_gemm`); planned launches gate on batch≥1024.
       A/B at batch=2048 (`/tmp/opencode/gufo_bench_f16ab.log`, median of 15):
       int8→f16 auto 1.32–1.60×; staged8 attn_out_swa 1.01×, attn_out_full
       1.36× over auto (and 1.41× over int8), rgroups8 ffn_down 1.05×;
@@ -592,7 +592,7 @@ it only pays together with the fork's register-frugal 2.5 template
           is now fully closed. Lever 10 applied fast-math only to the
           tolerance-gated TUs (`gemm`, `gemv`, `moe_prefill`,
           `routed_f16`, `vision`, plus the shared
-          `gufo_core_hip_gemm`): every quality gate passed -
+          `gufo_staging_gemm`): every quality gate passed -
           `rocm_kernels` bit-exact PASS, `rocm_forward` oracle PASS
           (10.4 s real run), validator **status=PASS**
           (kl=3.0411e-5 - better bulk-vs-exactness than the control's

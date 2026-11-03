@@ -9,7 +9,7 @@
 #include <cstdint>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/gemm/dense_f16_gemm.hpp"
+#include "staging/core/gemm/dense_f16_gemm.hpp"
 #include "staging/models/qwen36_a3b/kernels/rocm/dense_f16_gemm.hpp"
 
 namespace gufo::models::qwen36_a3b::rocm {

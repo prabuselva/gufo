@@ -193,8 +193,13 @@ function(gufo_stage_hip_runtime target)
 endfunction()
 
 
-# Qwen3.6-35B-A3B (qwen35moe) — isolated hybrid GDN + gated-GQA + MoE engine.
 if(STAGING_MODELS)
+if(ENGINE_ENABLE_HIP)
+# Shared dense binary16 prefill GEMM used by the staging model engines.
+add_subdirectory(staging/core/gemm)
+endif()
+
+# Qwen3.6-35B-A3B (qwen35moe) — isolated hybrid GDN + gated-GQA + MoE engine.
 add_subdirectory(staging/models/qwen36_a3b)
 
 # Gemma-4-26B-A4B (gemma4) — isolated hybrid SWA/full attention + MoE engine.
@@ -384,24 +389,6 @@ if (ENGINE_ENABLE_HIP)
     roc::hipblaslt roc::rocblas)
 endif()
 
-if (ENGINE_ENABLE_HIP)
-  # Shared dense binary16 prefill GEMM: Q8_0 weights dequantized to F16 in
-  # LDS over F16 activations, with a tile-plan hook the models select per
-  # projection (src/core/hip/gemm/dense_f16_gemm.hpp).
-  add_library(gufo_core_hip_gemm STATIC EXCLUDE_FROM_ALL
-    src/core/hip/gemm/dense_f16_gemm.hip.cpp)
-  set_source_files_properties(src/core/hip/gemm/dense_f16_gemm.hip.cpp
-    PROPERTIES LANGUAGE HIP)
-  set_target_properties(gufo_core_hip_gemm PROPERTIES
-    HIP_STANDARD 17
-    HIP_STANDARD_REQUIRED ON
-    POSITION_INDEPENDENT_CODE ON)
-  target_include_directories(gufo_core_hip_gemm PUBLIC ${PROJECT_SOURCE_DIR})
-  target_compile_options(gufo_core_hip_gemm PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-finite-math-only;-Wno-unused-command-line-argument>)
-  target_link_libraries(gufo_core_hip_gemm PUBLIC hip::host)
-endif()
-
 # Card 08 (RFC step 5): the model, comparison and eval tiers that used to be
 # object files of gufo_core are separate targets now. They are added here,
 # after the warning/sanitizer block, so their sources keep the compile
@@ -465,6 +452,7 @@ if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_serving PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next)
   if(STAGING_MODELS)
+    add_subdirectory(staging/integration)
     target_sources(gufo_serving PRIVATE
       staging/models/flint/serve_runner.cpp
       staging/models/gemma4/serve_runner.cpp
@@ -472,6 +460,7 @@ if(ENGINE_ENABLE_HIP)
       staging/models/nemotron_h_moe/serve_runner.cpp
       staging/models/qwen36_a3b/serve_runner.cpp)
     target_link_libraries(gufo_serving PUBLIC
+      gufo_staging_integration
       gufo_gemma4_engine gufo_ling3_0_engine gufo_qwen36_a3b_engine
       gufo_nemotron_h_moe_engine gufo_flint_engine)
     # Extension targets link their operators PRIVATE, so transitive archives

@@ -24,7 +24,7 @@
 #include <memory>
 #include <vector>
 
-#include "src/core/hip/gemm/dense_f16_gemm.hpp"
+#include "staging/core/gemm/dense_f16_gemm.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "staging/tests/models/gemma4/hip_test.hpp"
 

@@ -1,4 +1,4 @@
-#include "src/core/hip/gemm/dense_f16_gemm.hpp"
+#include "staging/core/gemm/dense_f16_gemm.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
