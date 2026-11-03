@@ -61,19 +61,7 @@ bool ClosedProperties(const json::Value& schema, bool best_effort) {
          !unevaluated->as_bool();
 }
 
-// Gemma 4 call arguments: `<|"|>`-delimited raw strings, bare keys.
-constexpr std::string_view kGemmaQuote = "<|\"|>";
-
-// A bare Gemma 4 key ends at its first ':' and may not hold structure bytes;
-// its parser trims surrounding whitespace and reads `<|"|>` as a quoted key.
-// Other names use the quoted form.
-bool BareGemmaKey(std::string_view name) {
-  constexpr std::string_view kSpace = " \t\r\n\f\v";
-  return !name.empty() && name.find_first_of(":{}[],") == std::string::npos &&
-         kSpace.find(name.front()) == std::string_view::npos &&
-         kSpace.find(name.back()) == std::string_view::npos &&
-         !name.starts_with(kGemmaQuote.substr(0, 1));
-}
+#include "staging/core/json/json_constraint_gemma_names_staging.inl"
 
 std::string RegexLiteral(std::string_view text) {
   std::string result;
@@ -1251,53 +1239,13 @@ private:
   }
   // A Gemma 4 string satisfying the JSON string predicate. Its raw text cannot
   // contain the closing quote, which the parser takes at its first occurrence.
-  std::uint32_t GemmaString(const json::Value& predicate) {
-    const auto raw =
-        JsonSchemaLexeme::RawString(predicate, std::string(kGemmaQuote));
-    auto text = Lexeme(raw);
-    if (raw->Check("").complete)
-      text = Optional(text);
-    return Seq({Literal(kGemmaQuote), text, Literal(kGemmaQuote)});
-  }
+  std::uint32_t GemmaString(const json::Value& predicate);
   // A dynamic bare key other than the declared names.
-  std::uint32_t GemmaKey(const std::set<std::string>& excluded) {
-    std::string pattern = "^";
-    if (!excluded.empty()) {
-      pattern += "(?!(?:";
-      bool separator = false;
-      for (const auto& name : excluded) {
-        if (separator)
-          pattern += '|';
-        separator = true;
-        pattern += RegexLiteral(name);
-      }
-      pattern += ")$)";
-    }
-    pattern += "[^:{}\\[\\],<\\s](?:[^:{}\\[\\],]*[^:{}\\[\\],\\s])?$";
-    auto predicate = json::Value::object();
-    predicate["pattern"] = std::move(pattern);
-    return Lexeme(JsonSchemaLexeme::RawString(predicate, ":"));
-  }
-  std::uint32_t KeyLiteral(const std::string& name) {
-    if (!gemma_)
-      return Literal(json::Value(name).dump());
-    if (BareGemmaKey(name))
-      return Literal(name);
-    // The parser also reads `<|"|>`-quoted keys, as declarations render them.
-    if (name.find(kGemmaQuote) != std::string::npos)
-      Invalid("property name cannot be a Gemma 4 key");
-    return Literal(std::string(kGemmaQuote) + name + std::string(kGemmaQuote));
-  }
+  std::uint32_t GemmaKey(const std::set<std::string>& excluded);
+  std::uint32_t KeyLiteral(const std::string& name);
   // Gemma 4 renders object keys in sorted order at every depth.
   std::vector<std::pair<std::string, const json::Value*>> Members(
-      const json::Value& object) const {
-    std::vector<std::pair<std::string, const json::Value*>> members;
-    for (const auto& [name, value] : object.members())
-      members.emplace_back(name, &value);
-    if (gemma_)
-      std::ranges::sort(members, {}, &decltype(members)::value_type::first);
-    return members;
-  }
+      const json::Value& object) const;
   // Compile an unsigned interval using shared digit prefixes. Work grows with
   // the number of digits, not the number of integers between the bounds.
   std::uint32_t DigitsBetween(std::string_view low, std::string_view high) {
@@ -1820,6 +1768,8 @@ private:
       value_checks_;
   std::size_t properties_{0}, enum_values_{0}, string_characters_{0};
 };
+
+#include "staging/core/json/json_constraint_gemma_members_staging.inl"
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::Compile(
     const json::Value& schema, bool strict, bool open_objects) {
