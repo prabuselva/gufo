@@ -3,7 +3,7 @@ project(gufo LANGUAGES C CXX)
 
 # Staging-only model engines live under staging/ and are excluded from
 # the upstream build by default parity targets. ON keeps the staging selection.
-option(STAGING_MODELS "Build the fork staging model engines" ON)
+option(STAGING_MODELS "Build the staging model engines" ON)
 if(STAGING_MODELS)
   add_compile_definitions(GUFO_STAGING_MODELS=1)
 endif()
@@ -194,27 +194,7 @@ endfunction()
 
 
 if(STAGING_MODELS)
-if(ENGINE_ENABLE_HIP)
-# Shared dense binary16 prefill GEMM used by the staging model engines.
-add_subdirectory(staging/core/gemm)
-endif()
-
-# Qwen3.6-35B-A3B (qwen35moe) — isolated hybrid GDN + gated-GQA + MoE engine.
-add_subdirectory(staging/models/qwen36_a3b)
-
-# Gemma-4-26B-A4B (gemma4) — isolated hybrid SWA/full attention + MoE engine.
-add_subdirectory(staging/models/gemma4)
-
-# Ling 3.0 Flash (bailingmoe3) — hybrid KDA + absorbed-MLA + MoE engine.
-add_subdirectory(staging/models/ling3_0)
-
-# Nemotron 3.5 Bolt (nemotron_h_moe) — hybrid Mamba-2 + NoPE-GQA + latent
-# MoE engine. Model-private kernels only; no other model tree is modified.
-add_subdirectory(staging/models/nemotron_h_moe)
-
-# Flint Preview 40B-A2B (flint) — dense-lead MoE with gated rotary/window
-# attention, QK norms and attention sinks. Metadata loader first.
-add_subdirectory(staging/models/flint)
+  add_subdirectory(staging)
 endif()
 
 # Compiler warnings and sanitizers
@@ -400,34 +380,12 @@ add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_compare gufo_ext_runtime)
-if(STAGING_MODELS)
-  target_sources(gufo_llm_cli PRIVATE
-    staging/models/gemma4/cli_runner.cpp
-    staging/models/ling3_0/cli_runner.cpp
-    staging/models/qwen36_a3b/cli_runner.cpp)
-endif()
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next)
-  if(STAGING_MODELS)
-    target_link_libraries(gufo_llm_cli PUBLIC gufo_qwen36_a3b_engine
-      gufo_gemma4_engine gufo_ling3_0_engine gufo_nemotron_h_moe_engine
-      gufo_flint_engine)
-    # Extension targets link their operators PRIVATE, so transitive archives
-    # must be named here for every gufo_llm_cli consumer.
-    target_link_libraries(gufo_llm_cli PUBLIC gufo_qwen_hip gufo_qwen_kernels
-      gufo_qwen_vision hip::host)
-  endif()
 endif()
 
 add_subdirectory(src/ext)
-
-# Serve- and CLI-seam glue consumed by gufo_llm_cli and gufo_serving; added
-# after src/ext so the integration target can reference the extension runtime.
-if(STAGING_MODELS)
-  add_subdirectory(staging/integration)
-  target_link_libraries(gufo_llm_cli PUBLIC gufo_staging_integration)
-endif()
 
 # RFC step 6: the text-serving tier the gufo executable used to compile into
 # itself. Scheduler, runner pool, component text cache and InferenceBackend
@@ -454,26 +412,10 @@ if (BUILD_TESTING)
   endif()
 endif()
 # Staging model engines reach execution through the dispatch chain in
-# inference_backend.cpp; their serve runners compile into this tier.
-if(ENGINE_ENABLE_HIP)
+# inference_backend.cpp; their serve runners link in staging/CMakeLists.txt.
+if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_serving PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next)
-  if(STAGING_MODELS)
-    target_sources(gufo_serving PRIVATE
-      staging/models/flint/serve_runner.cpp
-      staging/models/gemma4/serve_runner.cpp
-      staging/models/ling3_0/serve_runner.cpp
-      staging/models/nemotron_h_moe/serve_runner.cpp
-      staging/models/qwen36_a3b/serve_runner.cpp)
-    target_link_libraries(gufo_serving PUBLIC
-      gufo_staging_integration
-      gufo_gemma4_engine gufo_ling3_0_engine gufo_qwen36_a3b_engine
-      gufo_nemotron_h_moe_engine gufo_flint_engine)
-    # Extension targets link their operators PRIVATE, so transitive archives
-    # must be named here for every gufo_serving consumer.
-    target_link_libraries(gufo_serving PUBLIC gufo_qwen_hip
-      gufo_qwen_kernels gufo_qwen_vision)
-  endif()
 endif()
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_serving PUBLIC gufo_cache_hip hip::host)
@@ -501,9 +443,6 @@ add_library(gufo_http STATIC
 )
 target_link_libraries(gufo_http PUBLIC gufo_logging gufo_ext_runtime gufo_core
   gufo_qwen_text gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
-if(STAGING_MODELS)
-  target_link_libraries(gufo_http PUBLIC gufo_gemma4)
-endif()
 
 add_executable(gufo
   src/cli/main.cpp
@@ -517,14 +456,6 @@ add_executable(gufo
   src/cli/serve/serve.cpp
   src/eval/http_client.cpp
 )
-if(STAGING_MODELS)
-  target_sources(gufo PRIVATE
-    staging/models/flint/serve_runner.cpp
-    staging/models/gemma4/serve_runner.cpp
-    staging/models/ling3_0/serve_runner.cpp
-    staging/models/nemotron_h_moe/serve_runner.cpp
-    staging/models/qwen36_a3b/serve_runner.cpp)
-endif()
 target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_eval
   gufo_llm_cli gufo_http gufo_serving CURL::libcurl)
 # Extension directories register their own tests, so CTest is enabled before
@@ -995,13 +926,6 @@ endfunction()
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
-  if(STAGING_MODELS)
-    add_subdirectory(staging/tests/models/qwen36_a3b)
-    add_subdirectory(staging/tests/models/gemma4)
-    add_subdirectory(staging/tests/models/ling3_0)
-    add_subdirectory(staging/tests/models/nemotron_h_moe)
-    add_subdirectory(staging/tests/models/flint)
-  endif()
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
@@ -1673,4 +1597,10 @@ endif()
 
 if (BUILD_TESTING)
   include(cmake/Checks.cmake)
+endif()
+
+# Staging engine wiring onto the root CLI and serving targets; every consumer
+# target exists at this point.
+if(STAGING_MODELS)
+  include(staging/wire_targets.cmake)
 endif()
