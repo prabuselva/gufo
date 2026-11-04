@@ -7,17 +7,21 @@ is a supported native build target for development. CMake owns
 compiler flags, dependencies and installation; Nix supplies the pinned toolchain.
 Linux source-build prerequisites are in [README.md](README.md#build-from-source).
 
-Do not invoke `nix` on this machine; it is unavailable. Use the plain
-`cmake`/`ctest` presets and host tools (e.g. `clang-format` on `PATH`) instead.
-
 ```sh
-# Production build without Nix, with the documented dependencies installed
+nix build                              # development package, all discovered extensions
+nix build .#release                    # shipped lock-mode package, no tests/tools
+./result/bin/gufo diagnose
+nix flake check                       # hosted CPU/repository checks
+nix develop                            # GPU development and reference tools
+
+# Same production build without Nix, with the documented dependencies installed
 cmake --preset release                # discovery build
 # Add -DGUFO_EXTENSIONS_FROM_LOCK=ON for the shipped extension selection.
 cmake --build --preset release --parallel 4
 ```
 
-Measure performance with `build/release/gufo`. Preserve
+Stage only task-owned paths before Nix builds; flakes include tracked files.
+Measure performance with `result/bin/gufo` or `build/release/gufo`. Preserve
 compiler/dependency versions when comparing results.
 
 ## Focused tests
@@ -26,26 +30,28 @@ Formatting and Python repository checks may run on the editing host; they do
 not need the remote GPU. Before committing C++ changes, run the shared CI check:
 
 ```sh
-python3 tools/ci/check-format.py
+nix shell --inputs-from . nixpkgs#clang-tools -c python3 tools/ci/check-format.py
 # Add --fix to apply formatting, then rerun the check.
 ```
+
+Tests selected by `nix flake check` should stay fast and cache-friendly where
+possible. Reuse expensive setup and compiler caches when valid, use the smallest
+deterministic fixtures that preserve the assertions, and avoid redundant builds,
+fixed sleeps and repeated whole-tree work. Measure added wall time; keep expensive
+stress/model qualification explicitly selectable without weakening correctness.
 
 Run the smallest check covering the change. `gpu-test` is RelWithDebInfo with
 assertions enabled. Build only the affected target during iteration:
 
 ```sh
-cmake --preset gpu-test
-cmake --build --preset gpu-test --target <test-target>
-ctest --preset gpu-full -R '^<test-name>$' --output-on-failure
+nix develop -c cmake --preset gpu-test
+nix develop -c cmake --build --preset gpu-test --target <test-target>
+nix develop -c ctest --preset gpu-full -R '^<test-name>$' --output-on-failure
 ```
 
-Model kernel tests (`EXCLUDE_FROM_ALL`) are absent from the default
-`cmake --build --preset gpu-test`, and `ctest` never compiles: always pass the
-explicit `--target` after editing kernels or a gate verdict comes from a stale
-executable.
-
 The same CMake/CTest commands work outside Nix. `cmake --build --preset pr`
-runs the hosted contract suite after configuring `cpu-test`. Full CPU checks,
+runs the focused contract subset after configuring `cpu-test`; `nix flake check`
+runs the canonical CPU/repository gate. Full CPU checks,
 sanitisers, GPU/operator/model checks and H3 quality tools remain available
 locally; see [docs/TESTING.md](docs/TESTING.md). Do not run full model sweeps,
 video generation or duplicate suites for routine edits. A missing-model skip
@@ -81,72 +87,6 @@ Use `tools/bench/build.sh` for standalone HIP experiments,
 `tools/prof/prof.py` for pipeline/wall-time profiles, and
 `tools/prof/isa_mix.py` for instruction analysis. Production paths must retain
 quality; successful optimizations become the default, without extra switches.
-
-A resident `gufo serve` holds most VRAM and contends for the GPU, so any GPU
-benchmark needs exclusive access. Run it through
-`tools/bench/gpu_exclusive.sh [options] -- <command>`: it stops the server,
-waits for VRAM to release, runs one command, then respawns the server via the
-launch script and polls `/v1/models` until ready before returning (override with
-`--launch-script`, `--port`, `--expect-model`, `--ready-timeout`, `--settle`).
-`--no-respawn` stops + runs only, leaving the respawn to a foreground harness;
-`tools/bench/gpu_respawn_server.sh` is the canonical foreground respawn. Never
-time a benchmark while the server is resident; contention and lazy allocation
-make such numbers meaningless.
-
-### Running a benchmark from the harness
-
-`gpu_exclusive.sh` blocks for the whole run (stop server -> benchmark -> respawn
--> poll), which can exceed a tool's wall-clock limit. Do NOT run it directly in
-one blocking tool call, and do NOT background the respawn: an automated harness
-kills a call's whole process tree on timeout, which would take an in-flight
-respawn down with it and leave the server down.
-
-Instead run the benchmark in the background and the respawn in the foreground,
-but ALWAYS launch BOTH in the SAME tool call (one shell session), never as two
-separate calls. The watchdog must attach to the live run the instant it starts:
-if `bench_bg.sh` and `bench_wait.sh` are separate tool calls, the gap between
-them lets the benchmark finish and the server get respawned out-of-band, so the
-watchdog only prints `already serving; skipping respawn` and never exercises the
-wait+respawn path, and the detached run is no longer tied to this session.
-
-1. `tools/bench/bench_bg.sh <name> <inner_timeout_sec> <cmd...>` runs
-   `gpu_exclusive.sh --no-respawn` (stop + run only) under `timeout`, writes
-   `${GUFO_BENCH_STATE_DIR:-/tmp/opencode}/gufo_bench_<name>.{log,pid,status}`,
-   and returns immediately. Launch it with `setsid ... & disown` so its PID is a
-   process group the watchdog can kill as a unit. The detached run also carries
-   a fallback respawner: if it finds the watchdog gone (`gufo_bench_<name>.watchdog.pid`
-   dead), no `gpu_exclusive.sh` running, and the port unserved after a grace
-   period, it respawns the server itself, serialized by a respawn flock.
-2. IMMEDIATELY, in the same command, run
-   `tools/bench/bench_wait.sh <name> <total_sec> <ready_grace>` in the FOREGROUND
-   with a tool timeout LARGER than `total_sec` plus the respawn time. It stays
-   alive, polls the background run, kills the process group if the budget is
-   exceeded, then respawns the resident server in the foreground
-   (`gpu_respawn_server.sh`) and confirms `/v1/models` before returning. The
-   watchdog is what brings the server back; never continue the session until it
-   reports done. Tool-call timeouts are MILLISECONDS: `<total_sec>` is seconds,
-   but the call's timeout argument is not - a mistyped small timeout kills the
-   watchdog instantly and leaves the server down until the fallback fires.
-
-```sh
-# ONE tool call: launch detached, then wait + respawn in the same shell.
-setsid tools/bench/bench_bg.sh pp16k 600 \
-  build/release/gufo bench --model "$MODEL" --n-prompt 16384 --n-gen 1 & disown
-sleep 2
-tools/bench/bench_wait.sh pp16k 660 90   # foreground; tool timeout > 660s + respawn
-cat /tmp/opencode/gufo_bench_pp16k.log   # read the real numbers afterwards
-```
-
-The watchdog prints `finished rc=0` as soon as the benchmark's status file
-appears; always read the `.log` for the actual results.
-
-### Iterate at short context first
-
-Long-context prefill is slow (pp102400 ~90 s/prefill) and the long-context gap
-widens with depth, so a lever that helps at 16K may not at 100K. But benchmarking
-small levers at 32-100K wastes minutes per A/B. Iterate every candidate at
-**<=16K context first** (pp2048/pp8192/pp16384, ~1-20 s/prefill); only escalate a
-lever that shows a real win at short context to 32K/65K/100K confirmation.
 
 ## Development
 
