@@ -27,8 +27,8 @@ that is correct for every model, including hybrid-recurrent ones. It costs the
 ability to trim a checkpoint: a saved snapshot can only be reused **whole**,
 and only when its tokens are an exact prefix of the new prompt.
 
-Qwen3.8-27B (AR and DFlash2) and Qwen3.8-Flash-Next serve through the
-component cache of the [cache redesign](cache-redesign/RFC.md). Its backing
+Qwen3.8-27B (AR and DFlash2), Qwen3.8-Flash-Next and DeepSeek V4 Flash (AR and
+DSpark) serve through the component cache of the [cache redesign](cache-redesign/RFC.md). Its backing
 and disk options are described under [component-cache budgets](#component-cache-budgets).
 Qwen27B retains target KV, convolution and recurrent state, image identity,
 sampled frontier and pending output tokens. DFlash2 adds private ring KV with
@@ -37,9 +37,16 @@ Borrowed target KV rows are preserved before mutation or rollback; private
 frontiers are captured into committed host backing. Disk transfers use fixed
 1 MiB staging regardless of checkpoint size.
 
-The snapshot-cache implementation below remains in use for DeepSeek. Earlier
-Qwen examples and measurements describe its former snapshot implementation;
-they are historical evidence, rather than qualification of the component path.
+DeepSeek shares its compressed attention and indexer rows, which are final once
+emitted, one row per `ratio` tokens. Each layer's sliding window and compressor
+frontiers are private, as are logits and the DSpark windows, so a checkpoint
+carries a fixed private cost whatever its depth. Rows are copied at capture
+rather than borrowed, because compressed caches grow by reallocation.
+
+The snapshot-cache implementation below remains for runners that do not provide
+a component adapter, such as extensions. Earlier examples and measurements
+describe that implementation; they are historical evidence, rather than
+qualification of the component path.
 
 ## Why it exists
 
@@ -301,7 +308,8 @@ history, and a one-row head computes the boundary logits. Attention queries
 on either side keep the grouping of separate passes. The final batch can
 include up to 128 tokens beyond the normal 2,048-token chunk, so a prompt that
 ends just past a chunk needs no separate tail pass; the stable boundary must be
-within eight tokens of that batch's end.
+within eleven tokens of that batch's end (an eight-token assistant suffix plus
+the up to three tokens a four-token-aligned boundary falls back).
 The cache reserves the full payload before enabling this capture. Disk,
 image, intermediate and learned-prefix checkpoints still stop prefill at
 their boundary.

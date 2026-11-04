@@ -715,8 +715,9 @@ void PrintServeHelp(std::string_view program_name,
                      "initial tokens when --attn-window is set (default 0)",
                      "Model", &attn_sink);
     parser.AddFlag("", "--enable-yarn",
-                   "Flash-Next: static YaRN, required for --context above the "
-                   "native 262144; it applies to every request",
+                   "Flash-Next: YaRN for --context above the native 262144; "
+                   "each session stays native until it holds more than "
+                   "262144 tokens",
                    "Model", &enable_yarn);
 
     // Sampling Defaults
@@ -1401,8 +1402,9 @@ int RunServe(std::span<const char* const> args) {
                          "initial tokens when --attn-window is set (default 0)",
                          "Model", &attn_sink);
     llm_parser.AddFlag("", "--enable-yarn",
-                       "Flash-Next: static YaRN, required for --context above "
-                       "the native 262144; it applies to every request",
+                       "Flash-Next: YaRN for --context above the native "
+                       "262144; each session stays native until it holds more "
+                       "than 262144 tokens",
                        "Model", &enable_yarn);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
