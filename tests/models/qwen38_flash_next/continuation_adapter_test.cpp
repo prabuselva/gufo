@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -12,7 +13,7 @@
 #include <vector>
 
 #include "src/cache/slot.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
@@ -20,6 +21,7 @@ namespace cache = gufo::cache;
 namespace sampling = gufo::sampling;
 void FailNextResetSubmission();
 void FailNextTransferWait();
+void LimitReportedDeviceFree(std::size_t bytes);
 namespace {
 void Require(bool ok, const std::string& message) {
   if (!ok)
@@ -775,7 +777,8 @@ void CheckImages(const std::shared_ptr<qfn::Model>& model, bool mtp) {
     pixels.pixels.resize(64 * 64 * 3);
     for (std::size_t i = blue ? 2 : 0; i < pixels.pixels.size(); i += 3)
       pixels.pixels[i] = 255;
-    prompt->images.push_back({std::move(pixels), grid});
+    prompt->images.push_back(
+        {std::make_shared<const gufo::core::Image>(std::move(pixels)), grid});
     prompt->images.back().prefix_identity.fill(blue ? 2 : 1);
     prompt->cache_identity.assign(32, blue ? 2 : 1);
     return prompt;
@@ -956,6 +959,20 @@ int main(int argc, char** argv) {
     Require(sampled_tail && sampled_tail->size() < 8203, error);
     std::copy(sampled_tail->begin(), sampled_tail->end(),
               prompt.begin() + 8203 - sampled_tail->size());
+    if (!image_only && !guard_only) {
+      // Before any capture commits the in-pass checkpoint arena: without
+      // device headroom for it, the consumer reads the live session at a
+      // pass split at the boundary (#937).
+      struct Unlimit {
+        ~Unlimit() {
+          LimitReportedDeviceFree(std::numeric_limits<std::size_t>::max());
+        }
+      } unlimit;
+      LimitReportedDeviceFree(0);
+      std::cout << "device exhaustion:\n";
+      CheckInPass(model, false, prompt);
+      CheckInPass(model, true, prompt);
+    }
     if (!image_only && !in_pass_only) {
       CheckTransferAndGuardLifetime(model, false, prompt);
       CheckTransferAndGuardLifetime(model, true, prompt);

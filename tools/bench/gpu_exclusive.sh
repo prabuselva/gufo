@@ -30,7 +30,7 @@
 #   tools/bench/gpu_exclusive.sh -- /tmp/attn_causal_bench
 #   tools/bench/gpu_exclusive.sh --expect-model Qwen3.8 -- \
 #       env GUFO_QWEN36_A3B_BENCH=2048,4096,100000 \
-#       build/gpu-test/tests/models/qwen36_a3b/qwen36_a3b_rocm_forward_test
+#       build/gpu-test/staging/tests/models/qwen36_a3b/qwen36_a3b_rocm_forward_test
 #   tools/bench/gpu_exclusive.sh -- bash -c '/tmp/bench_a && /tmp/bench_b'
 set -euo pipefail
 

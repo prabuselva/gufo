@@ -3,6 +3,8 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # ROCm 10.1.0 / HIP Clang 24, with gfx1151 binaries on gufo.cachix.org.
+    nixpkgs-rocm10.url = "github:gufo-org/nixpkgs/1a6ba8bc6f744f7a843d025e46bc9911b4b6c37d";
     # Reference ASR/TTS runtime for benchmark comparisons; exposes a
     # ROCm gfx1151 package tuned for Strix Halo.
     audio-cpp = {
@@ -11,8 +13,17 @@
     };
   };
 
+  # Prebuilt outputs that cache.nixos.org lacks (patched ROCr, gufo, the
+  # gfx1151 reference builds and the ROCm Python tools).
+  nixConfig = {
+    extra-substituters = [ "https://gufo.cachix.org" ];
+    extra-trusted-public-keys = [
+      "gufo.cachix.org-1:rfZe3n4lHINgyoACKzs5EthIZmBNvEyCCtufUpth0PE="
+    ];
+  };
+
   outputs =
-    { self, nixpkgs, audio-cpp }:
+    { self, nixpkgs, nixpkgs-rocm10, audio-cpp }:
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
@@ -26,15 +37,28 @@
         value;
       revision = self.shortRev or self.dirtyShortRev or "dirty";
 
-      pkgs = forAllSystems (system: import nixpkgs { inherit system; });
+      # Reuse the cached ROCm closure, including its matching compiler/runtime.
+      # Python and general dependencies stay on the nixos-unstable input.
+      rocmPkgs = forAllSystems (system: import nixpkgs-rocm10 { inherit system; });
+      pkgs = forAllSystems (system: import nixpkgs {
+        inherit system;
+        overlays = [ (_final: _prev: {
+          rocmPackages = rocmPkgs.${system}.rocmPackages_10;
+        }) ];
+      });
 
       gufoPackages = forAllSystems (
         system:
-        pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit revision; }
+        pkgs.${system}.callPackage ./.devops/nix/scope.nix {
+          inherit revision;
+          rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+        }
       );
 
       llamaReferences = forAllSystems (
-        system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix { }
+        system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix {
+          rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+        }
       );
 
       alexnetWeights = system:
@@ -54,27 +78,32 @@
       # dependency of the server (see tools/README.md for the offline toolchain).
       # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
       # the single toolchain serves CPU flows and the --device cuda
-      # reference forward alike. gfx1151 verified on this host.
+      # reference forward alike. Built from plain nixos-unstable, without the
+      # ROCm 10.1 overlay, so torchWithRocm and its ROCm closure come from
+      # cache.nixos.org.
       pythonTools = system:
-        let pt = pkgs.${system}.python313; in
+        let pt = nixpkgs.legacyPackages.${system}.python313; in
         pt.withPackages (
           ps:
           let
             # Nixpkgs' default torchvision/lpips closures use CPU torch.
             # Override both edges so evaluation has one ROCm torch derivation.
+            # The default target list includes gfx1151; keep it so the cached
+            # build is used.
+            torchRocm = ps.torchWithRocm;
             torchvisionRocm = ps.torchvision.override {
-              torch = ps.torchWithRocm;
+              torch = torchRocm;
             };
             lpipsRocm = ps.lpips.override {
-              torch = ps.torchWithRocm;
+              torch = torchRocm;
               torchvision = torchvisionRocm;
             };
             accelerateRocm = ps.accelerate.override {
-              torch = ps.torchWithRocm;
+              torch = torchRocm;
             };
           in
           [
-            ps.torchWithRocm
+            torchRocm
             torchvisionRocm
             ps.transformers
             accelerateRocm
@@ -85,6 +114,8 @@
             ps.jsonschema # independent structured-output schema oracle
             lpipsRocm
             ps.numpy
+            ps.av # official video decoder oracle
+            ps.librosa # pinned official EmbeddingGemma audio decoder oracle
             ps.scipy
             ps.matplotlib # benchmark charts (tools/bench/model-bench.py render)
           ]
@@ -127,10 +158,21 @@
           default = base;
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
-          release = base.override { inherit releaseVersion; };
+          release = base.override { inherit releaseVersion; extensionsFromLock = true; };
+          # Windows test binaries of the platform leaves and the CPU cache,
+          # cross-built here and run on a Windows CI host.
+          windows-platform-tests =
+            pkgs.${system}.pkgsCross.mingwW64.callPackage ./.devops/nix/windows-platform-tests.nix
+              {
+                # The build-host ccache from the main package set, which the
+                # binary cache already holds.
+                inherit (pkgs.${system}) ccache;
+              };
           # Optional benchmark packages: excluded from Gufo, the default
           # development shell and hosted checks.
-          ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
+          ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix {
+            rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+          };
           llama-cpp-reference = llamaReferences.${system}.release;
           llama-cpp-mtp-reference = llamaReferences.${system}.mtp;
         }
@@ -148,7 +190,7 @@
               pkgs.${system}.clang-tools
               pkgs.${system}.ffmpeg-headless
               pkgs.${system}.sox
-              pkgs.${system}.rocmPackages.rocprofiler-sdk
+              pkgs.${system}.rocmPackages.gfx1151.rocprofiler-sdk
               pkgs.${system}.sqlite
               # Debugging and repository work. The test presets build
               # RelWithDebInfo with assertions, and contributors commit with
@@ -159,11 +201,16 @@
               # Compiler cache for the local loop; CMake attaches it as the C
               # and C++ launcher when it is on PATH, as the CPU checks do.
               pkgs.${system}.ccache
-              audio-cpp.packages.${system}.rocm-gfx1151
+              (audio-cpp.packages.${system}.rocm-gfx1151.override {
+                rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+              })
             ];
             env = {
               TORCH_HOME = "${alexnetTorchHome system}";
+              # CMake links HIP binaries against the patched ROCr.
+              GUFO_ROCR_LIBRARY_DIR = "${self.packages.${system}.default.rocmRuntime}/lib";
               LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
+                self.packages.${system}.default.rocmRuntime
                 pkgs.${system}.stdenv.cc.cc.lib
                 pkgs.${system}.zlib
               ];
@@ -177,7 +224,6 @@
               export CCACHE_NOHASHDIR=true
             '';
           };
-
         }
       );
 
@@ -214,6 +260,7 @@
 
           formatSource = mkFilteredSource {
             directories = [
+              "include"
               "src"
               "tests"
             ];
@@ -225,6 +272,7 @@
 
           staticAnalysisSource = mkFilteredSource {
             directories = [
+              "include"
               "cmake"
               "src"
             ];
@@ -232,11 +280,15 @@
               ".clang-format"
               ".clang-tidy"
               "CMakeLists.txt"
+              "extensions.lock"
             ];
           };
 
           testSource = mkFilteredSource {
             directories = [
+              "examples/extension_template"
+              "include"
+              "schemas"
               "cmake"
               "src"
               "tests"
@@ -245,7 +297,10 @@
             files = [
               ".clang-format"
               "CMakeLists.txt"
+              "extensions.lock"
+              "AGENTS.md"
               "docs/RELEASING.md"
+              "docs/models/README.md"
               "tools/prof/prof.py"
               "tools/bench/speculative-corpus.py"
             ];
@@ -315,6 +370,9 @@
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
+              pkgsSys.libsndfile
+              pkgsSys.soxr
+              pkgsSys.ffmpeg-headless
               pkgsSys.openssl
             ];
             src = staticAnalysisSource;
@@ -426,12 +484,15 @@
               pkgsSys.cmake
               pkgsSys.ninja
               pkgsSys.pkg-config
-              (if full then pkgsSys.python3.withPackages (ps: [ ps.numpy ]) else pkgsSys.python3)
+              (pkgsSys.python3.withPackages (ps: [ ps.jsonschema ] ++ pkgsSys.lib.optionals full [ ps.numpy ]))
               pkgsSys.icu
               pkgsSys.curl
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
+              pkgsSys.libsndfile
+              pkgsSys.soxr
+              pkgsSys.ffmpeg-headless
               pkgsSys.openssl
             ];
             src = testSource;
@@ -462,6 +523,13 @@
               cmake --build . --parallel "$NIX_BUILD_CORES" --target check-pr
             ''}
 
+            # Build the real CPU lock-mode executable, using the same source
+            # and toolchain. This does not replace shipped HIP qualification.
+            cmake "$src" -B ../lock-build -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DGUFO_EXTENSIONS_FROM_LOCK=ON
+            cmake --build ../lock-build --target gufo --parallel "$NIX_BUILD_CORES"
+            ../lock-build/gufo diagnose --section extensions --json
+            ../lock-build/gufo --version | grep -Fx 'Extension selection: lock'
+
             if [[ -n "$ccache_launcher" ]]; then
               ccache --show-stats
             fi
@@ -475,6 +543,7 @@
 
           mkServeCheck =
             let
+              evaluationTests = import ./.devops/nix/mk-serve-tests.nix { lib = pkgsSys.lib; };
               # Test command rendering without realizing the GPU package.
               mkServe = args: self.lib.${system}.mkGufoServe (args // { gufo = "/gufo-test"; });
               ttsCmd = mkServe {
@@ -536,6 +605,8 @@
               };
               mtpCmd = mkServe {
                 model = "/var/models/qwen-flash.gguf";
+                context = 409600;
+                enableYarn = true;
                 speculative = "mtp";
                 mtpModel = "/var/models/mtp.gguf";
                 draftTokens = 3;
@@ -598,6 +669,10 @@
                 exit 1
               fi
               mtp_cmd="${mtpCmd}"
+              echo "$mtp_cmd" | grep -F -- "--context 409600 --enable-yarn"
+              if echo "$cmd_str" | grep -F -- "--enable-yarn"; then
+                exit 1
+              fi
               echo "$mtp_cmd" | grep -F -- "--speculative mtp"
               echo "$mtp_cmd" | grep -F -- "--mtp-model /var/models/mtp.gguf"
               echo "$mtp_cmd" | grep -F -- "--draft-tokens 3"
@@ -606,7 +681,18 @@
               echo "$image_str" | grep -F -- "--max-request-bytes 33554432"
               echo "$image_str" | grep -F -- "image --model /var/models/qwen-image --served-model-name qwen-image-test"
               mkdir -p $out
-              echo "PASS: mkGufoServe CLI string check passed" > $out/result.txt
+              echo "PASS: mkGufoServe CLI string check passed; ${toString (builtins.length evaluationTests.passed)} metadata evaluation cases" > $out/result.txt
+            '';
+
+          mkServeNixosCheck =
+            assert import ./.devops/nix/mk-serve-nixos-tests.nix {
+              pkgs = pkgsSys;
+              defaultPackage = self.packages.${system}.default;
+              releasePackage = self.packages.${system}.release;
+            };
+            pkgsSys.runCommand "check-mk-serve-nixos" { } ''
+              mkdir -p $out
+              echo "PASS: default/release mkServe NixOS service evaluation" > $out/result.txt
             '';
 
           # The hosted runner builds CPU contracts only. GPU compilation,
@@ -617,7 +703,8 @@
                 ${dependencyInventoryCheck}/result.txt \
                 ${docsCheck}/result.txt \
                 ${prTestCheck}/result.txt \
-                ${mkServeCheck}/result.txt > $out/pr-summary.txt
+                ${mkServeCheck}/result.txt \
+                ${mkServeNixosCheck}/result.txt > $out/pr-summary.txt
             cat $out/pr-summary.txt
           '';
         in
@@ -632,6 +719,7 @@
           tests = testCheck;
           pr-tests = prTestCheck;
           mk-serve = mkServeCheck;
+          mk-serve-nixos = mkServeNixosCheck;
           pr = prCheck;
         }
       );

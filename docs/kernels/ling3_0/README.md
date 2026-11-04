@@ -1,9 +1,9 @@
 # Ling 3.0 Flash — ROCm kernel sources
 
-Sources: `src/models/ling3_0/kernels/rocm/`. The scalar oracles live in
-`src/models/ling3_0/reference.cpp` / `cpu_ops.cpp`; every kernel is
+Sources: `staging/models/ling3_0/kernels/rocm/`. The scalar oracles live in
+`staging/models/ling3_0/reference.cpp` / `cpu_ops.cpp`; every kernel is
 compared against them by the `ling3_rocm_*` tests
-([../../../tests/models/ling3_0](../../../tests/models/ling3_0)).
+([../../../staging/tests/models/ling3_0](../../../staging/tests/models/ling3_0)).
 
 | Source | Contents | Used by |
 | --- | --- | --- |

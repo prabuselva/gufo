@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -165,10 +166,10 @@ void run(unsigned dim, std::mt19937& random) {
   }
   compare("paired projection tails", expected.size());
 
-  grouped_q8_0_a_preq_warp8_kernel<<<dim3((groups * rows + 7) / 8, Tokens),
-                                     256>>>(reference.data, w.data, x.data,
-                                            s.data, dim, rows, groups, Tokens,
-                                            blocks, 1);
+  grouped_q8_0_a_preq_warp8_kernel<false>
+      <<<dim3((groups * rows + 7) / 8, Tokens), 256>>>(
+          reference.data, w.data, x.data, s.data, dim, rows, groups, Tokens,
+          blocks, 1, nullptr, nullptr);
   check(hipMemcpy(expected.data(), reference.data,
                   expected.size() * sizeof(float), hipMemcpyDeviceToHost));
   grouped_q8_0_a_preq_batch_reuse_w32_kernel<Tokens, true>
@@ -373,7 +374,9 @@ void iq2_gate(unsigned tokens, unsigned blocks, std::mt19937& random) {
                       hipMemcpyDeviceToHost));
       check(hipMemcpy(actual.data(), candidate, size * sizeof(float),
                       hipMemcpyDeviceToHost));
-      equal(name, expected.data(), actual.data(), size);
+      const std::string boundary = std::string(name) + " " +
+                                   std::array{"gate", "up", "activation"}[kind];
+      equal(boundary.c_str(), expected.data(), actual.data(), size);
       for (const auto& [index, values] : samples) {
         if (std::abs(actual[index] - values[kind]) >
             2e-5 * std::max(1., std::abs(values[kind]))) {

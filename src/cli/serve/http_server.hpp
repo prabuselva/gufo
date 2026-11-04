@@ -23,6 +23,8 @@ class VideoJobService;
 class TtsService;
 class AsrService;
 class ImageService;
+class EmbeddingService;
+struct DecisionService;
 class WebSocket;
 
 struct HttpRequest {
@@ -92,11 +94,11 @@ using Handler =
 struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
-  std::string api_key;
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
-  /// Called once, on the listener or a request thread, when the backend reports
-  /// a lost device. Health, readiness and generation answer 503 `device_lost`
-  /// from then on; the hook decides how the process exits.
+  /// Called once, on the listener or a request thread, when the text backend or
+  /// the embedding service reports a lost device. Health, readiness and
+  /// generation answer 503 `device_lost` from then on; the hook decides how the
+  /// process exits.
   std::function<void()> on_device_lost{};
 };
 
@@ -113,7 +115,9 @@ public:
              std::shared_ptr<TtsService> tts = nullptr,
              std::shared_ptr<AsrService> asr = nullptr,
              HttpServerOptions options = {},
-             std::shared_ptr<ImageService> images = nullptr);
+             std::shared_ptr<ImageService> images = nullptr,
+             std::shared_ptr<EmbeddingService> embeddings = nullptr,
+             std::shared_ptr<DecisionService> decisions = nullptr);
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -139,7 +143,7 @@ private:
 
   HttpResponse handle_request(const HttpRequest& req);
   bool device_lost();
-  void handle_connection(int client_fd);
+  void handle_connection(int client_fd, std::atomic<bool>& response_sent);
   void reap_workers();
   void register_routes();
 
@@ -150,8 +154,9 @@ private:
   std::shared_ptr<TtsService> tts_;
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
+  std::shared_ptr<EmbeddingService> embeddings_;
+  std::shared_ptr<DecisionService> decisions_;
   HttpServerOptions options_;
-  std::string api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> device_lost_reported_{false};
@@ -183,7 +188,8 @@ public:
   [[nodiscard]] bool listening() const noexcept { return listen_fd_ >= 0; }
 
   /// Stops answering and releases the port. Returns within one poll interval
-  /// plus the bounded wait for a request that is still arriving.
+  /// plus the bounded waits for a request that is still arriving and for the
+  /// answered client to close.
   void stop();
 
 private:

@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — Prefill GEMM Tier (`gemm.hip.cpp`)
 
-Source: `src/models/qwen36_a3b/kernels/rocm/gemm.hip.cpp` (151 lines).
+Source: `staging/models/qwen36_a3b/kernels/rocm/gemm.hip.cpp` (151 lines).
 Public API: `gemm.hpp`. Batched projections `out[t][r] = Σ_k W[r][k] ·
 x[t][k]` for the prefill path. The file is mostly **dispatch**: the heavy
 compute lives either in the shared mmq library or in hipBLAS. Weights

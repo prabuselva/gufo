@@ -86,6 +86,9 @@ public:
     ReleaseRows();
   }
   bool IsValid() const noexcept override { return valid; }
+  bool ExecutionComplete() const noexcept override {
+    return execution_complete;
+  }
   void ReleaseRows() noexcept {
     if (!target.empty())
       guard_.BeforeRelease(kTarget, 0, target.size());
@@ -105,6 +108,7 @@ public:
   mutable std::size_t pending_reads{0};
   std::size_t pending_loads{0};
   bool valid{true};
+  bool execution_complete{true};
   bool restoring{false};
   bool private_loaded{false};
   std::array<bool, 32> private_pieces{};
@@ -231,13 +235,16 @@ Completion FakeStream::SubmitTracked(
 Capabilities FakeAdapter::GetCapabilities() const {
   return {.continuation = true, .persistent_encoding = true};
 }
+FakeAdapter::FakeAdapter(Rows rows_per_chunk)
+    : components_{{
+          {kTarget, 1, ComponentKind::kAppendRows, sizeof(Token),
+           rows_per_chunk, 0},
+          {kDraft, 1, ComponentKind::kAppendRows, sizeof(Token), rows_per_chunk,
+           0},
+          {kRecurrent, 1, ComponentKind::kPrivateState, 0, 0, 32},
+      }} {}
 std::span<const ComponentDescriptor> FakeAdapter::Components() const {
-  static constexpr std::array<ComponentDescriptor, 3> components{{
-      {kTarget, 1, ComponentKind::kAppendRows, sizeof(Token), 4, 0},
-      {kDraft, 1, ComponentKind::kAppendRows, sizeof(Token), 4, 0},
-      {kRecurrent, 1, ComponentKind::kPrivateState, 0, 0, 32},
-  }};
-  return components;
+  return components_;
 }
 Identity FakeAdapter::CompatibilityIdentity() const {
   return {'f', 'a', 'k', 'e', 2};
@@ -251,6 +258,9 @@ void FakeAdapter::SetPrefillPassRows(Rows rows) {
   if (!rows)
     throw std::invalid_argument("empty prefill pass");
   prefill_pass_rows_ = rows;
+}
+void FakeAdapter::SetExecutionComplete(Slot& slot, bool complete) {
+  AsSlot(slot).execution_complete = complete;
 }
 std::vector<Rows> FakeAdapter::PlanPrefill(const Slot& slot, Rows first,
                                            Rows end) const {
@@ -504,6 +514,7 @@ bool FakeAdapter::Validate(Slot& slot,
   return complete;
 }
 bool FakeAdapter::Invalidate(Slot& slot) noexcept {
+  invalidations_.fetch_add(1, std::memory_order_relaxed);
   auto& state = AsSlot(slot);
   if (state.Busy())
     return false;

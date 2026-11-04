@@ -54,7 +54,7 @@ constexpr std::uint32_t kKvRow = 2 * kKvdim;  // floats per KV cache row
 constexpr float kScale = 0.08838834764831845F;  // 1 / sqrt(128)
 
 // ---------------------------------------------------------------------------
-// Baseline: the production tiled kernel (src/models/nemotron_h_moe/kernels/
+// Baseline: the production tiled kernel (staging/models/nemotron_h_moe/kernels/
 // rocm/nb_attention.hip.cpp, AttnKernel<24, 16>) copied verbatim.
 // ---------------------------------------------------------------------------
 

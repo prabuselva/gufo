@@ -12,9 +12,10 @@
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/runner.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
@@ -244,7 +245,8 @@ void CheckImageSnapshotAttachment(const std::shared_ptr<qfn::Model>& model) {
     pixels.pixels.resize(64 * 64 * 3);
     for (std::size_t i = blue ? 2 : 0; i < pixels.pixels.size(); i += 3)
       pixels.pixels[i] = 255;
-    prompt->images.push_back({std::move(pixels), grid});
+    prompt->images.push_back(
+        {std::make_shared<const gufo::core::Image>(std::move(pixels)), grid});
     prompt->images.back().prefix_identity.fill(blue ? 2 : 1);
     prompt->cache_identity.assign(32, blue ? 2 : 1);
     return prompt;
@@ -359,6 +361,57 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
     std::cout << "prefill chunks: length=" << length << " boundary=" << boundary
               << " four logit rows and sampled MTP replay exact\n"
               << std::flush;
+  }
+}
+
+// A prefetched chunk serves the next chunk's leading tokens when a cache
+// frontier or step budget ends that chunk before or after the hint.
+void CheckPrefetchHints(const std::shared_ptr<qfn::Model>& model) {
+  const auto& c = model->config();
+  if (c.ple_layer < 0)
+    return;
+  std::string error;
+  const auto pattern = model->Tokenize(
+      "Virtual memory maps pages to physical storage. "
+      "A train travels sixty kilometers per hour. ");
+  std::vector<std::int32_t> tokens(2048), other(2048);
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    tokens[i] = pattern[i % pattern.size()];
+    other[i] = pattern[(i + 1025) % pattern.size()];
+  }
+  Require(other[0] != tokens[1024], "diverging hint shares its first token");
+  const auto mode = model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                                    : gufo::core::SessionMode::kAutoregressive;
+  auto bulk = model->CreateSession(mode, 6145, &error);
+  Require(bulk && bulk->Sync(tokens, &error), error);
+  const std::span all(tokens);
+  struct Case {
+    const char* name;
+    std::span<const std::int32_t> hint;
+    std::size_t middle;  ///< a frontier before the full prompt, or 0
+    std::size_t wasted;  ///< hinted tokens no chunk claims
+  };
+  for (const auto& [name, hint, middle, wasted] : {
+           Case{"exact", all.subspan(1024), 0, 0},
+           Case{"shorter", all.subspan(1024, 512), 0, 0},
+           Case{"longer", all.subspan(1024), 1536, 512},
+           Case{"diverging", std::span<const std::int32_t>(other).first(1024),
+                0, 1024},
+       }) {
+    auto split = model->CreateSession(mode, 6145, &error);
+    Require(split != nullptr, error);
+    Require(split->Sync(all.first(1024), &error, hint), error);
+    if (middle != 0)
+      Require(split->Sync(all.first(middle), &error), error);
+    Require(split->Sync(tokens, &error), error);
+    const auto rows = split->NgramRowTotals();
+    Require(
+        rows.rows == (tokens.size() + wasted) * c.ple_heads &&
+            rows.rows == rows.dedup_rows + rows.cache_hits + rows.disk_reads,
+        std::string("prefetch hint read unexpected rows: ") + name);
+    RequireExact(bulk->Logits(), split->Logits(),
+                 std::string("prefetch hint changed logits: ") + name);
+    std::cout << "prefetch hint: " << name << " exact\n" << std::flush;
   }
 }
 
@@ -613,6 +666,7 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   std::size_t sampled_rejections = 0;
   std::size_t sampled_acceptances = 0;
+  std::size_t sampled_small_head = 0;
   std::vector<std::unique_ptr<qfn::Session>> serial, batched;
   std::vector<sampling::SamplerState> serial_samplers, batch_samplers;
   const auto cases = gufo::test::QwenSamplingCases();
@@ -703,8 +757,10 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
         before.push_back(serial[i]->Statistics());
+        // Unplanned greedy rows price drafts at the cohort width.
         Require(serial[i]->DecodeStep(budget, serial_samplers[i], &expected[i],
-                                      &error, false),
+                                      &error, false,
+                                      static_cast<std::uint32_t>(width)),
                 error);
         requests.push_back(
             {batched[i].get(), budget, &batch_samplers[i], &actual[i], false});
@@ -751,6 +807,8 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
           const auto drafted = a.drafted - before[i].drafted;
           const auto accepted = a.accepted - before[i].accepted;
           sampled_acceptances += accepted;
+          sampled_small_head +=
+              a.small_head_cycles - before[i].small_head_cycles;
           if (accepted < drafted) {
             ++sampled_rejections;
             // stop_at_eos is false: a sampled rejection always defers its
@@ -767,8 +825,12 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   Require(
       sampled_acceptances > 0 && sampled_rejections > 0,
       "batch test must exercise sampled acceptance and residual correction");
+  // Sampled members draft through the small head on this eight-session model.
+  Require(sampled_small_head > 0,
+          "batched sampled members never used the small draft head");
   std::cout << "batch sampled_accepted=" << sampled_acceptances
             << " rejected_cycles=" << sampled_rejections
+            << " sampled_small_head_cycles=" << sampled_small_head
             << " history_and_residual_exact=1\n"
             << std::flush;
   // A complete state comparison catches recurrent/hidden differences that a
@@ -817,6 +879,13 @@ void CheckLookupBatch(const std::shared_ptr<qfn::Model>& model) {
     config.repeat_penalty = 1;
     config.frequency_penalty = 0;
     config.presence_penalty = 0;
+    if (i % 4 == 1) {
+      // Mix default sampled verification with unbounded sampling and greedy
+      // peers, retaining exact per-session logits and replay across C2..C8.
+      config.top_k = 20;
+      config.top_p = 0.8F;
+      config.presence_penalty = 1.5F;
+    }
     samplers.emplace_back(
         config, std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
     twins.push_back(samplers.back());
@@ -827,8 +896,9 @@ void CheckLookupBatch(const std::shared_ptr<qfn::Model>& model) {
       std::vector<qfn::Session::DecodeRequest> requests;
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t budget = cycle == 2 && i % 3 == 0 ? 3 : 8;
+        // Unplanned greedy rows price drafts at the cohort width.
         Require(serial[i]->DecodeStep(budget, samplers[i], &expected[i], &error,
-                                      false),
+                                      false, static_cast<std::uint32_t>(width)),
                 error);
         requests.push_back(
             {batched[i].get(), budget, &twins[i], &actual[i], false});
@@ -943,11 +1013,11 @@ std::size_t RareTokens(std::span<const std::int32_t> tokens) {
       }));
 }
 
-// The reduced draft head serves one-session requests (and planned batches);
-// on a multi-session model an unplanned request keeps the full head, so this
-// check needs a one-session model. Greedy prompt lookup can supply a whole
-// chain without any draft head, so head use is judged per cycle, for the
-// cycles that draft through the MTP head.
+// The reduced draft head serves one-session greedy requests (and planned
+// batches); on a multi-session model an unplanned greedy request keeps the
+// full head, so this check needs a one-session model. Greedy prompt lookup can
+// supply a whole chain without any draft head, so head use is judged per cycle,
+// for the cycles that draft through the MTP head.
 void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
   if (!model->HasMtp())
     return;
@@ -1080,8 +1150,8 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
   }
 
   // Switching to penalties preserves the target/predictor checkpoint.
-  // Greedy penalties use the full head; sampled proposals may use the table.
-  // Both must replay exactly in populated and fresh sessions.
+  // Greedy and sampled penalized proposals may both use the table. Both must
+  // replay exactly in populated and fresh sessions.
   for (const float temperature : {0.0F, 0.8F}) {
     auto fresh = create();
     Require(t->RestoreSnapshot(*thai_snapshot, &error) &&
@@ -1097,15 +1167,9 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     const auto actual = gufo::test::DecodeMtpReplay(*t, b, 32);
     Require(expected == actual && actual.drafted > 0,
             "penalized replay differs after a populated draft table");
-    if (temperature == 0.0F) {
-      Require(t->Statistics().small_head_cycles == 0 &&
-                  fresh->Statistics().small_head_cycles == 0,
-              "greedy penalties retained the reduced draft head");
-    } else {
-      Require(t->Statistics().small_head_cycles > 0 &&
-                  fresh->Statistics().small_head_cycles > 0,
-              "sampled penalty replay did not exercise the reduced head");
-    }
+    Require(t->Statistics().small_head_cycles > 0 &&
+                fresh->Statistics().small_head_cycles > 0,
+            "penalized replay did not exercise the reduced head");
     RequireExact(fresh->Logits(), t->Logits(),
                  "penalized replay changed target logits");
   }
@@ -1144,8 +1208,9 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     std::vector<qfn::Session::DecodeResult> expected(3), actual(3);
     std::vector<qfn::Session::DecodeRequest> requests;
     for (std::size_t i = 0; i < 3; ++i) {
+      // Unplanned greedy rows price drafts at the cohort width.
       Require(serial[i]->DecodeStep(8, serial_samplers[i], &expected[i], &error,
-                                    false),
+                                    false, 3),
               error);
       requests.push_back(
           {batched[i].get(), 8, &batch_samplers[i], &actual[i], false});
@@ -1186,6 +1251,333 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
                "used tables and mixed batches are exact\n";
 }
 
+// On a two-session model, sampled requests draft through the small head
+// alone and in batches, and each request's head choice and table stay its
+// own: an isolated run, peers joining and leaving, and reordered pairs give
+// identical tokens (reasoning included), RNG, acceptance, head use and
+// logits. Restores into used sessions match fresh ones. Plain greedy uses
+// the small head alone and in a jointly planned batch, keeps the full head
+// beside a sampled peer, and its text is the same either way.
+void CheckSampledDraftHead(const std::shared_ptr<qfn::Model>& model) {
+  namespace qt = gufo::tokenization;
+  if (!model->HasMtp())
+    return;
+  Require(model->DecodeConcurrency() == 2,
+          "the sampled draft-head check needs a two-session model");
+  std::string error;
+  const auto create = [&] {
+    auto session = model->CreateSession(gufo::core::SessionMode::kSpeculative,
+                                        6145, &error);
+    Require(session != nullptr, error);
+    return session;
+  };
+  const auto chat = [&](const std::string& user, bool thinking) {
+    const std::array messages{qt::ChatMessage{qt::ChatRole::kUser, user}};
+    const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+        model->tokenizer(), messages, {.enable_thinking = thinking}, &error);
+    Require(encoded.has_value(), error);
+    return std::vector<std::int32_t>(encoded->begin(), encoded->end());
+  };
+  auto json = std::make_shared<sampling::TokenConstraint>();
+  json->grammar = sampling::JsonConstraint::Compile(
+      gufo::json::parse(R"({"type":"object","properties":{"summary":)"
+                        R"({"type":"string"}},"required":["summary"],)"
+                        R"("additionalProperties":false})"),
+      true);
+  json->vocabulary = std::make_shared<sampling::ConstraintVocabulary>(
+      model->tokenizer().GetVocabSize(), [&](std::uint32_t id) {
+        const auto& tokenizer = model->tokenizer();
+        return sampling::ConstraintVocabulary::Piece{
+            tokenizer.DecodeTokenCopy(id), tokenizer.IsStopToken(id)};
+      });
+  // Pi-like defaults, sampled penalties, a Thai request that starts on the
+  // full head, and a constrained JSON request.
+  struct Member {
+    std::vector<std::int32_t> prompt;
+    sampling::SamplingConfig config;
+  };
+  const std::array<Member, 4> members{{
+      {chat("Write a Python function that merges overlapping intervals, "
+            "then explain its complexity.",
+            true),
+       {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F, .seed = 11}},
+      {chat("List practical tips for reviewing a pull request.", true),
+       {.temperature = 0.8F,
+        .seed = 12,
+        .frequency_penalty = 0.2F,
+        .presence_penalty = 1.5F}},
+      {chat("เขียนกลอน"
+            "สั้นๆ เกี่"
+            "ยวกับฝนที"
+            "่ตกในเมือ"
+            "ง",
+            true),
+       {.temperature = 0.8F, .top_k = 20, .seed = 13}},
+      {chat("Summarize the benefits of unit tests as JSON.", false),
+       {.temperature = 0.8F, .seed = 14, .constraint = json}},
+  }};
+  Require(RareTokens(members[2].prompt) > 0, "Thai member has no rare token");
+  constexpr std::size_t kCycles = 8;
+  struct Run {
+    std::vector<std::unique_ptr<qfn::Session>> sessions;
+    std::vector<sampling::SamplerState> samplers;
+    std::vector<std::vector<std::int32_t>> generated;
+    std::vector<std::size_t> full_head_drafts;
+  };
+  const auto start = [&] {
+    Run run;
+    for (const auto& member : members) {
+      run.sessions.push_back(create());
+      Require(run.sessions.back()->Sync(member.prompt, &error), error);
+      run.samplers.emplace_back(
+          member.config, std::vector<sampling::TokenId>(member.prompt.begin(),
+                                                        member.prompt.end()));
+      run.generated.emplace_back();
+      run.full_head_drafts.push_back(0);
+    }
+    return run;
+  };
+  // Small-head batches and mixed small/full-head batches seen in a schedule.
+  struct BatchUse {
+    std::size_t all_small{0};
+    std::size_t mixed{0};
+  };
+  const auto step = [&](Run& run, std::span<const std::size_t> group,
+                        BatchUse* use) {
+    std::vector<qfn::Session::SpeculativeStats> before;
+    std::vector<qfn::Session::DecodeResult> results(group.size());
+    std::vector<qfn::Session::DecodeRequest> requests;
+    for (std::size_t g = 0; g < group.size(); ++g) {
+      const auto i = group[g];
+      before.push_back(run.sessions[i]->Statistics());
+      requests.push_back(
+          {run.sessions[i].get(), 8, &run.samplers[i], &results[g], false});
+    }
+    if (requests.size() == 1) {
+      Require(run.sessions[group[0]]->DecodeStep(8, run.samplers[group[0]],
+                                                 &results[0], &error, false),
+              error);
+    } else {
+      Require(qfn::Session::DecodeBatch(requests, &error), error);
+    }
+    std::size_t drafting = 0, small = 0;
+    for (std::size_t g = 0; g < group.size(); ++g) {
+      const auto i = group[g];
+      const auto& after = run.sessions[i]->Statistics();
+      Require(!results[g].tokens.empty(), "sampled step made no progress");
+      run.generated[i].insert(run.generated[i].end(), results[g].tokens.begin(),
+                              results[g].tokens.end());
+      if (after.drafted - before[g].drafted > after.lookup - before[g].lookup) {
+        ++drafting;
+        const auto used_small =
+            after.small_head_cycles - before[g].small_head_cycles;
+        small += used_small;
+        run.full_head_drafts[i] += used_small == 0;
+      }
+    }
+    if (use && group.size() > 1 && drafting == group.size()) {
+      use->all_small += small == drafting;
+      use->mixed += small != 0 && small != drafting;
+    }
+  };
+  // Each member decodes kCycles steps in every schedule.
+  using Group = std::vector<std::size_t>;
+  const std::vector<Group> isolated = [&] {
+    std::vector<Group> groups;
+    for (std::size_t i = 0; i < members.size(); ++i)
+      for (std::size_t c = 0; c < kCycles; ++c)
+        groups.push_back({i});
+    return groups;
+  }();
+  // Peers join and leave: member 0 starts alone, the Thai member joins and
+  // leaves, then member 1; later pairs mix penalties, the constraint and
+  // the Thai member, and some members finish alone.
+  const std::vector<Group> overlapping{{0},    {0},    {0, 2}, {0, 2}, {0, 2},
+                                       {0, 1}, {0, 1}, {0},    {1, 3}, {1, 3},
+                                       {1, 2}, {1, 2}, {1},    {1, 3}, {3},
+                                       {2, 3}, {2, 3}, {2},    {3},    {3}};
+  const std::vector<Group> reordered = [&] {
+    std::vector<Group> groups;
+    for (std::size_t c = 0; c < kCycles; ++c) {
+      groups.push_back(c % 2 ? Group{1, 0} : Group{0, 1});
+      groups.push_back(c % 2 ? Group{2, 3} : Group{3, 2});
+    }
+    return groups;
+  }();
+  const auto play = [&](const std::vector<Group>& schedule, BatchUse* use) {
+    std::array<std::size_t, 4> count{};
+    for (const auto& group : schedule)
+      for (const auto i : group)
+        ++count[i];
+    Require(std::ranges::all_of(count, [](auto c) { return c == kCycles; }),
+            "schedule gives a member the wrong number of cycles");
+    auto run = start();
+    for (const auto& group : schedule)
+      step(run, group, use);
+    return run;
+  };
+  const auto reference = play(isolated, nullptr);
+  BatchUse overlap_use, reordered_use;
+  for (const auto* schedule : {&overlapping, &reordered}) {
+    const auto run = play(
+        *schedule, schedule == &overlapping ? &overlap_use : &reordered_use);
+    for (std::size_t i = 0; i < members.size(); ++i) {
+      const auto& a = reference.sessions[i]->Statistics();
+      const auto& b = run.sessions[i]->Statistics();
+      Require(reference.generated[i] == run.generated[i] &&
+                  reference.samplers[i].rng_state() ==
+                      run.samplers[i].rng_state() &&
+                  std::ranges::equal(reference.samplers[i].history(),
+                                     run.samplers[i].history()) &&
+                  a.cycles == b.cycles && a.drafted == b.drafted &&
+                  a.accepted == b.accepted &&
+                  a.small_head_cycles == b.small_head_cycles &&
+                  a.lookup == b.lookup &&
+                  a.lookup_accepted == b.lookup_accepted,
+              "sampled member " + std::to_string(i) +
+                  " depends on its overlap schedule");
+      RequireExact(
+          reference.sessions[i]->Logits(), run.sessions[i]->Logits(),
+          "overlap schedule changed logits of member " + std::to_string(i));
+    }
+  }
+  // The small head served every sampled kind alone, the Thai member also
+  // drafted over the full head, and batches of both kinds ran.
+  std::array<std::uint64_t, 4> small_cycles{};
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    const auto& stats = reference.sessions[i]->Statistics();
+    small_cycles[i] = stats.small_head_cycles;
+    Require(stats.drafted > stats.lookup, "a sampled member never drafted");
+  }
+  Require(small_cycles[0] > 0 && small_cycles[1] > 0 && small_cycles[3] > 0,
+          "a sampled member never used the small head on two sessions");
+  Require(reference.full_head_drafts[2] > 0,
+          "the Thai member never drafted over the full head");
+  Require(overlap_use.all_small > 0 && overlap_use.mixed > 0 &&
+              reordered_use.mixed + reordered_use.all_small > 0,
+          "overlapping schedules did not run small-head and mixed batches");
+
+  // Restore each table into the other's used session and into a fresh one,
+  // then decode the used pair as a batch and the fresh pair alone.
+  const auto english_snapshot = reference.sessions[0]->SaveSnapshot(&error);
+  const auto thai_snapshot = reference.sessions[2]->SaveSnapshot(&error);
+  Require(english_snapshot && thai_snapshot, error);
+  const std::array snapshots{english_snapshot.get(), thai_snapshot.get()};
+  std::array<std::unique_ptr<qfn::Session>, 2> fresh{create(), create()};
+  std::array<qfn::Session*, 2> used{reference.sessions[2].get(),
+                                    reference.sessions[0].get()};
+  std::vector<sampling::SamplerState> fresh_samplers, used_samplers;
+  for (std::size_t k = 0; k < 2; ++k) {
+    Require(fresh[k]->RestoreSnapshot(*snapshots[k], &error) &&
+                used[k]->RestoreSnapshot(*snapshots[k], &error),
+            error);
+    const auto tokens = fresh[k]->Tokens();
+    const std::vector<sampling::TokenId> history(tokens.begin(), tokens.end());
+    fresh_samplers.emplace_back(members[k * 2].config, history);
+    used_samplers.emplace_back(members[k * 2].config, history);
+  }
+  const auto restored_small = fresh[0]->Statistics().small_head_cycles;
+  for (std::size_t c = 0; c < 4; ++c) {
+    std::array<qfn::Session::DecodeResult, 2> expected, actual;
+    std::vector<qfn::Session::DecodeRequest> requests;
+    for (std::size_t k = 0; k < 2; ++k) {
+      Require(fresh[k]->DecodeStep(8, fresh_samplers[k], &expected[k], &error,
+                                   false),
+              error);
+      requests.push_back({used[k], 8, &used_samplers[k], &actual[k], false});
+    }
+    Require(qfn::Session::DecodeBatch(requests, &error), error);
+    for (std::size_t k = 0; k < 2; ++k) {
+      const auto& a = fresh[k]->Statistics();
+      const auto& b = used[k]->Statistics();
+      Require(
+          expected[k].tokens == actual[k].tokens &&
+              fresh_samplers[k].rng_state() == used_samplers[k].rng_state() &&
+              a.drafted == b.drafted && a.accepted == b.accepted &&
+              a.small_head_cycles == b.small_head_cycles,
+          "restore into a used session differs from a fresh one");
+      RequireExact(fresh[k]->Logits(), used[k]->Logits(),
+                   "restore into a used session changed logits");
+    }
+  }
+  Require(fresh[0]->Statistics().small_head_cycles > restored_small,
+          "the restored English member left the small head");
+
+  // Alone, plain greedy drafts through the small head on two sessions as on
+  // one; beside a sampled peer it keeps the full head and makes the same
+  // text; a jointly planned greedy pair uses the small head.
+  const auto english = chat("Count from one to thirty in words.", false);
+  std::array<std::unique_ptr<qfn::Session>, 3> greedy{create(), create(),
+                                                      create()};
+  std::vector<sampling::SamplerState> greedy_samplers;
+  for (auto& session : greedy) {
+    Require(session->Sync(english, &error), error);
+    greedy_samplers.emplace_back(
+        sampling::SamplingConfig{},
+        std::vector<sampling::TokenId>(english.begin(), english.end()));
+  }
+  std::vector<std::int32_t> alone_tokens, mixed_tokens;
+  for (std::size_t c = 0; c < 4; ++c) {
+    qfn::Session::DecodeResult alone;
+    Require(greedy[0]->DecodeStep(8, greedy_samplers[0], &alone, &error, false),
+            error);
+    alone_tokens.insert(alone_tokens.end(), alone.tokens.begin(),
+                        alone.tokens.end());
+  }
+  const auto& alone = greedy[0]->Statistics();
+  Require(alone.drafted > alone.lookup && alone.small_head_cycles > 0,
+          "plain greedy kept the full head alone on two sessions");
+  auto sampled_peer = create();
+  Require(sampled_peer->Sync(members[0].prompt, &error), error);
+  sampling::SamplerState sampled_peer_sampler(
+      members[0].config,
+      std::vector<sampling::TokenId>(members[0].prompt.begin(),
+                                     members[0].prompt.end()));
+  while (mixed_tokens.size() < alone_tokens.size()) {
+    std::array<qfn::Session::DecodeResult, 2> results;
+    std::array<qfn::Session::DecodeRequest, 2> requests{{
+        {greedy[2].get(), 8, &greedy_samplers[2], &results[0], false},
+        {sampled_peer.get(), 8, &sampled_peer_sampler, &results[1], false},
+    }};
+    Require(qfn::Session::DecodeBatch(requests, &error), error);
+    Require(!results[0].tokens.empty(), "mixed greedy step made no progress");
+    mixed_tokens.insert(mixed_tokens.end(), results[0].tokens.begin(),
+                        results[0].tokens.end());
+  }
+  const auto& mixed = greedy[2]->Statistics();
+  Require(mixed.drafted > mixed.lookup && mixed.small_head_cycles == 0,
+          "plain greedy reached the small head beside a sampled peer");
+  Require(std::equal(alone_tokens.begin(), alone_tokens.end(),
+                     mixed_tokens.begin()),
+          "the small head changed greedy text");
+  auto peer = create();
+  Require(peer->Sync(english, &error), error);
+  sampling::SamplerState peer_sampler(
+      sampling::SamplingConfig{},
+      std::vector<sampling::TokenId>(english.begin(), english.end()));
+  for (std::size_t c = 0; c < 4; ++c) {
+    std::array<qfn::Session::DecodeResult, 2> results;
+    std::array<qfn::Session::DecodeRequest, 2> requests{{
+        {greedy[1].get(), 8, &greedy_samplers[1], &results[0], false},
+        {peer.get(), 8, &peer_sampler, &results[1], false},
+    }};
+    Require(qfn::Session::DecodeBatch(requests, &error), error);
+  }
+  Require(greedy[1]->Statistics().small_head_cycles > 0,
+          "a jointly planned greedy pair left the small head");
+  std::cout << "sampled draft head: two sessions small_head_cycles="
+            << small_cycles[0] << "," << small_cycles[1] << ","
+            << small_cycles[2] << "," << small_cycles[3]
+            << " thai_full_head_drafts=" << reference.full_head_drafts[2]
+            << " overlap all_small=" << overlap_use.all_small
+            << " mixed=" << overlap_use.mixed
+            << " reordered all_small=" << reordered_use.all_small
+            << " mixed=" << reordered_use.mixed
+            << " schedules_and_restores_exact=1 greedy_alone_small_head="
+            << alone.small_head_cycles << " greedy_text_exact=1\n"
+            << std::flush;
+}
+
 void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model,
                          std::uint32_t prompt_tokens = 4096,
                          bool with_image = false) {
@@ -1224,7 +1616,8 @@ void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model,
     pixels.pixels.resize(64 * 64 * 3);
     for (std::size_t i = 0; i < pixels.pixels.size(); ++i)
       pixels.pixels[i] = static_cast<std::uint8_t>((i * 37 + i / 64) % 256);
-    image->images.push_back({std::move(pixels), grid});
+    image->images.push_back(
+        {std::make_shared<const gufo::core::Image>(std::move(pixels)), grid});
     image->images.back().prefix_identity.fill(3);
     image->cache_identity.assign(32, 3);
     ar->ConfigureVision(image);
@@ -1288,7 +1681,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(backend.load(model, &error, 128, 2, {}, {}, options), error);
+  Require(backend.load(qfn::CreateQwenFlashNextTextRunner(model, 128, options),
+                       &error, 2),
+          error);
   // Synthetic grammar pieces make the boundary deterministic: any ordinary
   // first token completes the empty JSON object; only stop tokens may follow.
   // Actual token IDs, EOS recognition, GPU execution and checkpoints stay real.
@@ -1306,12 +1701,17 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
       });
   sampling::SamplingConfig config;
   config.constraint = std::move(constraint);
+  config.logprobs = 2;
   const std::array<std::string, 2> prompts{
       "EOS fixture one: continue red, blue,",
       "EOS fixture two: continue green, yellow,"};
   std::array<Backend::Result, 2> references;
   for (std::size_t row = 0; row < prompts.size(); ++row) {
     references[row] = backend.complete(prompts[row], 8, config);
+    Require(references[row].logprobs.size() == 2 &&
+                model->IsStopToken(
+                    references[row].logprobs.back().entries.front().id),
+            "constrained EOS must retain its raw token probability");
     Require(
         references[row].tokens.size() == 1 &&
             !model->IsStopToken(references[row].tokens.front()),
@@ -1333,6 +1733,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::size_t batched = 0;
   for (std::size_t row = 0; row < pending.size(); ++row) {
     const auto result = pending[row].get();
+    Require(result.logprobs.size() == 2 &&
+                model->IsStopToken(result.logprobs.back().entries.front().id),
+            "batched cached EOS must retain token metadata");
     Require(result.tokens == references[row].tokens,
             "batched EOS accounting differs from the scalar checkpoint");
     batched += result.physical_execution_width > 1;
@@ -1377,10 +1780,13 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   using Backend = server::InferenceBackend;
   Backend ar, mtp;
   std::string error;
-  Require(ar.load(model, &error, 6145, 2), error);
+  Require(ar.load(qfn::CreateQwenFlashNextTextRunner(model, 6145), &error, 2),
+          error);
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(mtp.load(model, &error, 6145, 2, {}, {}, options), error);
+  Require(mtp.load(qfn::CreateQwenFlashNextTextRunner(model, 6145, options),
+                   &error, 2),
+          error);
   struct Reference {
     gufo::test::SamplingCase test;
     std::string prompt;
@@ -1513,7 +1919,80 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+void CheckLogprobs(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto prompt = model->Tokenize(
+      "Continue this list: red blue green red blue green red blue green");
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  for (const bool mtp : {false, true}) {
+    for (const float temperature : {0.F, 0.7F}) {
+      const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                            : gufo::core::SessionMode::kAutoregressive;
+      auto observed = model->CreateSession(mode, 256, &error);
+      auto plain = model->CreateSession(mode, 256, &error);
+      auto reference = model->CreateSession(
+          gufo::core::SessionMode::kAutoregressive, 256, &error);
+      Require(observed && plain && reference, error);
+      Require(observed->Sync(prompt, &error) && plain->Sync(prompt, &error) &&
+                  reference->Sync(prompt, &error),
+              error);
+      sampling::SamplingConfig config;
+      config.temperature = temperature;
+      config.top_k = 20;
+      config.seed = 73;
+      sampling::SamplerState a(config, history);
+      config.logprobs = 5;
+      sampling::SamplerState b(config, history);
+      std::size_t generated = 0;
+      while (generated < 32) {
+        qfn::Session::DecodeResult expected, actual;
+        const auto budget = std::min<std::size_t>(mtp ? 8 : 1, 32 - generated);
+        Require(plain->DecodeStep(budget, a, &expected, &error, false) &&
+                    observed->DecodeStep(budget, b, &actual, &error, false),
+                error);
+        Require(
+            expected.tokens == actual.tokens && a.rng_state() == b.rng_state(),
+            "logprobs changed selected tokens or RNG");
+        Require(actual.logprobs.size() == actual.tokens.size(),
+                "missing accepted-token probabilities");
+        for (std::size_t i = 0; i < actual.tokens.size(); ++i) {
+          const auto logits = reference->Logits();
+          const double maximum =
+              *std::max_element(logits.begin(), logits.end());
+          double sum = 0;
+          for (const float value : logits)
+            sum += std::exp(double(value) - maximum);
+          const auto check = [&](const sampling::TokenLogprob& entry) {
+            const double expected_lp =
+                (double(logits[entry.token]) - maximum) - std::log(sum);
+            Require(std::abs(entry.logprob - expected_lp) < 1e-5,
+                    "reported probability disagrees with teacher-forced target "
+                    "logits");
+          };
+          Require(actual.logprobs[i].selected.token ==
+                      static_cast<sampling::TokenId>(actual.tokens[i]),
+                  "probability token order differs");
+          check(actual.logprobs[i].selected);
+          for (const auto& entry : actual.logprobs[i].top)
+            check(entry);
+          Require(reference->Evaluate(actual.tokens[i], &error), error);
+        }
+        generated += actual.tokens.size();
+      }
+      const auto x = observed->Statistics(), y = plain->Statistics();
+      Require(x.drafted == y.drafted && x.accepted == y.accepted,
+              "observation changed speculative acceptance");
+      if (mtp)
+        Require(x.drafted > 0, "logprob fixture must execute drafts");
+      std::cout << "logprobs mtp=" << mtp << " temperature=" << temperature
+                << " tokens=" << generated << " drafted=" << x.drafted << '\n';
+    }
+  }
+}
+
 int main(int argc, char** argv) {
+  const bool logprobs_only =
+      argc == 6 && std::string_view(argv[5]) == "--logprobs-only";
   const bool lookup_only =
       argc == 6 && std::string_view(argv[5]) == "--lookup-only";
   const bool execution_only =
@@ -1529,13 +2008,15 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
   const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only && !eos_only && !execution_only && !lookup_only) ||
+       !cache_only && !eos_only && !execution_only && !lookup_only &&
+       !logprobs_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only | --lookup-only | "
-                 "--execution-only TOKENS]\n";
+    std::cerr
+        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+           "[--batch-only | --prefill-only | --sampling-only | "
+           "--cache-only | --eos-only | --lookup-only | --logprobs-only | "
+           "--execution-only TOKENS]\n";
     return 77;
   }
   if (execution_only) {
@@ -1558,6 +2039,11 @@ int main(int argc, char** argv) {
          .decode_concurrency = 8},
         &error);
     Require(model != nullptr, error);
+    if (logprobs_only) {
+      CheckLogprobs(model);
+      CheckServingEos(model);
+      return 0;
+    }
     if (lookup_only) {
       CheckLookupBatch(model);
       return 0;
@@ -1587,6 +2073,7 @@ int main(int argc, char** argv) {
     if (!batch_only) {
       CheckExecutionModes(model, 2048, true);
       CheckPrefillChunks(model);
+      CheckPrefetchHints(model);
     }
     if (prefill_only)
       return 0;
@@ -1601,7 +2088,8 @@ int main(int argc, char** argv) {
     CheckBatchedSessions(model);
     CheckLookupBatch(model);
     // The checks above batch up to eight sessions; the draft-vocabulary
-    // lifecycle needs one (see CheckDraftVocabLifecycle).
+    // lifecycle needs one (see CheckDraftVocabLifecycle) and the sampled
+    // draft-head check two.
     const auto load = [&](std::uint32_t decode_concurrency) {
       model.reset();
       model = qfn::Model::Load(argv[2],
@@ -1614,6 +2102,8 @@ int main(int argc, char** argv) {
     };
     load(1);
     CheckDraftVocabLifecycle(model);
+    load(2);
+    CheckSampledDraftHead(model);
     if (batch_only)
       return 0;
     load(8);

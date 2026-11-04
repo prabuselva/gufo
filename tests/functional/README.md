@@ -1,12 +1,150 @@
-# Text API functional tests
+# Model API functional tests
 
-The runner starts an isolated local server and checks real responses with the
-OpenAI SDK. Use production binaries and local weights; no models are downloaded.
+The runners start isolated local servers and check real HTTP responses. Manual
+suites use production binaries and local weights. Devlab CI downloads only its
+selected models from pinned revisions.
 
-Flash-Next prompt lookup has a focused MTP runner. It requires actual accepted
-copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
+## Embedding, ASR and TTS service checks
+
+`model_services.py` starts an isolated loopback production server, checks readiness
+and advertised model identity, runs real HTTP inference, and shuts down its owned
+process. These suites are explicit and separate from the text runner's `--suite all`.
+They do not download weights or voice recordings. Missing inputs fail the run.
+Use `nix develop`, or install `tests/functional/requirements.txt` in a virtualenv.
+Build the production binary with `cmake --preset release` and
+`cmake --build --preset release --parallel 4` inside the pinned development shell.
+
+```sh
+nix develop -c python3 tests/functional/model_services.py embedding \
+  --binary build/release/gufo --model models/embeddinggemma-2 \
+  --output artifacts/model-services/embedding-1
+
+nix develop -c python3 tests/functional/model_services.py asr \
+  --binary build/release/gufo --model models/audio/Qwen3-ASR-1.7B \
+  --output artifacts/model-services/asr-1
+
+nix develop -c python3 tests/functional/model_services.py tts \
+  --binary build/release/gufo --model models/audio/Qwen3-TTS-12Hz-1.7B-Base \
+  --variant base \
+  --asr-binary /path/to/pinned/gufo --asr-model models/audio/Qwen3-ASR-1.7B \
+  --output artifacts/model-services/tts-base-1
+```
+
+Embedding uses `--embedding-suite smoke` by default, including Devlab's PR tier.
+It retains independent reference-vector checks for all four modalities in one
+small batch, then checks an invalid clip and successful text recovery. This is
+a smoke check, not full model qualification. Select `--embedding-suite full`
+for the existing numerical/API suites plus video goldens, sampling/timestamps,
+dimensions, concurrent requests, context overflow, cancellation and recovery.
+Devlab's full tier selects that suite. Both retain individual request timings;
+manual invocations do not qualify performance against main.
+
+The default audio root is the packaged `fixtures/audio/` English WAV and reviewed
+transcript, authorized by the maintainer for publication. Override `--audio-root`
+only with a folder containing that English pair. ASR generates silence in memory
+for its second concurrent input. Base TTS registers the English recording as the
+`narrator` ICL clone. Reports retain the fixture hash and expected transcript.
+For the other checkpoints, select `--variant custom` with the CustomVoice model
+(default speaker `ryan`, override with `--voice`) or `--variant design` with the
+VoiceDesign model (fixed English voice instructions). Neither requires a clone.
+
+| Suite | Required checks |
+| --- | --- |
+| Embedding | The default three-request smoke check covers text, image, video, mixed video/audio/image input, malformed-video rejection and recovery. `--embedding-suite full` retains the text, image, audio and video HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, ignored unknown members, llama.cpp `content`/`embd_normalize`, invalid inputs, cancellation and recovery |
+| ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, ignored unknown fields, rejected options (including timestamps and logprobs), malformed WAV recovery, stream cancellation and subsequent valid inference |
+| TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, ignored unknown fields, rejected inputs, stream cancellation and subsequent valid inference |
+
+Audio cancellation must appear against the cancelled request's ID in the server
+log; a client closing a response alone does not satisfy the assertion. SSE must
+include its terminal event and a complete payload. Tests never retry requests.
+The audio checks bound output duration to 0.3–20 seconds and require RMS > 0.001;
+TTS requests use checkpoint sampling, fixed seeds and a 180-codec-step cap.
+
+TTS intelligibility requires an explicitly selected ASR evaluator binary. Pin its
+revision and checkpoint independently when changing ASR or TTS runtime behavior;
+using the same candidate as its own evaluator does not qualify those changes.
+The current ASR malformed-WAV path returns `500 transcription_failed` rather than
+400. The suite records this known limitation and checks its exact error and
+subsequent recovery; it does not claim correct client-error classification.
+
+Every invocation requires a new output directory. `report.json` retains status,
+per-case results, request timings and headers (including available server phase
+measurements), binary/harness hashes, source revision, weight file metadata and
+available download revision metadata. Response bodies, generated WAVs, evaluator
+transcripts and server logs stay beside it. Embedding subreports retain individual
+requests. Exceptions leave a failed report and return a nonzero exit code.
+Timings are observations; this runner does not perform matched baseline timing
+qualification. WebSocket streaming, long recordings, broad language/voice quality
+and speaker-similarity scoring remain separate coverage.
+
+Devlab speed comparisons use a pinned main revision and candidate, matching the
+runner, toolchain, weights, settings and request histories. `service_phases.py`
+uses server-emitted request timings and work counters: ASR `Server-Timing`
+phases, TTS synthesis time and codec/audio work, and embedding request duration
+and token/input counts. Client latency and first-output observations remain
+separate. Each request and phase retains every paired repeat at the existing
+5% and 3-ms thresholds; mismatched work stays inconclusive.
+
+Repeat with fresh output directories to check stability. Preserve failed attempts
+alongside successful runs. CPU checks for metric and incomplete-stream refusal:
+
+```sh
+nix develop -c python3 -m unittest discover -s tests/functional -p test_service_http.py
+```
+
+Qwen 27B deep-history recovery uses separate, explicitly selected workloads:
+
+```sh
+python3 tests/functional/deep_peers_qwen.py \
+  --binary /path/to/production/gufo --model /path/to/qwen27b.gguf \
+  --mode ar --source-revision BUILD_SHA --expect-component --out /tmp/qwen-deep
+python3 tests/functional/over_ram_qwen.py \
+  --binary /path/to/production/gufo --model /path/to/qwen27b.gguf \
+  --mode dflash2 --draft /path/to/dflash2.gguf \
+  --source-revision BUILD_SHA --expect-component --out /tmp/qwen-over-ram
+```
+
+Each starts its own loopback server, retains responses, loaded mode, actual draft
+counts and process/host memory samples, and removes only its owned disk cache
+after retaining an inventory. Use a new output directory for every invocation.
+The deep workload verifies 140K+ tokens, observes a published checkpoint before
+SIGKILL, checks newest compatible checkpoint selection after restarts and peers,
+and compares recovery with `cache_prompt: false` at temperature zero. The over-RAM
+workload verifies a completed cancellation frontier survives short peers and
+requires a rewritten final message to wait for successful deeper publication.
+That edited fork must select the observed published frontier; it cannot require
+a previous live boundary that has no restorable checkpoint.
+It fails if that publication race was not exercised. These are correctness
+workloads outside hosted model CI; retained phase times do not qualify speed.
+CPU evidence-refusal checks run with
+`python3 -m unittest discover -s tests/functional -p test_qwen_recovery.py`;
+they do not establish model correctness.
+
+Qwen 27B cancellation inside a prefill pass has a focused latency regression
+check. It disconnects both a cold prompt and a partially completed prompt,
+serves a short cached peer, then verifies retained work and resumed output:
+
+```sh
+nix develop -c python3 tests/functional/qwen_prefill_cancel.py \
+  --output /tmp/qwen-prefill-cancel -- \
+  /path/to/production/gufo serve llm --model /path/to/qwen27b.gguf \
+  --speculative dflash2 --dflash-model /path/to/draft.gguf
+```
+
+Use `--speculative off` for AR. The test owns its loopback server, records each
+request's phase timings and rejects a multi-second prefill blocking the short
+peer. Apply the usual matched 5% and 10 ms timing gates to its retained results.
+Add `--deep-peers` before `--` and serve with `--sessions 4` to fill the other
+slots with duplicate deep conversations. This checks that a short request
+after cancellation can reuse a redundant slot while another live copy retains
+the generated frontier. It also rejects the roughly 280 ms restore stall.
+
+Flash-Next MTP and Qwen27B DFlash2 prompt lookup have a focused runner. It
+requires actual accepted copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
 default sampling, mixes greedy copies with new text at C8, and checks stops
-followed by full replay:
+followed by full replay. It also checks top-k 64/65, disabled top-k and a
+65-token minimum support across warm replay and stops, covering compact
+sampled verification and its complete-vocabulary fallbacks:
 
 ```sh
 nix develop -c python3 tests/functional/prompt_lookup.py \
@@ -15,7 +153,11 @@ nix develop -c python3 tests/functional/prompt_lookup.py \
   --speculative mtp --mtp-model /path/to/mtp.gguf
 ```
 
-The runner owns eight sessions and the loopback listener. It retains individual
+For Qwen27B, substitute `--speculative dflash2 --dflash-model /path/to/draft.gguf`.
+Use `--max-concurrency 4` before `--` for a focused C2/C4 check; the default
+covers C2/C4/C6/C8.
+
+The runner owns its sessions and the loopback listener. It retains individual
 request timings and server logs, and stays outside hosted CI and `--suite all`.
 The native Flash-Next session test additionally checks full logits, RNG and
 snapshot restoration into previously used sessions.
@@ -23,6 +165,22 @@ Pass `--mmproj /path/to/mmproj.gguf` with the server command to add image-backed
 greedy and sampled copies. These cases require accepted lookup tokens before
 client cancellation, confirm the server observed cancellation, and replay the
 same output from the cached image prompt without prefill.
+
+`generation_quality.py` validates reviewed coding responses from the sampled
+Qwen27B generation controls. It checks generated interval tests plus independent
+coverage/input-preservation cases, and retry call counts, delay caps and error behavior.
+It requires completed output, so a truncated thinking response cannot pass:
+
+```sh
+nix develop -c python3 tests/functional/generation_quality.py \
+  /tmp/generation/results.json \
+  --thinking-results /tmp/completed-thinking/results.json
+```
+
+The reports contain `code` and `code-think` entries from `chat_result`, including
+text and finish reason. This executes the reviewed generated Python on the
+development host. The requests and measurement scope are recorded in the
+[Qwen27B quality notes](../../docs/models/qwen3.8-27b/QUALITY.md#october-21-coding-and-prose-follow-up).
 
 `prompt_lookup_workflows.py` checks extraction, generated URI tests and edits
 after a long source archive against an already running Flash-Next MTP server:
@@ -44,6 +202,13 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit, and `prompt_name`, whose vector must equal that of the same prompt written by the client.  It is standalone and outside `--suite all`:
+
+```sh
+nix develop -c python3 tests/functional/embeddings.py \
+  --base-url http://127.0.0.1:8080/v1 --model embeddinggemma-2
+```
+
 Flash-Next startup identity checks use a separate runner with an initially empty
 artifact-hash cache, as on a fresh container. RAM-only serving must skip full-file
 fingerprints and still reuse its prompt. Disk serving must fingerprint the model
@@ -57,7 +222,10 @@ nix develop -c python3 tests/functional/cache_startup.py \
 ```
 
 Run again with `--speculative off` for AR. `--case ram` or `--case disk` selects
-only that lifecycle. Commands, startup times, request timings, responses and logs
+only that lifecycle. For Qwen 27B, add `--model-kind qwen27b` before `--`,
+use its target weights, and select `--speculative off` or
+`--speculative dflash2 --dflash-model /path/to/draft.gguf` in the server command.
+Commands, startup times, request timings, responses and logs
 remain in the output directory. This check stays outside hosted model CI.
 
 The cluster workflow uses [impact.json](impact.json) to select suites from changed
@@ -74,53 +242,140 @@ priority rules contribute a union. Unknown paths expand to all compatible
 coverage. Suite metadata must cover every name in `run.py`; dependencies are
 deliberately conservative, so even narrow source rules can select many suites.
 
-`Devlab functional checks` starts when a maintainer applies `ci:functional` to a
-PR, or manually dispatches it with a PR number. The label event uses trusted base
-workflow code (`pull_request_target`); only Maintain/Admin senders and rerun
-actors authorize execution. The event's exact PR head must still be current.
-Later commits do not inherit approval: remove and reapply the label to approve
-another revision. It pins the PR head and merge base on `main`, plans on a hosted runner,
-and allocates the cluster only for affected Flash-Next MTP coverage (or an
-explicit benchmark request). AR suites run only when a dispatch sets `ar`, which
-plans with `--model flash-next-q4`; the default is `--model flash-next-q4/mtp`.
-`--model` accepts a model or a single `model/mode` profile. The workflow and harness come from the trusted
-workflow revision; only the production binary is built from the approved PR.
-It fetches the pinned Q4 shards, MTP sidecar and vision projector into a persistent
-cache under `$GUFO_CI_CACHE` (default `$RUNNER_TOOL_CACHE/gufo`; the weights need
-about 110 GiB free), and retains reports and selection reasons as artifacts.
-Weight and `ccache` reuse depend on the cluster preserving that directory on the
-allocated machine. A benchmark request also builds the merge base and runs the
-same AR sweep on it first, so the report shows per-depth deltas; one sweep per
-revision is an observation, not a qualified timing regression.
+`--tier pr` plans the per-PR set: one or two suites per behavior (`discovery`,
+`state-edges`, `messages-count-tokens`, `responses`, `stops`, `conversation`,
+`image-inputs`, `structured`, `tools`, `tool-streaming`, `sampling-defaults`,
+`batch` and `cache`). Every other suite is marked `"tier": "release"` and moves
+to `release_only`; the deep cache histories, `cache-stalls`, `long-context` and
+`reasoning-budget` still run on a PR when a changed path matches their
+`escalate` patterns: cache code, the suite's own module, or Flash-Next model
+code for depth checks. `run.py
+--tier pr` also trims transport matrices that a case does not depend on:
+`tool-reasoning` keeps the streamed mode, whose partial parses end in the same
+final parse a buffered reply uses, and `tool-native-schemas` rotates endpoint,
+stream and tool choice across cases. `--tier full` (the default for manual runs)
+keeps every suite and combination.
 
-The cluster installs the client from `requirements.txt`, pinned to the flake's
-versions, because newer unpinned SDKs break every suite inside the client. Keep it
-covering every third-party import here; the install step imports the harness
-to catch gaps.
+The literal-closer cases from #786 (a lone `</invoke>` and a closer before or
+between calls) use the deterministic HTTP fixtures in
+`tests/cli/openai_chat_test.cpp`, with buffered/streamed and whole/bytewise output.
+Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
+checks must not depend on a model following a request to copy tool markup.
 
-A hosted `report` job then updates a single PR comment with results, failure
-log tails and benchmark deltas, sets the `devlab/functional` commit status and
-removes `ci:functional`. The status is advisory: it is not a required check, so
-a broken cluster never blocks merging. Suite failures report `failure`; cluster
-or harness problems (authorization, build, download, cancellation) report
-`error`. The PR write token stays on the hosted runner.
+`Linux validation` runs on every push to a non-draft PR, like `Repository checks`
+(`pull_request`), with the repository's fork approval policy. A newer push cancels
+the PR's earlier run. PRs use the `pr` tier; release-please PRs and dispatches
+(unless they choose `tier: pr`) use `full`. Maintain/Admin users can dispatch a
+PR number. Authorization pins its head and GitHub's merge of it into main. Like
+`CI`, the GPU job builds and tests that merge commit with the suites it contains,
+so tests added on main never run against a PR binary that predates them. The
+merge's main parent is the diff base and the timing baseline. The GPU controller
+recreates the hosted plan from the merge commit.
 
-`cluster.py` executes each configuration group with a fresh server/cache history
-and continues to other groups after a failure, removing each group's disk cache
-once it finishes. Candidate correctness uses
-`--record-baseline` to capture observations; this does **not** qualify timing
-regressions. Failures fail the cluster job. Deferred cache rollout suites,
-other-model coverage, numerical checks and agent-client replays remain named
-qualification obligations rather than being counted as passes. This workflow
-currently covers only Flash-Next, including for shared changes.
+`devlab_plan.py` selects owners per path using reviewed priority rules in
+`devlab.json`, then uses `impact.py` for each selected LLM's affected suites.
+Selections from separate paths are combined:
 
-Planner and executor checks are CPU-only:
+| Changes | Automatic model coverage |
+| --- | --- |
+| Shared LLM behavior, cache, sampling or Qwen framing/vision | Flash-Next Q4/MTP |
+| Private Qwen27 implementation | Qwen27 Q4/DFlash2 |
+| Private DeepSeek implementation | DeepSeek V4/DSpark (disabled, see below) |
+| Shared LLM and private DeepSeek code | Flash-Next and DeepSeek (disabled, see below) |
+| Embedding, ASR or TTS code | That category's representative |
+| Shared infrastructure or unmapped paths | One representative per supported category |
+| Documentation, image generation or H3-only paths | No GPU job in this workflow |
+
+Models listed under `disabled` in `devlab.json`, with a reason, are left out of
+the plan and named in the report. DeepSeek V4 is disabled for now: its 81 GiB
+of weights and its suite set make the run too long to finish within a PR.
+Remove its entry to restore it.
+
+The embedding and ASR representatives are EmbeddingGemma 2 and Qwen3-ASR. TTS
+uses Base cloning in the PR tier; the full tier exercises Base, CustomVoice and
+VoiceDesign. Manual `ar` adds the selected LLMs' AR profiles. The existing manual
+`benchmark` option adds Flash-Next and its main/candidate AR depth sweep.
+Qwen27 Q8 remains an explicit manual functional qualification outside this bounded
+CI selection. Numerical and agent-replay obligations outside the selected suites
+remain separate; representative coverage is not all-model qualification.
+
+GitHub-hosted Linux runners build the candidate and main production packages
+with Nix, signed public binary caches, Cachix and a shared C/C++/HIP compiler cache.
+Both timing arms use the candidate's lock file. The binary artifact records the
+authorized revisions and executable checksums. A compressed portable bundle
+contains both executables, their pinned ELF loader, shared libraries and gfx1151
+BLAS kernel data. The GPU runner downloads directly from Actions artifacts.
+A bounded range probe
+measures the direct route; when slow, the downloader tests a rootless Cloudflare
+WARP MASQUE proxy (`usque` v4.2.1, checksum pinned) and uses it when faster.
+Only the binary transfer uses the proxy; runner control and model mirror traffic
+keep their existing routes. Temporary credentials and the loopback proxy are
+removed after transfer. The original Actions artifact SHA-256 is mandatory.
+No release relay or privileged publishing workflow is needed.
+The large Linux runtime is archived separately and cached under
+`$HF_HOME/gufo/runtimes` by SHA-256. Cache hits are hash-checked and unpacked
+locally; changed toolchains get a new content hash. Ordinary builds transfer
+only the two small executable packages. Windows PRs and manual dispatches use
+the same adaptive downloader and run device and per-family model smoke checks.
+The GPU runner unpacks and executes the verified bundle directly;
+it needs neither Nix nor administrator access and never compiles. Both binaries
+share one bundled runtime. Hosted jobs restore dependencies from signed binary
+caches; fork PRs need no cache write credentials.
+
+An ephemeral GPU runner needs GPU access and enough disk space for its selected
+checkpoints. It does not need mounted models or audio. `devlab_models.py`
+downloads only selected assets and necessary drafts/projectors/evaluator weights
+from fixed Hugging Face revisions while the hosted bundle builds and downloads.
+Linux and Windows inherit the runner's Hugging Face mirror and transfer settings.
+Model files and download metadata live under `$HF_HOME/gufo/models`, keyed by
+asset and revision, outside the disposable runner workspace. Without `HF_HOME`,
+the workflows use the user's standard `.cache/huggingface` directory. Cleanup
+preserves the models; logs report existing required files and download duration.
+The authorized controller checkout contains the English voice fixture. TTS uses
+the main Gufo binary and a pinned ASR checkpoint as its intelligibility
+evaluator. Missing downloads or fixtures fail visibly.
+
+`devlab_run.py` executes models sequentially on the same GPU. LLM configuration
+groups use fresh server/cache histories; service suites use `model_services.py`.
+Correctness runs on the candidate only. A model failure does not hide other
+models or their speed observations. Each LLM's `phases.py` arms exercise startup,
+short, long and follow-up requests; `service_phases.py` measures bounded service
+histories. Both alternate main/candidate servers for two paired repeats,
+with GPU cool-down. Every request and phase retains all measurements; a slowdown
+requires both >5% and >10 ms in every repeat. A phase that is slower in only
+some repeats is inconclusive; one that is faster in some repeats and never
+slower counts as unchanged. Different output/work counters mark
+relevant comparisons incomparable and keep the status incomplete. The plan selects timing gates from production
+changes; harness-only changes retain timing observations without gating unrelated
+noise. Startup phases gate only loader/configuration/build changes. Missing timing
+evidence is always incomplete. Display medians do not determine verdicts.
+
+The hosted report job updates one PR comment with the same correctness and phase
+layout for every selected model, selection reasons, known limitations and links
+to the run/artifacts. Missing selected groups, missing timing arms or mismatched
+revisions cannot pass. Correctness failures and consistently slower server phases
+set the advisory status to `failure`; incomplete, incomparable or unavailable evidence
+sets `error`. On ordinary and release PRs, complete but noisy timing comparisons keep a
+successful status with an explicit warning and retain every observation. HTTP-ready timing uses server
+monotonic timestamps at load completion and listener readiness. Comparisons with
+older binaries that lack these timestamps retain poll-derived timings as advisory
+observations, excluded from the gate. The ordinary PR check remains advisory;
+automatic release merging requires it. The optional AR depth benchmark remains observational.
+
+The PR write token stays on hosted runners. Fork runs upload their text report;
+`devlab-comment.yml` publishes it from `workflow_run` without executing PR code.
+It also maintains the running placeholder. Artifacts retain the plan, asset map,
+partial summaries, request bodies, generated audio, server logs and all timing
+arms. The client dependencies are pinned in `requirements.txt`; harness imports
+are checked before execution. Model correctness stays outside hosted CPU CI.
+
+Planner, report and timing-contract checks run without weights or a GPU:
 
 ```sh
 python3 -m unittest discover -s tests/functional -p test_impact.py
 python3 -m unittest discover -s tests/functional -p test_report.py
+python3 -m unittest discover -s tests/functional -p test_devlab.py
 ```
-
 
 The startup-loading runner polls health, readiness and generation from process
 start. Every answer during the load must be 503 `Loading model`, `/health`
@@ -190,6 +445,12 @@ Each invocation tests **one model and one mode**. Model-specific changes need
 only the affected target/modes. For shared text changes, run the affected suites
 once per row/mode below; no full benchmark sweep is needed.
 
+For correctness capture of slow cold prompts, `--request-timeout SECONDS` sets
+the SDK deadline (default 120); `--suite-timeout SECONDS` separately bounds the
+whole suite (default 900). The request deadline is retained in both reports and
+must match for baseline comparison. Longer deadlines do not change assertions
+or timing margins; retain the original timeout failure when investigating it.
+
 | Target | `--speculative` modes | Sidecar option |
 | --- | --- | --- |
 | Qwen27B Q4_K_XL | `off`, `dflash2` | `--dflash-model` |
@@ -218,33 +479,39 @@ RAM, disk and restart settings once their contracts pass.
 | --- | --- |
 | `discovery` | Health, readiness, model ID/context and advertised text/image inputs; no generation |
 | `responses` | SDK buffered, streaming and async Responses |
+| `logprobs` | Generated-token probabilities on Chat and raw Completions, buffered/streamed, greedy/sampled; verifies unchanged output, usage, candidate limits, finite values and UTF-8 bytes |
+| `responses-logprobs` | Responses token probabilities with counts 0/3/20, greedy/sampled, buffered and streamed; unchanged output/usage, SDK accumulation, per-item deltas/done events, finite scores and UTF-8 bytes |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
 | `tool-images` | Chat/Responses function and custom-call image outputs; text/image order, image-only output, actual colors, streamed retries, changed pixels, continuation reuse, role/URL errors and unchanged text-only controls |
 | `image-count` | 17+ images in one message and across turns; Chat/Responses, sampled thinking/JSON, concurrent colors, limits, cancellation and RAM/disk replay |
+| `image-detail` | `detail` `auto` and `low` on a 1536 × 1024 image, where `low` resizes it to 512 × 320, uses fewer prompt tokens, and reuses no image tokens from `auto` |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
 | `tool-reasoning` | Quoted tags, exact literal arguments, early stops, disabled tools, envelope framing, completed tool-result continuations and warm replay of contaminated history; Chat/Responses |
 | `tool-streaming` | Incremental argument arrival and exact assembly in Chat/Responses/Messages; stable IDs, literal framing, thinking, stopped/limited calls and successful retries |
 | `reasoning-separator` | No leading separator newlines after reasoning in Chat/Responses, plain/tools/JSON; exact streamed/buffered text, warm retry, continuation and thinking-off paragraph breaks |
+| `reasoning-budget` | llama.cpp-compatible budgets: Responses/Chat `reasoning_budget_tokens` (buffered and streamed), the older `thinking_budget_tokens` spelling, and Messages `budget_tokens` cap the ASCII fixture at N tokens while preserving its greedy reasoning prefix; adaptive and `-1` retain the server default, invalid/oversized values fail, sampled requests obey the cap, and replayed capped thinking preserves cache reuse |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
 | `messages-tools` | Messages `tool_use` call, `tool_result` replay with cache reuse, buffered and streamed events, and an uncached Chat control of the same prompt |
+| `openai-count-tokens` | Chat/Responses counts match complete generation prompt usage with system/history, Unicode, tools, reasoning, structured output and images; streaming request bodies, cold/warm caches, no inference side effects, over-context sizing and errors. Requires `--expected-input-modalities text,image` with a projector, or `text` for image rejection checks |
 | `messages-count-tokens` | Counts match complete Messages prompt usage with system/history, Unicode, all tool choices and thinking; cold/warm cache counts, no inference side effects, over-context sizing and request errors |
 | `messages-image-counts` | Image counts match buffered/streamed Messages usage, including tool results, warm caches, PNG/JPEG/WebP, multiple images, Unicode and over-context sizing; no inference side effects; text-only models reject image counts and generation. Requires `--expected-input-modalities text,image` with a projector, or `text` for capability rejection checks |
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
 | `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-native-schemas` | opencode's tool set beside each schema family that used to force a JSON envelope (pattern, oneOf, allOf, not, open objects), auto and required, strict: native calls, no prompt instruction, typed arguments and full reuse of the generated call; Chat/Responses |
 | `tool-choice-cache` | Required/auto/omitted transitions preserve the complete generated call, unchanged-choice controls, prompt-token equality and zero-prefill retries |
+| `tool-parameter-order` | Wide native schemas retain intended arguments across declaration orders, all three APIs, streaming, sampling and thinking; includes the 10/11/12-field controls from #641 |
 | `tool-native-types` | Focused subset: enum/const/inferred string types, literal delimiters and exact continuation reuse after new literal tool markers; Chat/Responses, text/images |
 | `tool-schema-edges` | Wildcard JSON types, conditional fields, impossible schemas, nested metadata and required-call timing; both APIs, cache, stops and sampled peers |
 | `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops (including inside quoted calls), image retry and failed-request recovery |
 | `structured`, `structured-limits` | Request JSON schemas, SDK parsing, limits and stops |
 | `sampling-defaults`, `sampling-ranges` | CLI/request overrides, partial/null settings and range validation |
-| `batch` | Independent requests across Chat, Responses and Completions; sessions 1–8 |
+| `batch` | Independent requests across Chat, Responses and Completions; batched short greedy replies match serial ones; sessions 1–8 |
 | `progress` | Opt-in progress on all text endpoints; output/sampling equality, limits, stops, images, batching and cancel/resume |
 | `stream-start` | Plain streams on all text endpoints send headers before a cold prefill completes; a stream queued behind every session sends them after the five-second bound |
 | `prefill-scheduling` | Short arrival during a cold prefill: work-aligned arrival, independent per-request timings, unchanged output and no repeated prefill. Requires sessions ≥2 and context ≥16384; not in `all` |
@@ -254,7 +521,7 @@ RAM, disk and restart settings once their contracts pass.
 | `cache-edits` | Reuse earlier work after editing the latest message, shortening an older tool result, or editing an earlier user message and dropping later turns; compare with uncached responses |
 | `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, including Messages thinking blocks, and compare with uncached responses |
 | `cache-depth` | Histories beyond 16K, concurrent branches from rewritten replies, a side conversation, resume, unchanged retries and exact uncached controls; use context 32768 and also check sessions 1 |
-| `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Use sessions 2/context 262144 to match its capacity; minimum context 65536. Explicit selection only, outside `all` |
+| `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Devlab runs sessions 2/context 131072: two 262144-token sessions exceed its 100 GiB device at load. Pass context 262144 locally to match #632's capacity; minimum context 65536. Explicit selection only, outside `all` |
 | `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
 | `cache-shared-prefix` | New conversations under one system prompt, one after another, with long and short tasks: from the third on they restore the whole shared prefix; compare answers with uncached controls |
 | `cache-bridge` | A chat bridge sends each user message with metadata its history copy drops, under a full RAM budget with small unrelated requests between turns: from the third turn on, reuse reaches the user turn two back; compare answers with uncached controls. Not in `all` |
@@ -279,6 +546,13 @@ controls on main, stop at
 `--through-case tool-images:tool_images_control_complete`; full candidate runs
 continue into the newly supported image-bearing tool outputs. A text-only
 model must not qualify the image suite by skipping its assertions.
+
+`image-detail` also requires `--mmproj`. Each of its two requests leaves a new
+stable boundary in the RAM cache. Retry copies cannot displace stable
+boundaries, as [KV-CACHE.md](../../docs/KV-CACHE.md) describes, so in a full
+cache these two boundaries can make a later unchanged retry prefill its
+assistant opening again. Select `image-detail` after `image-count`, whose
+unchanged retries expect full reuse.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
@@ -322,11 +596,38 @@ replay different assistant text from main. Compare those timings using matched
 interrupted histories, not a direct baseline for the divergent session; this
 also applies to later disk-spacing and cancellation requests in that history.
 
+For repeated screenshot preprocessing (#627), `image_history.py` measures full
+RAM-cache retries with 1, 2 and 4 synthetic 1080p screenshots, similar-token text
+controls and 128px image controls. It uses only the Python standard library:
+
+```sh
+python3 tests/functional/image_history.py --output /tmp/image-history-main -- \
+  /path/to/production/gufo serve llm --model /path/to/model.gguf \
+  --mmproj /path/to/mmproj.gguf --sessions 1 --context 32768 \
+  --cache-ram-bytes 8589934592 --think off
+```
+
+Repeat with the candidate, identical model/mode/options and a fresh output path.
+The harness owns host, port and debug logging. It retains every request,
+response, per-request queue time, process RSS and preprocessing-cache byte count;
+retries require identical output, full prompt reuse and zero prefill. Add
+`--turns 1 --kind 1080p --repeats 7` for a focused control. Also add
+`--fresh-encoding` to change PNG metadata on each retry while preserving pixels,
+tokens and continuation identity: this measures preprocessing misses without
+GPU prefill. Add `--image /path/to/1920x1080.png` to check a supplied PNG,
+including the digest cost of a larger encoded payload. The native
+`qwen_vision_cache_test --capacity-probe` separately
+checks the default byte ceiling with 22 resized 1080p images.
+
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh
 `--output` directory. Repeat `--case` to select affected tasks;
 `--case literal-protocol --passes 1` exercises a real write/read/verify loop
 containing literal ChatML vocabulary spellings.
+`--case wide-tool --passes 1` loads a fixture extension with a 12-field `todo`
+schema and verifies two actual updates and their tool results, covering #641.
+Both Chat and Responses require exactly the requested fields, including when
+Pi omits `strict`; unrequested default values also fail the test.
 It replays #368's five tasks, verifies the generated code independently, and
 retains Pi sessions, HTTP/SSE and per-request timings. It executes generated
 commands in disposable fixtures using isolated Pi configuration. Use `--passes 1`
@@ -410,6 +711,9 @@ logged a capacity refusal during the continued request.
 Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
+`cache` also checks `cache_persist: false` across the same restart: a flagged
+prompt still reuses RAM within the first server and finds nothing on disk after
+the restart, while an unflagged control prompt restores from disk.
 `cache-rotation` visits four conversations and eight small side requests; use
 `--sessions 1` to verify retention is independent of execution slots. It also
 checks the startup RAM cap; byte/record pressure is covered by CPU tests.
@@ -522,10 +826,30 @@ HTTP requests/responses and timings. It removes its own cache after each case.
 Use `--case bound --expect cap` only for a matched pre-fix main timing control;
 candidate correctness uses the default `bounded` expectation. The bound case
 schedules release after 130 seconds and releases earlier if the waiter finishes;
-the child-only helper has a longer safety timeout. The publication case waits
-for the scheduler's actual park before starting its 250 ms release timer, then
-checks the matching request/checkpoint release before its deadline and a disk
-restore. These checks stay outside hosted CI and the routine API suites.
+the child-only helper has a longer safety timeout. The bound waiter re-prefills
+from the deepest checkpoint it can restore. When RAM is tight, that can be a
+shallow seed on disk, so the waiter must match the cold answer and reasoning
+mode, not the full reasoning text. The retry must still match cold exactly. The
+publication case waits for the scheduler's actual park before starting its
+250 ms release timer, then checks the matching request/checkpoint release before
+its deadline and a disk restore. These checks stay outside hosted CI and the
+routine API suites.
+
+PR #677's staging-reclamation regression reuses this runner with `--case reclaim`
+before `--`. It defaults to a 256 MiB RAM cache, requires a retained checkpoint
+to release RAM during the deep request, then verifies publication and restoration
+of the exact held 50K+ token checkpoint. It also checks the loaded speculative
+mode, actual draft work, fewer than 64 prefill tokens and output against a cold
+control. A run that never reclaims RAM fails rather than passing on disk use
+alone. For example:
+
+```sh
+nix develop -c python3 tests/functional/publication_wait.py \
+  --case reclaim --output /tmp/publication-reclaim \
+  --fault-library build/cpu-test/libcache_disk_faults.so -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
+  --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
+```
 
 Unchanged retries must reproduce the complete output with zero prefill. After a
 restart, disk restores may re-prefill less than one 2048-token disk step;
@@ -544,7 +868,7 @@ Every request checks its applicable response format, expected output and timings
 Missing measurements fail. `comparison.json` reports per-request prefill, decode,
 queue, restore and wall times, plus server startup/restart. Missing cases,
 changed output/token counts or unexpected prefill/cache work fail immediately.
-Timing margins remain **both 5% and 3 ms**. One overrun is **inconclusive**, not
+Timing margins remain **both 5% and 10 ms**. One overrun is **inconclusive**, not
 proof of regression. Exit codes: **0 pass, 1 fail, 2 inconclusive/unqualified**.
 
 Use the code diff to identify affected paths. Investigate their timing flags;
@@ -574,3 +898,26 @@ benchmark and numerical quality tests; they do not establish upstream model
 parity. Sampled DSpark may differ across concurrency levels; fixed-path replay
 and greedy equality remain checked. API behavior and references are in
 [SERVER.md](../../docs/SERVER.md).
+
+`embedding_images.py` checks typed text/image `/v1/embeddings` requests against
+the official float32 image fixtures, including mixed batches, multiple images,
+the Frigate trailing newline, base64 dimensions, concurrency, PNG/WebP decoding,
+invalid image destinations and recovery. It requires Pillow and numpy and stays
+outside `--suite all`:
+
+```sh
+nix develop -c python3 tests/functional/embedding_images.py \
+  --base-url http://127.0.0.1:8080/v1 --output /tmp/image-embeddings.json
+```
+
+`embedding_audio.py` adds pinned official audio vectors, decoder/front-end
+fixtures, multiple clips, interleaved text/images, ordering, concurrency,
+Matryoshka/base64, expanded context bounds and server-observed cancellation.
+`family_smoke.py embedding` includes a generated one-second WAV against its
+independent official vector. Neither runner downloads recordings.
+
+```sh
+nix develop -c python3 tests/functional/embedding_audio.py \
+  --base-url http://127.0.0.1:8080/v1 --server-log /path/to/server.log \
+  --output /tmp/audio-embeddings.json
+```

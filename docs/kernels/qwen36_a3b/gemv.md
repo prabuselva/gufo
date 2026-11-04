@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — Decode GEMV Tier (`gemv.hip.cpp`)
 
-Source: `src/models/qwen36_a3b/kernels/rocm/gemv.hip.cpp` (397 lines).
+Source: `staging/models/qwen36_a3b/kernels/rocm/gemv.hip.cpp` (397 lines).
 Public API: `gemv.hpp` (`GemvType` = `kQ8_0 | kF32 | kBF16`). This tier
 runs every linear projection at decode (batch 1) and the shared-expert /
 router projections; it is the model's dominant memory consumer. Weights

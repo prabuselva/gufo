@@ -132,9 +132,9 @@ oracle-KL harness (§9) would quantify; no claim is made about its size here.
 Three arbiters were used, because an implementation can agree with its own
 oracle while both share a modelling error:
 
-* **A** — our oracle: `src/models/gemma4/reference.cpp` + `cpu_ops.cpp`.
-* **B** — the fork's oracle: `gufo_franzmoca/src/models/gemma4/reference.cpp`.
-* **C** — an independent source of truth: `llama.cpp/src/models/gemma4.cpp`
+* **A** — our oracle: `staging/models/gemma4/reference.cpp` + `cpu_ops.cpp`.
+* **B** — the fork's oracle: `gufo_franzmoca/staging/models/gemma4/reference.cpp`.
+* **C** — an independent source of truth: `llama.cpp/staging/models/gemma4.cpp`
   plus `src/llama-graph.cpp` (`build_ffn:1693`, `build_moe_ffn:1941`,
   `build_lora_mm_id:1542`).
 
@@ -164,7 +164,7 @@ scale — is settled by `build_lora_mm_id` itself.
 | Property | gufo (A) | franzmoca (B) |
 |---|---|---|
 | Driving mode | single-token `Step` + `DraftStep` | multi-row `Forward` (real chunked prefill), image-row window `ends` |
-| KV precision | binary16 rounding **unconditional** (`reference.cpp:24` `RoundF16`, applied at `:170-171`) | a mode: `Storage::kFloat32 / kHalfKv / kQ8Activations` (`reference.hpp:23-28`, applied at `reference.cpp:98,330`, exposed as `--half-kv` in `tests/models/gemma4/reference_probe.cpp:51-52`) |
+| KV precision | binary16 rounding **unconditional** (`reference.cpp:24` `RoundF16`, applied at `:170-171`) | a mode: `Storage::kFloat32 / kHalfKv / kQ8Activations` (`reference.hpp:23-28`, applied at `reference.cpp:98,330`, exposed as `--half-kv` in `staging/tests/models/gemma4/reference_probe.cpp:51-52`) |
 | Activation ablation | none | rounds *any* projection input to Q8_1 inside the oracle → predicts a GPU path's KL before writing a kernel |
 | Inner precision | float accum, `powf` rope | double rope + double attention accumulation (a stricter truth than llama.cpp's own float) |
 
@@ -298,7 +298,7 @@ worst-abs alone does not qualify a change.
 
 1. **Shape-tuned dense GEMM plans.** Add a plan parameter to
    `kernels/rocm/dense_f16_gemm.hpp:26` mirroring
-   `gufo_franzmoca/src/models/gemma4/kernels/rocm/executor.cpp:427-437`
+   `gufo_franzmoca/staging/models/gemma4/kernels/rocm/executor.cpp:427-437`
    (staged row-groups-8 for K ≥ 4096, row-groups-8 for K = 2112).
    *Gain:* ~12 % of the 18.8 % dense group. *Accuracy:* none expected (tiling
    only). *Gate:* dense-GEMM operator test + matched pp2048.

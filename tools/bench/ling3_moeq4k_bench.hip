@@ -13,7 +13,7 @@
 //       LDS reads of block b (single buffer, never reordered)
 // Every variant must stay bit-exact against V0: each row keeps the exact
 // super-block/j accumulation chain.
-#include "src/models/ling3_0/kernels/rocm/gemv.hip.cpp"
+#include "staging/models/ling3_0/kernels/rocm/gemv.hip.cpp"
 
 #include <algorithm>
 #include <cstdint>

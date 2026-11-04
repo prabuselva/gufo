@@ -1,6 +1,6 @@
 // A/B for a token-tiled GemvBatchBf16Kernel (flint router shape): the tiled
 // kernel must be BITWISE identical to the warp-per-token kernel and faster.
-// Pipe mirrors GemvBatchBf16TileKernel in src/models/flint/kernels/rocm/
+// Pipe mirrors GemvBatchBf16TileKernel in staging/models/flint/kernels/rocm/
 // linear.hip.cpp (pair-pipelined k steps). Variants tried and rejected on
 // this shape: LDS-staged x tiles with per-chunk barriers (-18..-25%),
 // 64-token tiles (register spill, -300%), plain __ldg on the strided

@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B — Routed F16 WMMA MoE (`routed_f16.hip.cpp`)
 
-Source: `src/models/qwen36_a3b/kernels/rocm/routed_f16.hip.cpp` (903
+Source: `staging/models/qwen36_a3b/kernels/rocm/routed_f16.hip.cpp` (903
 lines). Public API: `routed_f16.hpp` (`WeightType` = GGUF ids: kF32 0,
 kF16 1, kQ5_1 7, kQ8_0 8, kQ4_K 12, kQ5_K 13, kBF16 30). Ported verbatim
 from the Qwen3.8-Flash-Next route

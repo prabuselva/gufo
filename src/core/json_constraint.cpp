@@ -18,6 +18,7 @@ namespace gufo::sampling {
 namespace {
 constexpr std::uint32_t kTerminal = 1U << 31;
 constexpr std::uint32_t kLexeme = 1U << 30;
+constexpr std::uint32_t kArguments = 1U << 29;
 constexpr std::uint32_t kLeaf = kTerminal | kLexeme;
 constexpr std::size_t kMaxSchemaBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxRules = 262144;
@@ -60,19 +61,7 @@ bool ClosedProperties(const json::Value& schema, bool best_effort) {
          !unevaluated->as_bool();
 }
 
-// Gemma 4 call arguments: `<|"|>`-delimited raw strings, bare keys.
-constexpr std::string_view kGemmaQuote = "<|\"|>";
-
-// A bare Gemma 4 key ends at its first ':' and may not hold structure bytes;
-// its parser trims surrounding whitespace and reads `<|"|>` as a quoted key.
-// Other names use the quoted form.
-bool BareGemmaKey(std::string_view name) {
-  constexpr std::string_view kSpace = " \t\r\n\f\v";
-  return !name.empty() && name.find_first_of(":{}[],") == std::string::npos &&
-         kSpace.find(name.front()) == std::string_view::npos &&
-         kSpace.find(name.back()) == std::string_view::npos &&
-         !name.starts_with(kGemmaQuote.substr(0, 1));
-}
+#include "staging/core/json/json_constraint_gemma_names_staging.inl"
 
 std::string RegexLiteral(std::string_view text) {
   std::string result;
@@ -232,17 +221,39 @@ private:
     // A recursive schema must have a finite witness. References that recurse
     // without first consuming input are invalid for a predictive grammar.
     std::vector<bool> productive(grammar_->rules_.size()), nullable(productive);
+    const auto is_productive = [&](std::uint32_t symbol) {
+      if (symbol & kLeaf)
+        return true;
+      if (symbol & kArguments) {
+        const auto& arguments =
+            grammar_->argument_sets_.at(symbol & ~kArguments);
+        for (std::size_t i = 0; i < arguments.members.size(); ++i)
+          if ((arguments.required[i / 64] & (1ULL << (i % 64))) &&
+              !productive[arguments.members[i]])
+            return false;
+        return true;
+      }
+      return static_cast<bool>(productive[symbol]);
+    };
+    const auto is_nullable = [&](std::uint32_t symbol) {
+      if (symbol & kLeaf)
+        return false;
+      if (symbol & kArguments) {
+        const auto& arguments =
+            grammar_->argument_sets_.at(symbol & ~kArguments);
+        // Every member starts with a nonempty native parameter tag.
+        return std::ranges::all_of(arguments.required,
+                                   [](auto word) { return word == 0; });
+      }
+      return static_cast<bool>(nullable[symbol]);
+    };
     bool changed = true;
     while (changed) {
       changed = false;
       for (std::size_t id = 0; id < grammar_->rules_.size(); ++id) {
         for (const auto& sequence : grammar_->rules_[id]) {
-          const bool p = std::ranges::all_of(sequence, [&](auto symbol) {
-            return (symbol & kLeaf) || productive[symbol];
-          });
-          const bool n = std::ranges::all_of(sequence, [&](auto symbol) {
-            return !(symbol & kLeaf) && nullable[symbol];
-          });
+          const bool p = std::ranges::all_of(sequence, is_productive);
+          const bool n = std::ranges::all_of(sequence, is_nullable);
           changed |= (p && !productive[id]) || (n && !nullable[id]);
           productive[id] = productive[id] || p;
           nullable[id] = nullable[id] || n;
@@ -260,8 +271,14 @@ private:
         for (const auto symbol : sequence) {
           if (symbol & kLeaf)
             break;
-          self(self, symbol);
-          if (!nullable[symbol])
+          if (symbol & kArguments) {
+            for (const auto member :
+                 grammar_->argument_sets_.at(symbol & ~kArguments).members)
+              self(self, member);
+          } else {
+            self(self, symbol);
+          }
+          if (!is_nullable(symbol))
             break;
         }
       }
@@ -274,9 +291,8 @@ private:
     // Discard impossible alternatives before they can admit dead prefixes.
     for (auto& rule : grammar_->rules_)
       std::erase_if(rule, [&](const auto& sequence) {
-        return std::ranges::any_of(sequence, [&](auto symbol) {
-          return !(symbol & kLeaf) && !productive[symbol];
-        });
+        return std::ranges::any_of(
+            sequence, [&](auto symbol) { return !is_productive(symbol); });
       });
     (void)grammar_->Start();
     return std::move(grammar_);
@@ -580,16 +596,24 @@ public:
   }
 
 private:
-  // Native Qwen may choose argument order. Share subset suffixes for small
-  // objects; bound compilation for large schemas by retaining schema order.
+  // Native models choose argument order. Keep the small-object grammar, but
+  // represent wide objects with a request-local subset instead of compiling
+  // all 2^N subsets or forcing declaration order. Required fields and one-use
+  // parameter names keep the same contract in both representations.
   std::uint32_t Arguments(
       const std::vector<std::pair<std::string, std::uint32_t>>& members,
       const std::set<std::string>& required) {
     if (members.size() > 10) {
-      Sequence ordered;
-      for (const auto& [name, rule] : members)
-        ordered.push_back(required.contains(name) ? rule : Optional(rule));
-      return Seq(std::move(ordered));
+      JsonConstraint::ArgumentSet arguments;
+      arguments.required.resize((members.size() + 63) / 64);
+      for (std::size_t i = 0; i < members.size(); ++i) {
+        arguments.members.push_back(members[i].second);
+        if (required.contains(members[i].first))
+          arguments.required[i / 64] |= 1ULL << (i % 64);
+      }
+      const auto id = grammar_->argument_sets_.size();
+      grammar_->argument_sets_.push_back(std::move(arguments));
+      return Seq({static_cast<std::uint32_t>(kArguments | id)});
     }
     std::map<unsigned, std::uint32_t> suffixes;
     auto suffix = [&](auto&& self, unsigned used) -> std::uint32_t {
@@ -1215,53 +1239,13 @@ private:
   }
   // A Gemma 4 string satisfying the JSON string predicate. Its raw text cannot
   // contain the closing quote, which the parser takes at its first occurrence.
-  std::uint32_t GemmaString(const json::Value& predicate) {
-    const auto raw =
-        JsonSchemaLexeme::RawString(predicate, std::string(kGemmaQuote));
-    auto text = Lexeme(raw);
-    if (raw->Check("").complete)
-      text = Optional(text);
-    return Seq({Literal(kGemmaQuote), text, Literal(kGemmaQuote)});
-  }
+  std::uint32_t GemmaString(const json::Value& predicate);
   // A dynamic bare key other than the declared names.
-  std::uint32_t GemmaKey(const std::set<std::string>& excluded) {
-    std::string pattern = "^";
-    if (!excluded.empty()) {
-      pattern += "(?!(?:";
-      bool separator = false;
-      for (const auto& name : excluded) {
-        if (separator)
-          pattern += '|';
-        separator = true;
-        pattern += RegexLiteral(name);
-      }
-      pattern += ")$)";
-    }
-    pattern += "[^:{}\\[\\],<\\s](?:[^:{}\\[\\],]*[^:{}\\[\\],\\s])?$";
-    auto predicate = json::Value::object();
-    predicate["pattern"] = std::move(pattern);
-    return Lexeme(JsonSchemaLexeme::RawString(predicate, ":"));
-  }
-  std::uint32_t KeyLiteral(const std::string& name) {
-    if (!gemma_)
-      return Literal(json::Value(name).dump());
-    if (BareGemmaKey(name))
-      return Literal(name);
-    // The parser also reads `<|"|>`-quoted keys, as declarations render them.
-    if (name.find(kGemmaQuote) != std::string::npos)
-      Invalid("property name cannot be a Gemma 4 key");
-    return Literal(std::string(kGemmaQuote) + name + std::string(kGemmaQuote));
-  }
+  std::uint32_t GemmaKey(const std::set<std::string>& excluded);
+  std::uint32_t KeyLiteral(const std::string& name);
   // Gemma 4 renders object keys in sorted order at every depth.
   std::vector<std::pair<std::string, const json::Value*>> Members(
-      const json::Value& object) const {
-    std::vector<std::pair<std::string, const json::Value*>> members;
-    for (const auto& [name, value] : object.members())
-      members.emplace_back(name, &value);
-    if (gemma_)
-      std::ranges::sort(members, {}, &decltype(members)::value_type::first);
-    return members;
-  }
+      const json::Value& object) const;
   // Compile an unsigned interval using shared digit prefixes. Work grows with
   // the number of digits, not the number of integers between the bounds.
   std::uint32_t DigitsBetween(std::string_view low, std::string_view high) {
@@ -1785,6 +1769,8 @@ private:
   std::size_t properties_{0}, enum_values_{0}, string_characters_{0};
 };
 
+#include "staging/core/json/json_constraint_gemma_members_staging.inl"
+
 std::shared_ptr<const JsonConstraint> JsonConstraint::Compile(
     const json::Value& schema, bool strict, bool open_objects) {
   const auto key = std::string(strict ? "strict:" : "schema:") +
@@ -2076,13 +2062,15 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   if (!required && answer)
     alternatives.push_back({answer->root_});
   auto check_capacity = [&](std::size_t rules, std::size_t classes,
-                            std::size_t lexemes) {
+                            std::size_t lexemes,
+                            std::size_t argument_sets = 0) {
     auto fits = [](std::size_t current, std::size_t extra) {
       return current <= kMaxRules && extra <= kMaxRules - current;
     };
     if (!fits(grammar->rules_.size(), rules) ||
         !fits(grammar->classes_.size(), classes) ||
-        !fits(grammar->lexemes_.size(), lexemes))
+        !fits(grammar->lexemes_.size(), lexemes) ||
+        !fits(grammar->argument_sets_.size(), argument_sets))
       Invalid("combined tool grammar exceeds its resource budget");
   };
   auto literal = [&](std::string_view text) {
@@ -2223,16 +2211,23 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
       continue;
     }
     check_capacity(arguments->rules_.size(), arguments->classes_.size(),
-                   arguments->lexemes_.size());
+                   arguments->lexemes_.size(),
+                   arguments->argument_sets_.size());
     const auto rules = grammar->rules_.size();
     const auto classes = grammar->classes_.size();
     const auto lexemes = grammar->lexemes_.size();
+    const auto argument_sets = grammar->argument_sets_.size();
     grammar->classes_.insert(grammar->classes_.end(),
                              arguments->classes_.begin(),
                              arguments->classes_.end());
     grammar->lexemes_.insert(grammar->lexemes_.end(),
                              arguments->lexemes_.begin(),
                              arguments->lexemes_.end());
+    for (auto set : arguments->argument_sets_) {
+      for (auto& member : set.members)
+        member += rules;
+      grammar->argument_sets_.push_back(std::move(set));
+    }
     for (auto rule : arguments->rules_) {
       for (auto& sequence : rule)
         for (auto& symbol : sequence)
@@ -2240,6 +2235,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
                        ? kTerminal | ((symbol & ~kTerminal) + classes)
                    : (symbol & kLexeme)
                        ? kLexeme | ((symbol & ~kLexeme) + lexemes)
+                   : (symbol & kArguments)
+                       ? kArguments | ((symbol & ~kArguments) + argument_sets)
                        : symbol + rules;
       grammar->rules_.push_back(std::move(rule));
     }
@@ -2293,6 +2290,34 @@ JsonConstraint::State JsonConstraint::Expand(State pending) const {
     }
     const auto rule = stack.symbols.back();
     stack.symbols.pop_back();
+    if (rule & kArguments) {
+      const auto& arguments = argument_sets_.at(rule & ~kArguments);
+      if (stack.used_parameters.empty())
+        stack.used_parameters.resize(arguments.required.size());
+      if (stack.symbols.size() + 2 > kMaxStack)
+        throw std::runtime_error("JSON grammar stack limit exceeded");
+      bool complete = true;
+      for (std::size_t word = 0; word < arguments.required.size(); ++word)
+        complete &= (stack.used_parameters[word] & arguments.required[word]) ==
+                    arguments.required[word];
+      for (std::size_t i = 0; i < arguments.members.size(); ++i) {
+        const auto bit = 1ULL << (i % 64);
+        if (stack.used_parameters[i / 64] & bit)
+          continue;
+        if (pending.size() + output.size() >= kMaxStates)
+          throw std::runtime_error("JSON grammar state limit exceeded");
+        auto next = stack;
+        next.used_parameters[i / 64] |= bit;
+        next.symbols.push_back(rule);
+        next.symbols.push_back(arguments.members[i]);
+        pending.push_back(std::move(next));
+      }
+      if (complete) {
+        stack.used_parameters.clear();
+        pending.push_back(std::move(stack));
+      }
+      continue;
+    }
     for (const auto& sequence : rules_.at(rule)) {
       if (stack.symbols.size() + sequence.size() > kMaxStack)
         throw std::runtime_error("JSON grammar stack limit exceeded");
@@ -2308,7 +2333,7 @@ JsonConstraint::State JsonConstraint::Expand(State pending) const {
 }
 
 JsonConstraint::State JsonConstraint::Start() const {
-  return Expand({{{root_}, {}}});
+  return Expand({{{root_}, {}, {}}});
 }
 
 JsonConstraint::State JsonConstraint::Advance(const State& state,

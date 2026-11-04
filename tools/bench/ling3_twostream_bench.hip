@@ -15,7 +15,7 @@
 //                 layer where Add consumes it.
 //   C gu+shared : additionally split routed gate || up, main joins per layer
 //                 where down consumes both.
-#include "src/models/ling3_0/kernels/rocm/gemv.hip.cpp"
+#include "staging/models/ling3_0/kernels/rocm/gemv.hip.cpp"
 
 #include <algorithm>
 #include <cstdio>

@@ -54,7 +54,7 @@ for t in "${targets[@]}"; do
   fi
   echo "==> $src -> $out"
   compile=(hipcc -O3 --offload-arch=gfx1151 -std=c++20
-    -I. "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
+    -I. -I./include "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
   if [[ "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
     # The bench includes the production prefill GEMM unit, which gufo_core
     # compiles with SLP disabled (qwen CMakeLists).
@@ -67,11 +67,15 @@ for t in "${targets[@]}"; do
   native_sources=()
   if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ||
         "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
-    native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
-    native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
+    native_sources+=(src/families/qwen/kernels/small_batch_wave64.hip)
+    native_sources+=(src/families/qwen/kernels/small_batch_quant16_wave64.hip)
   fi
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
-    native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
+    native_sources+=(src/families/qwen/kernels/prefill_quant_wave64.hip)
+  fi
+  if [[ "$src" -ef tools/qwen27b/attention_bench.hip ]]; then
+    native_sources+=(
+      src/families/qwen/kernels/attention_decode_verify_wave64.hip)
   fi
   if [[ "$src" -ef tools/bench/flint_w8a8_bench.hip ]]; then
     # Wave64 WKQuantA8 tile configs (this unit also defines the shipped
@@ -81,16 +85,16 @@ for t in "${targets[@]}"; do
     native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
     native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
     # C9: the mmq k/v fallback baseline (flint_mmq_q8_0_dense).
-    extra+=(-Xlinker build/release/src/models/flint/libgufo_flint_mmq.a)
+    extra+=(-Xlinker build/release/staging/models/flint/libgufo_flint_mmq.a)
   fi
   if [[ "$src" -ef tools/bench/flint_moe_down_probe.hip ]]; then
     # The probe includes the production routed GEMM unit directly and links
     # the routing helpers (RoutedCompact, BuildRoutedTiles, NarrowActivations)
     # and the mmq oracle from the release build. The archives go through
     # -Xlinker so the driver does not try to compile them as HIP sources.
-    extra+=(-I src/models/flint/kernels/rocm/mmq
-      -Xlinker build/release/src/models/flint/libgufo_flint_moe.a
-      -Xlinker build/release/src/models/flint/libgufo_flint_mmq.a)
+    extra+=(-I staging/models/flint/kernels/rocm/mmq
+      -Xlinker build/release/staging/models/flint/libgufo_flint_moe.a
+      -Xlinker build/release/staging/models/flint/libgufo_flint_mmq.a)
   fi
   if ((${#native_sources[@]})); then
     # HIP helpers and their callers must share the native wave size.
@@ -102,7 +106,7 @@ for t in "${targets[@]}"; do
       for unit in "${native_sources[@]}"; do
         object="$objects/$(basename "$unit").o"
         native_extra=()
-        if [[ "$unit" == src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip ]]; then
+        if [[ "$unit" == src/families/qwen/kernels/small_batch_quant16_wave64.hip ]]; then
           native_extra+=(-Xarch_device -mllvm=-amdgpu-sched-strategy=iterative-ilp)
         fi
         if [[ "$unit" == tools/bench/flint_w8a8_wave64.hip ]]; then

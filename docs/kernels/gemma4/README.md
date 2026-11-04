@@ -1,6 +1,6 @@
 # Gemma-4-26B-A4B — ROCm Kernel Map
 
-All kernels for `gemma4` live in `src/models/gemma4/kernels/rocm/` and are
+All kernels for `gemma4` live in `staging/models/gemma4/kernels/rocm/` and are
 model-private. Geometry (validated in `config.cpp`, Q8_K_XL artifact):
 hidden 2816, 30 layers, 16 q-heads on both attention classes; sliding-window
 attention on five of six layers (`layer % 6 != 5`, 8 kv-heads, head_dim 256,

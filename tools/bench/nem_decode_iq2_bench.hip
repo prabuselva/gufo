@@ -18,7 +18,7 @@
 #include <cstring>
 #include <vector>
 
-#include "src/models/nemotron_h_moe/cpu_tables.hpp"
+#include "staging/models/nemotron_h_moe/cpu_tables.hpp"
 
 #define CHECK(cmd)                                                    \
   do {                                                                \

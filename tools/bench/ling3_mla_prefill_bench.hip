@@ -11,7 +11,7 @@
 
 #include <hip/hip_fp16.h>
 
-#include "src/models/ling3_0/kernels/rocm/attention.hip.cpp"
+#include "staging/models/ling3_0/kernels/rocm/attention.hip.cpp"
 
 namespace q = gufo::models::ling3_0::rocm;
 

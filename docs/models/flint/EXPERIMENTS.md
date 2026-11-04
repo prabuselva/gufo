@@ -214,7 +214,7 @@ commands and matched numbers live in the numbered entries of
 - C16a mmq Q8_0 route for the decode projections — rejected. Routing
   the batch-1 decode GEMVs through the batched mmq tier (the
   `B >= 8U` predicate lowered toward the decode shapes
-  (`src/models/flint/kernels/rocm/executor.cpp`)) regressed matched
+  (`staging/models/flint/kernels/rocm/executor.cpp`)) regressed matched
   tg128 42.31/42.30 → 42.21/41.00 at pp2048-flat and crashed the MoE
   raw sidecar path (`flint_mmq_q8_0_moe_raw: null pointer`); reverted
   to HEAD before further work. The bitwise SIMT `Gemv` stays the
@@ -248,7 +248,7 @@ commands and matched numbers live in the numbered entries of
   and a few small-col shapes, and there is nothing left to share an
   encoded sidecar between. The shared tiled-Q8_1 reuse the lever
   asked for already exists (`qa8`/`ao8`/`qd8` in
-  `src/models/flint/kernels/rocm/executor.cpp`). The remaining
+  `staging/models/flint/kernels/rocm/executor.cpp`). The remaining
   activation passes (`RmsNormQuantizeQ8_1` fused/unfused pair
   824/454 us, `QuantizeActivation4ToQ8_1` 429 us at B=8192) deconvolve
   through the profiler inflation to 230-235 GB/s — at the DRAM

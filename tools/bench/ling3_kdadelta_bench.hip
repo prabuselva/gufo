@@ -11,7 +11,7 @@
 // accumulator attribution run: NOT bit-safe, reported only to price the
 // double accumulate. Every variant is bitwise-compared against V0's
 // state and out on identical inputs.
-#include "src/models/ling3_0/kernels/rocm/kernels.hip.cpp"
+#include "staging/models/ling3_0/kernels/rocm/kernels.hip.cpp"
 
 #include <algorithm>
 #include <cstdio>

@@ -10,13 +10,13 @@ accepted lever. The backlog below is never trusted from memory.
 
 ## Phase 1 — Quality harness (gates all later phases)
 
-- [x] 1.1 Port oracle KL harness: `tests/models/gemma4/reference_probe.cpp`,
+- [x] 1.1 Port oracle KL harness: `staging/tests/models/gemma4/reference_probe.cpp`,
       `logit_file.hpp`, adapted to our `ReferenceModel` API; CMake target
       `gemma4_reference_probe` (EXCLUDE_FROM_ALL, `-O2`) builds and runs.
 - [x] 1.2 Port `tools/gemma4/compare_logits.py` (as-is, same G4LG v1 format).
       `compare_stages.py` deferred: needs `LayerTrace` export we don't have.
 - [x] 1.3 Oracle `Storage` modes `kFloat32 / kHalfKv / kQ8Activations` in
-      `src/models/gemma4/reference.{hpp,cpp}` (fork `reference.hpp:23-28`);
+      `staging/models/gemma4/reference.{hpp,cpp}` (fork `reference.hpp:23-28`);
       `RoundQ8` formula verified identical to fork `reference.cpp:78-91`.
 - [x] 1.4 `--validate-prefill` real KL bulk-vs-exact check in gemma4
       `cli_runner.cpp` (`KlDivergence` = softmax/log-sum-exp, same family as
@@ -35,7 +35,7 @@ accepted lever. The backlog below is never trusted from memory.
       45/11 — near-zero draft acceptance alongside the hash divergence).
       3.6 must make `--gate` pass.
 - [~] 1.6 Exit gate: runtime-vs-oracle KL harness reproduced on shared
-      artifacts. `tests/models/gemma4/runtime_probe.cpp` (`gemma4_runtime_probe`,
+      artifacts. `staging/tests/models/gemma4/runtime_probe.cpp` (`gemma4_runtime_probe`,
       EXCLUDE_FROM_ALL) mirrors `gemma4_reference_probe` framing (row p =
       logits after feeding token p; `--bulk-final` dumps the bulk-prefill last
       row); compared with `tools/gemma4/compare_logits.py`. Q8_K_XL, 25-token
@@ -52,8 +52,8 @@ accepted lever. The backlog below is never trusted from memory.
 
 - [x] 2.1 `gemm/dense_f16_gemm` + `DenseF16Plan` (staged row-groups-8 for
       K≥4096, row-groups-8 for K=2112; fork `kernels.hip.cpp:6227-6300`).
-      Landed as `src/core/hip/gemm/dense_f16_gemm.{hpp,hip.cpp}` (target
-      `gufo_core_hip_gemm`); planned launches gate on batch≥1024.
+      Landed as `staging/core/gemm/dense_f16_gemm.{hpp,hip.cpp}` (target
+      `gufo_staging_gemm`); planned launches gate on batch≥1024.
       A/B at batch=2048 (`/tmp/opencode/gufo_bench_f16ab.log`, median of 15):
       int8→f16 auto 1.32–1.60×; staged8 attn_out_swa 1.01×, attn_out_full
       1.36× over auto (and 1.41× over int8), rgroups8 ffn_down 1.05×;
@@ -570,7 +570,7 @@ it only pays together with the fork's register-frugal 2.5 template
           doc-only diffs, same clang binary, same RelWithDebInfo; the
           fork compiles `gemma4_kernels` with `-O3 -ffast-math
           -fno-finite-math-only` while gufo omits fast-math by policy
-          (scalar-oracle fidelity, see src/models/gemma4/CMakeLists.txt).
+          (scalar-oracle fidelity, see staging/models/gemma4/CMakeLists.txt).
           Scoped the exception to attention_wmma.hip.cpp only (source
           COMPILE_OPTIONS emit after the target's; flag order verified in
           compile_commands). Gates: `rocm_kernels` and `rocm_forward`
@@ -592,7 +592,7 @@ it only pays together with the fork's register-frugal 2.5 template
           is now fully closed. Lever 10 applied fast-math only to the
           tolerance-gated TUs (`gemm`, `gemv`, `moe_prefill`,
           `routed_f16`, `vision`, plus the shared
-          `gufo_core_hip_gemm`): every quality gate passed -
+          `gufo_staging_gemm`): every quality gate passed -
           `rocm_kernels` bit-exact PASS, `rocm_forward` oracle PASS
           (10.4 s real run), validator **status=PASS**
           (kl=3.0411e-5 - better bulk-vs-exactness than the control's
@@ -838,7 +838,7 @@ it only pays together with the fork's register-frugal 2.5 template
       profiled spec-decode line mix (`prof43_spec`: `GemvRowsQ8_0<5u>`
       606.6 ms/12688 calls alongside the width-1 GEMVs) matches that shape set.
     - Hash gate: `qwen36_a3b.rocm_mtp_spec`
-      (`tests/models/qwen36_a3b/rocm_mtp_spec_test.cpp`) runs greedy AR and
+      (`staging/tests/models/qwen36_a3b/rocm_mtp_spec_test.cpp`) runs greedy AR and
       greedy MTP verify (pinned 4 drafts, `drafted > 0` guards a vacuous pass)
       over the same session and stream-hashes both token streams; passes
       32.5 s on the Q8_K_XL artifact. Every bench sweep point below emitted an
@@ -888,7 +888,7 @@ it only pays together with the fork's register-frugal 2.5 template
       ~3300 ms/11037 ms busy (30 % of prefill) running ~31 TF/s against the
       55.2 TF/s WMMA ceiling, so plan tuning reopened (arithmetic unchanged,
       per-output K order preserved). The bench harness
-      (`tests/models/qwen36_a3b/dense_f16_bench.cpp`, `gufo_bench_plan17.log`)
+      (`staging/tests/models/qwen36_a3b/dense_f16_bench.cpp`, `gufo_bench_plan17.log`)
       raced five wide tile plans over the six production shapes at batch
       2048: auto 4×2 single-stage, `<256,128,2,4,2>`, `<128,128,1,4,2>`
       (both now explicit enum values), and 8×1-wave single-stage vs staged

@@ -33,9 +33,14 @@ namespace {
 std::atomic<std::size_t> allocations{};
 std::atomic<std::size_t> host_allocations{};
 std::atomic<std::size_t> max_piece{};
-std::atomic<bool> fail_populate{};
+std::atomic<int> fail_populate_after{-1};
+std::atomic<void*> failed_page{};
 bool pins_denied{};
 bool fail_copy{}, fail_record{}, fail_query{}, fail_wait{}, fail_alloc{};
+// When set, hipMemGetInfo reports this heap; registrations lower it while
+// heap_charges_registration is set, as on hosts that charge pinned pages.
+std::optional<std::size_t> fake_heap_free;
+bool heap_charges_registration{}, fail_heap_query{};
 int copies_before_failure{};
 thread_local bool fail_stream_new{}, observe_allocation_cleanup{};
 std::atomic<unsigned> allocation_cleanup_drains{};
@@ -61,7 +66,9 @@ void operator delete(void* memory, std::size_t) noexcept {
 extern "C" {
 int __real_madvise(void*, std::size_t, int);
 int __wrap_madvise(void* data, std::size_t bytes, int advice) {
-  if (advice == MADV_POPULATE_WRITE && fail_populate.exchange(false)) {
+  if (advice == MADV_POPULATE_WRITE && fail_populate_after.load() >= 0 &&
+      fail_populate_after.fetch_sub(1) == 0) {
+    failed_page.store(data);
     errno = ENOMEM;
     return -1;
   }
@@ -80,7 +87,21 @@ hipError_t __wrap_hipMalloc(void** p, std::size_t n) {
 hipError_t __real_hipHostRegister(void*, std::size_t, unsigned);
 hipError_t __wrap_hipHostRegister(void* p, std::size_t n, unsigned flags) {
   ++allocations;
-  return fail_alloc ? hipErrorOutOfMemory : __real_hipHostRegister(p, n, flags);
+  if (fail_alloc)
+    return hipErrorOutOfMemory;
+  if (fake_heap_free && heap_charges_registration)
+    *fake_heap_free -= std::min(*fake_heap_free, n);
+  return __real_hipHostRegister(p, n, flags);
+}
+hipError_t __real_hipMemGetInfo(std::size_t*, std::size_t*);
+hipError_t __wrap_hipMemGetInfo(std::size_t* free, std::size_t* total) {
+  if (fail_heap_query)
+    return hipErrorInvalidValue;
+  if (!fake_heap_free)
+    return __real_hipMemGetInfo(free, total);
+  *free = *fake_heap_free;
+  *total = std::size_t{128} << 30;
+  return hipSuccess;
 }
 hipError_t __real_hipMallocManaged(void**, std::size_t, unsigned);
 hipError_t __wrap_hipMallocManaged(void** p, std::size_t n, unsigned flags) {
@@ -521,13 +542,13 @@ void OnDemandBacking() {
       {ahead_capacity, block_bytes, headroom, 2 * block_bytes, {}});
   auto held = ahead.TryAcquire(Category::kPrivateTail);
   assert(held && ahead.BlockCount() == 2);
-  ahead.GrowAhead();
+  ahead.GrowAhead(2 * block_bytes);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (ahead.BlockCount() != 4 && std::chrono::steady_clock::now() < deadline)
     std::this_thread::yield();
   assert(ahead.BlockCount() == 4 && ahead.PageCommitAllocations() == 2);
-  ahead.GrowAhead();
+  ahead.GrowAhead(2 * block_bytes);
   assert(ahead.BlockCount() == 4);
   // A bounded startup reserve finishes before requests acquire its pages.
   // Observe real HIP allocations: neither request below may commit a segment.
@@ -535,10 +556,10 @@ void OnDemandBacking() {
   hip::CommittedBackingPool startup(
       startup_ledger,
       {ahead_capacity, block_bytes, headroom, 2 * block_bytes, {}});
-  startup.GrowAhead();
+  startup.GrowAhead(2 * block_bytes);
   startup.WaitForGrowth();
   assert(startup.BlockCount() == 2);
-  startup.GrowAhead(2);
+  startup.GrowAhead(4 * block_bytes);
   startup.WaitForGrowth();
   assert(startup.BlockCount() == 4 && startup.PageCommitAllocations() == 2);
   const auto committed_allocations = allocations.load();
@@ -548,6 +569,83 @@ void OnDemandBacking() {
       startup.TryAcquire(Category::kPrivateTail, 2 * block_bytes);
   assert(startup_first && startup_second &&
          allocations.load() == committed_allocations);
+  // A byte reserve need not be a segment multiple. It must not grow another
+  // segment just because the free backing is below a rounded-up threshold.
+  cache::ResourceLedger exact_ledger(Limits(many_capacity));
+  hip::CommittedBackingPool exact(
+      exact_ledger,
+      {many_capacity, block_bytes, many_headroom, 3 * block_bytes, {}});
+  exact.GrowAhead(0);
+  exact.WaitForGrowth();
+  assert(exact.BlockCount() == 0);
+  exact.GrowAhead(4 * block_bytes);
+  exact.WaitForGrowth();
+  assert(exact.BlockCount() == 6);
+  auto used = exact.TryAcquire(Category::kPrivateTail);
+  assert(used);
+  exact.GrowAhead(4 * block_bytes);
+  exact.WaitForGrowth();
+  assert(exact.BlockCount() == 6);
+  exact.GrowAhead(std::numeric_limits<std::size_t>::max());
+  exact.WaitForGrowth();
+  assert(exact.BlockCount() == many);
+}
+void HeapReserveSegments() {
+  // #781: 2.9 GiB of heap free, where registered pages are not charged.
+  constexpr std::uint64_t tight_heap = 2912776192ull;
+  assert(hip::RegistrationKeepsReserve(tight_heap, tight_heap));
+  assert(!hip::RegistrationKeepsReserve(tight_heap, tight_heap - 4096));
+  assert(hip::RegistrationKeepsReserve(hip::kDispatchReserve + 100,
+                                       hip::kDispatchReserve));
+  assert(!hip::RegistrationKeepsReserve(hip::kDispatchReserve + 100,
+                                        hip::kDispatchReserve - 1));
+  // Heap freed concurrently does not refuse a registration.
+  assert(hip::RegistrationKeepsReserve(tight_heap, tight_heap + 4096));
+  // A charge of at least half the segment marks a charging host; smaller
+  // drops and growth are taken as concurrent allocations.
+  constexpr std::uint64_t gib = std::uint64_t{1} << 30;
+  assert(hip::RegistrationCharged(gib, 10 * gib, 9 * gib));
+  assert(hip::RegistrationCharged(gib, 10 * gib, 10 * gib - gib / 2));
+  assert(!hip::RegistrationCharged(gib, 10 * gib, 10 * gib - gib / 2 + 1));
+  assert(!hip::RegistrationCharged(gib, tight_heap, tight_heap));
+  assert(!hip::RegistrationCharged(gib, tight_heap, tight_heap + 4096));
+  // A segment is kept unless its own registration took the device heap below
+  // the dispatch reserve, however little of the heap was free before (#781).
+  constexpr std::size_t capacity = 4 * block_bytes + metadata;
+  cache::ResourceLedger ledger(Limits(capacity));
+  std::vector<std::array<std::size_t, 3>> asked;
+  hip::CommittedBackingPool pool(
+      ledger, {capacity,
+               block_bytes,
+               metadata,
+               block_bytes,
+               {},
+               [&](std::size_t bytes, std::size_t before, std::size_t after) {
+                 asked.push_back({bytes, before, after});
+                 return hip::RegistrationKeepsReserve(before, after);
+               }});
+  const auto physical = allocations.load();
+  constexpr std::size_t tight = std::size_t{1} << 30;
+  fake_heap_free = tight;
+  auto kept = pool.TryAcquire(Category::kPrivateState);
+  assert(kept && pool.BlockCount() == 1 && allocations == physical + 1);
+  assert(asked.size() == 1 &&
+         asked.back() == (std::array{block_bytes, tight, tight}));
+  heap_charges_registration = true;
+  assert(!pool.TryAcquire(Category::kPrivateState));
+  assert(pool.BlockCount() == 1 && allocations == physical + 2);
+  assert(asked.size() == 2 && asked.back()[2] == tight - block_bytes);
+  assert(ledger.Snapshot().total_bytes == metadata + block_bytes);
+  fake_heap_free = hip::kDispatchReserve + block_bytes;
+  auto charged = pool.TryAcquire(Category::kPrivateState);
+  assert(charged && pool.BlockCount() == 2 &&
+         *fake_heap_free == hip::kDispatchReserve);
+  fail_heap_query = true;
+  assert(!pool.TryAcquire(Category::kPrivateState));
+  assert(pool.BlockCount() == 2 && allocations == physical + 3);
+  fail_heap_query = false;
+  heap_charges_registration = false;
+  fake_heap_free.reset();
 }
 void CaptureCapacity() {
   constexpr std::size_t pages = 6, headroom = 16 << 10;
@@ -660,6 +758,60 @@ void Transfers() {
   }
   assert(allocations == before + 2);  // only the explicitly created other pool
   assert(hipFree(device) == hipSuccess);
+}
+void BoundTransfers() {
+  struct Owner {
+    hipStream_t stream{};
+    bool& destroyed;
+    explicit Owner(bool& destroyed) : destroyed(destroyed) {
+      assert(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) ==
+             hipSuccess);
+    }
+    ~Owner() {
+      assert(hipStreamDestroy(stream) == hipSuccess);
+      destroyed = true;
+    }
+  };
+  for (const bool record_failure : {false, true}) {
+    bool destroyed = false;
+    auto owner = std::make_shared<Owner>(destroyed);
+    hip::TransferPool pool(1);
+    auto stream = pool.TryAcquire();
+    stream->BindTo(owner->stream, owner);
+    assert(stream->Native() == owner->stream);
+    Throws<std::logic_error>([&] { stream->BindTo(owner->stream, owner); });
+    std::atomic<bool> ran{false};
+    assert(hipLaunchHostFunc(
+               stream->Native(),
+               [](void* value) {
+                 static_cast<std::atomic<bool>*>(value)->store(true);
+               },
+               &ran) == hipSuccess);
+    owner.reset();
+    assert(!destroyed);
+    if (record_failure) {
+      fail_record = true;
+      Throws<std::runtime_error>([&] { (void)stream->Complete(); });
+      fail_record = false;
+      assert(ran && !destroyed);
+      stream.reset();
+      assert(destroyed && !pool.TryAcquire());
+    } else {
+      std::optional<cache::Completion> done(stream->Complete());
+      assert(done->Wait() == Result::kSucceeded && ran);
+      stream.reset();
+      assert(!destroyed && !pool.TryAcquire());
+      done.reset();
+      assert(destroyed && pool.TryAcquire());
+    }
+  }
+  bool destroyed = false;
+  auto owner = std::make_shared<Owner>(destroyed);
+  hip::TransferPool pool(1);
+  auto stream = pool.TryAcquire();
+  Throws<std::invalid_argument>([&] { stream->BindTo(nullptr, owner); });
+  (void)stream->Native();
+  Throws<std::logic_error>([&] { stream->BindTo(owner->stream, owner); });
 }
 void LifetimeAndFailures() {
   std::optional<cache::Completion> completion;
@@ -948,19 +1100,25 @@ void LongTermPagePins() {
   }
 }
 void PopulationFailure() {
-  for (const std::size_t bytes : {8ULL << 20, 128ULL << 20}) {
-    cache::ResourceLedger ledger(Limits(bytes + metadata));
-    const auto before = allocations.load();
-    // One worker fails while its peers may still populate other ranges.
-    // No mapping may be registered or escape, and all charges must unwind.
-    fail_populate = true;
-    Throws<std::runtime_error>([&] {
-      hip::CommittedBackingPool pool(ledger,
-                                     {bytes + metadata, bytes, metadata});
-    });
-    assert(!fail_populate && allocations == before);
-    assert(ledger.Snapshot().total_bytes == 0);
-  }
+  for (const std::size_t bytes : {8ULL << 20, 256ULL << 20})
+    for (int after : {0, 3}) {
+      cache::ResourceLedger ledger(Limits(bytes + metadata));
+      const auto before = allocations.load();
+      // Fail before or after partial population, including parallel workers.
+      // No mapping may be registered or escape; every charge and page unwinds.
+      failed_page = nullptr;
+      fail_populate_after = after;
+      Throws<std::runtime_error>([&] {
+        hip::CommittedBackingPool pool(ledger,
+                                       {bytes + metadata, bytes, metadata});
+      });
+      assert(fail_populate_after < 0 && failed_page != nullptr &&
+             allocations == before);
+      unsigned char resident{};
+      assert(mincore(failed_page.load(), 4096, &resident) == -1 &&
+             errno == ENOMEM);
+      assert(ledger.Snapshot().total_bytes == 0);
+    }
 }
 void LargeBacking() {
   constexpr std::size_t block = 64ULL << 20;
@@ -1017,8 +1175,10 @@ int main(int argc, char** argv) {
   GroupedBacking();
   CheckpointLifetimes();
   OnDemandBacking();
+  HeapReserveSegments();
   CaptureCapacity();
   Transfers();
+  BoundTransfers();
   LifetimeAndFailures();
   PendingStreams();
   AcquireAllocationFailure();

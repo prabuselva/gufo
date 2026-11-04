@@ -23,7 +23,7 @@
 #include <cstring>
 #include <vector>
 
-#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
+#include "src/families/qwen/kernels/prefill_quant_gemm.hpp"
 
 namespace probe {
 
