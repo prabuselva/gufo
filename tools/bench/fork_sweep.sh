@@ -48,6 +48,10 @@ case "$key" in
   ling30-tiny)
     model="$M/Ling3.0-Tiny/Ling-3.0-tiny-Q8_0.gguf"
     ;;
+  glm53-flash)
+    model="$M/GLM-5.3-Flash-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf"
+    spec=nextn
+    ;;
   flint-40b-a2b)
     model="$M/Flint-40B-A2B-GGUF/flint-Q8_0.gguf"
     ;;
@@ -92,7 +96,11 @@ for d in 2048 4096 8192 16384 32768 65536 100000; do
 done
 run pp512-tg1024 --model "$model" --n-prompt 512 --n-gen 1024
 if [ "$spec" != none ]; then
-  specargs=(--speculative mtp --mtp-model "$draft")
+  if [ "$spec" = nextn ]; then
+    specargs=(--speculative mtp)  # nextn block lives inside the model GGUF
+  else
+    specargs=(--speculative mtp --mtp-model "$draft")
+  fi
   [ -n "$draft_tokens" ] && specargs+=(--draft-tokens "$draft_tokens")
   run spec-tg128 --model "$model" "${specargs[@]}" --n-prompt 512 --n-gen 128
   run spec-tg1024 --model "$model" "${specargs[@]}" --n-prompt 512 --n-gen 1024
