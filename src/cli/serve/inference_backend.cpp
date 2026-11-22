@@ -52,6 +52,7 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
+    ChatTemplateCaps chat_template_caps;
     ReasoningOptions reasoning_defaults;
     std::string model_path;
     std::string build_info;
@@ -63,10 +64,12 @@ struct InferenceBackend::Impl {
         std::shared_ptr<const State> model_state,
         TextGenerationScheduler::Request scheduled_request,
         InitialOutputState initial = InitialOutputState::kContent,
-        std::optional<sampling::JsonConstraint::ToolFormat> tool_format = {})
+        std::optional<sampling::JsonConstraint::ToolFormat> tool_format = {},
+        std::optional<ext::ThoughtMarkers> thought = {})
         : state_(std::move(model_state)),
           request_(std::move(scheduled_request)),
-          tool_format_(tool_format) {
+          tool_format_(tool_format),
+          thought_(thought) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ =
             state_->scheduler->runner().TokenizeControl("</think>");
@@ -93,11 +96,16 @@ struct InferenceBackend::Impl {
       return tool_format_;
     }
 
+    std::optional<ext::ThoughtMarkers> ThoughtMarkers() const override {
+      return thought_;
+    }
+
   private:
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
     std::vector<tokenization::TokenId> reasoning_end_;
     const std::optional<sampling::JsonConstraint::ToolFormat> tool_format_;
+    const std::optional<ext::ThoughtMarkers> thought_;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -181,6 +189,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
     new_state->sampling_defaults.sampling = sampling::SamplingConfig{};
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = desc.capabilities.supports_vision;
+    new_state->chat_template_caps = runner->TemplateCaps();
     new_state->model_id = desc.model_id;
     new_state->max_context = desc.max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -235,9 +244,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                                         disk_cache_config, vision_model_path,
                                         attn_window, attn_sink, error)) {
       try {
+        const auto descriptor = staging->runner->Descriptor();
         auto new_state = std::make_shared<Impl::State>();
-        new_state->model_id = staging->runner->Descriptor().model_id;
+        new_state->model_id = descriptor.model_id;
+        new_state->max_context = descriptor.max_context;
         new_state->supports_images = staging->supports_images;
+        new_state->chat_template_caps = staging->runner->TemplateCaps();
         auto runner_pool = std::make_shared<TextRunnerPool>(
             std::move(staging->runner), session_count);
         new_state->scheduler = std::make_shared<TextGenerationScheduler>(
@@ -345,6 +357,15 @@ bool InferenceBackend::supports_images() const {
   return state != nullptr && state->supports_images;
 #else
   return false;
+#endif
+}
+
+ChatTemplateCaps InferenceBackend::chat_template_caps() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->chat_template_caps : ChatTemplateCaps{};
+#else
+  return {};
 #endif
 }
 
@@ -620,8 +641,10 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   auto effective_sampling = sampling_config;
   std::optional<sampling::JsonConstraint::ToolFormat> tool_format;
-  auto constrained = ConstrainChatRequest(request, state->scheduler->runner(),
-                                          &effective_sampling, &tool_format);
+  std::optional<ext::ThoughtMarkers> thought;
+  auto constrained =
+      ConstrainChatRequest(request, state->scheduler->runner(),
+                           &effective_sampling, &tool_format, &thought);
   const auto& effective_request = constrained ? *constrained : request;
   auto prompt = state->scheduler->runner().PreparePrompt(effective_request);
   if (!prompt.has_value() || prompt->tokens.empty()) {
@@ -653,7 +676,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .return_progress = request.return_progress,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
-      state, std::move(scheduled_request), initial, tool_format);
+      state, std::move(scheduled_request), initial, tool_format, thought);
 #else
   return TextGenerationBackend::start_chat(request, max_tokens, sampling_config,
                                            is_cancelled, stream_output);

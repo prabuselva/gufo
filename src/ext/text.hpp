@@ -352,6 +352,14 @@ public:
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
   }
+  /// Thought framing the output parser applies to this model's generations.
+  [[nodiscard]] virtual ext::ThoughtMarkers ThoughtMarkers() const {
+    return {};
+  }
+  /// What the runner's chat renderer consumes, for `/props`
+  /// `chat_template_caps`. Engines override this when their template honors
+  /// more than a plain ChatML baseline (reasoning effort, preserve, images).
+  [[nodiscard]] virtual ChatTemplateCaps TemplateCaps() const { return {}; }
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;
   std::size_t PrepareConstraintVocabulary() const;

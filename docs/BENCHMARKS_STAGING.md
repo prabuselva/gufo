@@ -11,7 +11,8 @@ All values are t/s. `Load` is the median cold model-load seconds over that
 model's runs. Drive a sweep with `tools/bench/fork_sweep.sh <key>` (the
 exclusive-GPU protocol) and parse with `tools/bench/fork_sweep_report.py`.
 
-Sweep dates: 2026-11-02/03, revision `74888ea0`. All 8 models, every cell rc=0.
+Sweep dates: 2026-11-02/03, revision `74888ea0` (models 1-8); GLM 5.3 Flash
+added 2026-11-22, revision `c5df8382`. All 9 models, every cell rc=0.
 
 | Model | Load | pp512 | pp2K | pp4K | pp8K | pp16K | pp32K | pp65K | pp100K | tg128 | tg1024 | tg128 + MTP | tg1024 + MTP |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -23,6 +24,7 @@ Sweep dates: 2026-11-02/03, revision `74888ea0`. All 8 models, every cell rc=0.
 | Ling 3.0 Flash (Q4_K_M) | 33.1 | 1233.4 | 1366.5 | 1233.3 | 1009.0 | 688.1 | 436.8 | 240.4 | 164.9 | 38.4 | 37.3 | 43.0 (1.12x) | 42.3 (1.13x) |
 | Nemotron 3.5 Bolt 74B (24 GB) | 7.3 | 555.1 | 619.9 | 654.5 | 664.9 | 640.3 | 571.3 | 478.8 | 392.7 | 26.3 | 24.0 | - | - |
 | Nemotron 3.5 Bolt 74B (UD-Q4_K_XL) | 22.8 | 527.4 | 624.1 | 642.7 | 646.4 | 607.5 | 556.3 | 459.6 | 384.6 | 20.2 | 18.9 | - | - |
+| GLM 5.3 Flash (UD-IQ1_M) | 38.2 | 245.8 | 296.2 | 282.7 | 265.2 | 239.3 | 205.2 | 142.1 | 110.9 | 11.4 | 11.5 | 15.8 (1.39x) | 15.9 (1.38x) |
 
 Artifacts and load spread under `$HOME/projects/llm/models/gguf`:
 
@@ -36,3 +38,4 @@ Artifacts and load spread under `$HOME/projects/llm/models/gguf`:
 | Ling 3.0 Flash | `Ling3.0-Flash/Ling-3.0-flash-Q4_K_M` (2 shards, 49.4 GiB) | 29.3-47.3 | in-model (builtin MTP heads) |
 | Nemotron 3.5 Bolt 74B | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (22.7 GiB IQ2-style distill) | 6.7-18.3 | - |
 | Nemotron 3.5 Bolt 74B | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-UD_4_K_XL-GGUF/UD-Q4_K_XL/` (3 shards, 43.08 GiB) | 20.5-34.2 | - |
+| GLM 5.3 Flash | `GLM-5.3-Flash-IQ1_M/GLM-5.3-Flash-UD-IQ1_M` (3 shards, 90.88 GiB) | 34.0-75.3 | in-model (nextn, `--speculative mtp`) |

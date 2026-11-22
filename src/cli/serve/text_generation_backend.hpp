@@ -245,6 +245,13 @@ public:
     /// Effective constrained tool format, including any schema fallback.
     /// Available before Wait and stable for this admitted request. Backends
     /// without this metadata retain the adapter's legacy format detection.
+    /// Thought framing resolved from the model runner; nullopt when the
+    /// serve default (Qwen dialect) applies.
+    [[nodiscard]] virtual std::optional<gufo::ext::ThoughtMarkers>
+    ThoughtMarkers() const {
+      return std::nullopt;
+    }
+
     [[nodiscard]] virtual std::optional<sampling::JsonConstraint::ToolFormat>
     ToolFormat() const {
       return std::nullopt;
@@ -281,6 +288,10 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
+  /// Chat-template capabilities for llama-server's `chat_template_caps`.
+  [[nodiscard]] virtual ChatTemplateCaps chat_template_caps() const {
+    return {};
+  }
   /// The served model file and build revision, as llama-server's /props
   /// reports them. Empty when unknown.
   [[nodiscard]] virtual std::string model_path() const { return {}; }

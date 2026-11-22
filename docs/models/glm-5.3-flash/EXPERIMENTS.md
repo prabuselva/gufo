@@ -1,0 +1,676 @@
+# GLM-5.3-Flash — Experiments
+
+Retained and rejected prefill/decode decisions, one line each. All numbers
+are `gufo serve` gate measurements (pp2048/tg32, HTTP `timings`, warmup +
+2 samples) from `/tmp/opencode/glm5_bench_gates.sh` under the
+bench_bg/bench_wait GPU-exclusive discipline on `build/gpu-test/gufo`.
+
+## Retained (shipped defaults)
+
+- P3a power-of-two `GemvRows` slices: the multi-row GEMV launcher
+  decomposes any 2..128-token width into descending power-of-two slices
+  (instances 1/2/4/8/16), replacing the 4-token ceiling. Per-row
+  accumulation order and per-token stores match `Gemv` bit-for-bit
+  (`glm5_next.rocm_gemv` bit fixtures).
+- P3b prefill chunk `kChunk` 4 → 128: 32× fewer per-chunk weight sweeps
+  for every projection. (Shipped with P3a; measured only combined.)
+- P3c bucket-compacted routed expert tier (`routed_compact` builders +
+  `GemvRoutedTiles`): `kBucketMinRows = 32` and above, slots are compacted
+  into 16-row padded expert buckets (`ExpertCounts`/`RoutedCompact`) and a
+  2-D `tile x row` grid decodes each expert weight row once per 16 slots,
+  scattering `out[slot*rows + r]`. Same decode/slot/reduce order as
+  `GemvGrouped`, so gate/up/down are bit-identical per slot
+  (`routed==grouped {gate,down}` checks for all six super-codec types).
+  Combined pp2048 **41.61 ± 0.04 t/s** (2.0× baseline 21.07), tg32
+  **12.36 ± 0.08** (decode path untouched; within 2 % of 12.12).
+- P4 WMMA tensor-core IQ1_M gate/up tier (`routed_wmma`, prototype
+  `tools/bench/glm5_iq1_wmma_bench.hip`): bucketed IQ1_M gate/up stacks
+  additionally take a 32-slot WMMA path — x converted to F16 once (with
+  overflow guard), gate and up blocks staged per tile, shared A fragments,
+  fused swiglu-clamp epilogue writing `moe_inter`, tensor-core decode at
+  26.5 TF/s effective on the prototype (tile-32 shape). Tensor-core
+  accumulation order differs from the scalar dot, so quality is held by
+  the new `glm5_next.rocm_routed_wmma` contract (rel. NMSE ≤ 1e-4 vs the
+  bit-tiered scalar tiles + `SwigluClamp`, replay bit-identical; measured
+  **8.9e-06**) and the unchanged full-model golden replay
+  (`glm5_next.rocm_forward`, GPU-exclusive). Matched three-point single
+  session (`/tmp/opencode/glm5_bench_ab3.sh`): pp2048 base 20.69 ± 0.18 →
+  bucket 38.56 ± 0.53 → post **42.21 ± 0.01** (tier alone **+9.5 %**),
+  tg32 12.14 / 12.10 / **12.24** (no regression; decode path untouched).
+- P4 correction (2026-11-12): while extending the tier under P5 the WMMA
+  kernel was found to stage row 0 of the expert stack for **every** output
+  row — the templated `fetch_weights` omitted the row/expert offset
+  (`f_off`) from the block pointer. The extension contract failed at
+  NMSE ≈ 2 until fixed (single-hot x at one column exposed it: constant
+  output over rows instead of the true per-row weight). The P4-era match
+  numbers (post 42.21, "measured 8.9e-06") cannot be reconciled with the
+  fixed kernel's behaviour and are superseded by P5; the shipped default
+  now carries the fixed, contract-verified kernel.
+- P5 fixed + widened WMMA routed tier (`routed_wmma` reworked as one
+  kernel template `<kSuper, kStride, kStacks>` with explicit
+  `DecodeFragmentHalf` specializations): bucketed IQ1_M **and IQ2_XXS**
+  gate/up stacks route to WMMA (`RoutedGateUpWmma`), and IQ3_XXS `down`
+  stacks join with `RoutedDownWmma` (x converted to F16 once,
+  `moe_inter_half_` staging, ConvertF32ToHalf back for the combine);
+  IQ4_XS/Q3_K `down` stay on the scalar tier. Staging strides
+  60/68/100 B per 256-K stage with a `TailU32` spill for the partial
+  super-block tail; epilogue maps the verified gfx1151 C-fragment
+  layout (row = 2l + (lane>>4), col = lane & 15; cross-checked with
+  `tools/bench/wmma_layout_test.hip`).
+  `glm5_next.rocm_routed_wmma` now carries three contracts and passes:
+  IQ1_M gate/up NMSE **8.893e-06**, IQ2_XXS gate/up **5.571e-05**,
+  IQ3_XXS down **3.432e-08** (limit 1e-4), x-half overflow 0, finite,
+  replay bit-identical. Full `glm5_next` ctest 8/8 green
+  GPU-exclusive, golden `rocm_device_model` 26.8 s + `rocm_forward`
+  80.7 s passing with the tier active.
+  Matched A/B (`/tmp/opencode/glm5_ab.sh`, alternating ×2, 128K-ctx
+  protocol, control = P3f `gufo_rows16`): control pp2048
+  42.69 ± 0.09 / 42.35 ± 0.03, candidate **51.65 ± 0.17 / 51.65 ± 0.31**
+  (**+21.4 %** prefill), tg32 11.51/11.12 control vs 11.30/11.48
+  candidate — flat. Escalated same-day at ~8.4K prompt
+  (`/tmp/opencode/glm5_ab8k.sh`, client-timed because
+  `usage.prompt_ms` is absent above the 2K path): control 37.73/37.38
+  /37.21/36.32 vs candidate 44.00/43.13 (**+17.2 %**); a 32K escalation
+  was cut by budget (≈13 min/prefill at these rates) and left no data.
+  Phase gate (pp2048 ≥ 170.5) still **not met**; remaining levers are
+  the MLA GatherScore rewrite (13.1 % of pp) and the KDA chunked scan
+  (9.3 %).
+- P6 dense Q5_K WMMA tier (`kernels/rocm/dense_wmma`): the chunked dense
+  projections reuse the proven routed geometry without any expert logic —
+  128 rows × 32 tokens per block, 176 B Q5_K blocks staged at a 180-byte
+  (45-dword, spill-free) stride, shared A fragments, `DecodeFragmentHalfQ5K`
+  mirroring the scalar sub-block walk, epilogue `out[t*out_stride + r]`;
+  F32 activations are converted to F16 at operand staging. `GemvN` routes
+  to `DenseWmma` only when the type is supported, `tokens >= 16` and
+  `cols % 256 == 0`, so decode (n ≤ 8) and the grouped
+  `attn_k_b`/`attn_v_b` launches stay on the scalar tier. Tensor-core
+  accumulation order differs from the scalar dot, so quality is held by
+  the new `glm5_next.rocm_dense_wmma` contract: rel. NMSE **2.9-3.0e-08**
+  vs the scalar `GemvRows` over four shapes (limit 1e-4), finite,
+  replay bit-identical. Matched A/B (`/tmp/opencode/glm5_ab_p6.sh`,
+  alternating ×2 plus a leading candidate smoke round, 128K-ctx
+  protocol, control = `gufo_p5`): control pp2048 51.12 ± 0.16 /
+  51.32 ± 0.31 vs candidate **68.03 ± 0.69 / 67.89 ± 0.61 /
+  67.83 ± 0.75** (**+32.6 %** tier increment; cumulative **+59.7 %**
+  over the `gufo_rows16` control at 42.52), tg32 flat (11.22 ± 0.53 /
+  11.45 ± 0.06 vs 11.26 / 11.31). Full `glm5_next` ctest 9/9 green
+  GPU-exclusive with the tier active (golden `rocm_forward` 95.1 s).
+  Escalated the same day at ~8.4K prompt
+  (`/tmp/opencode/glm5_ab8k_p6.sh`, client-timed, control = `gufo_p5`,
+  candidate = the shipped tree build): control 44.28/43.41/43.81/42.94
+  vs candidate 55.71/55.98/55.63/55.87 — **+28 %** kept
+  (`gufo_rows16` at 8.4K was 37.2, cumulative ~+50 %).
+  Gate attainment is now **0.40×** (pp2048 ≥ 170.5); the dense stage
+  leaves the tensor-core candidate list — MLA GatherScore (13.1 % of pp)
+  and the KDA chunked scan (9.3 %) remain.
+- P7 MLA GatherScore row-warp kernel (`kernels/rocm/attention.hip.cpp
+  MlaGatherScoreKernel`): one warp per key slot — lanes load two
+  coalesced `uint4` KV chunks, keep the rank row in registers, each
+  lane dots its head slice against `float4` q (`qa[kRank/8 + 2*lane]`)
+  and folds through a 5-step `__shfl_down_sync`; replaces the scattered
+  2-byte warp gathers (~32 L1 transactions per load). Microbench
+  (`tools/bench/glm5_gather_score_bench.hip`, NMSE 1.5-1.7e-13 vs the
+  bitwise oracle): 256-hot 0.87-0.92×, 1024-hot 2.2-2.4×, 2048-hot
+  6.5-6.9×, 8192-cold 26-31×; chain-split (0.08-0.35×) and uint4
+  oracle-vectorized (1.0×) variants rejected. Head span is host-side:
+  16 slots per block below 4096 selections, 32 above (`hspan`). The
+  reassociation moved the mHC-chaotic `code` golden by 0.5006 nats at
+  the documented 0.5 budget, so `llama_reference.json` was refreshed by
+  candidate re-capture per BENCHMARKS#fixtures (greedy chain, all
+  top-1s and prefill snapshots unchanged; revision 457151058). Full
+  `glm5_next` ctest green GPU-exclusive (`rocm_forward` ALL PASS
+  bit-identical to the refreshed golden; attention contract worst
+  latent 4.16e-5 < 5e-5). Matched A/B on a **rebuilt harness**
+  (`/tmp/opencode/glm5_ab_p7.sh`: reconstructed after a /tmp cleanup,
+  `serving_bench --concurrency 1 --warmup 1 --repetitions 2`,
+  prompt_n ≈ 2232, so absolute values are not comparable to the
+  archived-row cells; 128K-ctx protocol, control = `gufo_p6` rebuilt
+  from 457151058): control pp 66.90 ± 0.09 / 66.51 ± 0.05 vs candidate
+  **79.97 ± 0.03 / 79.79 ± 0.08** (**+19.7 %**), tg32 flat
+  (12.34/12.46 vs 12.39/12.49). Escalation (same harness family, pp
+  only, `/tmp/opencode/glm5_ab8k_p7.sh` + `glm5_ab32k_p7.sh`): at
+  prompt_n 8184 control 58.77 ± 0.17 vs candidate 79.85 ± 0.17
+  (**+35.9 %**); at prompt_n 32172 control 55.20 vs candidate 76.85
+  (**+39.2 %**, one session per binary, warm + 1 timed, p6 first).
+  The win widens monotonically with depth: `hspan=32` engages past
+  4096 selections and P6's pp degrades from 66.7 while P7 holds
+  ~80 t/s through 32K. Gate attainment is now **~0.48×**
+  (pp ≥ 170.5); the KDA chunked scan is the remaining listed lever.
+- P9 dense Q8_0 WMMA tier (`dense_wmma` extended to a second quant
+  instantiation, `DenseWmmaSupports` ⊇ {Q5_K, Q8_0}): the chunk-256 pp
+  profile showed `GemvRowsQ8<16>` still at decode cost — ~66 µs per
+  call, 12.5 % of a timed chunk pass — because the WMMA tier only
+  covered Q5_K. Q8_0 stores 8×(fp16 scale + 32 signed bytes) per
+  256-K; tier stages one super-block per row at a 276-dword-trick odd
+  stride (kSuper 272, kStride 276) and decodes each 16-element f16
+  fragment from one scale and a contiguous signed-byte run. Offline
+  `gufo bench` A/B (same session, alternating, warm+2):
+  pp2048 90.32/90.54 → **99.18/99.25 (+9.7 %)**; pp16384 83.07 ± 1.27
+  → **90.02 ± 0.03 / 90.69 ± 0.54 (+8.4 %)**; tg1 flat (tier engages
+  only at the `tokens ≥ 16` prefill predicate). Numeric evidence:
+  `glm5_next.rocm_dense_wmma` extended to Q8_0 shapes (scale pinned
+  1.0, decode exact in binary16) NMSE ≤ **3.5e-08** ≤ 1e-4, replay
+  bit-identical; full `glm5_next` ctest 9/9 GPU-exclusive with
+  `rocm_forward` ALL PASS max |dlogit| = 0.0000 vs the retained golden and
+  the greedy 128-token continuation sha `752281d6…` unchanged at
+  pp2048+tg128 (`/tmp/opencode/glm5_{ab_q8t,ab_q8t16k*,fwd_q8,full_q8,sha_q8t}`;
+  the 2048-prefill run executes nine 256-token tier chunks per layer).
+
+## Rejected / parked
+
+- `kChunk` 128 → 512 (bucket-reuse saturation probe): pp2048 41.77 ± 0.21
+  vs 41.61 ± 0.04 and tg32 12.43 ± 0.09 — flat. Bucket reuse saturates at
+  128-token chunks; the remaining ~4× pp gap to the 189 t/s llama.cpp row
+  is expert-decode efficiency at ~42 GB/s effective, not weight re-reads.
+  Rejected with the scratch it would cost.
+- P3f dense multi-row token-slice widening (`kMaxRows` 16 → 32/64 in
+  `LaunchRowsSlices`): the token-boundary reload theory was wrong. Matched
+  A/B (same session, alternating, 128K-ctx protocol, control = Rows 16):
+  Rows 32 pp2048 18.62/18.58 vs control 42.53/42.50, Rows 64 13.39/13.38,
+  tg32 flat. Kernel metadata explains the 64 case (every Q-kernel spills,
+  scratch 80-596 B/lane at VGPR 192) but not the 32 case (no spills,
+  VGPR ≤ 180): more tokens per weight load multiplies the activation read
+   stream per block and thrashes the cache. `kMaxRows` stays 16.
+- P3g dense WMMA 64-token tiles (`kTileTokens` 32 → 64 for Q5_K/Q6_K in
+   `DenseWmmaKernel`, weight re-reads halved): correct (unit NMSE ≤ 3.7e-8
+   bit-identical, n-gen-1 sha unchanged) but pp2048 157.9/157.9 vs control
+   178.1/179.0 (-12 %), worse still at 456 B/lane spills in the first
+   float4-staged form (-15 %; staging the f16 halves cut spill to 312 B of
+   the loss but not enough). VGPR 256 is the hard ceiling at 256 threads
+   and the doubled live accumulators (4 `v8f` tiles + 8 staged chunks) do
+   not fit; LDS occupancy was already 1 block/CU so the wider tile buys
+   nothing else. Reverted; `kTileTokens` stays 32.
+   Retested 2026-11-14 on the shipped tree with spill fixes (f16-staged
+   fetch, restructured double buffer): pp2048 190.9 (wide + f32 fetch)
+   and 200.6/201.4 (wide + f16 fetch, spills gone) vs alternating
+   control 214.05/213.64 — still -6 %..-11 %. `rocprofv3` split
+   (`/tmp/opencode/prof_kda2` vs `_prof_a2c`): the fetch restructure
+   alone costs +22 % on the geometry-untouched Q8 `<272>` kernel, and
+    the widening adds the rest (`<176>` +23.8 %, `<210>` +93 %). Both
+    experiments reverted in full; only the dword decode survives.
+- P3h routed WMMA 64-slot down tiles (`kTileTokens` as template `kTok`,
+   `RoutedWmmaKernel<98,100,1,64>` fed by a third 64-row tile height from
+   `BuildRoutedTiles`): the per-element order is unchanged, so the run is
+   bit-exact (contract NMSE + deterministic replay passed, n-gen-1 sha
+   unchanged) and halved the down weight re-reads - expert buckets average
+   ~57 slots, so one 64-tile usually covers a whole bucket. pp2048
+   211.35/211.11 vs alternating control 218.35/219.03 (-3.4 %). Kernel
+   metadata (`/tmp/opencode/asm4`): `kActPer` 4->8 (a_src+a_data +28 VGPR)
+   and 2 extra live `v8f` tiles push the kernel to VGPR 256 with 23 spills
+   (LDS 46592); under `rocprofv3` (`/tmp/opencode/prof_a1d64` vs
+   `prof_kda2`, one prefill pass) `<98,100,1,64>` ran mean 32.45 ms /
+   2531 ms/pass vs 24.74 ms / 1447 ms/pass for `<98,100,1>`: +75 % total
+   time for half the weight bytes. Routed IQ WMMA is compute-bound
+   (decode VALU), not weight-re-read-bound, so the widening class is
+   closed for this tier too; the gate/up stacks have less VGPR headroom
+    still (224 at 32) and were not built. Reverted in full.
+- A6 W8A8 narrow widening (`GemvN` dense-tier gate `cols % 256` -> `% 32`
+   so the KDA `ssm_f_b`/`ssm_g_b` Q8_0 K=128 projections, 8192 x 44 layers,
+   join the B12 tier): correct (contract NMSE passed on new 8192x128
+   shapes both `LaunchTuned` paths; tg64 greedy sha unchanged at prompt
+   depths 2048 and 4096) and positive offline (`gufo bench`: pp2048
+   271.42 -> 271.97 +0.2 %, pp4096 253.83 -> 254.93 +0.4 %), but the
+   serve-protocol A/B (same session, 3 alternating rounds, 128K-ctx
+   chunk-2048 protocol, `/tmp/opencode/a6/`) is neutral: pure server
+   prefill 252.48 -> 252.28 (-0.08 %, ranges fully overlapping) with the
+   +0.3 % request-level mean unsupportable, decode parity
+   (11.64 -> 11.81 within overlap). The 966 ms `GemvRowsQ8_0Tiled` pool
+   share estimated for these tensors does not materialise at production
+   chunk size: the W8A8 block kernel at K=128 trades evenly with the
+   tiled GEMV. Reverted in full.
+
+## Profiled (rocprofv3, serve workload)
+
+- P3d per-component pp profile (`tools/prof/prof.py run --stages glm5`
+  around a serve run: warmup + fresh pp2048/tg32 pair, 3.97 M dispatches,
+  98 s GPU-busy; warmup and timed passes are the same workload so shares
+  hold even though the capture was cut at the timed pass): moe routed IQ
+  GEMV **34.4 %**, dense multi-row GEMV **31.8 %**, MLA attention
+  **12.2 %**, KDA **8.8 %**, mhc 2.6 %, grouped/decode 1.9 %, route +
+  combine + indexer + norms remainder ~8 %.
+- Diagnosis (a): both GEMV families sustain only ~15-25 % of measured
+  LPDDR peak — weight-*decode*-throughput bound, not DRAM bound. The
+  `kChunk` 128→512 flat result already ruled out re-read traffic on the
+  MoE side; llama.cpp's 189 t/s needs only ~8.4 GB/s aggregate read-once,
+  so no bandwidth ceiling blocks the gates.
+- Diagnosis (b): dense multi-row GEMV wastes launch grain — the
+  `attn_k_b`/`attn_v_b` per-head loops fire 256 GEMVs per layer-chunk
+  (Q8_0, ~15 us each, launch-bound: 6.9 s of the capture) and the MLA
+  projections run at chunk-128 as 47 launches of ~344 us per layer-chunk
+  (Q5_K `GemvRows<16u>` = 21.9 % of the capture, the single largest
+  kernel). Diagnosis (b) was falsified by P3e below: the per-kernel
+  durations are wave-ramp GPU-busy time, not dispatch gap.
+
+## Measured, effect-free (kept code decision open)
+
+- P3e grouped-head launch collapse (`GemvRowsGrouped`): the multi-token
+  `attn_k_b`/`attn_v_b` per-head loops collapse into one launch with a
+  per-row activation advance; 30/30 `gemv_rows_grouped` bit-parity checks
+  (all six super-codec + Q types, per-group vs the per-head `GemvRows`
+  call). Matched A/B in one exclusive session, identical script and
+  prompt, pre then post: pp2048 38.45 ± 0.06 -> 38.57 ± 0.44 (within
+  noise), tg32 11.76 -> 12.02 on an untouched n==1 path (run-order noise
+  ceiling). No measurable pp gain: collapsing the head loops trades launch
+  count for an identical wave count, so diagnosis (b) yields nothing on
+  its own. A/B absolute values run ~7.6 % below the retained gate rows
+  (rebuilt gate script after the original was lost; clean A/B is the
+  effect measurement, the 41.61 row stays the retained gate).
+
+## Chunk and wave levers (2026-11-13)
+
+- Prefill chunk width `kChunk` 128 -> 256 (`executor.hpp`): doubles
+  routed-expert weight reuse per pass at pp2048. Offline `gufo bench`
+  A/B (same session, warm+2, alternating): 85.27/85.33 -> **90.38/90.21
+  (+6.0 %)**; 512 plateaus (89.33/89.88 vs 89.58/89.63 control —
+  rejected, keeps scratch small). Bit-identical: greedy 128-token
+  continuation sha256 `752281d6…` equal across 128/256 binaries,
+  `glm5_next.rocm_device_model` 626/626 payload bit-exact, and
+  `glm5_next.rocm_forward` ALL PASS with max |dlogit| = 0.0000
+  GPU-exclusive against the retained golden (`/tmp/opencode/glm5_*`).
+- `kChunk` 256 -> 2048 (revisit of the same lever after P9): each
+  256-token chunk's 2048 routed slots touch all 288 experts, so pp2048
+  swept the expert stack ~8x (effective ~29 GB/s); at 2048-token chunks
+  the sweep collapses and the bucketed WMMA tier runs fully bucketed.
+  Offline A/B (alternating, warm+2): pp2048 100.07/100.03 ->
+  **109.20/109.13 (p50 +9.1 %)**; pp4096 96.6 -> **104.6 (+8.3 %)**.
+  Bit-identical: n-gen-1 output sha256 `43557e0c…` equal across both
+  binaries and repetitions, full `glm5_next` ctest 9/9 GPU-exclusive
+  (`/tmp/opencode/glm5_gate_c2048.sh`). Profile after the change
+  (`/tmp/opencode/glm5_prof2k_c2048`): MoE RoutedWmma is no longer the
+  wall; per-token sequential launches dominate — KdaFoldSk 3.3 s +
+  KdaUpdateOut 3.3 s (each one launch per KDA layer per token), MLA
+  score/combine/bitonic 4.9 s, HcCoeffs/MoERoute/WeightedSum 3.5 s
+  (~1.4 M launches over two prefills) vs DenseWmma 3.8 s and RoutedWmma
+  5.3 s total. The next lever is processing a chunk's sequential stages
+  in one launch with a per-token loop inside (bit-identical order).
+- Single-launch chunked KDA (`ops.hip.cpp`, executor `KdaLayer`):
+  `KdaConvStepChunk` keeps each channel's ring live across the whole
+  chunk; `KdaFoldUpdateChunk` holds one head's recurrent state in 64 KB
+  dynamic LDS per block (grid = 64 heads) with the exact per-token fma
+  order, keeping `sk` in registers, and E-Gate/L2/Scale/Out-Gate run
+  once per chunk over flattened rows. Launchers fall back to the old
+  per-token pair if 64 KB LDS cannot be opted into. Offline A/B
+  (alternating, warm+2): pp2048 109.22/109.10 -> **132.76/133.05
+  (+21.7 %)**; n-gen-1 output sha256 `43557e0c…` identical across both
+  binaries and all four runs; full `glm5_next` ctest 9/9 GPU-exclusive,
+  including new `rocm_ops` bit-exact checks of chunk conv and fused
+  fold/update against the per-token chains
+  (`/tmp/opencode/glm5_kda_gate.sh`, `/tmp/opencode/gufo_bench_kda1.log`).
+- Row-batched HC/MoE elementwise loops (`MoERoute`, `HcCoeffs`,
+  `HcInputs` (+ `pre_stride` for the mean broadcast), `HcWriteback`,
+  `WeightedSumAdd`): one launch per chunk via `blockIdx.y`, row pitches
+  derived from the existing sizes, block-local state per row so the
+  per-row order is untouched. Offline A/B (alternating, warm+2): pp2048
+  132.89/132.93 -> **164.27/165.03 (+23.9 %)**; n-gen-1 output sha256
+  `43557e0c…` identical across both binaries and all four runs; full
+  `glm5_next` ctest 9/9 GPU-exclusive including new `rocm_ops`
+  row-batch bit-exact checks for all five ops
+  (`/tmp/opencode/glm5_rows_gate.sh`, `/tmp/opencode/gufo_bench_rows1.log`).
+- Q6_K dense WMMA tier (`dense_wmma.hip.cpp`): a third kernel kind
+  decodes Q6_K blocks (`ql`/`qh`/16 nibble-block scales, `kSuper=210`,
+  212-byte padded LDS stride with a two-byte tail fetch so nothing is
+  read past the tensor) into WMMA fragments; `DenseWmmaSupports` and
+  the executor dispatch admit `kQ6_K`, so `ffn_down_shexp`
+  (4096x2048) and the remaining Q6_K projections leave the wide-GEMV
+  path (`GemvRowsQ6K` was 1.23 s per two prefills). Offline A/B
+  (alternating, warm+2): pp2048 165.69/164.69 -> **179.09/178.83
+  (+8.3 %)** with variance down from ±2 to ±0.3; n-gen-1 output sha256
+  `43557e0c…` identical across both binaries and all four runs; full
+  `glm5_next` ctest 9/9 GPU-exclusive; `rocm_dense_wmma` gained
+  `MakeQ6K` plus four shapes (NMSE ≤ 3.7e-8 vs the scalar reference,
+  deterministic replay) (`/tmp/opencode/gufo_bench_q6kab.log`).
+- Token-batched DSA indexer/MLA launches (`IdxScoreBatch`,
+  `BuildSelBatch`, `MlaGatherScoreBatch`, `MlaGatherCombineBatch`):
+  the per-token gather/indexer launches were 22,528 per pp2048
+  prefill and latency-bound (launch + drain, not DRAM). Each kernel
+  gains the token as an extra grid dimension writing into per-token
+  scratch regions sized for `kChunk`; every block keeps the exact
+  per-token arithmetic, selection counts derive in-kernel from the
+  absolute position (`n_sel == 0` / negative sentinels distinguish the
+  fixed single-token decode call, which now runs the same kernels with
+  n = 1). `TopKDesc` stays a per-token loop. Scratch grows to
+  2048 x (capacity/kPool + 2) pool scores (~268 MB per 131K session)
+  and 2048-token tile-score staging. n-gen-1 output sha256
+  `43557e0c…` identical across both binaries; full `glm5_next` ctest
+  9/9 GPU-exclusive. A/B (alternating, warm+2): pp2048
+  178.32/179.63 -> **184.30/184.81 (+3.0 %)** with variance down to
+  ±0.13; pp16384 noisy control 147.05/141.67 -> stable
+  **146.78/147.19** (no loss at 16K; the win is the 45 % tail at
+  short prompts) (`/tmp/opencode/gufo_bench_mla2ab.log`,
+  `/tmp/opencode/gufo_bench_mla2gate.log`).
+- KDA fold + update chunk with the state **column in registers**
+  (`ops.hip.cpp KdaFoldUpdateChunkRegKernel<128>`): column `j` of the
+  `[d][d]` state evolves independently (`sk[j]` sums only over column
+  `j`), and both per-step reference kernels already scan `i` in order,
+  so one thread per column keeps its whole column in `float sc[128]`
+  (128 VGPR, ISA-checked zero spills, no shared memory) with the exact
+  per-element expression order. The `kda_fold_update_chunk`
+  bit-exactness contract passes with zero margin; the old LDS kernel
+  stays for `d != 128`. The launch drops from ~20 ms (LDS
+  read-modify-write chain) to ~2 ms: alternating pp2048 A/B 193.75/
+  194.43 -> **215.71/216.21 (+11.3 %)** and pp16384 163.49 vs
+  alternating controls 154.48/147.70 (+5.8 %..10.6 %); n-gen-1 sha
+  `43557e0c…` identical; `glm5_next` ctest 9/9 GPU-exclusive
+  (`/tmp/opencode/gufo_bench_kda2.log`, `_kda3gate.log`,
+  `_kda4ct.log`).
+- Single-list top-k shrink (`ops.hip.cpp TopKDesc`): every prefill token
+  below ~4K context took the `lists <= 1` shortcut, which always ran the
+  `BitonicGatherKernel<2048>` network (C = 4096 keys, ~4 sort strided
+  rounds per thread, ~30 us) no matter how few pools the token had —
+  early tokens sorted 4096 keys for 8 real ones. The shortcut now runs
+  the same switch-selected `k2` network with `final = true`; the key
+  order, neutral fills and tie-breaks are identical (bit-exact, the
+  existing `topk …/… single` contract passes untouched). Offline A/B
+  (alternating, warm+2): pp2048 185.32/184.94 -> **193.19/193.27
+  (+4.4 %)**; pp16384 parity 150.0/148.8 vs noisy control 153.3/147.1
+  (beyond ~4K tokens `k2` pins at 512 and multi-list merges dominate
+  again, so the shortcut only serves the shallow prefix there); n-gen-1
+  sha `43557e0c…` identical; `glm5_next` ctest 9/9 GPU-exclusive
+  (`/tmp/opencode/gufo_bench_topk1ab.log`, `_topk1gate.log`,
+  `_topk1ctest.log`).
+- Q5_K wmma fragment dword decode (`dense_wmma.hip.cpp
+  DecodeFragmentHalfQ5K`, A2): the fragment's 16 nibble bytes and high-bit
+  plane were read from LDS one byte at a time (32 scalar byte loads per
+  fragment); at the 180-byte staged stride both 16-byte windows are
+  dword-aligned, so they now arrive as two `__builtin_memcpy` windows and
+  the nibble/bit extraction shifts registers (`sh = 8 * (i & 3)`; the
+  `0xF` nibble mask is load-bearing — without it the `>> sh + 4` variant
+  leaks the adjacent byte's bits). Bit-exact: `rocm_dense_wmma` and
+  `rocm_routed_wmma` pass untouched. Offline A/B (alternating):
+  pp2048 214.05/213.64 -> **216.48/217.56 (+1.2-1.7 %)**; ship gate
+  pp16384 162.00/160.44 -> **169.49/162.15** (paired +2.9/+1.1 %,
+  means +2.8 %); n-gen-1 sha
+  `43557e0c…` identical across all 8 runs; `glm5_next` ctest 9/9
+  GPU-exclusive (`/tmp/opencode/gufo_bench_a2ab.log`,
+  `_shipgate.log`). Decoding instruction count is not the stage's wall,
+  though: cutting the fragment's LDS byte loads 48 -> 8 bought only the
+  +1.2 % shipped here, so the rest of A2's 1.3-1.5x hypothesis stays
+  parked and the weight re-read path keeps its shape (see P3g,
+  Rejected).
+- Q8_0 GEMV row tiling + grid.y slice batching (`gemv.hip.cpp
+  GemvRowsQ8_0Tiled`, A6): the Rows tier re-reads the identical 16-token
+  activation slice for every weight row. One wave now accumulates four
+  rows (each load feeds four FMAs) and grid.y enumerates the 256-token
+  chunk's sixteen 16-token slices in a single launch; per-row
+  accumulation order, shuffle tree and grouped x bases (group_rows
+  divides 4) are untouched, so the dots stay bit-identical. Launched
+  only for Q8_0 with rows % 16 == 0 and tokens >= 16; all other widths
+  and types keep the slice ladder. Microbench
+  (`tools/bench/glm5_rows_bench.hip`, exclusive): grid.y alone +3-11 %,
+  LDS-staged activations 3-6x worse (variants rejected), row tiling
+  alone -28-33 %, both together -37 %, matching the ssm/k_b/v_b call
+  shapes exactly (`/tmp/opencode/gufo_bench_rowsbench.log`,
+  `_rowsbench3.log`). Offline A/B (alternating): pp2048
+  218.26/218.65 -> **226.15/226.76 (+3.6 %)**; pp16384 (reps 3,
+  alternating pairs) 164.78/164.93 -> **167.21/167.39 (+1.4-1.5 %)**;
+  tg1/tg128 unchanged (decode path untouched). n-gen-1 sha
+  `43557e0c…` and n-gen-128 sha `752281d6…` identical across both
+  binaries and all runs (`/tmp/opencode/gufo_bench_tileab.log`,
+  `_tilesha.log`, `_tile16kb.log`); `glm5_next` ctest 9/9
+  GPU-exclusive (`/tmp/opencode/gufo_bench_gemvfull.log`). What is
+  left of the tier after this: the F32 router/idx_proj RowsF32 calls
+  (0.50 s per 9.4 s pass) were not tiled (F32 kernel unchanged) and
+  the split-K col-parallel idea stays closed (changes the per-row
+  reduction tree); RPT 8 spills and runs 2x slower, RPT 2 looses to 4.
+- F32 GEMV row tiling (same kernel shape, A6b): the RowsF32 router
+  (288x4096) and idx_proj (32x4096) calls keep the gate `type in
+  {Q8_0, F32} && tokens >= 16 && rows % 16 == 0` via
+  `LaunchRowsSlices -> GemvRowsF32Tiled`. Microbench (same tool,
+  exclusive): router 439 -> 121 us, idx_proj 316 -> 28.9 us per
+  16-slice call, bit-exact; grid.y batching alone was already 2.1x /
+  10x of A, and idx_proj (2 x-grids) still wins with tiles, so no
+  row-count floor beyond rows % 16. Offline A/B (alternating):
+  pp2048 218.84/217.41 -> **231.10/230.93 (+5.9 % cumulative over
+  part 1)**; pp16384 169.03/163.33 -> 169.49/**170.70**; tg1/tg128
+  unchanged. n-gen-1/128 shas `43557e0c…` / `752281d6…` re-verified
+  on the shipping binary; `glm5_next` ctest 9/9 GPU-exclusive
+  (`/tmp/opencode/gufo_bench_f32gate.log`, `_f32ab.log`,
+  `_f32ship.log`). The Rows tier is now fully tiled; what remains of
+   its 0.5 s/pass residue is the <16-token ladder tail.
+- Split-q WMMA MLA gather score + vectorized combine (`attention.hip.cpp
+  MlaPackQKernel`/`MlaGatherScoreKernel`/`MlaGatherCombineKernel`, A4):
+  the score now runs on tensor cores — q is packed once per call into hi
+  and lo F16 halves (`[tokens][2][heads][512]`), each 32-key tile stages
+  the gathered latent rows in LDS and scores 64 heads from two
+  `matrix_a` fragments (hi + lo) into one fp32 accumulator. A single
+  F16 q was tried first and rejected: bench NMSE 4.3e-8 looked fine but
+  softmax cancellation put the worst-rel latent error at 4e-3, past the
+  5e-5-era contract; the split recovers it to NMSE 1.03e-11 at 2.98x
+  instead of the single-fragment 3.67x. Combine moved to an uint4
+  8-column slice per thread (64 threads, 4-way j unroll). Microbench
+  (`tools/bench/glm5_mla_bench.hip`, exclusive): score 70.7 -> 23.7 ms
+  (2.98x), combine 80.5 -> 50.4 ms (1.60x) with worst-rel quality
+  reported on both variants
+  (`/tmp/opencode/gufo_bench_mlabench2.log`). Quality: attention test
+  gates latent at 2e-4 (documented F16-split residual on near-zero
+  latent elements; measured 1.21e-4) and out at 1e-3 (measured 7.9e-5).
+  The forward golden needed re-approval: the `code` case final snapshot
+  reached 0.5005 nats against the 0.5 margin while all five 24-token
+  argmax chains stayed exact and every other snapshot sat at 0.02-0.23;
+  re-captured through the STEPS self-capture path (prefill drift
+  <= 0.02, `code` final shift 0.48 nats, verification run ALL PASS,
+  fixture revision 1022d0191). Matched pp A/B (alternating pairs,
+  baseline rebuilt from a clean worktree of `1022d019` — an earlier
+  in-session "baseline" binary that predated A6b and a worktree whose
+  CMake source dir silently stayed `CMAKE_HOME_DIRECTORY` of the main
+  tree both polluted the first two attempts; absolute pp levels also
+  drift ~5 % across days, so only alternating same-session pairs mean
+  anything): pp2048 230.9/228.6 -> **251.2/249.8 (+9.0 %)**, pp16384
+  175.1/169.6 -> **193.7/192.8 (+12.2 %)** — the gain grows with depth
+  as the quadratic share predicts
+  (`/tmp/opencode/gufo_bench_a4true.log`); pp512 +2.9 %, tg1/tg128 at
+  noise (11.56/11.56 vs 11.42/11.64 t/s,
+  `/tmp/opencode/gufo_bench_a4tg.log`); `glm5_next` ctest green
+  GPU-exclusive on the shipped fixture
+   (`/tmp/opencode/gufo_bench_glm5suite.log`, `_glm5fix.log`).
+ - Head-grouped 8-key MLA combine (`MlaGatherCombineKernel`,
+   `kMlaCombineHeadW = 4`, `kMlaCombineKeyW = 8`, C2): the vectorized
+   combine still sat ~2.5x off its bandwidth floor, and sharing gathered
+   rows across 2 or 4 heads alone recaptured nothing (both 1.14x) — ISA
+   showed the kernel load-latency and issue bound (539 instructions, 39
+   `s_waitcnt`, only four independent `uint4` loads in flight), not
+   bandwidth bound. Sharing each gathered latent row across four heads
+   *and* deepening the prefetch window to eight keys took combine from
+   50.6 to **36.6 ms (1.38x** over the A4 vectorize; vec8 1.17x, q2
+   1.15x, q4 1.18x, `/tmp/opencode/gufo_bench_c4probe.log`). Each block
+   owns heads `head0..head0+3`, stores exps LDS-interleaved four per key
+   and issues one `uint4` per selected row into 4x8 accumulators;
+   per-head max/psum fold the same strided-partial + tree order as the
+   one-head kernel, and `__fmaf_rn` pins FMA contraction across the new
+   unroll widths — the result is **bit-exact** to the previous combine
+   (bit-diff 0 at 37 and 2048 tokens, so the golden needed no
+   re-approval). Quality: `glm5_next` ctest 9/9 GPU-exclusive, forward
+   golden ALL PASS unchanged at revision 1022d0191
+   (`/tmp/opencode/gufo_bench_c2tests.log`, `_c2tests2.log`). Alternating offline
+   A/B (same session, baseline `/tmp/opencode/gufo_c2base` = the A4
+   binary, `/tmp/opencode/gufo_bench_c2ab.log`, `_c2tg.log`): pp2048
+   253.35/255.84 -> **262.56/262.09 (+3.0 %)**, pp16384
+   200.99/200.70 -> **209.62/209.33 (+4.3 %)**, tg32 at noise
+   (11.39/11.40 vs 11.54/11.04). LDS grows to 4x(n_sel+33) floats
+   (33 KB at the 2051 cap, still two blocks/CU).
+
+## Routed WMMA prefetch depth (2026-11-17): rejected
+
+Production stall counters on the shipped `RoutedWmmaKernel<>` variants
+(`/tmp/opencode/s_RoutedWmmaKernel`, per-wave: WAIT_INST_ANY 247-334 k
+vs WAIT_INST_LDS 0.4-13.6 k, global-load waits and barrier bubbles
+dominate while LDS sits at 426) plus per-launch DRAM rates of
+137-164 GB/s against the 241 GB/s ceiling suggested the global->register
+pipeline had slack a deeper queue could fill. Porting the replica's
+depth lever (`kPfD`) to production — duplicated `f_word`/`a_data`
+register buffers over the same single LDS stage buffer, `sl = stage %
+kPfD`, VGPR max 221 at depth 2 with zero spills, `glm5_next.rocm_routed_wmma`
+NMSE green at both depths (4 stages at `kCols = 1024`)
+(`/tmp/opencode/gufo_bench_pf_d1.log`, `_pf_d2.log`) — regressed
+instead: exclusive two-round pp2048 (`/tmp/opencode/gufo_bench_pfab.log`,
+baseline `/tmp/opencode/t64/gufo_base`) 273.2/271.7 base vs
+271.5/272.2 depth-1 (restructure free) vs **249.3/249.3 depth-2
+(-8.2 %)**, tg32 flat. The replica's pf2/pf3 slowdown (+16-21 %)
+reproduces despite the different occupancy regime (1 block/CU, register
+headroom), so the fetch/commit phase cost of doubling the per-thread
+load set outweighs added memory-level parallelism; the kernel's idle
+wave time is not fetch-depth limited. Reverted; the one-stage pipeline
+stays.
+
+## Routed experts on the W8A8 tier (2026-11-17): rejected
+
+Item 7's routed-expert half assumed INT8 halves weight bytes at ~2x
+tensor-core rate. Both walls fail at the routed shape (m2048 k4096,
+topk 8, 2048 tokens, 288 experts) in exclusive microbenches
+(`/tmp/opencode/gufo_bench_r8ab.log`, `_r8iq1.log`;
+`glm5_iq1_wmma_bench` contract green, nmse 4.5e-8): the shared W8A8
+tier runs 25.7–28.0 TF/s (`attn_out` m2048×k4096, batches 512–8192)
+against the IQ1 replica's 21.2–30.8 TF/s eff — INT8 WMMA shares the
+FP16 unit on gfx1151, so the 55.07 TOPS ceiling comment is raw-MMA
+headline, not a compute win end to end. The byte wall is worse:
+`block_q8_0` is 272 B/256 weights vs IQ1_M's 56 B, turning the 6.03 GB
+gate+up launch into 29.3 GB; even at the 241 GB/s DRAM peak that is
+≥121 ms vs the shipped 42 ms (`RoutedWmmaKernel<56,60,2>`), and reuse
+additionally needs a full-expert 4.9x-size repack because IQ1_M has no
+native K-block encoding. Track closed; dense half stays. Lead from the
+same sweep: `v64 192x128 bk2 4x1` beat the shipped 128x128 2x2 tile
++3.5/+4.0 % at m2048×k4096 batch 2048/8192 — a dense-tier
+production-shape A/B candidate.
+
+## Dense-tier 192x128 wave64 tile (2026-11-17): retained
+
+That Flint lead is now the default: the W8A8 dense `LaunchTuned`
+batch ≥ 96 branch dispatches the wave64
+`WKQuantA8BlockedWmmaGEMMKernel<192, 128, 2, 4, 1>` slab from the new TU
+`kernels/rocm/w8a8_wave64.hip.cpp` (grid `((tokens+127)/128,
+(m+191)/192)`, 256 threads; batch < 96 keeps the wave32 128×64 tile).
+Production gate (B13): exclusive offline A/B pp2048
+`266.66 / 272.00` → `278.00 / 284.37` (**+4.4 %**, ranges disjoint),
+tg32 flat; serve-context gate c1 prefill `212.1 / 211.2` →
+`215.8 / 215.1` (+1.8 %, all pairs up), decode flat; tg64 greedy
+`output_sha256` bit-identical (`1d79e532…`); suite `glm5_next` 10/10
+including the strict `rocm_forward` golden (`/tmp/opencode/
+gufo_bench_t192g4.log`).
+
+## Fused online-softmax MLA attend (2026-11-17): retained
+
+The B7-B10 ladder's online-softmax attend item: `MlaFusedAttendKernel`
+(`kernels/rocm/attention.hip.cpp`) collapses the batch score+combine pair
+into one launch — a block per query token (8 waves), wave pairs owning
+16-head groups split the 512-dim scoring dots into latent halves merged
+through LDS, run the merged chunk softmax in base 2 with a running max
+and 16 F32 result accumulators, and consume a transposed V tile staged in
+the same LDS union as K. Q stays the hi/lo F16 pack; probabilities are
+F16. Microbench (`tools/bench/glm5_fused_attend.hip`, fp64 oracle): the
+attention leg at pp2048 shapes 59.34 → 36.49 ms (**1.63×**), sparse
+512-of-62K 17.13 → 12.98 ms (**1.23×**); hi-only (2.02×/1.58×) and a
+transposed-shadow-cache fast variant (2.15×) stayed bench-only — the
+champion keeps the NMSE at 1.4-1.8e-9 instead of trading it. Dispatch:
+prefill chunks with `heads % 16 == 0 && heads <= 64` (the model's 64),
+one fused launch after the shared q pack; the decode trio and the
+head-shape fallback keep the old pair. Production gate (B14): exclusive
+alternating offline A/B pp2048 `284.83 / 284.03` → `296.06 / 295.88`
+(**+4.0 %**, sample ranges disjoint), pp16384 `224.51` → `239.23`
+(**+6.6 %**), tg32 flat (`/tmp/opencode/gufo_bench_fusedab.log`). New
+`rocm_attention_test` fused contract: NMSE ≤ 4.0e-8 vs the doubles oracle
+over three token/pool shapes (gate 1e-5); the strict `rocm_forward`
+golden replays greedy-exact on all five cases with `max |dlogit| =
+0.0000` — no fixture refresh (`/tmp/opencode/gufo_bench_fwd3.log`).
+
+## Next candidates (fresh pp2048 profile on the shipped tree, 2026-11-15)
+
+The launch storm is closed (steady-state idle 2.2 %,
+`/tmp/opencode/prof_post_a6` post-A6 rerun): routed IQ WMMA 29.4 %,
+dense Q5_K WMMA 24.1 %, MLA score+combine 18.2 % (before C2 — the
+head-grouped combine shipped after this capture, ~38 % off the combine
+leg per pass), micro-kernel misc
+(convert/norm/elementwise, 112 k calls) 14.6 %, Rows GEMV 6.0 % (was
+~23 % before A6), KDA fold 4.7 %, indexer sort ~1 % (was 6 %). The
+measured-order ladder with per-item
+estimates and quality gates lives in
+[PLAN.md](PLAN.md) Phase 3: exact-default items A1-A6 (A1 rejected,
+A2/A3/A4/A5/A6 shipped 2026-11-15 — the exact-default ladder is done)
+plus C2 (head-grouped 8-key combine, +3.0/+4.3 % pp),
+then the approximate
+fast track B7-B10 (W8A8 — dense half default since the 2026-11-16 B12
+promotion, routed half rejected 2026-11-17; online-softmax attend shipped
+as B14 2026-11-17; capped
+window, DFlash2/MTP speculation) from which the reference-class 600+
+comes. Earlier items in this list (IQ routed WMMA tier, Q5_K WMMA tier,
+GatherScore rewrite, chunk-scan launch collapse) are all shipped; see
+Retained above.
+
+## MTP levers from the llama.cpp draft-mtp reference (2026-11-17)
+
+The llama.cpp `draft-mtp` capture (BENCHMARKS.md, Reference with native MTP:
+16.4 plain → **21.7 t/s** at n-max 2, 57.9 % acceptance, pp flat) pins the
+two structurally expensive points in the gufo B10 loop, in ladder order:
+
+1. **Base decode row** — 11.4 vs 16.4 t/s is most of the 0.68× absolute
+   decode gap (gufo's multiplier is already larger: 1.60× vs 1.32×); this is
+   the existing routed-expert/row ladder, now with a matched MTP-visible
+   reference.
+2. **Correction row** — every partial round feeds the target's own token
+   through a full serial `Step()` trunk pass (`engine.cpp` commit stage).
+   llama.cpp instead defers the correction token into the **next verify
+   round as row 0** and drafts off held-back verify hidden
+   (`pending_h`; `verify_hidden()` rows already exist in gufo at
+   `executor.cpp` MtpAdvance). Removing the extra row targets the majority
+   of rounds.
+3. **Draft-side prompt prefill** — the −6.4…−7.3 % pp penalty comes from
+   priming the separate draft DSA/KDA cache over all prompt rows; llama.cpp
+   shares the target context (`ctx_other`) with masked nextn embeddings and
+   pays zero pp.
+
+Ordering note: levers 2-3 are pure MTP-loop changes (lossless-gateable via
+the greedy `output_sha256` anchor); they compose with the row ladder
+rather than waiting for it.
+
+**Update (same day) — best n resolved, k=1 promoted (BENCHMARKS.md B15).**
+Offline scan on the HEAD binary: k=1 16.54 > streak 15.65 > k2 14.57 > k3
+12.90 > k4 10.36 (plain 11.83); serve A/B 12.10 → **13.76** (+13.7 %,
+acceptance 87.5 %). k=1 is the shipped default (`SetDraftLimits` maps the
+open-ended CLI defaults to k=1; explicit 2..4 keeps the ladder). Two
+consequences for the ladder: (a) lever 2's payoff estimate changes — at
+k=1 every partial round still pays the serial correction row, so deferring
+it into the next verify round (llama.cpp `pending_h`) is now the single
+largest remaining MTP-loop win; after that, revisit k∈{1,2} since extra
+verify rows get cheaper; (b) the lossless gate anchor moved with B14's
+fused attend and is now `ddae62cf…` at `-d 2048 -n 64` (verified
+plain==MTP on the B15 candidate; do not chase `1d79e532…`).
+
+**Update (2026-11-18) — lever 2 done, correction row deferred (BENCHMARKS.md
+B16).** The rejected-row correction token is now parked as the next round's
+seed (`pending_token_`/`pending_h_row_` in `engine.cpp`): the round's first
+executor row is `MtpStep` on `verify_hidden()[accepted]` plus `Verify` with
+the deferred token at row 0, so partial rounds drop 3 rows → 2 and no
+verification round ever pays a serial trunk pass. `FlushPending()` drains
+the parked row before the target's own `Step` on sync-tail continuation,
+`Evaluate` and the k==0 path; a dropped cache (sync mismatch, reset or plain
+prompt re-seed) discards the pending token because replay re-covers that
+position. Greedy anchors stay bit-identical (`f985b939…`, `ddae62cf…`); the
+sampling path intentionally shifts the RNG stream (the deferred round seeds
+from the pending token instead of `sampler.Sample`). Measured: median serve
+decode unchanged (+0.6 %, acceptance ≈88 % makes partial rounds the minor-
+ity) but the worst inter-token gap halves — 217 → 138–146 ms. The promised
+k∈{1,2} revisit with defer on: fixed k2 12.97 / k3 12.23 vs k1 13.84 t/s
+serve, tails 204/221 vs ~140 ms → **k=1 stays default**; deferral ships as
+the tail/row-count win, not a median lever. Remaining from the list: lever
+3 (draft-side pp penalty via a shared target context) and the base-row
+ladder.
+
+**Update (2026-11-18) — lever 3 done, and its premise was wrong
+(BENCHMARKS.md B17).** Stream-synced per-call probes decomposed the draft
+prefill: the draft **DSA runs at target parity (90.8 vs 90.5 µs/row)** —
+priming the draft caches over all prompt rows was never the penalty — while
+the draft **FFN cost 210.5 µs/row against the target's 39.4**: the UD
+artifact quantizes the last block and the nextn stack inside it as
+Q2_K gate/up + Q3_K down, types the WMMA tier did not enumerate, so every
+draft row fell through to the scalar bucketed GEMV. Extending the tier
+(Q2_K/Q3_K `DecodeFragmentHalf` specialisations, contract-covered at NMSE
+1.3e-5/3.4e-8) took the draft FFN to 25.6 µs/row (**8.2×**) and the paired
+penalty −7.8 % → **−3.9 %** at pp2048 @ d4096 and −8.3 % → **−1.5 %** at
+pp8192 @ d16384, with the `f985b939…`/`ddae62cf…` greedy anchors
+bit-identical. A `kMtpRows = kChunk` batch was tried and dropped: the
+probes showed FFN/DSA cost scales with rows, not weight passes, so
+fewer-but-wider draft calls measured neutral. What remains of the penalty
+(mtp still 1.5–3.9 % behind plain, growing with depth) is the draft's
+inherent extra embedding/projection rows plus its share of DSA priming —
+a shared target context (llama.cpp `ctx_other`) would need a lossy
+architecture change and is now worth ≲ 2 %, not 8. Remaining lever: the
+base-row ladder.
